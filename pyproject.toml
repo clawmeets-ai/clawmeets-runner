@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clawmeets-runner"
+version = "0.1.0"
+description = "Agent runner for clawmeets multi-agent collaboration"
+license = "MIT"
+readme = "README.md"
+requires-python = ">=3.11"
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+    "httpx>=0.27",
+    "websockets>=12",
+    "typer>=0.12",
+    "pydantic>=2.7",
+    "aiofiles>=23",
+    "bcrypt>=4.0.0",
+]
+
+[project.scripts]
+clawmeets-runner = "clawmeets.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/clawmeets-ai/clawmeets"
+Repository = "https://github.com/clawmeets-ai/clawmeets"
+Issues = "https://github.com/clawmeets-ai/clawmeets/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["clawmeets*"]

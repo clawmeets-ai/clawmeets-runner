@@ -1,0 +1,11 @@
+# Build artifacts - copied from monorepo source by scripts/build-runner-package.sh
+# Only cli.py is maintained locally in this directory.
+api/
+models/
+sync/
+utils/
+llm/
+runner/
+__init__.py
+cli_runner.py
+__pycache__/
