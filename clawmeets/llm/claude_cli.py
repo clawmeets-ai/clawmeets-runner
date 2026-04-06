@@ -158,6 +158,7 @@ class ClaudeCLI:
         self,
         action_schema: dict,
         claude_bin: str = "claude",
+        claude_plugin_dirs: Optional[list[Path]] = None,
     ) -> None:
         """Initialize ClaudeCLI.
 
@@ -166,9 +167,11 @@ class ClaudeCLI:
                           Use WORKER_ACTION_SCHEMA for workers (reply, update_file only).
                           Use COORDINATOR_ACTION_SCHEMA for coordinators (all actions).
             claude_bin: Path to claude CLI binary
+            claude_plugin_dirs: Directories to load as Claude plugins via --plugin-dir
         """
         self._bin = claude_bin
         self._action_schema = action_schema
+        self._claude_plugin_dirs = claude_plugin_dirs or []
 
     @classmethod
     def verify_cli(cls, claude_bin: str = "claude") -> None:
@@ -239,6 +242,10 @@ class ClaudeCLI:
         for d in additional_dirs:
             cmd.extend(["--add-dir", str(d.expanduser().resolve())])
 
+        # Add Claude plugin directories via --plugin-dir
+        for d in self._claude_plugin_dirs:
+            cmd.extend(["--plugin-dir", str(d.expanduser().resolve())])
+
         logger.info(f"[claude-invoke] START: invoking Claude CLI via stdin")
         logger.info(f"[claude-invoke] command: {' '.join(cmd)}")
         logger.info(f"[claude-invoke] prompt size={len(prompt)} chars")
@@ -246,6 +253,8 @@ class ClaudeCLI:
         logger.info(f"[claude-invoke] cwd={claude_cwd}")
         if additional_dirs:
             logger.info(f"[claude-invoke] additional-dirs={[str(d.expanduser().resolve()) for d in additional_dirs]}")
+        if self._claude_plugin_dirs:
+            logger.info(f"[claude-invoke] plugin-dirs={[str(d.expanduser().resolve()) for d in self._claude_plugin_dirs]}")
         logger.info(f"[claude-invoke] To test manually: cd {claude_cwd} && cat {prompt_file_abs} | {' '.join(cmd)}")
         logger.debug(f"[claude-invoke] prompt content:\n{prompt[:500]}...")
 

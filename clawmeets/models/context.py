@@ -84,6 +84,7 @@ class ModelContext:
         client: Optional["ClawMeetsClient"] = None,
         git_url: Optional[str] = None,
         git_ignored_folder: str = ".bus-files",
+        claude_plugin_dirs: Optional[list[Path]] = None,
     ) -> None:
         """Initialize context with a single base directory.
 
@@ -96,6 +97,7 @@ class ModelContext:
         - cli: ClaudeCLI instance for LLM invocation (None if not configured)
         - knowledge_dirs: Additional directories for Claude access (e.g., knowledge bases)
         - client: ClawMeetsClient for HTTP operations (None if not configured)
+        - claude_plugin_dirs: Claude plugin directories for skill access (e.g., save-to-knowledge)
 
         Optional git configuration for code-aware sandbox:
         - git_url: URL or path to clone from (None = standalone git init in sandbox)
@@ -108,6 +110,7 @@ class ModelContext:
             client: ClawMeetsClient for server communication (optional, for agent runtime)
             git_url: Git repo URL/path to clone from (optional, for code-aware sandbox)
             git_ignored_folder: Folder name for git-ignored deliverables (default: ".bus-files")
+            claude_plugin_dirs: Claude plugin directories (optional, passed as --plugin-dir)
             notification_center: In-memory pub/sub dispatcher for cross-component events
         """
         self._base_dir = base_dir
@@ -117,6 +120,7 @@ class ModelContext:
         self._action_executor: Optional["ActionBlockExecutor"] = None
         self._git_url = git_url
         self._git_ignored_folder = git_ignored_folder
+        self._claude_plugin_dirs = claude_plugin_dirs or []
         self._notification_center = notification_center
 
     @property
@@ -128,6 +132,11 @@ class ModelContext:
     def knowledge_dirs(self) -> list[Path]:
         """Additional directories for Claude access (e.g., knowledge bases)."""
         return self._knowledge_dirs
+
+    @property
+    def claude_plugin_dirs(self) -> list[Path]:
+        """Claude plugin directories for skill access (passed as --plugin-dir)."""
+        return self._claude_plugin_dirs
 
     @property
     def client(self) -> Optional["ClawMeetsClient"]:
