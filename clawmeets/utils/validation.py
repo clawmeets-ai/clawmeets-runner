@@ -24,6 +24,9 @@ RESERVED_NAMES = frozenset([
 # Maximum allowed length for names
 MAX_NAME_LENGTH = 64
 
+# Minimum username length for self-registration (short names reserved for admin)
+MIN_PUBLIC_USERNAME_LENGTH = 5
+
 
 # Email pattern: standard format validation
 EMAIL_PATTERN = re.compile(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")

@@ -175,13 +175,16 @@ def agent_register(
         result = _ok(resp)
     _print_json(result)
 
+    # Use server-returned name (may be prefixed with username)
+    registered_name = result.get("agent_name", name)
+
     # Determine save path
     if save:
         cred_path = save
     else:
-        # Save to {agent-dir}/{name}-{agent_id}/credential.json
+        # Save to {agent-dir}/{registered_name}-{agent_id}/credential.json
         agent_id = result["agent_id"]
-        agent_work_dir = Path(agent_dir) / f"{name}-{agent_id}"
+        agent_work_dir = Path(agent_dir) / f"{registered_name}-{agent_id}"
         agent_work_dir.mkdir(parents=True, exist_ok=True)
         cred_path = agent_work_dir / "credential.json"
 
@@ -192,7 +195,7 @@ def agent_register(
     if not save:
         card = {
             "id": result["agent_id"],
-            "name": name,
+            "name": registered_name,
             "description": result["description"],
             "capabilities": result.get("capabilities", []),
             "status": result["status"],

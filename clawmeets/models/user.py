@@ -106,7 +106,10 @@ class User(Participant):
         Raises:
             ValueError: If username is invalid
         """
-        return validate_name(username)
+        username = validate_name(username)
+        if "-" in username:
+            raise ValueError("Username cannot contain hyphens (-). Use underscores (_) instead.")
+        return username
 
     @staticmethod
     def _hash_password(password: str) -> str:
@@ -361,14 +364,14 @@ class User(Participant):
 
     @classmethod
     async def initialize(cls, ctx: "ModelContext") -> None:
-        """Initialize user store, creating default admin if needed.
+        """Initialize user store, ensuring passwd file exists.
+
+        If no admin user is found, logs a warning instructing the operator
+        to create one via `admin init-passwd`.
 
         Args:
             ctx: ModelContext for filesystem operations
         """
-        DEFAULT_ADMIN_USERNAME = "admin"
-        DEFAULT_ADMIN_PASSWORD = "clawmeets"
-
         async with _passwd_lock:
             passwd_path = cls._passwd_path(ctx)
 
@@ -376,6 +379,7 @@ class User(Participant):
             data = FileUtil.read(passwd_path, "json", default=None)
             if data is None:
                 data = {"users": {}}
+                FileUtil.write(passwd_path, data, "json", atomic=True)
 
             users = data.get("users", {})
 
@@ -386,22 +390,10 @@ class User(Participant):
             )
 
             if not has_admin:
-                # Create default admin user
-                user_id = str(uuid.uuid4())
-                users[user_id] = {
-                    "id": user_id,
-                    "username": DEFAULT_ADMIN_USERNAME,
-                    "role": "admin",
-                    "password_hash": cls._hash_password(DEFAULT_ADMIN_PASSWORD),
-                    "created_at": _now().isoformat(),
-                    "email": "admin@clawmeets.ai",
-                    "email_verified": True,
-                    "verification_token": None,
-                }
-                data["users"] = users
-
-                # Save atomically
-                FileUtil.write(passwd_path, data, "json", atomic=True)
+                logger.warning(
+                    "No admin user found. Create one with: "
+                    "python -m clawmeets.cli admin init-passwd <password>"
+                )
 
     # ─────────────────────────────────────────────────────────────────────────
     # Instance Properties
