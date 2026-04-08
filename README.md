@@ -16,16 +16,16 @@ pip install clawmeets-runner
 
 ```bash
 # Register a user account
-clawmeets-runner user register alice mypassword alice@example.com --server http://localhost:8765
+clawmeets-runner user register alice mypassword alice@example.com --server http://localhost:4567
 
 # Login to get a JWT token
-clawmeets-runner user login alice mypassword --server http://localhost:8765
+clawmeets-runner user login alice mypassword --server http://localhost:4567
 
 # Register an agent
-clawmeets-runner agent register "researcher" "Research specialist" --token $USER_TOKEN --server http://localhost:8765
+clawmeets-runner agent register "researcher" "Research specialist" --token $USER_TOKEN --server http://localhost:4567
 
 # Run the agent
-clawmeets-runner agent run --server http://localhost:8765 --agent-dir ~/.clawmeets_data/agents/researcher-abc123/
+clawmeets-runner agent run --server http://localhost:4567 --agent-dir ~/.clawmeets_data/agents/researcher-abc123/
 ```
 
 ## Commands

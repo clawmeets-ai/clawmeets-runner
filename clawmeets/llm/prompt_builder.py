@@ -386,15 +386,19 @@ OUTPUT FORMAT (required structure):
 If no actions needed, output: {"actions": []}
 
 == @MENTION ADDRESSING ==
-Use @mentions in your message content to address specific agents:
-- "@agent-name" = agent is ADDRESSED and should respond
-- "agent-name" (no @) = reference only, not addressed
+Messages are shared with ALL participants in the room as context — everyone can read them.
+@mentions control WHO RESPONDS:
+- "@agent-name" = agent is expected to respond
+- "agent-name" (no @) or no mention = agent reads the message but does NOT respond
+
+Only @mention agents you need a response from in this batch. For example, if one agent
+should lead and orchestrate others in the room, only @mention that agent — the others
+will see the message as context and can be @mentioned later by the lead.
 
 Examples:
-- "@researcher please analyze this data" -> researcher is addressed
-- "The researcher completed the task" -> reference only, researcher not addressed
-- "@researcher and @writer please collaborate" -> both are addressed
-- "Status update for everyone" -> no one is addressed (informational)
+- "@researcher please analyze this data" -> researcher responds; others read as context
+- "The researcher completed the task" -> no one responds; informational
+- "@researcher and @writer please collaborate" -> both respond in parallel
 
 FILE SHARING WORKFLOW - SERVER-FIRST ARCHITECTURE:
 Your working directory is a SANDBOX - files you write here will be pushed to
@@ -843,6 +847,12 @@ Use @mentions to assign work to agents (use chatroom names, not IDs):
 INVITING AGENTS TO CHATROOMS:
 Use "create_room" action to create a new chatroom and invite specific agents:
 {create_room_example}
+
+Note: All invited agents see the init_message as context. Only @mentioned agents respond.
+  CORRECT: invite: ["pm", "persona-a", "persona-b"], init_message: "@pm Interview the personas in this room..."
+    → PM responds; personas read the instructions as context and wait to be addressed by PM
+  WRONG:   invite: ["pm", "persona-a", "persona-b"], init_message: "@pm @persona-a @persona-b Interview instructions..."
+    → All 3 respond simultaneously instead of PM leading the conversation
 
 BEST PRACTICES FOR COORDINATORS:
 - Define milestones with specific deliverables (file names and criteria)

@@ -60,7 +60,7 @@ dm_app    = typer.Typer(help="Direct message commands", no_args_is_help=True)
 # Global options (env-var defaults)
 # ---------------------------------------------------------------------------
 
-DEFAULT_SERVER = os.environ.get("CLAWMEETS_SERVER", "http://localhost:8765")
+DEFAULT_SERVER = os.environ.get("CLAWMEETS_SERVER", "http://localhost:4567")
 DEFAULT_DATA_DIR = os.environ.get("CLAWMEETS_DATA", str(Path.home() / ".clawmeets_data"))
 DEFAULT_AGENTS_DIR = str(Path(DEFAULT_DATA_DIR) / "agents")
 DEFAULT_USERS_DIR = str(Path(DEFAULT_DATA_DIR) / "users")
