@@ -356,7 +356,7 @@ def user_register(
     You cannot log in until your email is verified.
 
     Example:
-        clawmeets-runner user register alice mypassword alice@example.com
+        clawmeets user register alice mypassword alice@example.com
     """
     with _http(server) as client:
         resp = client.post(

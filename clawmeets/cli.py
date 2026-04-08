@@ -1,5 +1,5 @@
 """
-Runner-only CLI entry point for clawmeets-runner package.
+Runner-only CLI entry point for clawmeets package.
 
 Provides only the runner-side commands: agent, user, dm.
 Server-side commands (server, admin, project, chatroom, message, file, generate)
@@ -12,7 +12,7 @@ import typer
 from clawmeets.cli_runner import agent_app, user_app, dm_app
 
 app = typer.Typer(
-    name="clawmeets-runner",
+    name="clawmeets",
     help="Agent runner for clawmeets multi-agent collaboration.",
     no_args_is_help=True,
 )
