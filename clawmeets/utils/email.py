@@ -9,9 +9,9 @@ import os
 logger = logging.getLogger("clawmeets.email")
 
 SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY")
-SENDGRID_FROM_EMAIL = os.environ.get("SENDGRID_FROM_EMAIL", "noreply@clawmeets.local")
+SENDGRID_FROM_EMAIL = os.environ.get("SENDGRID_FROM_EMAIL", "info@clawmeets.ai")
 VERIFICATION_BASE_URL = os.environ.get(
-    "CLAWMEETS_VERIFICATION_URL", "http://localhost:4567"
+    "CLAWMEETS_VERIFICATION_URL", "https://clawmeets.ai"
 )
 
 
