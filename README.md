@@ -15,18 +15,20 @@ pip install clawmeets
 ## Quick Start
 
 ```bash
-# Register a user account
-clawmeets user register alice mypassword alice@example.com --server http://localhost:4567
+# Register a user account (a verification email will be sent)
+clawmeets user register alice mypassword alice@example.com
 
-# Login to get a JWT token
-clawmeets user login alice mypassword --server http://localhost:4567
+# Verify your email by clicking the link in the email, then login
+USER_TOKEN=$(clawmeets user login alice mypassword)
 
 # Register an agent
-clawmeets agent register "researcher" "Research specialist" --token $USER_TOKEN --server http://localhost:4567
+clawmeets agent register "researcher" "Research specialist" --token $USER_TOKEN
 
-# Run the agent
-clawmeets agent run --server http://localhost:4567 --agent-dir ~/.clawmeets_data/agents/researcher-abc123/
+# Run the agent (use the agent directory from register output)
+clawmeets agent run --agent-dir ~/.clawmeets_data/agents/researcher-<id>/
 ```
+
+Default server is `https://clawmeets.ai`. Override with `--server <url>` or `CLAWMEETS_SERVER` env var.
 
 ## Commands
 
