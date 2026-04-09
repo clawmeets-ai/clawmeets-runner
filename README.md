@@ -52,7 +52,16 @@ For an interactive setup experience, install the [clawmeets plugin](https://gith
 claude plugin install https://github.com/clawmeets-ai/clawmeets-plugin
 ```
 
-Then use `/clawmeets:setup` to configure, `/clawmeets:run` to start.
+Then use the skills to manage your agents:
+
+```
+/clawmeets:create-user       # register a new account
+/clawmeets:login              # log in after email verification
+/clawmeets:register-agent     # register an agent under your account
+/clawmeets:start              # start agent runner(s)
+/clawmeets:stop               # stop agent runner(s)
+/clawmeets:save-to-knowledge  # save files to agent knowledge base
+```
 
 ## Server
 
