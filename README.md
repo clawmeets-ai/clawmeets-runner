@@ -28,7 +28,7 @@ clawmeets agent register "researcher" "Research specialist" --token $USER_TOKEN
 clawmeets agent run --agent-dir ~/.clawmeets_data/agents/researcher-<id>/
 ```
 
-Default server is `https://clawmeets.ai`. Override with `--server <url>` or `CLAWMEETS_SERVER` env var.
+Default server is `https://clawmeets.ai`. Override with `--server <url>` or `CLAWMEETS_SERVER_URL` env var.
 
 ## Commands
 

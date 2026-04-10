@@ -275,6 +275,7 @@ class Agent(PersistableParticipant):
             message_content=message.content,
             data_dir=data_dir,
             project_name=project.name,
+            knowledge_dirs=self._model_ctx.knowledge_dirs,
         )
 
         # Execute using ClaudeCLI with retry for transient failures
@@ -534,6 +535,7 @@ class Agent(PersistableParticipant):
             message_content=batch_content,
             data_dir=data_dir,
             project_name=project.name,
+            knowledge_dirs=self._model_ctx.knowledge_dirs,
         )
 
         await self._emit_acknowledgment(project_id, chatroom_name)
@@ -632,6 +634,7 @@ class Agent(PersistableParticipant):
             data_dir=data_dir,
             context_files=context_files,
             project_name=project.name,
+            knowledge_dirs=self._model_ctx.knowledge_dirs,
         )
 
         retry_delay = _INITIAL_RETRY_DELAY

@@ -105,6 +105,7 @@ Use update_file for BOTH types - the system handles git vs changelog separation 
         role_guidance: str,
         project_name: str,
         capabilities_line: str = "",
+        knowledge_dirs: list[Path] | None = None,
     ) -> str:
         """
         Build the base prompt structure used by both worker and coordinator.
@@ -124,6 +125,7 @@ Use update_file for BOTH types - the system handles git vs changelog separation 
             role_guidance: Role-specific guidance section
             capabilities_line: Optional capabilities line for workers
             project_name: Human-readable project name
+            knowledge_dirs: Optional list of knowledge base directories (read-write, persistent)
 
         Returns:
             Complete prompt string
@@ -132,6 +134,18 @@ Use update_file for BOTH types - the system handles git vs changelog separation 
         actions_doc = self.build_actions_doc()
 
         cap_section = f"\nCapabilities: {capabilities_line}" if capabilities_line else ""
+
+        knowledge_section = ""
+        if knowledge_dirs:
+            paths = "\n".join(f"- {d}" for d in knowledge_dirs)
+            knowledge_section = f"""
+== KNOWLEDGE BASE (read-write) ==
+Your persistent knowledge base directories:
+{paths}
+
+You can read AND write files here. Changes persist across projects.
+Use this to store learnings and reference material that improves your work over time.
+"""
 
         return f"""You are {name}, an AI agent.
 Description: {description}{cap_section}
@@ -142,7 +156,7 @@ Chatroom: {chatroom_name}
 == SYNCED PROJECT FILES (read-only) ==
 Files synced from server, available in {data_dir}:
 {file_manifest}
-
+{knowledge_section}
 == YOUR WORKING DIRECTORY ==
 Use relative paths to write files. Files you write will be synced to the server and shared with all participants.
 
@@ -248,6 +262,7 @@ You can read them but should not modify them directly - write to your working di
         message_content: str,
         data_dir: Path,
         project_name: str,
+        knowledge_dirs: list[Path] | None = None,
     ) -> str:
         """
         Build a worker-specific prompt.
@@ -265,6 +280,7 @@ You can read them but should not modify them directly - write to your working di
             message_content: Content of the incoming message
             data_dir: Data directory (synced, read-only)
             project_name: Human-readable project name
+            knowledge_dirs: Optional knowledge base directories (read-write, persistent)
 
         Returns:
             Complete worker prompt
@@ -283,6 +299,7 @@ You can read them but should not modify them directly - write to your working di
             role_guidance=worker_guidance,
             capabilities_line=capabilities_line,
             project_name=project_name,
+            knowledge_dirs=knowledge_dirs,
         )
 
     def _build_worker_guidance(self) -> str:
@@ -440,6 +457,7 @@ You can read them but should not modify them directly - write to your working di
         message_content: str,
         data_dir: Path,
         project_name: str,
+        knowledge_dirs: list[Path] | None = None,
     ) -> str:
         """
         Build a coordinator-specific prompt.
@@ -457,6 +475,7 @@ You can read them but should not modify them directly - write to your working di
             message_content: Content of the incoming message
             data_dir: Data directory (synced, read-only)
             project_name: Human-readable project name
+            knowledge_dirs: Optional knowledge base directories (read-write, persistent)
 
         Returns:
             Complete coordinator prompt
@@ -474,6 +493,7 @@ You can read them but should not modify them directly - write to your working di
             data_dir=data_dir,
             role_guidance=coordinator_guidance,
             project_name=project_name,
+            knowledge_dirs=knowledge_dirs,
         )
 
     def _build_agents_section(self, data_dir: Path) -> str:
@@ -513,6 +533,7 @@ chatrooms with the agents you need using the create_room action.
         data_dir: Path,
         context_files: list[str],
         project_name: str,
+        knowledge_dirs: list[Path] | None = None,
     ) -> str:
         """Build setup prompt for first user request.
 
@@ -530,6 +551,7 @@ chatrooms with the agents you need using the create_room action.
             data_dir: Data directory (synced, read-only)
             context_files: List of context files in shared-context
             project_name: Human-readable project name
+            knowledge_dirs: Optional knowledge base directories (read-write, persistent)
 
         Returns:
             Complete setup prompt
@@ -538,6 +560,18 @@ chatrooms with the agents you need using the create_room action.
         agents_section = self._build_agents_section(data_dir)
         file_manifest = self.build_file_manifest(data_dir)
         actions_doc = self.build_actions_doc()
+
+        knowledge_section = ""
+        if knowledge_dirs:
+            paths = "\n".join(f"- {d}" for d in knowledge_dirs)
+            knowledge_section = f"""
+== KNOWLEDGE BASE (read-write) ==
+Your persistent knowledge base directories:
+{paths}
+
+You can read AND write files here. Changes persist across projects.
+Use this to store learnings and reference material that improves your work over time.
+"""
 
         return f"""You are {name}, the COORDINATOR for project "{project_name}".
 
@@ -595,7 +629,7 @@ Read these files to understand project context before planning.
 == SYNCED PROJECT FILES (read-only) ==
 Files synced from server, available in {data_dir}:
 {file_manifest}
-
+{knowledge_section}
 == PLAN.md STRUCTURE ==
 Your PLAN.md MUST define milestones with CONCRETE DELIVERABLES, ACCEPTANCE CRITERIA, and WORKROOMS:
 

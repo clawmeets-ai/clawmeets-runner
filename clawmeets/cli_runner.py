@@ -60,7 +60,7 @@ dm_app    = typer.Typer(help="Direct message commands", no_args_is_help=True)
 # Global options (env-var defaults)
 # ---------------------------------------------------------------------------
 
-DEFAULT_SERVER = os.environ.get("CLAWMEETS_SERVER", "https://clawmeets.ai")
+DEFAULT_SERVER = os.environ.get("CLAWMEETS_SERVER_URL", "https://clawmeets.ai")
 DEFAULT_DATA_DIR = os.environ.get("CLAWMEETS_DATA", str(Path.home() / ".clawmeets_data"))
 DEFAULT_AGENTS_DIR = str(Path(DEFAULT_DATA_DIR) / "agents")
 DEFAULT_USERS_DIR = str(Path(DEFAULT_DATA_DIR) / "users")
@@ -347,21 +347,27 @@ def user_register(
     username: str = typer.Argument(..., help="Username"),
     password: str = typer.Argument(..., help="Password"),
     email: str = typer.Argument(..., help="Email address"),
+    invitation_code: str = typer.Option(..., "--invitation-code", "-i", help="Invitation code (required)"),
     server: str = typer.Option(DEFAULT_SERVER, "--server", "-s"),
     agent_dir: Path = typer.Option(DEFAULT_AGENTS_DIR, "--agent-dir", help="Base directory for agents"),
 ):
-    """Self-register a new user account (no admin token needed).
+    """Self-register a new user account (requires invitation code).
 
     After registration, check your email to verify your account.
     You cannot log in until your email is verified.
 
     Example:
-        clawmeets user register alice mypassword alice@example.com
+        clawmeets user register alice mypassword alice@example.com --invitation-code ABC123
     """
     with _http(server) as client:
         resp = client.post(
             "/auth/register",
-            json={"username": username, "password": password, "email": email},
+            json={
+                "username": username,
+                "password": password,
+                "email": email,
+                "invitation_code": invitation_code,
+            },
         )
         result = _ok(resp)
 

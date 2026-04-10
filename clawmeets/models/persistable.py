@@ -343,6 +343,111 @@ class PersistableParticipant(Participant, ABC):
         return result
 
     @classmethod
+    def search(
+        cls,
+        ctx: "ModelContext",
+        query: str = "",
+        capabilities: Optional[list[str]] = None,
+        status: Optional[str] = None,
+        offset: int = 0,
+        limit: int = 20,
+        sort: str = "status_first",
+        viewer_user_id: Optional[str] = None,
+        viewer_is_admin: bool = False,
+    ) -> tuple[list["Self"], int]:
+        """Search participants with filtering and pagination.
+
+        Loads card data once per agent and filters in-memory.
+
+        Args:
+            ctx: ModelContext for filesystem operations
+            query: Text search across name and description (case-insensitive)
+            capabilities: Filter by capabilities (agent must have at least one)
+            status: Filter by agent status (e.g., "online")
+            offset: Pagination offset
+            limit: Page size (max 50)
+            sort: Sort order - "status_first" (online first) or "name"
+            viewer_user_id: User ID of the viewer (for visibility)
+            viewer_is_admin: Whether the viewer is an admin
+
+        Returns:
+            Tuple of (paginated results, total matching count)
+        """
+        limit = min(limit, 50)
+        query_lower = query.lower().strip()
+        capabilities_set = set(c.lower() for c in (capabilities or []))
+
+        # Load all cards once and filter
+        matching: list[tuple[dict, "Self"]] = []
+        for entry in cls._list_dirs(ctx):
+            data = FileUtil.read(entry / "card.json", "json")
+            if not data:
+                continue
+
+            # Visibility filter (same logic as list_all)
+            is_discoverable = data.get("discoverable_through_registry", True)
+            if not viewer_is_admin:
+                if viewer_user_id:
+                    if not (data.get("registered_by") == viewer_user_id or is_discoverable):
+                        continue
+                elif not is_discoverable:
+                    continue
+
+            # Text search filter
+            if query_lower:
+                name = data.get("name", "").lower()
+                desc = data.get("description", "").lower()
+                if query_lower not in name and query_lower not in desc:
+                    continue
+
+            # Capabilities filter
+            if capabilities_set:
+                agent_caps = set(c.lower() for c in data.get("capabilities", []))
+                if not capabilities_set & agent_caps:
+                    continue
+
+            # Status filter
+            if status:
+                if data.get("status", "offline") != status:
+                    continue
+
+            matching.append((data, cls(data["id"], ctx)))
+
+        # Sort
+        if sort == "name":
+            matching.sort(key=lambda x: x[0].get("name", ""))
+        else:
+            # status_first: online first, then verified, then alphabetical
+            status_order = {"online": 0, "busy": 1, "rate_limited": 2, "offline": 3}
+            matching.sort(key=lambda x: (
+                status_order.get(x[0].get("status", "offline"), 3),
+                0 if x[0].get("is_verified", False) else 1,
+                x[0].get("name", ""),
+            ))
+
+        total = len(matching)
+        page = [item[1] for item in matching[offset:offset + limit]]
+        return page, total
+
+    @classmethod
+    def list_capabilities(
+        cls,
+        ctx: "ModelContext",
+    ) -> list[str]:
+        """Return distinct capabilities across all discoverable participants.
+
+        Returns:
+            Sorted list of unique capability strings
+        """
+        caps: set[str] = set()
+        for entry in cls._list_dirs(ctx):
+            data = FileUtil.read(entry / "card.json", "json")
+            if data and data.get("discoverable_through_registry", True):
+                for cap in data.get("capabilities", []):
+                    caps.add(cap)
+        return sorted(caps)
+
+    @classmethod
     def _validate_name(cls, name: str) -> str:
         """Validate and normalize participant name.
 

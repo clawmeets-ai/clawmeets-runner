@@ -517,6 +517,7 @@ If the current approach isn't working, document why in Learnings and try a diffe
             message_content=message.content,
             data_dir=data_dir,
             project_name=project.name,
+            knowledge_dirs=self._model_ctx.knowledge_dirs,
         )
 
         # Execute using ClaudeCLI with retry for transient failures

@@ -47,6 +47,14 @@ class AgentResponse(BaseModel):
     is_verified: bool = False
 
 
+class AgentSearchResponse(BaseModel):
+    """Paginated search results for agent discovery."""
+    agents: list[AgentResponse]
+    total: int
+    offset: int
+    limit: int
+
+
 class AgentRegistrationResponse(BaseModel):
     """Flat response from agent registration.
 
@@ -58,6 +66,7 @@ class AgentRegistrationResponse(BaseModel):
     description: str
     status: AgentStatus = AgentStatus.OFFLINE
     registered_at: datetime
+    discoverable_through_registry: bool = True
 
 
 class CreateUserResponse(BaseModel):
