@@ -218,7 +218,10 @@ class ReactiveControlLoop:
         # Sync assistant card (so card_path can find self via nested path)
         # Only assistants can access /assistants (requires user JWT auth)
         if self._participant.role == ParticipantRole.ASSISTANT:
-            await Assistant.sync_from_server(ctx=self._model_ctx)
+            try:
+                await Assistant.sync_from_server(ctx=self._model_ctx)
+            except Exception as e:
+                logger.warning(f"Failed to sync assistant card (non-fatal): {e}")
 
         # Sync project changelogs
         server_projects = await self._fetch_server_projects()

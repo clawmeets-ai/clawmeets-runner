@@ -515,6 +515,23 @@ class User(Participant):
             data["users"] = users
             self._save_passwd(data)
 
+    async def set_email_verified(self, verified: bool) -> None:
+        """Set email verification status.
+
+        Args:
+            verified: Whether email is verified
+        """
+        async with _passwd_lock:
+            data = self._load_passwd()
+            users = data.get("users", {})
+            if self._id not in users:
+                raise KeyError(f"User {self._id!r} not found")
+            users[self._id]["email_verified"] = verified
+            if verified:
+                users[self._id]["verification_token"] = None
+            data["users"] = users
+            self._save_passwd(data)
+
     async def delete(self) -> None:
         """Delete this user."""
         async with _passwd_lock:

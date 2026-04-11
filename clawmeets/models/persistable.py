@@ -531,6 +531,19 @@ class PersistableParticipant(Participant, ABC):
 
         return cls(participant_id, ctx), token
 
+    def regenerate_token(self) -> str:
+        """Generate a new token and update credential.json.
+
+        Returns:
+            The new raw token (only available at call time).
+        """
+        token = secrets.token_urlsafe(32)
+        part_dir = self._get_dir(self._model_ctx, self.name, self._id)
+        FileUtil.write(part_dir / "credential.json", {
+            "token_hash": hashlib.sha256(token.encode()).hexdigest()
+        }, "json", atomic=True)
+        return token
+
     @classmethod
     def verify_token(cls, participant_id: str, token: str, ctx: "ModelContext") -> bool:
         """Verify participant token.
