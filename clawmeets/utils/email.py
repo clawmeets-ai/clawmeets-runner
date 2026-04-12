@@ -45,6 +45,74 @@ async def send_waitlist_email(to_email: str) -> None:
         _send_waitlist_via_console(to_email)
 
 
+async def send_notification_email(
+    to_email: str,
+    username: str,
+    subject: str,
+    body: str,
+) -> None:
+    """Send a notification email.
+
+    Uses SendGrid if SENDGRID_API_KEY is set, otherwise logs to console.
+    """
+    if SENDGRID_API_KEY:
+        await _send_notification_via_sendgrid(to_email, subject, body)
+    else:
+        _send_notification_via_console(to_email, username, subject, body)
+
+
+async def _send_notification_via_sendgrid(
+    to_email: str,
+    subject: str,
+    body: str,
+) -> None:
+    """Send notification via SendGrid API."""
+    try:
+        import sendgrid
+        from sendgrid.helpers.mail import Mail, Email, To, Content
+    except ImportError:
+        logger.error(
+            "SendGrid is not installed. Install with: pip install sendgrid\n"
+            "Falling back to console output."
+        )
+        _send_notification_via_console(to_email, "", subject, body)
+        return
+
+    sg = sendgrid.SendGridAPIClient(api_key=SENDGRID_API_KEY)
+    message = Mail(
+        from_email=Email(SENDGRID_FROM_EMAIL),
+        to_emails=To(to_email),
+        subject=subject,
+        plain_text_content=Content("text/plain", body),
+    )
+    try:
+        response = sg.send(message)
+        logger.info(
+            f"Notification email sent to {to_email} "
+            f"(status={response.status_code})"
+        )
+    except Exception as e:
+        logger.error(f"Failed to send notification email to {to_email}: {e}")
+        raise
+
+
+def _send_notification_via_console(
+    to_email: str,
+    username: str,
+    subject: str,
+    body: str,
+) -> None:
+    """Fallback: log notification email to console."""
+    logger.info(
+        f"[EMAIL FALLBACK] Notification email for {username} ({to_email})"
+    )
+    print(f"\n--- Notification Email (SendGrid not configured) ---")
+    print(f"To: {to_email}")
+    print(f"Subject: {subject}")
+    print(f"Body: {body}")
+    print(f"----------------------------------------------------\n")
+
+
 async def _send_waitlist_via_sendgrid(to_email: str) -> None:
     """Send waitlist confirmation via SendGrid API."""
     try:
