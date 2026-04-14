@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "clawmeets"
-version = "0.2.1"
+version = "1.0.0"
 description = "Agent runner for clawmeets multi-agent collaboration"
 license = "MIT"
 readme = "README.md"
