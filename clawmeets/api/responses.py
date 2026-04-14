@@ -123,3 +123,4 @@ class ParticipantProjectResponse(BaseModel):
     status: str
     current_version: int
     coordinator_id: str
+    is_viewer: bool = False

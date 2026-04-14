@@ -243,6 +243,7 @@ def agent_run(
     claude_plugin_dir: Optional[list[Path]] = typer.Option(None, "--claude-plugin-dir", help="Claude plugin directory (passed as --plugin-dir to Claude CLI, repeatable)"),
     git_url: Optional[str] = typer.Option(None, "--git-url", help="Git repo URL/path for code-aware sandbox"),
     git_ignored_folder: str = typer.Option(".bus-files", "--git-ignored-folder", help="Git-ignored folder for deliverables"),
+    chrome: bool = typer.Option(False, "--chrome", help="Enable Chrome browser integration via Claude Code --chrome flag"),
     log_level: str = typer.Option("info"),
 ):
     """
@@ -302,7 +303,7 @@ def agent_run(
     if claude_plugin_dir:
         typer.echo(f"Claude plugin dirs: {claude_plugin_dir}")
 
-    asyncio.run(_runner_loop(agent_name, agent_id, token, server, Path(agent_dir), working_dir, knowledge_dir, claude_plugin_dir or [], git_url, git_ignored_folder))
+    asyncio.run(_runner_loop(agent_name, agent_id, token, server, Path(agent_dir), working_dir, knowledge_dir, claude_plugin_dir or [], git_url, git_ignored_folder, use_chrome=chrome))
 
 
 async def _ws_heartbeat_task(ws, agent_id: str) -> None:
@@ -716,6 +717,7 @@ async def _runner_loop(
     claude_plugin_dirs: Optional[list[Path]] = None,
     git_url: Optional[str] = None,
     git_ignored_folder: str = ".bus-files",
+    use_chrome: bool = False,
 ) -> None:
     """Run the reactive control loop for an agent."""
     agent_dir.mkdir(parents=True, exist_ok=True)
@@ -737,7 +739,7 @@ async def _runner_loop(
 
     # Set up Claude CLI with role-appropriate schema (fail early if CLI not available)
     ClaudeCLI.verify_cli()
-    cli = ClaudeCLI(action_schema=action_schema, claude_plugin_dirs=claude_plugin_dirs or [])
+    cli = ClaudeCLI(action_schema=action_schema, claude_plugin_dirs=claude_plugin_dirs or [], use_chrome=use_chrome)
 
     # Build knowledge_dirs list (e.g., knowledge bases)
     knowledge_dirs_list: list[Path] = []

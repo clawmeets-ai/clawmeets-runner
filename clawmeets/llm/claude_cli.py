@@ -159,6 +159,7 @@ class ClaudeCLI:
         action_schema: dict,
         claude_bin: str = "claude",
         claude_plugin_dirs: Optional[list[Path]] = None,
+        use_chrome: bool = False,
     ) -> None:
         """Initialize ClaudeCLI.
 
@@ -168,10 +169,12 @@ class ClaudeCLI:
                           Use COORDINATOR_ACTION_SCHEMA for coordinators (all actions).
             claude_bin: Path to claude CLI binary
             claude_plugin_dirs: Directories to load as Claude plugins via --plugin-dir
+            use_chrome: Enable Chrome browser integration via --chrome flag
         """
         self._bin = claude_bin
         self._action_schema = action_schema
         self._claude_plugin_dirs = claude_plugin_dirs or []
+        self._use_chrome = use_chrome
 
     @classmethod
     def verify_cli(cls, claude_bin: str = "claude") -> None:
@@ -245,6 +248,10 @@ class ClaudeCLI:
         # Add Claude plugin directories via --plugin-dir
         for d in self._claude_plugin_dirs:
             cmd.extend(["--plugin-dir", str(d.expanduser().resolve())])
+
+        # Enable Chrome browser integration
+        if self._use_chrome:
+            cmd.append("--chrome")
 
         logger.info(f"[claude-invoke] START: invoking Claude CLI via stdin")
         logger.info(f"[claude-invoke] command: {' '.join(cmd)}")
@@ -383,6 +390,9 @@ class ClaudeCLI:
         env = os.environ.copy()
         env["CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD"] = "1"
 
+        # Chrome browsing takes longer (navigating, filling forms, extracting)
+        invoke_timeout = 600 if self._use_chrome else 300
+
         # Run subprocess
         start_time = time.time()
         try:
@@ -394,7 +404,7 @@ class ClaudeCLI:
                 text=True,
                 cwd=claude_cwd,
                 env=env,
-                timeout=300,
+                timeout=invoke_timeout,
             )
             elapsed = time.time() - start_time
             logger.info(f"[claude-invoke] FINISHED in {elapsed:.1f}s, returncode={result.returncode}")
@@ -413,7 +423,7 @@ class ClaudeCLI:
             logger.error(f"[claude-invoke] partial stderr: {getattr(e, 'stderr', 'N/A')}")
             logger.error(f"[claude-invoke] prompt file saved at: {prompt_file_abs}")
             error = ClaudeTimeoutError(
-                timeout_seconds=300,
+                timeout_seconds=invoke_timeout,
                 prompt_file=prompt_file_abs,
                 working_dir=claude_cwd,
             )
