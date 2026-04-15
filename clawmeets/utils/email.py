@@ -25,7 +25,7 @@ async def send_verification_email(
     Uses SendGrid if SENDGRID_API_KEY is set, otherwise logs to console.
     """
     verification_url = (
-        f"{VERIFICATION_BASE_URL}/auth/verify-email?token={verification_token}"
+        f"{VERIFICATION_BASE_URL}/app/auth/verify-email?token={verification_token}"
     )
 
     if SENDGRID_API_KEY:
