@@ -10,12 +10,20 @@ from __future__ import annotations
 import typer
 
 from clawmeets.cli_runner import agent_app, user_app, dm_app
+from clawmeets.cli_init import init_command
+from clawmeets.cli_lifecycle import start_command, stop_command, status_command
 
 app = typer.Typer(
     name="clawmeets",
     help="Agent runner for clawmeets multi-agent collaboration.",
     no_args_is_help=True,
 )
+
+# Top-level commands (setup + lifecycle)
+app.command("init")(init_command)
+app.command("start")(start_command)
+app.command("stop")(stop_command)
+app.command("status")(status_command)
 
 app.add_typer(agent_app, name="agent")
 app.add_typer(user_app,  name="user")

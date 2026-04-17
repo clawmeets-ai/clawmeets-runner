@@ -234,6 +234,29 @@ class User(Participant):
         return None
 
     @classmethod
+    def get_by_phone(cls, phone_number: str, ctx: "ModelContext") -> Optional["User"]:
+        """Load user by phone number.
+
+        Args:
+            phone_number: The phone number to find
+            ctx: ModelContext for filesystem operations
+
+        Returns:
+            User instance or None if not found
+        """
+        phone_number = phone_number.strip()
+        passwd_path = cls._passwd_path(ctx)
+        data = FileUtil.read(passwd_path, "json", default=None)
+        if data is None:
+            return None
+
+        users = data.get("users", {})
+        for user_id, user_data in users.items():
+            if user_data.get("phone_number") == phone_number:
+                return cls(user_id, ctx)
+        return None
+
+    @classmethod
     async def verify_email(cls, token: str, ctx: "ModelContext") -> Optional["User"]:
         """Verify a user's email using the verification token.
 
@@ -459,6 +482,21 @@ class User(Participant):
         return self._load_passwd_entry().get("verification_token")
 
     @property
+    def phone_number(self) -> Optional[str]:
+        """Get phone number from filesystem."""
+        return self._load_passwd_entry().get("phone_number")
+
+    @property
+    def phone_verified(self) -> bool:
+        """Check if user's phone number is verified."""
+        return self._load_passwd_entry().get("phone_verified", False)
+
+    @property
+    def phone_verification_code(self) -> Optional[str]:
+        """Get phone verification code (None if already verified)."""
+        return self._load_passwd_entry().get("phone_verification_code")
+
+    @property
     def description(self) -> str:
         """Users don't have descriptions."""
         return ""
@@ -529,6 +567,41 @@ class User(Participant):
             users[self._id]["email_verified"] = verified
             if verified:
                 users[self._id]["verification_token"] = None
+            data["users"] = users
+            self._save_passwd(data)
+
+    async def update_phone_number(self, phone_number: str, verification_code: str) -> None:
+        """Update phone number and set verification code.
+
+        Args:
+            phone_number: The new phone number (E.164 format)
+            verification_code: The verification code to send via SMS
+        """
+        async with _passwd_lock:
+            data = self._load_passwd()
+            users = data.get("users", {})
+            if self._id not in users:
+                raise KeyError(f"User {self._id!r} not found")
+            users[self._id]["phone_number"] = phone_number
+            users[self._id]["phone_verified"] = False
+            users[self._id]["phone_verification_code"] = verification_code
+            data["users"] = users
+            self._save_passwd(data)
+
+    async def set_phone_verified(self, verified: bool) -> None:
+        """Set phone verification status.
+
+        Args:
+            verified: Whether phone is verified
+        """
+        async with _passwd_lock:
+            data = self._load_passwd()
+            users = data.get("users", {})
+            if self._id not in users:
+                raise KeyError(f"User {self._id!r} not found")
+            users[self._id]["phone_verified"] = verified
+            if verified:
+                users[self._id]["phone_verification_code"] = None
             data["users"] = users
             self._save_passwd(data)
 
@@ -697,6 +770,8 @@ class User(Participant):
             "username": entry.get("username", ""),
             "email": entry.get("email"),
             "email_verified": entry.get("email_verified", False),
+            "phone_number": entry.get("phone_number"),
+            "phone_verified": entry.get("phone_verified", False),
             "assistant_agent_id": entry.get("assistant_agent_id"),
             "created_at": entry.get("created_at", ""),
             "is_admin": entry.get("role") == "admin",

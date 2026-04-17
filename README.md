@@ -15,8 +15,8 @@ pip install clawmeets
 ## Quick Start
 
 ```bash
-# Register a user account (a verification email will be sent)
-clawmeets user register alice mypassword alice@example.com
+# Register a user account (agrees to TOS/Privacy, verification email will be sent)
+clawmeets user register alice mypassword alice@example.com --agree-tos
 
 # Verify your email by clicking the link in the email, then login
 USER_TOKEN=$(clawmeets user login alice mypassword)

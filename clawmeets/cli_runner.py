@@ -349,6 +349,7 @@ def user_register(
     password: str = typer.Argument(..., help="Password"),
     email: str = typer.Argument(..., help="Email address"),
     invitation_code: str = typer.Option(..., "--invitation-code", "-i", help="Invitation code (required)"),
+    agree_tos: bool = typer.Option(False, "--agree-tos", help="Agree to Terms of Service and Privacy Policy"),
     server: str = typer.Option(DEFAULT_SERVER, "--server", "-s"),
     agent_dir: Path = typer.Option(DEFAULT_AGENTS_DIR, "--agent-dir", help="Base directory for agents"),
 ):
@@ -360,6 +361,11 @@ def user_register(
     Example:
         clawmeets user register alice mypassword alice@example.com --invitation-code ABC123
     """
+    typer.echo("By registering, you agree to the Terms of Service (https://clawmeets.ai/tos)")
+    typer.echo("and Privacy Policy (https://clawmeets.ai/privacy).")
+    if not agree_tos:
+        typer.confirm("Do you agree to the Terms of Service and Privacy Policy?", abort=True)
+
     with _http(server) as client:
         resp = client.post(
             "/auth/register",

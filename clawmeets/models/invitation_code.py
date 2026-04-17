@@ -35,7 +35,7 @@ def _save(data: dict, data_dir: Path) -> None:
     FileUtil.write(_codes_path(data_dir), data, "json")
 
 
-def generate_codes(n: int, data_dir: Path) -> list[str]:
+def generate_codes(n: int, data_dir: Path, *, allowed_usage_count: int = 1) -> list[str]:
     """Generate N invitation codes and append them to the codes file.
 
     Returns the list of newly generated codes.
@@ -53,15 +53,26 @@ def generate_codes(n: int, data_dir: Path) -> list[str]:
             data["codes"].append({
                 "code": code,
                 "created_at": now,
-                "used_by": None,
+                "used_by": [],
+                "allowed_usage_count": allowed_usage_count,
             })
 
     _save(data, data_dir)
     return new_codes
 
 
+def _normalize_used_by(entry: dict) -> list[str]:
+    """Normalize legacy used_by formats to a list."""
+    used_by = entry.get("used_by")
+    if used_by is None:
+        return []
+    if isinstance(used_by, str):
+        return [used_by]
+    return used_by
+
+
 async def validate_and_consume(code: str, data_dir: Path, username: str) -> bool:
-    """Check if code is valid and unused, then mark it as consumed.
+    """Check if code is valid and has remaining uses, then mark it as consumed.
 
     Returns True if the code was valid and consumed, False otherwise.
     """
@@ -71,8 +82,12 @@ async def validate_and_consume(code: str, data_dir: Path, username: str) -> bool
     async with _lock:
         data = _load(data_dir)
         for entry in data["codes"]:
-            if entry["code"] == code.strip().upper() and entry["used_by"] is None:
-                entry["used_by"] = username
-                _save(data, data_dir)
-                return True
+            if entry["code"] == code.strip().upper():
+                used_by = _normalize_used_by(entry)
+                allowed = entry.get("allowed_usage_count", 1)
+                if len(used_by) < allowed:
+                    used_by.append(username)
+                    entry["used_by"] = used_by
+                    _save(data, data_dir)
+                    return True
         return False
