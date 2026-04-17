@@ -29,6 +29,7 @@ class ControlMessageType(str, Enum):
     HEARTBEAT = "heartbeat"                # Connection health check
     AGENT_STATUS_CHANGE = "agent_status_change"  # Server notifies clients of agent online/offline
     PROJECT_DELETED = "project_deleted"            # Server notifies clients that a project was deleted
+    SKILL_SYNC = "skill_sync"              # Server notifies client to install/uninstall a skill
 
 
 class ChangelogUpdatePayload(BaseModel):
@@ -55,10 +56,19 @@ class ProjectDeletedPayload(BaseModel):
     project_name: str
 
 
+class SkillSyncPayload(BaseModel):
+    """Payload for SKILL_SYNC messages."""
+    agent_id: str
+    agent_name: str
+    action: str  # "install" or "uninstall"
+    skill_name: str
+    skill_content: str | None = None  # Full SKILL.md content for install; None for uninstall
+
+
 class ControlEnvelope(BaseModel):
     """Lightweight WebSocket notification - never carries file content."""
     type: ControlMessageType
-    payload: Union[ChangelogUpdatePayload, AgentStatusChangePayload, ProjectDeletedPayload, dict] = Field(default_factory=dict)
+    payload: Union[ChangelogUpdatePayload, AgentStatusChangePayload, ProjectDeletedPayload, SkillSyncPayload, dict] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_required_fields_for_type(self) -> "ControlEnvelope":
@@ -72,4 +82,7 @@ class ControlEnvelope(BaseModel):
         elif self.type == ControlMessageType.PROJECT_DELETED:
             if not isinstance(self.payload, ProjectDeletedPayload):
                 raise ValueError(f"control message type {self.type} requires ProjectDeletedPayload")
+        elif self.type == ControlMessageType.SKILL_SYNC:
+            if not isinstance(self.payload, SkillSyncPayload):
+                raise ValueError(f"control message type {self.type} requires SkillSyncPayload")
         return self

@@ -174,12 +174,16 @@ def start_command(
     git_ignored_folder = config.get("git_ignored_folder", "")
     claude_plugin_dir = config.get("claude_plugin_dir", "")
 
-    # Resolve relative git_url
+    # Resolve relative paths from config directory
+    config_dir = CONFIG_DIR if (CONFIG_DIR / "project.json").exists() else Path(".")
     if git_url and not git_url.startswith("/") and not git_url.startswith("http") and not git_url.startswith("git@"):
-        config_dir = CONFIG_DIR if (CONFIG_DIR / "project.json").exists() else Path(".")
         resolved = (config_dir / git_url).resolve()
         if resolved.exists():
             git_url = str(resolved)
+    if claude_plugin_dir and not claude_plugin_dir.startswith("/"):
+        resolved = (config_dir / claude_plugin_dir).resolve()
+        if resolved.exists():
+            claude_plugin_dir = str(resolved)
 
     typer.echo("=== Start Agents ===\n")
 
@@ -209,14 +213,6 @@ def start_command(
                 pass
 
         # Build command
-        cmd = [
-            sys.executable, "-m", "clawmeets.cli_runner",
-            "agent", "run",
-            "--server", server_url,
-            "--agent-dir", str(agent_dir),
-        ]
-        # The runner package may use a different entry point
-        # Try clawmeets CLI directly first
         cmd = ["clawmeets", "agent", "run", "--server", server_url, "--agent-dir", str(agent_dir)]
 
         if knowledge_dir:

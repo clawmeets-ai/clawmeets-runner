@@ -46,6 +46,7 @@ from clawmeets.models.assistant import Assistant
 from clawmeets.models.user import User, NotificationConfig
 from clawmeets.sync.console_subscriber import ConsoleOutputSubscriber, ConsoleConfig
 from clawmeets.runner.reactive_loop import ReactiveControlLoop
+from clawmeets.runner.skill_manager import SkillManager
 
 # Backward compatibility alias
 AgentRegistrationResult = AgentRegistrationResponse
@@ -743,9 +744,14 @@ async def _runner_loop(
     else:
         action_schema = WORKER_ACTION_SCHEMA
 
+    # Set up skill manager (downloads skills from server on startup)
+    skill_manager = SkillManager(agent_dir)
+
     # Set up Claude CLI with role-appropriate schema (fail early if CLI not available)
+    # Include skill-hub plugin dir alongside any explicit plugin dirs
+    all_plugin_dirs = list(claude_plugin_dirs or []) + [skill_manager.plugin_dir]
     ClaudeCLI.verify_cli()
-    cli = ClaudeCLI(action_schema=action_schema, claude_plugin_dirs=claude_plugin_dirs or [], use_chrome=use_chrome)
+    cli = ClaudeCLI(action_schema=action_schema, claude_plugin_dirs=all_plugin_dirs, use_chrome=use_chrome)
 
     # Build knowledge_dirs list (e.g., knowledge bases)
     knowledge_dirs_list: list[Path] = []
@@ -774,7 +780,7 @@ async def _runner_loop(
         client=client,
         git_url=git_url,
         git_ignored_folder=git_ignored_folder,
-        claude_plugin_dirs=claude_plugin_dirs or [],
+        claude_plugin_dirs=all_plugin_dirs,
         notification_center=notification_center,
     )
 
@@ -790,6 +796,7 @@ async def _runner_loop(
         client=client,
         model_ctx=model_ctx,
         extra_subscribers=[],
+        skill_manager=skill_manager,
     )
 
     # Start the loop
@@ -811,6 +818,9 @@ async def _runner_loop(
                 await ws.send(json.dumps({"token": token}))
 
                 reconnect_delay = 2.0  # reset on success
+
+                # Sync installed skills from server (catch-up on connect/reconnect)
+                await skill_manager.sync_from_server(client, agent_id)
 
                 # HTTP-based catch-up on connect
                 await loop_obj.catch_up()

@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 
 import httpx
 
-from clawmeets.api.control import AgentStatusChangePayload, ChangelogUpdatePayload, ControlMessageType, ProjectDeletedPayload
+from clawmeets.api.control import AgentStatusChangePayload, ChangelogUpdatePayload, ControlMessageType, ProjectDeletedPayload, SkillSyncPayload
 from clawmeets.models.agent import Agent
 from clawmeets.models.assistant import Assistant
 from clawmeets.models.context import ModelContext
@@ -28,6 +28,7 @@ from .participant_notifier import ParticipantNotifier
 if TYPE_CHECKING:
     from clawmeets.api.client import ClawMeetsClient
     from clawmeets.models.participant import Participant
+    from clawmeets.runner.skill_manager import SkillManager
 
 logger = logging.getLogger("clawmeets.runner")
 
@@ -54,6 +55,7 @@ class ReactiveControlLoop:
         client: "ClawMeetsClient",
         model_ctx: ModelContext,
         extra_subscribers: list[ChangelogSubscriber],
+        skill_manager: "SkillManager | None" = None,
     ) -> None:
         """
         Initialize the reactive control loop.
@@ -70,6 +72,7 @@ class ReactiveControlLoop:
         self._client = client
         self._model_ctx = model_ctx
         self._extra_subscribers = extra_subscribers
+        self._skill_manager = skill_manager
 
         # Create shared notifier (one per participant, shared across projects)
         self._notifier = ParticipantNotifier(participant=self._participant)
@@ -147,6 +150,16 @@ class ReactiveControlLoop:
                 payload: ProjectDeletedPayload = envelope.payload
                 logger.info(f"Project {payload.project_name} ({payload.project_id[:8]}...) was deleted")
                 await self._cleanup_local_project(payload.project_id, payload.project_name)
+
+            case ControlMessageType.SKILL_SYNC:
+                payload: SkillSyncPayload = envelope.payload
+                if self._skill_manager:
+                    if payload.action == "install" and payload.skill_content:
+                        self._skill_manager.install_skill(payload.skill_name, payload.skill_content)
+                    elif payload.action == "uninstall":
+                        self._skill_manager.uninstall_skill(payload.skill_name)
+                else:
+                    logger.warning("Received SKILL_SYNC but no SkillManager configured")
 
             case _:
                 raise ValueError(f"Unknown control message type: {envelope.type}")
