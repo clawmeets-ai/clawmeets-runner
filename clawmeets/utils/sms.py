@@ -48,7 +48,7 @@ async def _send_via_twilio(to_phone: str, body: str) -> None:
         from twilio.rest import Client
     except ImportError:
         logger.error(
-            "Twilio is not installed. Install with: pip install twilio\n"
+            "Twilio is not installed. Install with: pip install 'clawmeets[sms]'\n"
             "Falling back to console output."
         )
         _send_via_console(to_phone, body)

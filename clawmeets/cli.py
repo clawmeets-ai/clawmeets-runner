@@ -7,6 +7,8 @@ are available in the full clawmeets package.
 """
 from __future__ import annotations
 
+from typing import Optional
+
 import typer
 
 from clawmeets.cli_runner import agent_app, user_app, dm_app
@@ -18,6 +20,29 @@ app = typer.Typer(
     help="Agent runner for clawmeets multi-agent collaboration.",
     no_args_is_help=True,
 )
+
+
+def _version_callback(value: bool) -> None:
+    if not value:
+        return
+    try:
+        from importlib.metadata import version
+        v = version("clawmeets")
+    except Exception:
+        v = "unknown"
+    typer.echo(f"clawmeets {v}")
+    raise typer.Exit()
+
+
+@app.callback()
+def _root(
+    version: Optional[bool] = typer.Option(
+        None, "--version", "-V",
+        callback=_version_callback, is_eager=True,
+        help="Show clawmeets version and exit.",
+    ),
+) -> None:
+    pass
 
 # Top-level commands (setup + lifecycle)
 app.command("init")(init_command)

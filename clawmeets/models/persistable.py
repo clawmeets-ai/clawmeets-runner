@@ -354,6 +354,7 @@ class PersistableParticipant(Participant, ABC):
         sort: str = "status_first",
         viewer_user_id: Optional[str] = None,
         viewer_is_admin: bool = False,
+        discoverable_only: bool = False,
     ) -> tuple[list["Self"], int]:
         """Search participants with filtering and pagination.
 
@@ -369,6 +370,9 @@ class PersistableParticipant(Participant, ABC):
             sort: Sort order - "status_first" (online first) or "name"
             viewer_user_id: User ID of the viewer (for visibility)
             viewer_is_admin: Whether the viewer is an admin
+            discoverable_only: If True, return only discoverable (public) agents
+                and ignore viewer-ownership and admin visibility expansions.
+                Used by the public agent directory browse view.
 
         Returns:
             Tuple of (paginated results, total matching count)
@@ -384,9 +388,14 @@ class PersistableParticipant(Participant, ABC):
             if not data:
                 continue
 
-            # Visibility filter (same logic as list_all)
             is_discoverable = data.get("discoverable_through_registry", True)
-            if not viewer_is_admin:
+
+            # Visibility filter (same logic as list_all), unless caller forces
+            # public-only via discoverable_only.
+            if discoverable_only:
+                if not is_discoverable:
+                    continue
+            elif not viewer_is_admin:
                 if viewer_user_id:
                     if not (data.get("registered_by") == viewer_user_id or is_discoverable):
                         continue

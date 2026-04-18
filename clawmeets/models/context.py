@@ -24,8 +24,8 @@ ModelContext is system-level - use a single instance across all projects.
 All methods take project_id/project_name as explicit parameters.
 
 Optional runtime fields for agent execution:
-- cli: ClaudeCLI instance for LLM invocation
-- knowledge_dirs: Additional directories for Claude access
+- cli: LLMProvider instance for LLM invocation (e.g. ClaudeCLI, CodexCLI)
+- knowledge_dirs: Additional directories for LLM access
 """
 from __future__ import annotations
 
@@ -50,7 +50,7 @@ from clawmeets.models.chat_message import ChatMessage
 
 from clawmeets.api.action_executor import ActionBlockExecutor
 from clawmeets.api.client import ClawMeetsClient
-from clawmeets.llm.claude_cli import ClaudeCLI
+from clawmeets.llm.base import LLMProvider
 from clawmeets.utils.notification_center import NotificationCenter
 
 
@@ -79,7 +79,7 @@ class ModelContext:
         self,
         base_dir: Path,
         notification_center: NotificationCenter,
-        cli: Optional["ClaudeCLI"] = None,
+        cli: Optional["LLMProvider"] = None,
         knowledge_dirs: Optional[list[Path]] = None,
         client: Optional["ClawMeetsClient"] = None,
         claude_plugin_dirs: Optional[list[Path]] = None,
@@ -92,10 +92,11 @@ class ModelContext:
         - participants_dir: base_dir (contains agents/, assistants/, users/)
 
         Optional runtime fields for agent execution:
-        - cli: ClaudeCLI instance for LLM invocation (None if not configured)
-        - knowledge_dirs: Additional directories for Claude access (e.g., knowledge bases)
+        - cli: LLMProvider instance for LLM invocation (None if not configured)
+        - knowledge_dirs: Additional directories for LLM access (e.g., knowledge bases)
         - client: ClawMeetsClient for HTTP operations (None if not configured)
-        - claude_plugin_dirs: Claude plugin directories for skill access (e.g., save-to-knowledge)
+        - claude_plugin_dirs: Claude plugin directories for skill access (e.g., save-to-knowledge).
+            Used only by ClaudeCLI; other providers ignore this field.
 
         Git configuration (git_url, git_ignored_folder) is now per-project,
         stored in the PROJECT_CREATED changelog payload and read by
@@ -103,10 +104,10 @@ class ModelContext:
 
         Args:
             base_dir: Base directory for all data
-            cli: Claude CLI for LLM invocation (optional, for agent runtime)
-            knowledge_dirs: Additional directories for Claude access (optional)
+            cli: LLM provider for invocation (optional, for agent runtime)
+            knowledge_dirs: Additional directories for LLM access (optional)
             client: ClawMeetsClient for server communication (optional, for agent runtime)
-            claude_plugin_dirs: Claude plugin directories (optional, passed as --plugin-dir)
+            claude_plugin_dirs: Claude plugin directories (optional, Claude-specific)
             notification_center: In-memory pub/sub dispatcher for cross-component events
         """
         self._base_dir = base_dir
@@ -118,13 +119,13 @@ class ModelContext:
         self._notification_center = notification_center
 
     @property
-    def cli(self) -> Optional["ClaudeCLI"]:
-        """Claude CLI for LLM invocation (None if not configured)."""
+    def cli(self) -> Optional["LLMProvider"]:
+        """LLM provider for invocation (None if not configured)."""
         return self._cli
 
     @property
     def knowledge_dirs(self) -> list[Path]:
-        """Additional directories for Claude access (e.g., knowledge bases)."""
+        """Additional directories for LLM access (e.g., knowledge bases)."""
         return self._knowledge_dirs
 
     def update_knowledge_dirs(self, dirs: list[Path]) -> None:

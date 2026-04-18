@@ -72,7 +72,7 @@ async def _send_notification_via_sendgrid(
         from sendgrid.helpers.mail import Mail, Email, To, Content
     except ImportError:
         logger.error(
-            "SendGrid is not installed. Install with: pip install sendgrid\n"
+            "SendGrid is not installed. Install with: pip install 'clawmeets[email]'\n"
             "Falling back to console output."
         )
         _send_notification_via_console(to_email, "", subject, body)
@@ -120,7 +120,7 @@ async def _send_waitlist_via_sendgrid(to_email: str) -> None:
         from sendgrid.helpers.mail import Mail, Email, To, Content, Bcc
     except ImportError:
         logger.error(
-            "SendGrid is not installed. Install with: pip install sendgrid\n"
+            "SendGrid is not installed. Install with: pip install 'clawmeets[email]'\n"
             "Falling back to console output."
         )
         _send_waitlist_via_console(to_email)
@@ -176,7 +176,7 @@ async def _send_via_sendgrid(
         from sendgrid.helpers.mail import Mail, Email, To, Content
     except ImportError:
         logger.error(
-            "SendGrid is not installed. Install with: pip install sendgrid\n"
+            "SendGrid is not installed. Install with: pip install 'clawmeets[email]'\n"
             "Falling back to console output."
         )
         _send_via_console(to_email, username, verification_url)

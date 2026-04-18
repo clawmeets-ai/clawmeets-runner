@@ -4,8 +4,8 @@ clawmeets/cli_init.py
 
 Interactive setup wizard for clawmeets.
 
-Replaces scripts/setup.sh — generates ~/.clawmeets/project.json and per-agent
-CLAUDE.md files, then registers agents with the server.
+Replaces scripts/setup.sh — generates ~/.clawmeets/config/{user}/settings.json
+and per-agent CLAUDE.md files, then registers agents with the server.
 
 Usage:
     clawmeets init
@@ -150,7 +150,7 @@ def _collect_git_repo() -> tuple[str, str]:
 
     Note: Git configuration is now per-project (set at project creation time
     via the web UI). This CLI prompt is kept for backward compatibility with
-    `clawmeets init` but the values are stored in project.json for reference only.
+    `clawmeets init` but the values are stored in settings.json for reference only.
     """
     typer.echo("\n--- Git Repository (Optional) ---")
     typer.echo("A git repo enables code-aware agent sandboxes. When set, agents clone this")
@@ -170,7 +170,27 @@ def _collect_git_repo() -> tuple[str, str]:
 
 
 def _fetch_setup_template(url: str) -> dict:
-    """Fetch a setup.json template from a URL. Returns parsed dict."""
+    """Fetch a setup.json template. Accepts HTTP(S) URLs, file:// URLs, and
+    plain filesystem paths (useful for iterating on templates locally before
+    publishing them)."""
+    # Resolve to a local path if the input is a file:// URL or has no scheme.
+    if url.startswith("file://"):
+        local_path: Optional[Path] = Path(url[len("file://"):])
+    elif "://" not in url:
+        local_path = Path(url).expanduser()
+    else:
+        local_path = None
+
+    if local_path is not None:
+        try:
+            return json.loads(local_path.read_text())
+        except FileNotFoundError:
+            typer.echo(f"Error: Template file not found: {local_path}", err=True)
+            raise typer.Exit(1)
+        except json.JSONDecodeError:
+            typer.echo(f"Error: Invalid JSON at {local_path}", err=True)
+            raise typer.Exit(1)
+
     try:
         resp = httpx.get(url, timeout=30, follow_redirects=True)
         resp.raise_for_status()
@@ -299,6 +319,24 @@ def _register_agents(
             if agent.get("knowledge_dir"):
                 local_settings["knowledge_dir"] = agent["knowledge_dir"]
 
+            # Persist local_settings on the server card too, so the Agent
+            # Settings page and server-side callers see the same value the
+            # runner uses. The register endpoint does not take local_settings,
+            # so we PUT it right after.
+            if local_settings:
+                put_resp = client.put(
+                    f"/agents/{agent_id}",
+                    json={"local_settings": local_settings},
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                try:
+                    put_resp.raise_for_status()
+                except httpx.HTTPStatusError:
+                    typer.echo(
+                        f"  Warning: failed to sync local_settings for '{registered_name}': {put_resp.text}",
+                        err=True,
+                    )
+
             card = {
                 "id": agent_id,
                 "name": registered_name,
@@ -375,7 +413,7 @@ def _setup_assistant_credentials(
 # ---------------------------------------------------------------------------
 
 
-def _write_project_json(
+def _write_settings_json(
     output_dir: Path,
     *,
     server_url: str,
@@ -387,9 +425,9 @@ def _write_project_json(
     git_url: str,
     git_ignored_folder: str,
 ) -> Path:
-    """Generate project.json, merging agents with any existing config. Returns the path."""
+    """Generate settings.json, merging agents with any existing config. Returns the path."""
     output_dir.mkdir(parents=True, exist_ok=True)
-    path = output_dir / "project.json"
+    path = output_dir / "settings.json"
 
     # Load existing config to preserve agents from prior runs
     existing_agents: list[dict] = []
@@ -436,8 +474,8 @@ def _write_project_json(
     return path
 
 
-def _save_token_to_project_json(token: str, username: str, data_dir: Path) -> Path:
-    """Save JWT token to the user's project.json after login/registration."""
+def _save_token_to_settings_json(token: str, username: str, data_dir: Path) -> Path:
+    """Save JWT token to the user's settings.json after login/registration."""
     from clawmeets.cli_lifecycle import get_user_config_path
     config_path = get_user_config_path(data_dir, username)
     config = json.loads(config_path.read_text())
@@ -461,7 +499,7 @@ def init_command(
 ) -> None:
     """Interactive setup wizard: configure agents and register with the server.
 
-    Generates project.json and CLAUDE.md files, then registers your agents.
+    Generates settings.json and CLAUDE.md files, then registers your agents.
     After this, run `clawmeets start` to bring your agents online.
 
     Example (interactive):
@@ -472,11 +510,17 @@ def init_command(
 
     Example (non-interactive):
         clawmeets init --username alice --password secret --assistant-token abc123
+
+    Example (from template, non-interactive — full scripted setup):
+        clawmeets init --from-url /tmp/team.json --non-interactive \\
+            --username alice --password secret --assistant-token abc123
     """
     typer.echo("\n=== ClawMeets Setup Wizard ===\n")
+    typer.echo(f"  Before continuing, make sure you have an account at {server.rstrip('/')}/app/signup.")
+    typer.echo("  If you haven't registered yet, sign up there first and verify your email.\n")
 
     if from_url:
-        # ---- Template mode: fetch agent definitions, prompt only for credentials ----
+        # ---- Template mode: fetch agent definitions, then collect credentials ----
         typer.echo("  Fetching template...\n")
         template = _fetch_setup_template(from_url)
 
@@ -493,18 +537,28 @@ def init_command(
             typer.echo(f"  {template_desc}")
         typer.echo(f"  Agents:   {', '.join(a['name'] for a in agents_list)}\n")
 
-        typer.echo("--- Account Info ---")
-        typer.echo("Enter the username and password you registered at clawmeets.ai\n")
+        if non_interactive:
+            if not username or not password:
+                typer.echo("Error: --username and --password are required with --non-interactive", err=True)
+                raise typer.Exit(1)
+            name_err = _validate_name(username, "username")
+            if name_err:
+                typer.echo(f"Error: {name_err}", err=True)
+                raise typer.Exit(1)
+            _assistant_token = assistant_token or ""
+        else:
+            typer.echo("--- Account Info ---")
+            typer.echo(f"Enter the username and password you registered at {server.rstrip('/')}\n")
 
-        username = _prompt_validated_name("  Username", "username")
-        password = _prompt_required("  Password", password=True)
-        password_confirm = _prompt_required("  Confirm password", password=True)
-        if password != password_confirm:
-            typer.echo("Error: Passwords do not match.", err=True)
-            raise typer.Exit(1)
+            username = _prompt_validated_name("  Username", "username")
+            password = _prompt_required("  Password", password=True)
+            password_confirm = _prompt_required("  Confirm password", password=True)
+            if password != password_confirm:
+                typer.echo("Error: Passwords do not match.", err=True)
+                raise typer.Exit(1)
 
-        typer.echo("\n  Your assistant token was shown after signing up at clawmeets.ai.")
-        _assistant_token = _prompt("  Assistant token (leave empty to add later)", password=True)
+            typer.echo(f"\n  Find your assistant token at {server.rstrip('/')}/app under Account Settings.")
+            _assistant_token = _prompt("  Assistant token (leave empty to add later)", password=True)
 
         data_dir = DEFAULT_DATA_DIR
         git_url = ""
@@ -516,7 +570,7 @@ def init_command(
         typer.echo("  so you can run `clawmeets start`.\n")
 
         typer.echo("--- Account Info ---")
-        typer.echo("Enter the username and password you registered at clawmeets.ai\n")
+        typer.echo(f"Enter the username and password you registered at {server.rstrip('/')}\n")
 
         if not username or not password:
             typer.echo("Error: --username and --password required in non-interactive mode", err=True)
@@ -533,7 +587,7 @@ def init_command(
 
         # ---- Account info ----
         typer.echo("--- Account Info ---")
-        typer.echo("Enter the username and password you registered at clawmeets.ai\n")
+        typer.echo(f"Enter the username and password you registered at {server.rstrip('/')}\n")
 
         username = _prompt_validated_name("  Username", "username")
         password = _prompt_required("  Password", password=True)
@@ -542,7 +596,7 @@ def init_command(
             typer.echo("Error: Passwords do not match.", err=True)
             raise typer.Exit(1)
 
-        typer.echo("\n  Your assistant token was shown after signing up at clawmeets.ai.")
+        typer.echo(f"\n  Find your assistant token at {server.rstrip('/')}/app under Account Settings.")
         _assistant_token = _prompt("  Assistant token (leave empty to add later)", password=True)
 
         data_dir = _prompt("\n  Data directory", default=DEFAULT_DATA_DIR)
@@ -574,12 +628,12 @@ def init_command(
             typer.echo(f"      Knowledge dir: {a['knowledge_dir']}")
         typer.echo("")
 
-        if not typer.confirm("  Proceed?"):
+        if not typer.confirm("  Proceed?", default=True):
             raise typer.Abort()
 
-    # ---- Generate project.json ----
+    # ---- Generate settings.json ----
     typer.echo("\n--- Generating configuration ---")
-    project_path = _write_project_json(
+    settings_path = _write_settings_json(
         output_dir,
         server_url=server,
         username=username,
@@ -590,7 +644,7 @@ def init_command(
         git_url=git_url,
         git_ignored_folder=git_ignored_folder,
     )
-    typer.echo(f"  Generated {project_path}")
+    typer.echo(f"  Generated {settings_path}")
 
     # ---- Generate CLAUDE.md files ----
     for agent in agents_list:
@@ -620,8 +674,8 @@ def init_command(
     if agents_list:
         _register_agents(server, token, agents_list, agents_dir)
 
-    # ---- Save token to project.json and set current user ----
-    config_path = _save_token_to_project_json(token, username, resolved_data_dir)
+    # ---- Save token to settings.json and set current user ----
+    config_path = _save_token_to_settings_json(token, username, resolved_data_dir)
     from clawmeets.cli_lifecycle import set_current_user
     set_current_user(resolved_data_dir, username)
     typer.echo(f"  Saved session to {config_path}")
@@ -632,7 +686,7 @@ def init_command(
     typer.echo("    1. Start your agents:")
     typer.echo("       clawmeets start\n")
     typer.echo("    2. Open the dashboard to create projects:")
-    typer.echo("       https://clawmeets.ai/app\n")
+    typer.echo(f"       {server.rstrip('/')}/app\n")
     typer.echo("    3. When done, stop agents:")
     typer.echo("       clawmeets stop\n")
     typer.echo("  Tip: Customize your agents by editing the CLAUDE.md files")

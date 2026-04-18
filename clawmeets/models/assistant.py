@@ -23,7 +23,7 @@ from .participant import ParticipantRole, OperationalMode
 from .persistable import PersistableParticipant
 from ..api.actions import ActionBlock
 from ..api.responses import AgentStatus
-from ..llm.claude_cli import ClaudeInvocationError, ClaudeRateLimitError, ClaudeTimeoutError
+from ..llm.base import LLMInvocationError, LLMRateLimitError, LLMTimeoutError
 from ..llm.prompt_builder import CoordinatorPromptBuilder, create_prompt_builder
 
 if TYPE_CHECKING:
@@ -32,17 +32,17 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Retry configuration for transient Claude CLI failures
+# Retry configuration for transient LLM CLI failures
 _MAX_RETRIES = 2  # Total attempts: 3 (1 original + 2 retries)
 _INITIAL_RETRY_DELAY = 30  # seconds
 _TRANSIENT_INDICATORS = ("overloaded", "rate_limit", "529", "503", "too many requests")
 
 
-def _is_transient_error(error: ClaudeInvocationError) -> bool:
-    """Check if a ClaudeInvocationError is likely transient (retryable)."""
-    if isinstance(error, ClaudeRateLimitError):
+def _is_transient_error(error: LLMInvocationError) -> bool:
+    """Check if an LLMInvocationError is likely transient (retryable)."""
+    if isinstance(error, LLMRateLimitError):
         return False  # Rate limits should not be retried with short backoff
-    if isinstance(error, ClaudeTimeoutError):
+    if isinstance(error, LLMTimeoutError):
         return True
     msg = str(error).lower()
     return any(indicator in msg for indicator in _TRANSIENT_INDICATORS)
@@ -366,7 +366,7 @@ class Assistant(PersistableParticipant):
                     notification_center=self._model_ctx.notification_center,
                 )
                 break
-            except ClaudeRateLimitError as e:
+            except LLMRateLimitError as e:
                 logger.warning(
                     f"Assistant {assistant_name}: rate limited "
                     f"(type={e.rate_limit_type}, resets={e.resets_at_human})"
@@ -375,7 +375,7 @@ class Assistant(PersistableParticipant):
                     project_id, chatroom_name, assistant_name, e
                 )
                 raise
-            except ClaudeInvocationError as e:
+            except LLMInvocationError as e:
                 if attempt < _MAX_RETRIES and _is_transient_error(e):
                     logger.warning(
                         f"Assistant {assistant_name}: transient failure "
@@ -532,7 +532,7 @@ If the current approach isn't working, document why in Learnings and try a diffe
                     notification_center=self._model_ctx.notification_center,
                 )
                 break
-            except ClaudeRateLimitError as e:
+            except LLMRateLimitError as e:
                 logger.warning(
                     f"Assistant {assistant_name}: rate limited "
                     f"(type={e.rate_limit_type}, resets={e.resets_at_human})"
@@ -541,7 +541,7 @@ If the current approach isn't working, document why in Learnings and try a diffe
                     project_id, chatroom_name, assistant_name, e
                 )
                 raise
-            except ClaudeInvocationError as e:
+            except LLMInvocationError as e:
                 if attempt < _MAX_RETRIES and _is_transient_error(e):
                     logger.warning(
                         f"Assistant {assistant_name}: transient failure "
@@ -588,7 +588,7 @@ If the current approach isn't working, document why in Learnings and try a diffe
             return
 
         try:
-            if isinstance(error, ClaudeRateLimitError):
+            if isinstance(error, LLMRateLimitError):
                 self.update_status(AgentStatus.RATE_LIMITED)
                 reset_info = f" Resets at {error.resets_at_human}." if error.resets_at_human else ""
                 content = f"I've hit a rate limit and cannot continue.{reset_info}"

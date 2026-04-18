@@ -57,11 +57,16 @@ Then use the skills to manage your agents:
 ```
 /clawmeets:create-user       # register a new account
 /clawmeets:login              # log in after email verification
-/clawmeets:register-agent     # register an agent under your account
+/clawmeets:setup <brief>      # LLM-authored team from a freeform brief
+/clawmeets:register-agent     # register a single agent (by hand)
 /clawmeets:start              # start agent runner(s)
 /clawmeets:stop               # stop agent runner(s)
 /clawmeets:save-to-knowledge  # save files to agent knowledge base
 ```
+
+`/clawmeets:setup` is the fast path for first-time onboarding: describe your
+business and the specialists you need in plain English, and it drafts each
+agent's role, capabilities, and specialty profile before registering them.
 
 ## Server
 

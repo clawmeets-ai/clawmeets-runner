@@ -502,6 +502,16 @@ class User(Participant):
         return ""
 
     @property
+    def assistant_token(self) -> Optional[str]:
+        """Get the plaintext assistant token for this user.
+
+        The token is stored in the passwd entry so the user can retrieve it
+        from the Account Settings page any time. Authentication itself still
+        uses the bcrypt hash persisted in the assistant's credential.json.
+        """
+        return self._load_passwd_entry().get("assistant_token")
+
+    @property
     def user_role(self) -> str:
         """Get the user's role (admin/user)."""
         return self._load_passwd_entry().get("role", "user")
@@ -628,6 +638,21 @@ class User(Participant):
             if self._id not in users:
                 raise KeyError(f"User {self._id!r} not found")
             users[self._id]["assistant_agent_id"] = assistant_agent_id
+            data["users"] = users
+            self._save_passwd(data)
+
+    async def set_assistant_token(self, token: str) -> None:
+        """Persist the plaintext assistant token on this user's passwd entry.
+
+        Stored so the user can view the token on the Account Settings page.
+        The bcrypt hash in the assistant's credential.json still drives auth.
+        """
+        async with _passwd_lock:
+            data = self._load_passwd()
+            users = data.get("users", {})
+            if self._id not in users:
+                raise KeyError(f"User {self._id!r} not found")
+            users[self._id]["assistant_token"] = token
             data["users"] = users
             self._save_passwd(data)
 

@@ -175,18 +175,36 @@ class ReactiveControlLoop:
     def _apply_local_settings(self, local_settings: dict) -> None:
         """Apply local_settings changes to runtime components.
 
-        Updates ModelContext.knowledge_dirs and ClaudeCLI.use_chrome
+        Updates ModelContext.knowledge_dirs and the provider's use_chrome flag
         so the next LLM invocation uses the new settings without restart.
         Also persists changes to local card.json.
+
+        llm_provider / llm_model changes are persisted but NOT swapped live —
+        the CLI subclass is bound at process start. Logs a warning that a
+        restart is required for those fields.
         """
         from pathlib import Path
+
+        # Detect llm_provider / llm_model changes before persisting.
+        prior_settings = (
+            self._participant._load_card().get("local_settings") or {}
+            if hasattr(self._participant, "_load_card")
+            else {}
+        )
+        for field in ("llm_provider", "llm_model"):
+            if field in local_settings and local_settings[field] != prior_settings.get(field):
+                logger.warning(
+                    f"{self._participant.name}: {field} changed to "
+                    f"{local_settings[field]!r} — restart the runner for the new "
+                    f"provider to take effect"
+                )
 
         # Update knowledge_dirs
         knowledge_dir = local_settings.get("knowledge_dir", "")
         new_dirs = [Path(knowledge_dir)] if knowledge_dir else []
         self._model_ctx.update_knowledge_dirs(new_dirs)
 
-        # Update use_chrome
+        # Update use_chrome (no-op on providers that don't support browser tools)
         use_chrome = local_settings.get("use_chrome", False)
         if self._model_ctx.cli is not None:
             self._model_ctx.cli.use_chrome = use_chrome
@@ -196,7 +214,9 @@ class ReactiveControlLoop:
 
         logger.info(
             f"Applied local_settings for {self._participant.name}: "
-            f"knowledge_dir={knowledge_dir!r}, use_chrome={use_chrome}"
+            f"knowledge_dir={knowledge_dir!r}, use_chrome={use_chrome}, "
+            f"llm_provider={local_settings.get('llm_provider')!r}, "
+            f"llm_model={local_settings.get('llm_model')!r}"
         )
 
     # ─────────────────────────────────────────────────────────

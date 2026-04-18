@@ -38,7 +38,10 @@ from clawmeets.api.client import ClawMeetsClient
 from clawmeets.models.chat_message import ChatMessage
 from clawmeets.utils.file_io import FileUtil
 from clawmeets.utils.notification_center import NotificationCenter
+from clawmeets.llm.base import LLMProvider
 from clawmeets.llm.claude_cli import ClaudeCLI
+from clawmeets.llm.codex_cli import CodexCLI
+from clawmeets.llm.gemini_cli import GeminiCLI
 from clawmeets.api.actions import WORKER_ACTION_SCHEMA, COORDINATOR_ACTION_SCHEMA
 from clawmeets.models.context import ModelContext
 from clawmeets.models.agent import Agent
@@ -63,9 +66,6 @@ dm_app    = typer.Typer(help="Direct message commands", no_args_is_help=True)
 
 DEFAULT_SERVER = os.environ.get("CLAWMEETS_SERVER_URL", "https://clawmeets.ai")
 DEFAULT_DATA_DIR = os.environ.get("CLAWMEETS_DATA_DIR", str(Path.home() / ".clawmeets"))
-DEFAULT_AGENTS_DIR = str(Path(DEFAULT_DATA_DIR) / "agents")
-DEFAULT_USERS_DIR = str(Path(DEFAULT_DATA_DIR) / "users")
-DEFAULT_SERVER_DIR = str(Path(DEFAULT_DATA_DIR) / "server")
 
 
 def _server_url(server: str) -> str:
@@ -89,6 +89,33 @@ def _print_json(data: dict | list) -> None:
     typer.echo(json.dumps(data, indent=2, default=str))
 
 
+_VALID_LLM_PROVIDERS = ("claude", "codex", "gemini")
+
+
+def _build_initial_local_settings(
+    llm_provider: Optional[str],
+    llm_model: Optional[str],
+) -> dict:
+    """Build the local_settings block for a freshly generated card.json.
+
+    Exits with code 1 if llm_provider is not one of the supported values.
+    """
+    settings: dict = {}
+    if llm_provider:
+        normalized = llm_provider.lower()
+        if normalized not in _VALID_LLM_PROVIDERS:
+            typer.echo(
+                f"Error: --llm-provider must be one of {_VALID_LLM_PROVIDERS} "
+                f"(got {llm_provider!r})",
+                err=True,
+            )
+            raise typer.Exit(1)
+        settings["llm_provider"] = normalized
+    if llm_model:
+        settings["llm_model"] = llm_model
+    return settings
+
+
 # ---------------------------------------------------------------------------
 # agent register
 # ---------------------------------------------------------------------------
@@ -97,13 +124,33 @@ def _print_json(data: dict | list) -> None:
 def agent_register(
     name: Optional[str] = typer.Argument(None, help="Agent name (required unless --from-card)"),
     description: Optional[str] = typer.Argument(None, help="Short description (required unless --from-card)"),
-    token: Optional[str] = typer.Option(None, "--token", "-t", help="Admin JWT token (required)"),
-    server: str = typer.Option(DEFAULT_SERVER, "--server", "-s"),
-    agent_dir: Path = typer.Option(DEFAULT_AGENTS_DIR, "--agent-dir", help="Base directory for agents"),
-    save: Optional[Path] = typer.Option(None, "--save", help="Save credentials to custom path (overrides agent-dir)"),
+    token: Optional[str] = typer.Option(None, "--token", "-t", help="User JWT token (defaults to the saved token of --as-user or current_user)"),
+    server: Optional[str] = typer.Option(None, "--server", "-s", help="Server URL (defaults to the server of --as-user or current_user, else env/default)"),
+    data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir", help="Root data directory (agents at {data_dir}/agents/)"),
+    save: Optional[Path] = typer.Option(None, "--save", help="Save credentials to custom path (overrides data-dir)"),
     discoverable: Optional[bool] = typer.Option(None, "--discoverable/--no-discoverable", help="Show agent in /agents list"),
     capabilities: Optional[str] = typer.Option(None, "--capabilities", "-c", help="Comma-separated list of capabilities"),
     from_card: Optional[Path] = typer.Option(None, "--from-card", help="Path to card.json to register from"),
+    save_to_settings: bool = typer.Option(
+        False, "--save-to-settings",
+        help="Also append this agent to the logged-in user's settings.json agents[].",
+    ),
+    knowledge_dir: Optional[str] = typer.Option(
+        None, "--knowledge-dir",
+        help="Local knowledge directory for this agent (saved to settings.json; only meaningful with --save-to-settings).",
+    ),
+    as_user: Optional[str] = typer.Option(
+        None, "--as-user",
+        help="Username for --save-to-settings (defaults to current_user).",
+    ),
+    llm_provider: Optional[str] = typer.Option(
+        None, "--llm-provider",
+        help="LLM backend for this agent: 'claude' (default), 'codex', or 'gemini'. Written to card.json local_settings.",
+    ),
+    llm_model: Optional[str] = typer.Option(
+        None, "--llm-model",
+        help="Provider-specific model name (e.g. 'o3' for Codex, 'gemini-2.5-pro' for Gemini). Written to card.json local_settings.",
+    ),
 ):
     """Register a new agent with the server (requires admin token).
 
@@ -123,8 +170,26 @@ def agent_register(
         # Override capabilities from card
         clawmeets agent register --from-card ./kb/card.json --capabilities "new,caps" --token $ADMIN_TOKEN
     """
+    # Auto-fill --token and --server from the logged-in user's settings.json
+    # when not explicitly provided. Lets skills and scripts avoid re-parsing the
+    # config file themselves.
+    if not token or not server:
+        from clawmeets.cli_lifecycle import get_current_user, get_user_config_path
+        data_dir_p = Path(data_dir).expanduser()
+        resolved_user = as_user or get_current_user(data_dir_p)
+        if resolved_user:
+            cfg_path = get_user_config_path(data_dir_p, resolved_user)
+            if cfg_path.exists():
+                cfg = json.loads(cfg_path.read_text())
+                token = token or cfg.get("user", {}).get("token")
+                server = server or cfg.get("server_url")
+    server = server or DEFAULT_SERVER
     if not token:
-        typer.echo("Error: --token is required. Get admin token with: user login admin <password>", err=True)
+        typer.echo(
+            "Error: --token is required. Log in with `clawmeets user login <user> <pass> --save`, "
+            "or pass --token explicitly.",
+            err=True,
+        )
         raise typer.Exit(1)
 
     # Load from card.json if provided
@@ -183,9 +248,10 @@ def agent_register(
     if save:
         cred_path = save
     else:
-        # Save to {agent-dir}/{registered_name}-{agent_id}/credential.json
+        # Save to {data_dir}/agents/{registered_name}-{agent_id}/credential.json
         agent_id = result["agent_id"]
-        agent_work_dir = Path(agent_dir) / f"{registered_name}-{agent_id}"
+        agents_dir = Path(data_dir).expanduser() / "agents"
+        agent_work_dir = agents_dir / f"{registered_name}-{agent_id}"
         agent_work_dir.mkdir(parents=True, exist_ok=True)
         cred_path = agent_work_dir / "credential.json"
 
@@ -203,9 +269,41 @@ def agent_register(
             "registered_at": result["registered_at"],
             "discoverable_through_registry": result.get("discoverable_through_registry", True),
         }
+        initial_local_settings = _build_initial_local_settings(llm_provider, llm_model)
+        if initial_local_settings:
+            card["local_settings"] = initial_local_settings
         card_path = agent_work_dir / "card.json"
         card_path.write_text(json.dumps(card, indent=2, default=str))
         typer.echo(f"Card saved to {card_path}")
+
+    # Optionally link this agent to the logged-in user's settings.json.
+    if save_to_settings:
+        from clawmeets.cli_lifecycle import add_agent_to_settings, get_current_user
+        data_dir_p = Path(data_dir).expanduser()
+        target_user = as_user or get_current_user(data_dir_p)
+        if not target_user:
+            typer.echo(
+                "  Warning: --save-to-settings set but no current_user and no --as-user; skipping settings.json update.",
+                err=True,
+            )
+        else:
+            # The server-returned name is typically "{username}-{name}"; strip the
+            # prefix so settings.json stores the unprefixed name the runtime expects.
+            prefix = f"{target_user}-"
+            stored_name = registered_name[len(prefix):] if registered_name.startswith(prefix) else registered_name
+            entry: dict = {
+                "name": stored_name,
+                "description": result["description"],
+                "capabilities": result.get("capabilities", []),
+                "discoverable": result.get("discoverable_through_registry", False),
+            }
+            if knowledge_dir:
+                entry["knowledge_dir"] = knowledge_dir
+            try:
+                settings_path = add_agent_to_settings(data_dir_p, target_user, entry)
+                typer.echo(f"  Linked to user '{target_user}' in {settings_path}.")
+            except FileNotFoundError as e:
+                typer.echo(f"  Warning: {e}", err=True)
 
 
 # ---------------------------------------------------------------------------
@@ -236,9 +334,9 @@ def agent_list(
 
 @agent_app.command("run")
 def agent_run(
-    credentials: Optional[Path] = typer.Argument(None, help="JSON credentials file (optional if credential.json exists in agent-dir)"),
+    credentials: Optional[Path] = typer.Argument(None, help="JSON credentials file (optional if credential.json exists in --agent-dir)"),
     server: str = typer.Option(DEFAULT_SERVER, "--server", "-s"),
-    agent_dir: Path = typer.Option(DEFAULT_AGENTS_DIR, "--agent-dir"),
+    agent_dir: Path = typer.Option(..., "--agent-dir", help="Agent's working directory (contains credential.json, sandbox/, projects/); e.g. ~/.clawmeets/agents/my-agent-{id}/"),
     working_dir: Optional[Path] = typer.Option(None, "--working-dir", "-w", help="Sandbox directory for Claude (default: agent-dir/sandbox)"),
     knowledge_dir: Optional[Path] = typer.Option(None, "--knowledge-dir", "-k", help="Knowledge base directory (passed as --add-dir to Claude)"),
     claude_plugin_dir: Optional[list[Path]] = typer.Option(None, "--claude-plugin-dir", help="Claude plugin directory (passed as --plugin-dir to Claude CLI, repeatable)"),
@@ -334,12 +432,63 @@ def user_login(
     username: str = typer.Argument(..., help="Username"),
     password: str = typer.Argument(..., help="Password"),
     server: str = typer.Option(DEFAULT_SERVER, "--server", "-s"),
+    save: bool = typer.Option(
+        False, "--save",
+        help="Persist the session: write token into settings.json and set current_user.",
+    ),
+    data_dir: Path = typer.Option(
+        DEFAULT_DATA_DIR, "--data-dir",
+        help="Root data directory (only used with --save).",
+    ),
 ):
-    """Login as a user and print the JWT token."""
+    """Login as a user. Prints the JWT token to stdout by default.
+
+    With --save, writes the token to ~/.clawmeets/config/{username}/settings.json
+    and marks the user as current_user, so other `clawmeets` commands can find
+    them without re-authenticating. Nothing is printed in --save mode beyond a
+    confirmation line, so shell pipelines that capture the token should omit --save.
+    """
     with _http(server) as client:
         resp = client.post("/auth/login", json={"username": username, "password": password})
         result = _ok(resp)
-    typer.echo(result["token"])
+    token = result["token"]
+    if save:
+        from clawmeets.cli_lifecycle import save_user_session
+        path = save_user_session(Path(data_dir).expanduser(), username, _server_url(server), token)
+        typer.echo(f"Logged in as {username}. Session saved to {path}.")
+    else:
+        typer.echo(token)
+
+
+@user_app.command("logout")
+def user_logout(
+    username: Optional[str] = typer.Option(
+        None, "--user", "-u",
+        help="Username (defaults to current_user).",
+    ),
+    data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir"),
+    clear_current: bool = typer.Option(
+        False, "--clear-current-user",
+        help="Also clear the ~/.clawmeets/config/current_user pointer.",
+    ),
+):
+    """Clear the saved JWT token from a user's settings.json.
+
+    Does NOT stop agents or delete any data — running agents keep their own
+    per-agent tokens and stay online until `clawmeets stop` is called.
+    """
+    from clawmeets.cli_lifecycle import clear_user_token, get_current_user
+    data_dir_p = Path(data_dir).expanduser()
+    if username is None:
+        username = get_current_user(data_dir_p)
+    if not username:
+        typer.echo("Not logged in (no current_user).", err=True)
+        raise typer.Exit(1)
+    path = clear_user_token(data_dir_p, username)
+    typer.echo(f"Logged out user '{username}' ({path}).")
+    if clear_current:
+        (data_dir_p / "config" / "current_user").unlink(missing_ok=True)
+        typer.echo("Cleared current_user.")
 
 
 @user_app.command("register")
@@ -350,7 +499,15 @@ def user_register(
     invitation_code: str = typer.Option(..., "--invitation-code", "-i", help="Invitation code (required)"),
     agree_tos: bool = typer.Option(False, "--agree-tos", help="Agree to Terms of Service and Privacy Policy"),
     server: str = typer.Option(DEFAULT_SERVER, "--server", "-s"),
-    agent_dir: Path = typer.Option(DEFAULT_AGENTS_DIR, "--agent-dir", help="Base directory for agents"),
+    data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir", help="Root data directory (assistant saved to {data_dir}/agents/)"),
+    llm_provider: Optional[str] = typer.Option(
+        None, "--llm-provider",
+        help="LLM backend for this user's assistant: 'claude' (default), 'codex', or 'gemini'.",
+    ),
+    llm_model: Optional[str] = typer.Option(
+        None, "--llm-model",
+        help="Provider-specific model name (e.g. 'o3' for Codex, 'gemini-2.5-pro' for Gemini).",
+    ),
 ):
     """Self-register a new user account (requires invitation code).
 
@@ -391,7 +548,8 @@ def user_register(
             "agent_name": agent_name,
         }
 
-        assistant_dir = Path(agent_dir) / f"{agent_name}-{agent_id}"
+        agents_dir = Path(data_dir).expanduser() / "agents"
+        assistant_dir = agents_dir / f"{agent_name}-{agent_id}"
         assistant_dir.mkdir(parents=True, exist_ok=True)
 
         cred_path = assistant_dir / "credential.json"
@@ -408,6 +566,9 @@ def user_register(
             "registered_at": datetime.now(UTC).isoformat(),
             "discoverable_through_registry": False,
         }
+        initial_local_settings = _build_initial_local_settings(llm_provider, llm_model)
+        if initial_local_settings:
+            card["local_settings"] = initial_local_settings
         card_path = assistant_dir / "card.json"
         card_path.write_text(json.dumps(card, indent=2, default=str))
         typer.echo(f"Card saved to {card_path}")
@@ -421,7 +582,15 @@ def user_create(
     email: Optional[str] = typer.Option(None, "--email", "-e", help="User email address"),
     token: Optional[str] = typer.Option(None, "--token", "-t", help="Admin JWT token (required)"),
     server: str = typer.Option(DEFAULT_SERVER, "--server", "-s"),
-    agent_dir: Path = typer.Option(DEFAULT_AGENTS_DIR, "--agent-dir", help="Base directory for agents"),
+    data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir", help="Root data directory (assistant saved to {data_dir}/agents/)"),
+    llm_provider: Optional[str] = typer.Option(
+        None, "--llm-provider",
+        help="LLM backend for this user's assistant: 'claude' (default), 'codex', or 'gemini'.",
+    ),
+    llm_model: Optional[str] = typer.Option(
+        None, "--llm-model",
+        help="Provider-specific model name (e.g. 'o3' for Codex, 'gemini-2.5-pro' for Gemini).",
+    ),
 ):
     """Create a new user with assistant agent (requires admin token).
 
@@ -456,8 +625,9 @@ def user_create(
             "agent_name": agent_name,
         }
 
-        # Save assistant credentials to agent directory
-        assistant_dir = Path(agent_dir) / f"{agent_name}-{agent_id}"
+        # Save assistant credentials to {data_dir}/agents/
+        agents_dir = Path(data_dir).expanduser() / "agents"
+        assistant_dir = agents_dir / f"{agent_name}-{agent_id}"
         assistant_dir.mkdir(parents=True, exist_ok=True)
 
         cred_path = assistant_dir / "credential.json"
@@ -474,6 +644,9 @@ def user_create(
             "registered_at": result["user_created_at"],
             "discoverable_through_registry": False,
         }
+        initial_local_settings = _build_initial_local_settings(llm_provider, llm_model)
+        if initial_local_settings:
+            card["local_settings"] = initial_local_settings
         card_path = assistant_dir / "card.json"
         card_path.write_text(json.dumps(card, indent=2, default=str))
         typer.echo(f"Card saved to {card_path}")
@@ -501,7 +674,7 @@ def user_listen(
     password: str = typer.Argument(..., help="Password"),
     script: Optional[Path] = typer.Argument(None, help="Notification script path (optional with --console)"),
     server: str = typer.Option(DEFAULT_SERVER, "--server", "-s"),
-    user_dir: Path = typer.Option(DEFAULT_USERS_DIR, "--user-dir", help="Base directory for user listener data"),
+    data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir", help="Root data directory (listener data at {data_dir}/users/)"),
     timeout: float = typer.Option(30.0, "--timeout", help="Script execution timeout (seconds)"),
     fail_fast: bool = typer.Option(False, "--fail-fast", help="Exit on script failure"),
     log_level: str = typer.Option("info", "--log-level"),
@@ -582,8 +755,9 @@ def user_listen(
         typer.echo("Error: User has no linked assistant agent", err=True)
         raise typer.Exit(1)
 
+    users_dir = Path(data_dir).expanduser() / "users"
     typer.echo(f"Authenticated as {username} (user_id={user_id[:8]}...)")
-    typer.echo(f"Server: {server}  |  User dir: {user_dir}")
+    typer.echo(f"Server: {server}  |  User dir: {users_dir}")
     if console:
         typer.echo(f"Console output: enabled (colors={'off' if no_colors else 'on'})")
     if script:
@@ -601,7 +775,7 @@ def user_listen(
         assistant_id=assistant_id,
         token=token,
         server_http=server,
-        user_base_dir=Path(user_dir),
+        user_base_dir=users_dir,
         script=script,
         timeout=timeout,
         fail_fast=fail_fast,
@@ -734,9 +908,28 @@ async def _runner_loop(
     # Assistants have discoverable_through_registry=False
     is_assistant = not card_data.get("discoverable_through_registry", True)
 
-    # Read local_settings from card.json (primary source, synced with server)
-    # CLI flags (--knowledge-dir, --chrome) serve as overrides for backward compat
-    local_settings = card_data.get("local_settings", {})
+    # Read local_settings from card.json (primary source, not synced with server).
+    # CLI flags (--knowledge-dir, --chrome) serve as overrides for backward compat.
+    local_settings = card_data.get("local_settings", {}) or {}
+
+    # Migration: older cards stored llm_provider/llm_model at the top level.
+    # Move them into local_settings on next save so new clients find them
+    # in the expected place. Keep the top-level copy readable for this run
+    # (see `card_llm_*` below) in case the save fails.
+    migrated = False
+    if "llm_provider" in card_data and "llm_provider" not in local_settings:
+        local_settings["llm_provider"] = card_data["llm_provider"]
+        migrated = True
+    if "llm_model" in card_data and "llm_model" not in local_settings:
+        local_settings["llm_model"] = card_data["llm_model"]
+        migrated = True
+    if migrated:
+        card_data.pop("llm_provider", None)
+        card_data.pop("llm_model", None)
+        card_data["local_settings"] = local_settings
+        card_path.write_text(json.dumps(card_data, indent=2, default=str))
+        typer.echo("Migrated llm_provider/llm_model into local_settings in card.json")
+
     effective_knowledge_dir = knowledge_dir or local_settings.get("knowledge_dir", "")
     effective_use_chrome = use_chrome or local_settings.get("use_chrome", False)
 
@@ -749,11 +942,39 @@ async def _runner_loop(
     # Set up skill manager (downloads skills from server on startup)
     skill_manager = SkillManager(agent_dir)
 
-    # Set up Claude CLI with role-appropriate schema (fail early if CLI not available)
-    # Include skill-hub plugin dir alongside any explicit plugin dirs
+    # Pick LLM provider from card.json local_settings ("claude" default;
+    # "codex" and "gemini" also supported). Skill-hub plugin dir is appended
+    # to explicit plugin dirs for Claude; other providers ignore plugin dirs.
     all_plugin_dirs = list(claude_plugin_dirs or []) + [skill_manager.plugin_dir]
-    ClaudeCLI.verify_cli()
-    cli = ClaudeCLI(action_schema=action_schema, claude_plugin_dirs=all_plugin_dirs, use_chrome=effective_use_chrome)
+    llm_provider_name = (local_settings.get("llm_provider") or "claude").lower()
+    llm_model = local_settings.get("llm_model") or None
+    cli: LLMProvider
+    if llm_provider_name == "codex":
+        CodexCLI.verify_cli()
+        cli = CodexCLI(action_schema=action_schema, model=llm_model)
+        typer.echo(f"LLM provider: codex (model={llm_model or 'default'})")
+    elif llm_provider_name == "gemini":
+        GeminiCLI.verify_cli()
+        cli = GeminiCLI(action_schema=action_schema, model=llm_model)
+        typer.echo(f"LLM provider: gemini (model={llm_model or 'default'})")
+    elif llm_provider_name == "claude":
+        ClaudeCLI.verify_cli()
+        cli = ClaudeCLI(
+            action_schema=action_schema,
+            claude_plugin_dirs=all_plugin_dirs,
+            use_chrome=effective_use_chrome,
+        )
+        typer.echo(
+            f"LLM provider: claude"
+            + (f" (model={llm_model})" if llm_model else "")
+        )
+    else:
+        typer.echo(
+            f"Error: unknown llm_provider '{llm_provider_name}' in "
+            f"card.json local_settings (expected one of {_VALID_LLM_PROVIDERS})",
+            err=True,
+        )
+        raise typer.Exit(1)
 
     # Build knowledge_dirs list (e.g., knowledge bases)
     knowledge_dirs_list: list[Path] = []
@@ -919,7 +1140,7 @@ def dm_send(
     username: str = typer.Option(..., "-u", "--username", help="Username"),
     password: str = typer.Option(..., "-p", "--password", help="Password"),
     server: str = typer.Option(DEFAULT_SERVER, "--server", "-s"),
-    agent_dir: Path = typer.Option(DEFAULT_AGENTS_DIR, "--agent-dir", help="Base directory for agents"),
+    data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir", help="Root data directory (assistant creds under {data_dir}/agents/)"),
 ):
     """Send a direct message to an agent.
 
@@ -947,13 +1168,15 @@ def dm_send(
             raise typer.Exit(1)
 
         # Load assistant credentials for chatroom creation
+        agents_dir = Path(data_dir).expanduser() / "agents"
         assistant_cred_path = None
-        for entry in Path(agent_dir).iterdir():
-            if entry.is_dir() and entry.name.endswith(f"-{assistant_id}"):
-                cred_path = entry / "credential.json"
-                if cred_path.exists():
-                    assistant_cred_path = cred_path
-                    break
+        if agents_dir.exists():
+            for entry in agents_dir.iterdir():
+                if entry.is_dir() and entry.name.endswith(f"-{assistant_id}"):
+                    cred_path = entry / "credential.json"
+                    if cred_path.exists():
+                        assistant_cred_path = cred_path
+                        break
 
         assistant_token = None
         if assistant_cred_path:
@@ -1099,7 +1322,7 @@ def dm_schedule(
     username: str = typer.Option(..., "-u", "--username", help="Username"),
     password: str = typer.Option(..., "-p", "--password", help="Password"),
     server: str = typer.Option(DEFAULT_SERVER, "--server", "-s"),
-    agent_dir: Path = typer.Option(DEFAULT_AGENTS_DIR, "--agent-dir", help="Base directory for agents"),
+    data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir", help="Root data directory (assistant creds under {data_dir}/agents/)"),
 ):
     """Schedule a recurring DM to an agent.
 
@@ -1128,14 +1351,16 @@ def dm_schedule(
             raise typer.Exit(1)
 
         # Load assistant credentials for chatroom creation
+        agents_dir = Path(data_dir).expanduser() / "agents"
         assistant_token = None
-        for entry in Path(agent_dir).iterdir():
-            if entry.is_dir() and entry.name.endswith(f"-{assistant_id}"):
-                cred_path = entry / "credential.json"
-                if cred_path.exists():
-                    creds = json.loads(cred_path.read_text())
-                    assistant_token = creds.get("token")
-                    break
+        if agents_dir.exists():
+            for entry in agents_dir.iterdir():
+                if entry.is_dir() and entry.name.endswith(f"-{assistant_id}"):
+                    cred_path = entry / "credential.json"
+                    if cred_path.exists():
+                        creds = json.loads(cred_path.read_text())
+                        assistant_token = creds.get("token")
+                        break
 
         # Find or create DM chatroom
         chatroom = _find_or_create_dm_chatroom(

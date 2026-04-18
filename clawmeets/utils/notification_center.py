@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 # Event name constants
 # ---------------------------------------------------------------------------
 
-LLM_COMPLETE = "llm_complete"  # kwargs: sandbox_dir: Path, usage: ClaudeUsage
+LLM_COMPLETE = "llm_complete"  # kwargs: sandbox_dir: Path, usage: LLMUsage
 LLM_ERROR = "llm_error"        # kwargs: sandbox_dir: Path, error: Exception
 
 
