@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import getpass
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -29,9 +30,8 @@ import typer
 RESERVED_NAMES = {"admin", "system", "root", "agent", "agents", "user", "users", "assistant"}
 NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 
-DEFAULT_SERVER = "https://clawmeets.ai"
-DEFAULT_DATA_DIR = "~/.clawmeets_data"
-CONFIG_DIR = Path.home() / ".clawmeets"
+DEFAULT_SERVER = os.environ.get("CLAWMEETS_SERVER_URL", "https://clawmeets.ai")
+DEFAULT_DATA_DIR = os.environ.get("CLAWMEETS_DATA_DIR", "~/.clawmeets")
 
 # ---------------------------------------------------------------------------
 # Validation
@@ -146,7 +146,12 @@ def _collect_agents() -> list[dict]:
 
 
 def _collect_git_repo() -> tuple[str, str]:
-    """Optionally collect git repo config. Returns (git_url, git_ignored_folder)."""
+    """Optionally collect git repo config. Returns (git_url, git_ignored_folder).
+
+    Note: Git configuration is now per-project (set at project creation time
+    via the web UI). This CLI prompt is kept for backward compatibility with
+    `clawmeets init` but the values are stored in project.json for reference only.
+    """
     typer.echo("\n--- Git Repository (Optional) ---")
     typer.echo("A git repo enables code-aware agent sandboxes. When set, agents clone this")
     typer.echo("repo as their working directory and work on branches per task.\n")
@@ -289,6 +294,11 @@ def _register_agents(
             cred = {"agent_id": agent_id, "token": result["token"], "agent_name": registered_name}
             (agent_work_dir / "credential.json").write_text(json.dumps(cred, indent=2))
 
+            # Build local_settings from agent config
+            local_settings = {}
+            if agent.get("knowledge_dir"):
+                local_settings["knowledge_dir"] = agent["knowledge_dir"]
+
             card = {
                 "id": agent_id,
                 "name": registered_name,
@@ -297,14 +307,9 @@ def _register_agents(
                 "status": result["status"],
                 "registered_at": result["registered_at"],
                 "discoverable_through_registry": result.get("discoverable_through_registry", False),
+                "local_settings": local_settings,
             }
             (agent_work_dir / "card.json").write_text(json.dumps(card, indent=2))
-
-            # Save agent-specific config (knowledge_dir, etc.)
-            config = {}
-            if agent.get("knowledge_dir"):
-                config["knowledge_dir"] = agent["knowledge_dir"]
-            (agent_work_dir / "config.json").write_text(json.dumps(config, indent=2))
 
             typer.echo(f"  Registered '{registered_name}' ({agent_id[:8]}...)")
 
@@ -431,52 +436,12 @@ def _write_project_json(
     return path
 
 
-def _write_config_json(
-    *,
-    server_url: str,
-    username: str,
-    token: str,
-    agents: list[dict],
-    agents_dir: Path,
-) -> Path:
-    """Write ~/.clawmeets/config.json for skill compatibility."""
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    config_path = CONFIG_DIR / "config.json"
-
-    # Load existing config if present
-    if config_path.exists():
-        try:
-            config = json.loads(config_path.read_text())
-        except json.JSONDecodeError:
-            config = {}
-    else:
-        config = {}
-
-    config["server_url"] = server_url
-    config["current_user"] = username
-
-    users = config.setdefault("users", {})
-    user_config = users.setdefault(username, {})
-    user_config["token"] = token
-
-    # Populate agent entries from registered agents on disk
-    user_agents = user_config.setdefault("agents", {})
-    for agent in agents:
-        name = agent["name"]
-        # Find the registered agent directory (prefixed with username)
-        prefixed_name = f"{username}-{name}"
-        agent_dir = None
-        for d in agents_dir.iterdir():
-            if d.is_dir() and d.name.startswith(f"{prefixed_name}-"):
-                agent_dir = d
-                break
-
-        if agent_dir:
-            entry: dict = {"agent_dir": str(agent_dir)}
-            if agent.get("knowledge_dir"):
-                entry["knowledge_dir"] = agent["knowledge_dir"]
-            user_agents[prefixed_name] = entry
-
+def _save_token_to_project_json(token: str, username: str, data_dir: Path) -> Path:
+    """Save JWT token to the user's project.json after login/registration."""
+    from clawmeets.cli_lifecycle import get_user_config_path
+    config_path = get_user_config_path(data_dir, username)
+    config = json.loads(config_path.read_text())
+    config.setdefault("user", {})["token"] = token
     config_path.write_text(json.dumps(config, indent=2))
     return config_path
 
@@ -589,8 +554,8 @@ def init_command(
     resolved_data_dir = Path(data_dir).expanduser()
     agents_dir = resolved_data_dir / "agents"
 
-    # ---- Output directory ----
-    output_dir = CONFIG_DIR
+    # ---- Output directory (per-user config) ----
+    output_dir = resolved_data_dir / "config" / username
 
     # ---- Confirmation ----
     if not non_interactive:
@@ -655,14 +620,10 @@ def init_command(
     if agents_list:
         _register_agents(server, token, agents_list, agents_dir)
 
-    # ---- Write config.json (skill compatibility) ----
-    config_path = _write_config_json(
-        server_url=server,
-        username=username,
-        token=token,
-        agents=agents_list,
-        agents_dir=agents_dir,
-    )
+    # ---- Save token to project.json and set current user ----
+    config_path = _save_token_to_project_json(token, username, resolved_data_dir)
+    from clawmeets.cli_lifecycle import set_current_user
+    set_current_user(resolved_data_dir, username)
     typer.echo(f"  Saved session to {config_path}")
 
     # ---- Done ----

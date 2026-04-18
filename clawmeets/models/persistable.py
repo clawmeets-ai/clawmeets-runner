@@ -645,6 +645,7 @@ class PersistableParticipant(Participant, ABC):
         Returns:
             AgentResponse DTO for API serialization
         """
+        card = self._load_card()
         return AgentResponse(
             id=self._id,
             name=self.name,
@@ -656,6 +657,7 @@ class PersistableParticipant(Participant, ABC):
             discoverable_through_registry=self.is_discoverable,
             registered_by=self.registered_by,
             is_verified=self.is_verified,
+            local_settings=card.get("local_settings", {}),
         )
 
     def to_dict(self) -> dict:

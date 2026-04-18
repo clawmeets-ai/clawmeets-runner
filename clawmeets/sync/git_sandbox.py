@@ -87,25 +87,25 @@ class GitSandboxSubscriber(ChangelogSubscriber):
     def __init__(
         self,
         sandbox_dir: Path,
-        git_url: Optional[str],
-        ignored_folder: str,
         coordinator_id: str,
         participant_id: str,
         project_dir: Path,
     ) -> None:
         """Initialize the git sandbox subscriber.
 
+        The git_url and ignored_folder are read lazily from the
+        PROJECT_CREATED changelog payload, making this subscriber
+        per-project rather than globally configured.
+
         Args:
             sandbox_dir: Agent's sandbox directory (will contain the clone/repo)
-            git_url: URL or path to clone from. None = standalone git init.
-            ignored_folder: Folder name for deliverables (git-ignored, e.g. ".bus-files")
             coordinator_id: The project coordinator's participant ID
             participant_id: This participant's ID
             project_dir: The synced project_dir where chatroom files appear
         """
         self._sandbox_dir = sandbox_dir
-        self._git_url = git_url
-        self._ignored_folder = ignored_folder
+        self._git_url: Optional[str] = None  # Set from PROJECT_CREATED payload
+        self._ignored_folder = ".bus-files"  # Default; overridden by payload
         self._is_coordinator = coordinator_id == participant_id
         self._project_dir = project_dir
         self._initialized = False
@@ -119,8 +119,13 @@ class GitSandboxSubscriber(ChangelogSubscriber):
         """Process a changelog entry for git operations."""
         if entry.entry_type == ChangelogEntryType.PROJECT_CREATED:
             await self._handle_project_created(entry, project_name)
+            return
 
-        elif entry.entry_type == ChangelogEntryType.ROOM_CREATED:
+        # Skip all git operations if no git_url configured for this project
+        if not self._git_url:
+            return
+
+        if entry.entry_type == ChangelogEntryType.ROOM_CREATED:
             await self._handle_room_created(entry, project_name)
 
         elif entry.entry_type == ChangelogEntryType.BATCH_COMPLETE:
@@ -133,8 +138,9 @@ class GitSandboxSubscriber(ChangelogSubscriber):
         """Commit and push sandbox changes after successful LLM invocation.
 
         Only acts for workers — coordinators merge via _handle_batch_complete.
+        No-ops if this project has no git_url configured.
         """
-        if self._is_coordinator:
+        if self._is_coordinator or not self._git_url:
             return
         await self._commit_and_push(sandbox_dir)
 
@@ -170,11 +176,24 @@ class GitSandboxSubscriber(ChangelogSubscriber):
     ) -> None:
         """Initialize git repo on project creation.
 
+        Reads git_url from the PROJECT_CREATED payload. If no git_url,
+        marks as initialized and all future operations become no-ops.
+
         Coordinator: clone/init, create project branch, push.
         Worker: clone/init, fetch project branch.
         """
         if self._initialized:
             return  # Idempotent
+
+        # Read git config from payload
+        payload = entry.payload
+        raw_url = getattr(payload, "git_url", "") or ""
+        self._git_url = raw_url if raw_url else None
+        self._ignored_folder = getattr(payload, "git_ignored_folder", self._ignored_folder)
+
+        if not self._git_url:
+            self._initialized = True  # No git needed — all future on_entry calls skip
+            return
 
         sandbox = self._sandbox_dir
 

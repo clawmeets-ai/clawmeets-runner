@@ -390,7 +390,7 @@ class User(Participant):
         """Initialize user store, ensuring passwd file exists.
 
         If no admin user is found, logs a warning instructing the operator
-        to create one via `admin init-passwd`.
+        to create one via `server init`.
 
         Args:
             ctx: ModelContext for filesystem operations
@@ -415,7 +415,7 @@ class User(Participant):
             if not has_admin:
                 logger.warning(
                     "No admin user found. Create one with: "
-                    "python -m clawmeets.cli admin init-passwd <password>"
+                    "python -m clawmeets.cli server init <password>"
                 )
 
     # ─────────────────────────────────────────────────────────────────────────

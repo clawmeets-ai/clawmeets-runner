@@ -30,6 +30,7 @@ class ControlMessageType(str, Enum):
     AGENT_STATUS_CHANGE = "agent_status_change"  # Server notifies clients of agent online/offline
     PROJECT_DELETED = "project_deleted"            # Server notifies clients that a project was deleted
     SKILL_SYNC = "skill_sync"              # Server notifies client to install/uninstall a skill
+    AGENT_SETTINGS_CHANGE = "agent_settings_change"  # Server notifies agent of local_settings update
 
 
 class ChangelogUpdatePayload(BaseModel):
@@ -65,10 +66,17 @@ class SkillSyncPayload(BaseModel):
     skill_content: str | None = None  # Full SKILL.md content for install; None for uninstall
 
 
+class AgentSettingsChangePayload(BaseModel):
+    """Payload for AGENT_SETTINGS_CHANGE messages."""
+    agent_id: str
+    agent_name: str
+    local_settings: dict  # knowledge_dir, use_chrome
+
+
 class ControlEnvelope(BaseModel):
     """Lightweight WebSocket notification - never carries file content."""
     type: ControlMessageType
-    payload: Union[ChangelogUpdatePayload, AgentStatusChangePayload, ProjectDeletedPayload, SkillSyncPayload, dict] = Field(default_factory=dict)
+    payload: Union[ChangelogUpdatePayload, AgentStatusChangePayload, ProjectDeletedPayload, SkillSyncPayload, AgentSettingsChangePayload, dict] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_required_fields_for_type(self) -> "ControlEnvelope":
@@ -85,4 +93,7 @@ class ControlEnvelope(BaseModel):
         elif self.type == ControlMessageType.SKILL_SYNC:
             if not isinstance(self.payload, SkillSyncPayload):
                 raise ValueError(f"control message type {self.type} requires SkillSyncPayload")
+        elif self.type == ControlMessageType.AGENT_SETTINGS_CHANGE:
+            if not isinstance(self.payload, AgentSettingsChangePayload):
+                raise ValueError(f"control message type {self.type} requires AgentSettingsChangePayload")
         return self

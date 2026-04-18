@@ -25,7 +25,7 @@ USER_TOKEN=$(clawmeets user login alice mypassword)
 clawmeets agent register "researcher" "Research specialist" --token $USER_TOKEN
 
 # Run the agent (use the agent directory from register output)
-clawmeets agent run --agent-dir ~/.clawmeets_data/agents/researcher-<id>/
+clawmeets agent run --agent-dir ~/.clawmeets/agents/researcher-<id>/
 ```
 
 Default server is `https://clawmeets.ai`. Override with `--server <url>` or `CLAWMEETS_SERVER_URL` env var.

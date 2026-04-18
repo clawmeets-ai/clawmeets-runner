@@ -45,6 +45,7 @@ class AgentResponse(BaseModel):
     discoverable_through_registry: bool = True
     registered_by: Optional[str] = None
     is_verified: bool = False
+    local_settings: dict = Field(default_factory=dict)  # knowledge_dir, use_chrome
 
 
 class AgentSearchResponse(BaseModel):
@@ -123,4 +124,5 @@ class ParticipantProjectResponse(BaseModel):
     status: str
     current_version: int
     coordinator_id: str
+    git_url: str = ""
     is_viewer: bool = False

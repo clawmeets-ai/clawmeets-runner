@@ -143,6 +143,8 @@ class ProjectCreatedPayload(BaseModel):
     request: str
     created_by: str  # user_id of creator (required - derived from auth)
     agent_pool: str = "verified"  # "owned", "verified", or "all"
+    git_url: str = ""  # Git repo URL (empty = no git)
+    git_ignored_folder: str = ".bus-files"  # Folder for non-git deliverables
 
 
 # Union type for changelog payloads

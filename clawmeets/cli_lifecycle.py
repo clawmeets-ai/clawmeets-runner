@@ -28,22 +28,59 @@ import typer
 # Constants
 # ---------------------------------------------------------------------------
 
-CONFIG_DIR = Path.home() / ".clawmeets"
 DEFAULT_SERVER = os.environ.get("CLAWMEETS_SERVER_URL", "https://clawmeets.ai")
-DEFAULT_DATA_DIR = os.environ.get("CLAWMEETS_DATA", str(Path.home() / ".clawmeets_data"))
+DEFAULT_DATA_DIR = os.environ.get("CLAWMEETS_DATA_DIR", str(Path.home() / ".clawmeets"))
+
+
+# ---------------------------------------------------------------------------
+# Multi-user config helpers
+# ---------------------------------------------------------------------------
+
+
+def get_current_user(data_dir: Path) -> str | None:
+    """Read current_user file."""
+    path = data_dir / "config" / "current_user"
+    return path.read_text().strip() if path.exists() else None
+
+
+def set_current_user(data_dir: Path, username: str) -> None:
+    """Write current_user file."""
+    path = data_dir / "config" / "current_user"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(username)
+
+
+def get_user_config_path(data_dir: Path, username: str) -> Path:
+    """Get path to a user's project.json."""
+    return data_dir / "config" / username / "project.json"
+
+
+def load_user_config(data_dir: Path, username: str | None = None) -> tuple[dict, Path]:
+    """Load a user's project.json. Uses current_user if username not specified.
+
+    Also falls back to ./project.json in the current directory for backward
+    compatibility with the project.sh workflow.
+    """
+    if username is None:
+        username = get_current_user(data_dir)
+    if username:
+        path = get_user_config_path(data_dir, username)
+        if path.exists():
+            return json.loads(path.read_text()), path
+    # Fallback: ./project.json in current directory (project.sh workflow)
+    local = Path("project.json")
+    if local.exists():
+        return json.loads(local.read_text()), local
+    if username:
+        typer.echo(f"Error: No config for user '{username}'. Run `clawmeets init` first.", err=True)
+    else:
+        typer.echo("Error: No user configured. Run `clawmeets init` first.", err=True)
+    raise typer.Exit(1)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _load_config() -> tuple[dict | None, Path | None]:
-    """Load project.json from ~/.clawmeets/ or current directory."""
-    for candidate in [CONFIG_DIR / "project.json", Path("project.json")]:
-        if candidate.exists():
-            return json.loads(candidate.read_text()), candidate
-    return None, None
 
 
 def _pid_is_alive(pid: int) -> bool:
@@ -140,14 +177,16 @@ def _build_agent_list(config: dict) -> list[str]:
 def start_command(
     server: Optional[str] = typer.Option(None, "--server", "-s", help="Server URL (overrides config)"),
     config_file: Optional[Path] = typer.Option(None, "--config", "-c", help="Path to project.json"),
+    user: Optional[str] = typer.Option(None, "--user", "-u", help="Username (overrides current_user)"),
 ) -> None:
     """Start all agents in the background.
 
-    Reads agent configuration from ~/.clawmeets/project.json (or ./project.json)
-    and starts each agent as a background process.
+    Reads agent configuration from the current user's project.json and starts
+    each agent as a background process.
 
     Example:
         clawmeets start
+        clawmeets start --user alice
         clawmeets start --server https://my-server.com
     """
     if config_file:
@@ -155,11 +194,9 @@ def start_command(
             typer.echo(f"Error: Config file not found: {config_file}", err=True)
             raise typer.Exit(1)
         config = json.loads(config_file.read_text())
+        config_path = config_file
     else:
-        config, config_path = _load_config()
-        if config is None:
-            typer.echo("Error: No project.json found. Run `clawmeets init` first.", err=True)
-            raise typer.Exit(1)
+        config, config_path = load_user_config(Path(DEFAULT_DATA_DIR), user)
 
     server_url = server or config.get("server_url", DEFAULT_SERVER)
     agents_dir = _get_agents_dir(config)
@@ -169,19 +206,12 @@ def start_command(
         typer.echo("No agents found in config.")
         return
 
-    # Read git and plugin config
-    git_url = config.get("git_url", "")
-    git_ignored_folder = config.get("git_ignored_folder", "")
+    # Read plugin config
     claude_plugin_dir = config.get("claude_plugin_dir", "")
 
     # Resolve relative paths from config directory
-    config_dir = CONFIG_DIR if (CONFIG_DIR / "project.json").exists() else Path(".")
-    if git_url and not git_url.startswith("/") and not git_url.startswith("http") and not git_url.startswith("git@"):
-        resolved = (config_dir / git_url).resolve()
-        if resolved.exists():
-            git_url = str(resolved)
     if claude_plugin_dir and not claude_plugin_dir.startswith("/"):
-        resolved = (config_dir / claude_plugin_dir).resolve()
+        resolved = (config_path.parent / claude_plugin_dir).resolve()
         if resolved.exists():
             claude_plugin_dir = str(resolved)
 
@@ -200,15 +230,17 @@ def start_command(
             typer.echo(f"  Agent '{name}' already running (PID {existing_pid})")
             continue
 
-        # Read agent-specific config
+        # Read agent-specific config from card.json local_settings
+        # (config.json is deprecated — local_settings in card.json is the primary source)
         knowledge_dir = ""
         use_chrome = False
-        agent_config_path = agent_dir / "config.json"
-        if agent_config_path.exists():
+        card_path = agent_dir / "card.json"
+        if card_path.exists():
             try:
-                agent_config = json.loads(agent_config_path.read_text())
-                knowledge_dir = agent_config.get("knowledge_dir", "")
-                use_chrome = agent_config.get("use_chrome", False)
+                card_data = json.loads(card_path.read_text())
+                local_settings = card_data.get("local_settings", {})
+                knowledge_dir = local_settings.get("knowledge_dir", "")
+                use_chrome = local_settings.get("use_chrome", False)
             except json.JSONDecodeError:
                 pass
 
@@ -219,10 +251,6 @@ def start_command(
             cmd.extend(["--knowledge-dir", knowledge_dir])
         if use_chrome:
             cmd.append("--chrome")
-        if git_url:
-            cmd.extend(["--git-url", git_url])
-        if git_ignored_folder:
-            cmd.extend(["--git-ignored-folder", git_ignored_folder])
         if claude_plugin_dir:
             cmd.extend(["--claude-plugin-dir", claude_plugin_dir])
 
@@ -256,19 +284,18 @@ def start_command(
 
 def stop_command(
     config_file: Optional[Path] = typer.Option(None, "--config", "-c", help="Path to project.json"),
+    user: Optional[str] = typer.Option(None, "--user", "-u", help="Username (overrides current_user)"),
 ) -> None:
     """Stop all running agents.
 
     Example:
         clawmeets stop
+        clawmeets stop --user alice
     """
     if config_file:
         config = json.loads(config_file.read_text())
     else:
-        config, _ = _load_config()
-        if config is None:
-            typer.echo("Error: No project.json found. Run `clawmeets init` first.", err=True)
-            raise typer.Exit(1)
+        config, _ = load_user_config(Path(DEFAULT_DATA_DIR), user)
 
     agents_dir = _get_agents_dir(config)
     agent_names = _build_agent_list(config)
@@ -297,19 +324,19 @@ def stop_command(
 
 def status_command(
     config_file: Optional[Path] = typer.Option(None, "--config", "-c", help="Path to project.json"),
+    user: Optional[str] = typer.Option(None, "--user", "-u", help="Username (overrides current_user)"),
 ) -> None:
     """Show status of all agents.
 
     Example:
         clawmeets status
+        clawmeets status --user alice
     """
     if config_file:
         config = json.loads(config_file.read_text())
+        config_path = config_file
     else:
-        config, config_path = _load_config()
-        if config is None:
-            typer.echo("Error: No project.json found. Run `clawmeets init` first.", err=True)
-            raise typer.Exit(1)
+        config, config_path = load_user_config(Path(DEFAULT_DATA_DIR), user)
 
     agents_dir = _get_agents_dir(config)
     agent_names = _build_agent_list(config)
@@ -317,7 +344,7 @@ def status_command(
 
     typer.echo("=== Agent Status ===\n")
     typer.echo(f"  Server:     {server_url}")
-    typer.echo(f"  Config:     {config_path or 'project.json'}")
+    typer.echo(f"  Config:     {config_path}")
     typer.echo(f"  Agents dir: {agents_dir}\n")
 
     for name in agent_names:

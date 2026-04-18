@@ -262,7 +262,7 @@ class Agent(PersistableParticipant):
             OperationalMode.WORKER,
             coordinator_name=project.coordinator_name,
             capabilities=self.capabilities,
-            git_ignored_folder=self._model_ctx.git_ignored_folder if self._model_ctx.git_url else None,
+            git_ignored_folder=project.git_ignored_folder if project.git_url else None,
         )
 
         # Build prompt - extract message fields for Layer 0 compatibility
@@ -517,7 +517,7 @@ class Agent(PersistableParticipant):
         # Create coordinator prompt builder for this task
         coordinator_builder = create_prompt_builder(
             OperationalMode.COORDINATOR,
-            git_ignored_folder=self._model_ctx.git_ignored_folder if self._model_ctx.git_url else None,
+            git_ignored_folder=project.git_ignored_folder if project.git_url else None,
         )
         assert isinstance(coordinator_builder, CoordinatorPromptBuilder)
 
@@ -618,7 +618,7 @@ class Agent(PersistableParticipant):
         # Create coordinator prompt builder for this task
         coordinator_builder = create_prompt_builder(
             OperationalMode.COORDINATOR,
-            git_ignored_folder=self._model_ctx.git_ignored_folder if self._model_ctx.git_url else None,
+            git_ignored_folder=project.git_ignored_folder if project.git_url else None,
         )
         assert isinstance(coordinator_builder, CoordinatorPromptBuilder)
 

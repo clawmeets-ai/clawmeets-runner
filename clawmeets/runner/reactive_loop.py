@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 
 import httpx
 
-from clawmeets.api.control import AgentStatusChangePayload, ChangelogUpdatePayload, ControlMessageType, ProjectDeletedPayload, SkillSyncPayload
+from clawmeets.api.control import AgentSettingsChangePayload, AgentStatusChangePayload, ChangelogUpdatePayload, ControlMessageType, ProjectDeletedPayload, SkillSyncPayload
 from clawmeets.models.agent import Agent
 from clawmeets.models.assistant import Assistant
 from clawmeets.models.context import ModelContext
@@ -82,19 +82,18 @@ class ReactiveControlLoop:
             subs: list[ChangelogSubscriber] = [
                 model_ctx.changelog_subscriber(pid, pname),
             ]
-            if model_ctx.git_url:
-                git_sub = GitSandboxSubscriber(
-                    sandbox_dir=model_ctx.sandbox_dir(pid, pname),
-                    git_url=model_ctx.git_url,
-                    ignored_folder=model_ctx.git_ignored_folder,
-                    coordinator_id=coordinator_id,
-                    participant_id=participant.id,
-                    project_dir=model_ctx.project_dir(pid, pname),
-                )
-                model_ctx.notification_center.subscribe(
-                    LLM_COMPLETE, git_sub._on_llm_complete,
-                )
-                subs.append(git_sub)
+            # Always register GitSandboxSubscriber — it reads git_url
+            # from the PROJECT_CREATED payload and no-ops if empty.
+            git_sub = GitSandboxSubscriber(
+                sandbox_dir=model_ctx.sandbox_dir(pid, pname),
+                coordinator_id=coordinator_id,
+                participant_id=participant.id,
+                project_dir=model_ctx.project_dir(pid, pname),
+            )
+            model_ctx.notification_center.subscribe(
+                LLM_COMPLETE, git_sub._on_llm_complete,
+            )
+            subs.append(git_sub)
             subs.extend(extra_subscribers)
             subs.append(self._notifier)
             return model_ctx.changelog_dir(pid, pname), subs
@@ -161,8 +160,44 @@ class ReactiveControlLoop:
                 else:
                     logger.warning("Received SKILL_SYNC but no SkillManager configured")
 
+            case ControlMessageType.AGENT_SETTINGS_CHANGE:
+                payload: AgentSettingsChangePayload = envelope.payload
+                if payload.agent_id == self._participant.id:
+                    self._apply_local_settings(payload.local_settings)
+
             case _:
                 raise ValueError(f"Unknown control message type: {envelope.type}")
+
+    # ─────────────────────────────────────────────────────────
+    # Local Settings
+    # ─────────────────────────────────────────────────────────
+
+    def _apply_local_settings(self, local_settings: dict) -> None:
+        """Apply local_settings changes to runtime components.
+
+        Updates ModelContext.knowledge_dirs and ClaudeCLI.use_chrome
+        so the next LLM invocation uses the new settings without restart.
+        Also persists changes to local card.json.
+        """
+        from pathlib import Path
+
+        # Update knowledge_dirs
+        knowledge_dir = local_settings.get("knowledge_dir", "")
+        new_dirs = [Path(knowledge_dir)] if knowledge_dir else []
+        self._model_ctx.update_knowledge_dirs(new_dirs)
+
+        # Update use_chrome
+        use_chrome = local_settings.get("use_chrome", False)
+        if self._model_ctx.cli is not None:
+            self._model_ctx.cli.use_chrome = use_chrome
+
+        # Persist to local card.json
+        self._participant.update_card(local_settings=local_settings)
+
+        logger.info(
+            f"Applied local_settings for {self._participant.name}: "
+            f"knowledge_dir={knowledge_dir!r}, use_chrome={use_chrome}"
+        )
 
     # ─────────────────────────────────────────────────────────
     # Changelog Sync

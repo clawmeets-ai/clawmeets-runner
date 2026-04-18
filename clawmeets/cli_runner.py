@@ -62,7 +62,7 @@ dm_app    = typer.Typer(help="Direct message commands", no_args_is_help=True)
 # ---------------------------------------------------------------------------
 
 DEFAULT_SERVER = os.environ.get("CLAWMEETS_SERVER_URL", "https://clawmeets.ai")
-DEFAULT_DATA_DIR = os.environ.get("CLAWMEETS_DATA", str(Path.home() / ".clawmeets_data"))
+DEFAULT_DATA_DIR = os.environ.get("CLAWMEETS_DATA_DIR", str(Path.home() / ".clawmeets"))
 DEFAULT_AGENTS_DIR = str(Path(DEFAULT_DATA_DIR) / "agents")
 DEFAULT_USERS_DIR = str(Path(DEFAULT_DATA_DIR) / "users")
 DEFAULT_SERVER_DIR = str(Path(DEFAULT_DATA_DIR) / "server")
@@ -242,8 +242,6 @@ def agent_run(
     working_dir: Optional[Path] = typer.Option(None, "--working-dir", "-w", help="Sandbox directory for Claude (default: agent-dir/sandbox)"),
     knowledge_dir: Optional[Path] = typer.Option(None, "--knowledge-dir", "-k", help="Knowledge base directory (passed as --add-dir to Claude)"),
     claude_plugin_dir: Optional[list[Path]] = typer.Option(None, "--claude-plugin-dir", help="Claude plugin directory (passed as --plugin-dir to Claude CLI, repeatable)"),
-    git_url: Optional[str] = typer.Option(None, "--git-url", help="Git repo URL/path for code-aware sandbox"),
-    git_ignored_folder: str = typer.Option(".bus-files", "--git-ignored-folder", help="Git-ignored folder for deliverables"),
     chrome: bool = typer.Option(False, "--chrome", help="Enable Chrome browser integration via Claude Code --chrome flag"),
     log_level: str = typer.Option("info"),
 ):
@@ -304,7 +302,7 @@ def agent_run(
     if claude_plugin_dir:
         typer.echo(f"Claude plugin dirs: {claude_plugin_dir}")
 
-    asyncio.run(_runner_loop(agent_name, agent_id, token, server, Path(agent_dir), working_dir, knowledge_dir, claude_plugin_dir or [], git_url, git_ignored_folder, use_chrome=chrome))
+    asyncio.run(_runner_loop(agent_name, agent_id, token, server, Path(agent_dir), working_dir, knowledge_dir, claude_plugin_dir or [], use_chrome=chrome))
 
 
 async def _ws_heartbeat_task(ws, agent_id: str) -> None:
@@ -722,8 +720,6 @@ async def _runner_loop(
     working_dir: Optional[Path] = None,
     knowledge_dir: Optional[Path] = None,
     claude_plugin_dirs: Optional[list[Path]] = None,
-    git_url: Optional[str] = None,
-    git_ignored_folder: str = ".bus-files",
     use_chrome: bool = False,
 ) -> None:
     """Run the reactive control loop for an agent."""
@@ -738,6 +734,12 @@ async def _runner_loop(
     # Assistants have discoverable_through_registry=False
     is_assistant = not card_data.get("discoverable_through_registry", True)
 
+    # Read local_settings from card.json (primary source, synced with server)
+    # CLI flags (--knowledge-dir, --chrome) serve as overrides for backward compat
+    local_settings = card_data.get("local_settings", {})
+    effective_knowledge_dir = knowledge_dir or local_settings.get("knowledge_dir", "")
+    effective_use_chrome = use_chrome or local_settings.get("use_chrome", False)
+
     # Determine action schema based on role
     if is_assistant:
         action_schema = COORDINATOR_ACTION_SCHEMA
@@ -751,12 +753,12 @@ async def _runner_loop(
     # Include skill-hub plugin dir alongside any explicit plugin dirs
     all_plugin_dirs = list(claude_plugin_dirs or []) + [skill_manager.plugin_dir]
     ClaudeCLI.verify_cli()
-    cli = ClaudeCLI(action_schema=action_schema, claude_plugin_dirs=all_plugin_dirs, use_chrome=use_chrome)
+    cli = ClaudeCLI(action_schema=action_schema, claude_plugin_dirs=all_plugin_dirs, use_chrome=effective_use_chrome)
 
     # Build knowledge_dirs list (e.g., knowledge bases)
     knowledge_dirs_list: list[Path] = []
-    if knowledge_dir:
-        knowledge_dirs_list.append(Path(knowledge_dir))
+    if effective_knowledge_dir:
+        knowledge_dirs_list.append(Path(effective_knowledge_dir))
 
     # Create HTTP client with auth
     http_client = httpx.AsyncClient(
@@ -778,8 +780,6 @@ async def _runner_loop(
         cli=cli,
         knowledge_dirs=knowledge_dirs_list,
         client=client,
-        git_url=git_url,
-        git_ignored_folder=git_ignored_folder,
         claude_plugin_dirs=all_plugin_dirs,
         notification_center=notification_center,
     )

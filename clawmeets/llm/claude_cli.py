@@ -176,6 +176,16 @@ class ClaudeCLI:
         self._claude_plugin_dirs = claude_plugin_dirs or []
         self._use_chrome = use_chrome
 
+    @property
+    def use_chrome(self) -> bool:
+        """Whether Chrome browser integration is enabled."""
+        return self._use_chrome
+
+    @use_chrome.setter
+    def use_chrome(self, value: bool) -> None:
+        """Update Chrome integration. Takes effect on the next invocation."""
+        self._use_chrome = value
+
     @classmethod
     def verify_cli(cls, claude_bin: str = "claude") -> None:
         """Verify Claude CLI is available.

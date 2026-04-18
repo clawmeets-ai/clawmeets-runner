@@ -338,7 +338,7 @@ class Assistant(PersistableParticipant):
         # Create coordinator prompt builder on-demand
         prompt_builder = create_prompt_builder(
             OperationalMode.COORDINATOR,
-            git_ignored_folder=self._model_ctx.git_ignored_folder if self._model_ctx.git_url else None,
+            git_ignored_folder=project.git_ignored_folder if project.git_url else None,
         )
         assert isinstance(prompt_builder, CoordinatorPromptBuilder)
 
@@ -503,7 +503,7 @@ If the current approach isn't working, document why in Learnings and try a diffe
         # Create coordinator prompt builder on-demand
         prompt_builder = create_prompt_builder(
             OperationalMode.COORDINATOR,
-            git_ignored_folder=self._model_ctx.git_ignored_folder if self._model_ctx.git_url else None,
+            git_ignored_folder=project.git_ignored_folder if project.git_url else None,
         )
         assert isinstance(prompt_builder, CoordinatorPromptBuilder)
 

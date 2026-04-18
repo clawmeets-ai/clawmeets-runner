@@ -82,8 +82,6 @@ class ModelContext:
         cli: Optional["ClaudeCLI"] = None,
         knowledge_dirs: Optional[list[Path]] = None,
         client: Optional["ClawMeetsClient"] = None,
-        git_url: Optional[str] = None,
-        git_ignored_folder: str = ".bus-files",
         claude_plugin_dirs: Optional[list[Path]] = None,
     ) -> None:
         """Initialize context with a single base directory.
@@ -99,17 +97,15 @@ class ModelContext:
         - client: ClawMeetsClient for HTTP operations (None if not configured)
         - claude_plugin_dirs: Claude plugin directories for skill access (e.g., save-to-knowledge)
 
-        Optional git configuration for code-aware sandbox:
-        - git_url: URL or path to clone from (None = standalone git init in sandbox)
-        - git_ignored_folder: Folder for deliverables that should not be git-tracked
+        Git configuration (git_url, git_ignored_folder) is now per-project,
+        stored in the PROJECT_CREATED changelog payload and read by
+        GitSandboxSubscriber at runtime.
 
         Args:
             base_dir: Base directory for all data
             cli: Claude CLI for LLM invocation (optional, for agent runtime)
             knowledge_dirs: Additional directories for Claude access (optional)
             client: ClawMeetsClient for server communication (optional, for agent runtime)
-            git_url: Git repo URL/path to clone from (optional, for code-aware sandbox)
-            git_ignored_folder: Folder name for git-ignored deliverables (default: ".bus-files")
             claude_plugin_dirs: Claude plugin directories (optional, passed as --plugin-dir)
             notification_center: In-memory pub/sub dispatcher for cross-component events
         """
@@ -118,8 +114,6 @@ class ModelContext:
         self._knowledge_dirs = knowledge_dirs or []
         self._client = client
         self._action_executor: Optional["ActionBlockExecutor"] = None
-        self._git_url = git_url
-        self._git_ignored_folder = git_ignored_folder
         self._claude_plugin_dirs = claude_plugin_dirs or []
         self._notification_center = notification_center
 
@@ -133,6 +127,10 @@ class ModelContext:
         """Additional directories for Claude access (e.g., knowledge bases)."""
         return self._knowledge_dirs
 
+    def update_knowledge_dirs(self, dirs: list[Path]) -> None:
+        """Replace knowledge directories. Takes effect on the next LLM invocation."""
+        self._knowledge_dirs = dirs
+
     @property
     def claude_plugin_dirs(self) -> list[Path]:
         """Claude plugin directories for skill access (passed as --plugin-dir)."""
@@ -142,16 +140,6 @@ class ModelContext:
     def client(self) -> Optional["ClawMeetsClient"]:
         """HTTP client for server communication (None if not configured)."""
         return self._client
-
-    @property
-    def git_url(self) -> Optional[str]:
-        """Git repo URL/path to clone from (None if not configured)."""
-        return self._git_url
-
-    @property
-    def git_ignored_folder(self) -> str:
-        """Folder name for git-ignored deliverables (e.g. '.bus-files')."""
-        return self._git_ignored_folder
 
     @property
     def notification_center(self) -> NotificationCenter:
@@ -383,6 +371,8 @@ class ModelContextChangelogSubscriber(ChangelogSubscriber):
             created_at=entry.timestamp,
             ctx=self._model_ctx,
             agent_pool=getattr(payload, "agent_pool", "verified"),
+            git_url=getattr(payload, "git_url", ""),
+            git_ignored_folder=getattr(payload, "git_ignored_folder", ".bus-files"),
         )
 
     async def _handle_room_created(self, entry: ChangelogEntry) -> None:

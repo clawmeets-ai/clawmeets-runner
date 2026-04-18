@@ -59,6 +59,8 @@ class Project(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     created_by: str               # user_id of creator (derived from auth)
     agent_pool: str = Field(default="verified")  # "owned", "verified", or "all"
+    git_url: str = Field(default="")  # Git repo URL (empty = no git)
+    git_ignored_folder: str = Field(default=".bus-files")  # Folder for non-git deliverables
 
     # Private runtime state (not serialized)
     _ctx: Optional["ModelContext"] = PrivateAttr(default=None)
@@ -378,6 +380,8 @@ class ProjectState:
         created_at: datetime,
         ctx: "ModelContext",
         agent_pool: str = "verified",
+        git_url: str = "",
+        git_ignored_folder: str = ".bus-files",
     ) -> Project:
         """Create a new project with directories and meta.json.
 
@@ -421,6 +425,8 @@ class ProjectState:
             "created_at": created_at.isoformat() if created_at else None,
             "created_by": created_by,
             "agent_pool": agent_pool,
+            "git_url": git_url,
+            "git_ignored_folder": git_ignored_folder,
         }
         FileUtil.write(meta_dir / "meta.json", project_data, "json", atomic=True)
 
