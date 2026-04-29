@@ -4,8 +4,6 @@ clawmeets/cli_lifecycle.py
 
 Agent lifecycle commands: start, stop, status.
 
-Replaces the corresponding project.sh commands with pure Python.
-
 Usage:
     clawmeets start          # start all agents
     clawmeets stop           # stop all agents
@@ -109,21 +107,13 @@ def add_agent_to_settings(data_dir: Path, username: str, agent_entry: dict) -> P
 
 
 def load_user_config(data_dir: Path, username: str | None = None) -> tuple[dict, Path]:
-    """Load a user's settings.json. Uses current_user if username not specified.
-
-    Also falls back to ./project.json in the current directory for backward
-    compatibility with the project.sh workflow.
-    """
+    """Load a user's settings.json. Uses current_user if username not specified."""
     if username is None:
         username = get_current_user(data_dir)
     if username:
         path = get_user_config_path(data_dir, username)
         if path.exists():
             return json.loads(path.read_text()), path
-    # Fallback: ./project.json in current directory (project.sh workflow)
-    local = Path("project.json")
-    if local.exists():
-        return json.loads(local.read_text()), local
     if username:
         typer.echo(f"Error: No config for user '{username}'. Run `clawmeets init` first.", err=True)
     else:
@@ -317,6 +307,7 @@ def start_command(
 
     server_url = server or config.get("server_url", DEFAULT_SERVER)
     agents_dir = _get_agents_dir(config)
+
     agent_names = _build_agent_list(config)
 
     if not agent_names:
@@ -333,6 +324,16 @@ def start_command(
             claude_plugin_dir = str(resolved)
 
     typer.echo("=== Start Agents ===\n")
+
+    # Map prefixed name -> short name for settings.json self-destruct cleanup.
+    # Assistants are not in settings.json agents[], so they won't appear here.
+    username = config.get("user", {}).get("username") or config.get("name", "")
+    short_name_by_prefixed: dict[str, str] = {}
+    if username:
+        for agent_def in config.get("agents", []):
+            short = agent_def.get("name")
+            if short:
+                short_name_by_prefixed[_prefixed_name(username, short)] = short
 
     started = 0
     for name in agent_names:
@@ -370,6 +371,18 @@ def start_command(
             cmd.append("--chrome")
         if claude_plugin_dir:
             cmd.extend(["--claude-plugin-dir", claude_plugin_dir])
+
+        # Always pass --user-config so the runner can resolve relative
+        # knowledge_dir strings against ~/.clawmeets/config/<username>/ —
+        # the same base cli_init.py used when it wrote CLAUDE.md.
+        cmd.extend(["--user-config", str(config_path)])
+
+        # --settings-name is only set for agents that appear in
+        # settings.json[agents]; it scopes self-destruct cleanup to that
+        # entry. Assistants aren't in agents[] so this stays unset for them.
+        settings_short_name = short_name_by_prefixed.get(name)
+        if settings_short_name:
+            cmd.extend(["--settings-name", settings_short_name])
 
         stdout_log = agent_dir / "stdout.log"
         stderr_log = agent_dir / "stderr.log"

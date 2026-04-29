@@ -87,7 +87,6 @@ class CodexCLI(LLMProvider):
 
     def __init__(
         self,
-        action_schema: dict,
         codex_bin: str = "codex",
         model: Optional[str] = None,
         sandbox_mode: str = "workspace-write",
@@ -95,17 +94,17 @@ class CodexCLI(LLMProvider):
         """Initialize CodexCLI.
 
         Args:
-            action_schema: JSON schema for `--output-schema`. Forces the final
-                response to match this shape.
             codex_bin: Path to codex CLI binary
             model: Optional model override (e.g. "o3"); None uses Codex default.
             sandbox_mode: Codex sandbox policy. Default "workspace-write" lets
                 the agent modify its own sandbox (clawmeets already isolates
                 sandboxes per agent). Other options: "read-only",
                 "danger-full-access".
+
+        The JSON action schema is selected per invocation and passed to
+        ``invoke(action_schema=...)``.
         """
         self._bin = codex_bin
-        self._action_schema = action_schema
         self._model = model
         self._sandbox_mode = sandbox_mode
         # Codex has no Chrome integration; use_chrome stays False (inherited).
@@ -144,6 +143,7 @@ class CodexCLI(LLMProvider):
         prompt: str,
         working_dir: Path,
         additional_dirs: list[Path],
+        action_schema: dict,
     ) -> tuple[str, str, str, str, list[str]]:
         """Set up directories, write prompt + schema files, build command.
 
@@ -158,7 +158,7 @@ class CodexCLI(LLMProvider):
         prompt_file_abs = str(prompt_file.resolve())
 
         schema_file = working_dir / ".agent-schema.json"
-        adapted_schema = _adapt_schema_for_codex(self._action_schema)
+        adapted_schema = _adapt_schema_for_codex(action_schema)
         schema_file.write_text(json.dumps(adapted_schema), encoding="utf-8")
         schema_file_abs = str(schema_file.resolve())
 
@@ -315,6 +315,7 @@ class CodexCLI(LLMProvider):
         log_dir: Path,
         additional_dirs: list[Path],
         notification_center: NotificationCenter,
+        action_schema: dict,
     ) -> tuple[ActionBlock, LLMUsage]:
         """Invoke Codex CLI with the given prompt."""
         (
@@ -323,71 +324,102 @@ class CodexCLI(LLMProvider):
             last_message_abs,
             codex_cwd,
             cmd,
-        ) = self._prepare_invocation(prompt, working_dir, additional_dirs)
+        ) = self._prepare_invocation(prompt, working_dir, additional_dirs, action_schema)
 
         env = os.environ.copy()
 
         invoke_timeout = 300
 
         start_time = time.time()
+        proc: Optional[asyncio.subprocess.Process] = None
         try:
-            result = await asyncio.to_thread(
-                subprocess.run,
-                cmd,
-                input=prompt,
-                capture_output=True,
-                text=True,
-                cwd=codex_cwd,
-                env=env,
-                timeout=invoke_timeout,
-            )
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=codex_cwd,
+                    env=env,
+                )
+            except FileNotFoundError:
+                raise LLMNotFoundError(
+                    self._bin,
+                    install_hint="Install Codex: https://github.com/openai/codex",
+                )
+
+            try:
+                stdout_b, stderr_b = await asyncio.wait_for(
+                    proc.communicate(input=prompt.encode("utf-8")),
+                    timeout=invoke_timeout,
+                )
+            except asyncio.CancelledError:
+                proc.kill()
+                try:
+                    await proc.wait()
+                except Exception:
+                    pass
+                elapsed = time.time() - start_time
+                logger.info(f"[codex-invoke] CANCELLED after {elapsed:.1f}s")
+                raise
+            except asyncio.TimeoutError:
+                proc.kill()
+                try:
+                    await proc.wait()
+                except Exception:
+                    pass
+                elapsed = time.time() - start_time
+                logger.error(f"[codex-invoke] TIMEOUT after {elapsed:.1f}s")
+                error = LLMTimeoutError(
+                    timeout_seconds=invoke_timeout,
+                    prompt_file=prompt_file_abs,
+                    working_dir=codex_cwd,
+                    provider="Codex",
+                )
+                await notification_center.publish(LLM_ERROR, sandbox_dir=working_dir, error=error)
+                raise error
+
+            stdout = stdout_b.decode("utf-8", errors="replace")
+            stderr = stderr_b.decode("utf-8", errors="replace")
+            returncode = proc.returncode if proc.returncode is not None else -1
+
             elapsed = time.time() - start_time
-            logger.info(f"[codex-invoke] FINISHED in {elapsed:.1f}s, returncode={result.returncode}")
-            logger.info(f"[codex-invoke] stdout length={len(result.stdout)} chars")
-            if result.stderr:
-                logger.warning(f"[codex-invoke] stderr ({len(result.stderr)} chars): {result.stderr[:1000]}")
+            logger.info(f"[codex-invoke] FINISHED in {elapsed:.1f}s, returncode={returncode}")
+            logger.info(f"[codex-invoke] stdout length={len(stdout)} chars")
+            if stderr:
+                logger.warning(f"[codex-invoke] stderr ({len(stderr)} chars): {stderr[:1000]}")
 
-            self._write_invocation_logs(log_dir, result.stdout, result.stderr)
+            self._write_invocation_logs(log_dir, stdout, stderr)
+        finally:
+            if proc is not None and proc.returncode is None:
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except Exception:
+                    pass
 
-        except FileNotFoundError:
-            raise LLMNotFoundError(
-                self._bin,
-                install_hint="Install Codex: https://github.com/openai/codex",
-            )
-        except subprocess.TimeoutExpired:
-            elapsed = time.time() - start_time
-            logger.error(f"[codex-invoke] TIMEOUT after {elapsed:.1f}s")
-            error = LLMTimeoutError(
-                timeout_seconds=invoke_timeout,
-                prompt_file=prompt_file_abs,
-                working_dir=codex_cwd,
-                provider="Codex",
-            )
-            await notification_center.publish(LLM_ERROR, sandbox_dir=working_dir, error=error)
-            raise error
-
-        usage, error_events = self._parse_events(result.stdout)
+        usage, error_events = self._parse_events(stdout)
 
         # Rate limit detection takes precedence — they look like invocation errors
         # otherwise, and should not be retried with short backoff.
-        rate_limit_error = self._detect_rate_limit(error_events, result.stderr)
+        rate_limit_error = self._detect_rate_limit(error_events, stderr)
         if rate_limit_error is not None:
             rate_limit_error.prompt_file = prompt_file_abs
             rate_limit_error.working_dir = codex_cwd
             await notification_center.publish(LLM_ERROR, sandbox_dir=working_dir, error=rate_limit_error)
             raise rate_limit_error
 
-        if result.returncode != 0 or error_events:
-            logger.error(f"[codex-invoke] stdout tail: {result.stdout[-2000:]}")
+        if returncode != 0 or error_events:
+            logger.error(f"[codex-invoke] stdout tail: {stdout[-2000:]}")
             detail_parts = []
             if error_events:
                 for ev in error_events[:3]:
                     detail_parts.append(json.dumps(ev)[:500])
-            if result.stderr:
-                detail_parts.append(result.stderr[:500])
+            if stderr:
+                detail_parts.append(stderr[:500])
             detail = "\n".join(detail_parts) or "(no error detail)"
             error = LLMInvocationError(
-                f"Codex exited with code {result.returncode}:\n{detail}",
+                f"Codex exited with code {returncode}:\n{detail}",
                 prompt_file=prompt_file_abs,
                 working_dir=codex_cwd,
             )

@@ -159,6 +159,7 @@ class ActionBlock(BaseModel):
     """Parsed output of a Claude Code invocation."""
     raw: str
     actions: list[dict[str, Any]] = Field(default_factory=list)
+    source_version: int | None = None  # Version of the changelog entry that triggered this response
 
     def typed_actions(self) -> list[Action]:
         """Return fully typed Action objects. Unknown types are silently skipped."""

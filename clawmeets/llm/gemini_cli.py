@@ -90,22 +90,22 @@ class GeminiCLI(LLMProvider):
 
     def __init__(
         self,
-        action_schema: dict,
         gemini_bin: str = "gemini",
         model: Optional[str] = None,
     ) -> None:
         """Initialize GeminiCLI.
 
         Args:
-            action_schema: JSON schema for structured output. Gemini cannot
-                enforce this at the CLI level — it is embedded in the prompt
-                (via the existing prompt builder) and validated post-hoc.
             gemini_bin: Path to gemini CLI binary
             model: Optional model override (e.g. "gemini-2.5-pro"); None uses
                 Gemini's default.
+
+        Gemini cannot enforce a JSON schema at the CLI level; the schema is
+        embedded in the prompt (via the existing prompt builder) and parsed
+        post-hoc. The schema is still passed to ``invoke(action_schema=...)``
+        for symmetry with the other providers, but is ignored at this layer.
         """
         self._bin = gemini_bin
-        self._action_schema = action_schema
         self._model = model
         # Gemini has no Chrome integration; use_chrome stays False (inherited).
 
@@ -317,8 +317,14 @@ class GeminiCLI(LLMProvider):
         log_dir: Path,
         additional_dirs: list[Path],
         notification_center: NotificationCenter,
+        action_schema: dict,
     ) -> tuple[ActionBlock, LLMUsage]:
-        """Invoke Gemini CLI with the given prompt."""
+        """Invoke Gemini CLI with the given prompt.
+
+        ``action_schema`` is accepted for interface symmetry but not used —
+        Gemini has no CLI-level schema enforcement; the schema is embedded
+        in the prompt by the caller's prompt builder.
+        """
         (
             prompt_file_abs,
             gemini_cwd,
@@ -331,49 +337,81 @@ class GeminiCLI(LLMProvider):
         invoke_timeout = 300
 
         start_time = time.time()
+        proc: Optional[asyncio.subprocess.Process] = None
         try:
-            result = await asyncio.to_thread(
-                subprocess.run,
-                cmd,
-                capture_output=True,
-                text=True,
-                cwd=gemini_cwd,
-                env=env,
-                timeout=invoke_timeout,
-            )
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=gemini_cwd,
+                    env=env,
+                )
+            except FileNotFoundError:
+                raise LLMNotFoundError(
+                    self._bin,
+                    install_hint="Install Gemini CLI: https://github.com/google-gemini/gemini-cli",
+                )
+
+            try:
+                stdout_b, stderr_b = await asyncio.wait_for(
+                    proc.communicate(),
+                    timeout=invoke_timeout,
+                )
+            except asyncio.CancelledError:
+                proc.kill()
+                try:
+                    await proc.wait()
+                except Exception:
+                    pass
+                elapsed = time.time() - start_time
+                logger.info(f"[gemini-invoke] CANCELLED after {elapsed:.1f}s")
+                raise
+            except asyncio.TimeoutError:
+                proc.kill()
+                try:
+                    await proc.wait()
+                except Exception:
+                    pass
+                elapsed = time.time() - start_time
+                logger.error(f"[gemini-invoke] TIMEOUT after {elapsed:.1f}s")
+                error = LLMTimeoutError(
+                    timeout_seconds=invoke_timeout,
+                    prompt_file=prompt_file_abs,
+                    working_dir=gemini_cwd,
+                    provider="Gemini",
+                )
+                await notification_center.publish(LLM_ERROR, sandbox_dir=working_dir, error=error)
+                raise error
+
+            stdout = stdout_b.decode("utf-8", errors="replace")
+            stderr = stderr_b.decode("utf-8", errors="replace")
+            returncode = proc.returncode if proc.returncode is not None else -1
+
             elapsed = time.time() - start_time
             logger.info(
                 f"[gemini-invoke] FINISHED in {elapsed:.1f}s, "
-                f"returncode={result.returncode}"
+                f"returncode={returncode}"
             )
-            logger.info(f"[gemini-invoke] stdout length={len(result.stdout)} chars")
-            if result.stderr:
+            logger.info(f"[gemini-invoke] stdout length={len(stdout)} chars")
+            if stderr:
                 logger.warning(
-                    f"[gemini-invoke] stderr ({len(result.stderr)} chars): "
-                    f"{result.stderr[:1000]}"
+                    f"[gemini-invoke] stderr ({len(stderr)} chars): "
+                    f"{stderr[:1000]}"
                 )
 
-            self._write_invocation_logs(log_dir, result.stdout, result.stderr)
-
-        except FileNotFoundError:
-            raise LLMNotFoundError(
-                self._bin,
-                install_hint="Install Gemini CLI: https://github.com/google-gemini/gemini-cli",
-            )
-        except subprocess.TimeoutExpired:
-            elapsed = time.time() - start_time
-            logger.error(f"[gemini-invoke] TIMEOUT after {elapsed:.1f}s")
-            error = LLMTimeoutError(
-                timeout_seconds=invoke_timeout,
-                prompt_file=prompt_file_abs,
-                working_dir=gemini_cwd,
-                provider="Gemini",
-            )
-            await notification_center.publish(LLM_ERROR, sandbox_dir=working_dir, error=error)
-            raise error
+            self._write_invocation_logs(log_dir, stdout, stderr)
+        finally:
+            if proc is not None and proc.returncode is None:
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except Exception:
+                    pass
 
         # Rate limit check — look at stderr first (most likely location).
-        envelope = self._parse_envelope(result.stdout)
+        envelope = self._parse_envelope(stdout)
         envelope_error_text = ""
         if envelope is not None:
             err = envelope.get("error")
@@ -382,7 +420,7 @@ class GeminiCLI(LLMProvider):
             elif isinstance(err, dict):
                 envelope_error_text = err.get("message", "") or json.dumps(err)
 
-        rate_limit_error = self._detect_rate_limit(result.stderr, envelope_error_text)
+        rate_limit_error = self._detect_rate_limit(stderr, envelope_error_text)
         if rate_limit_error is not None:
             rate_limit_error.prompt_file = prompt_file_abs
             rate_limit_error.working_dir = gemini_cwd
@@ -390,16 +428,16 @@ class GeminiCLI(LLMProvider):
             raise rate_limit_error
 
         # Non-zero exit with no rate-limit signature is a generic invocation error.
-        if result.returncode != 0:
-            logger.error(f"[gemini-invoke] stdout tail: {result.stdout[-2000:]}")
+        if returncode != 0:
+            logger.error(f"[gemini-invoke] stdout tail: {stdout[-2000:]}")
             detail_parts = []
             if envelope_error_text:
                 detail_parts.append(envelope_error_text[:500])
-            if result.stderr:
-                detail_parts.append(result.stderr[:500])
+            if stderr:
+                detail_parts.append(stderr[:500])
             detail = "\n".join(detail_parts) or "(no error detail)"
             error = LLMInvocationError(
-                f"Gemini exited with code {result.returncode}:\n{detail}",
+                f"Gemini exited with code {returncode}:\n{detail}",
                 prompt_file=prompt_file_abs,
                 working_dir=gemini_cwd,
             )
@@ -409,7 +447,7 @@ class GeminiCLI(LLMProvider):
         # Returncode 0 but no envelope → treat as invocation error (malformed output).
         if envelope is None:
             error = LLMInvocationError(
-                f"Gemini returned non-JSON stdout:\n{result.stdout[:500]}",
+                f"Gemini returned non-JSON stdout:\n{stdout[:500]}",
                 prompt_file=prompt_file_abs,
                 working_dir=gemini_cwd,
             )

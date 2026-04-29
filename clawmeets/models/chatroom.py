@@ -34,7 +34,7 @@ from pydantic import BaseModel, Field, PrivateAttr, computed_field
 
 from ..utils.file_io import FileUtil
 from ..utils.validation import validate_name
-from .chat_message import ChatMessage
+from .chat_message import ChatFileEvent, ChatLogEntry, ChatMessage, parse_log_line
 from .participant import Participant
 
 if TYPE_CHECKING:
@@ -191,23 +191,37 @@ class Chatroom(BaseModel):
                 result.append(participant)
         return result
 
-    def get_messages(self, limit: int = 9999999) -> list:
-        """Load messages from this chatroom.
+    def get_log_entries(self, limit: int = 9999999) -> list[ChatLogEntry]:
+        """Load all CHATS.ndjson rows (messages + file events).
+
+        Legacy rows without `entry_type` are parsed as ChatMessage.
 
         Args:
-            limit: Maximum number of messages to return (None for all)
+            limit: Maximum number of entries to return (most recent)
+
+        Returns:
+            List of ChatMessage | ChatFileEvent in file order
+        """
+        if not self.chats_path.exists():
+            return []
+        result: list[ChatLogEntry] = []
+        for line_data in FileUtil.read(self.chats_path, "ndjson"):
+            result.append(parse_log_line(line_data))
+        return result[-limit:]
+
+    def get_messages(self, limit: int = 9999999) -> list[ChatMessage]:
+        """Load messages from this chatroom, filtering out file events.
+
+        Args:
+            limit: Maximum number of messages to return (most recent last)
 
         Returns:
             List of ChatMessage objects (most recent last)
         """
-        if not self.chats_path.exists():
-            return []
-        result = []
-        for line_data in FileUtil.read(self.chats_path, "ndjson"):
-            result.append(ChatMessage.model_validate(line_data))
-        return result[-limit:]
+        messages = [e for e in self.get_log_entries() if isinstance(e, ChatMessage)]
+        return messages[-limit:]
 
-    def get_messages_since(self, since_message_id: str) -> list:
+    def get_messages_since(self, since_message_id: str) -> list[ChatMessage]:
         """Get messages after a given message ID.
 
         Args:
@@ -468,6 +482,21 @@ class ChatroomState:
         FileUtil.write(
             self._chatroom.chats_path,
             message.model_dump(by_alias=True),
+            "ndjson",
+            mode="a",
+            ensure_dir=True,
+            atomic=False,
+        )
+
+    def append_file_event(self, event: ChatFileEvent) -> None:
+        """Append a file-touched event to CHATS.ndjson.
+
+        Args:
+            event: The ChatFileEvent to append
+        """
+        FileUtil.write(
+            self._chatroom.chats_path,
+            event.model_dump(by_alias=True),
             "ndjson",
             mode="a",
             ensure_dir=True,

@@ -195,6 +195,7 @@ class ChangelogRunloop:
         self,
         entry_type: ChangelogEntryType,
         payload: ChangelogPayload,
+        source_version: int | None = None,
     ) -> ChangelogEntry:
         """Append entry with version assignment (server-side).
 
@@ -204,6 +205,7 @@ class ChangelogRunloop:
         Args:
             entry_type: Type of changelog entry
             payload: Entry payload (chatroom_name is in payload for chatroom-scoped entries)
+            source_version: Version of the entry that triggered this one (reply-to link)
 
         Returns:
             The created ChangelogEntry with assigned version
@@ -217,6 +219,7 @@ class ChangelogRunloop:
                 version=current_version + 1,
                 entry_type=entry_type,
                 payload=payload,
+                source_version=source_version,
             )
 
             # Persist to changelog.ndjson

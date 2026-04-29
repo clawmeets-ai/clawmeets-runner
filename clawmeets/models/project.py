@@ -59,6 +59,7 @@ class Project(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     created_by: str               # user_id of creator (derived from auth)
     agent_pool: str = Field(default="verified")  # "owned", "verified", or "all"
+    agent_teams: list[str] = Field(default_factory=list)  # Restrict invite pool to agents carrying any of these user_teams; empty = no team filter
     git_url: str = Field(default="")  # Git repo URL (empty = no git)
     git_ignored_folder: str = Field(default=".bus-files")  # Folder for non-git deliverables
 
@@ -380,6 +381,7 @@ class ProjectState:
         created_at: datetime,
         ctx: "ModelContext",
         agent_pool: str = "verified",
+        agent_teams: list[str] | None = None,
         git_url: str = "",
         git_ignored_folder: str = ".bus-files",
     ) -> Project:
@@ -400,6 +402,7 @@ class ProjectState:
             created_at: Creation timestamp
             ctx: ModelContext for filesystem operations
             agent_pool: Agent pool mode ("owned", "verified", or "all")
+            agent_teams: Optional list of user_teams; only agents carrying any of these teams are offered for invitation (empty/None = no team filter)
 
         Returns:
             The created Project instance
@@ -425,6 +428,7 @@ class ProjectState:
             "created_at": created_at.isoformat() if created_at else None,
             "created_by": created_by,
             "agent_pool": agent_pool,
+            "agent_teams": list(agent_teams) if agent_teams else [],
             "git_url": git_url,
             "git_ignored_folder": git_ignored_folder,
         }

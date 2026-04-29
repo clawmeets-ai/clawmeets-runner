@@ -57,6 +57,7 @@ class ClawMeetsClient:
         chatroom_name: str,
         content: str,
         is_ack: bool = False,
+        source_version: int | None = None,
     ) -> str:
         """
         Post a message to a chatroom.
@@ -69,6 +70,7 @@ class ClawMeetsClient:
             chatroom_name: Name of the chatroom
             content: Message content (may include @mentions)
             is_ack: If True, mark as acknowledgment (skipped in batch tracking)
+            source_version: Version of the changelog entry that triggered this reply
 
         Returns:
             The message ID assigned by the server
@@ -79,6 +81,9 @@ class ClawMeetsClient:
         if is_ack:
             payload["expects_response_from"] = []
             payload["is_ack"] = True
+
+        if source_version is not None:
+            payload["source_version"] = source_version
 
         resp = await self._http.post(url, json=payload)
         resp.raise_for_status()
@@ -97,6 +102,7 @@ class ClawMeetsClient:
         chatroom_name: str,
         filename: str,
         content: bytes,
+        source_version: int | None = None,
     ) -> None:
         """
         Upload a file to a chatroom.
@@ -106,9 +112,13 @@ class ClawMeetsClient:
             chatroom_name: Name of the chatroom
             filename: Remote filename
             content: File content as bytes
+            source_version: Version of the changelog entry that triggered this update
         """
         url = f"{self._base_url}/projects/{project_id}/chatrooms/{chatroom_name}/files/{filename}"
-        resp = await self._http.put(url, content=content)
+        params: dict[str, Any] = {}
+        if source_version is not None:
+            params["source_version"] = source_version
+        resp = await self._http.put(url, content=content, params=params)
         resp.raise_for_status()
         logger.debug(f"Uploaded file {filename} to {chatroom_name}")
 
@@ -122,6 +132,7 @@ class ClawMeetsClient:
         name: str,
         participant_names: list[str],
         init_message: str,
+        source_version: int | None = None,
     ) -> str:
         """
         Create a new chatroom in a project.
@@ -134,6 +145,7 @@ class ClawMeetsClient:
             name: Chatroom name
             participant_names: List of agent names to invite
             init_message: Initial message content with @mentions to address agents
+            source_version: Version of the changelog entry that triggered this room creation
 
         Returns:
             The chatroom ID assigned by the server
@@ -144,6 +156,8 @@ class ClawMeetsClient:
             "participant_names": participant_names,
             "init_message": init_message,
         }
+        if source_version is not None:
+            payload["source_version"] = source_version
 
         resp = await self._http.post(url, json=payload)
         resp.raise_for_status()
@@ -156,15 +170,23 @@ class ClawMeetsClient:
     # Project Operations
     # ─────────────────────────────────────────────────────────────────────────
 
-    async def complete_project(self, project_id: str) -> None:
+    async def complete_project(
+        self,
+        project_id: str,
+        source_version: int | None = None,
+    ) -> None:
         """
         Mark a project as completed.
 
         Args:
             project_id: The project ID
+            source_version: Version of the changelog entry that triggered completion
         """
         url = f"{self._base_url}/projects/{project_id}/complete"
-        resp = await self._http.post(url)
+        params: dict[str, Any] = {}
+        if source_version is not None:
+            params["source_version"] = source_version
+        resp = await self._http.post(url, params=params)
         resp.raise_for_status()
         logger.debug(f"Marked project {project_id} as completed")
 

@@ -46,12 +46,16 @@ from clawmeets.sync.subscriber import ChangelogSubscriber
 from clawmeets.utils.file_io import FileUtil
 from clawmeets.models.project import Project, ProjectState
 from clawmeets.models.chatroom import Chatroom, ChatroomState
-from clawmeets.models.chat_message import ChatMessage
+from clawmeets.models.chat_message import ChatFileEvent, ChatMessage
 
 from clawmeets.api.action_executor import ActionBlockExecutor
 from clawmeets.api.client import ClawMeetsClient
 from clawmeets.llm.base import LLMProvider
 from clawmeets.utils.notification_center import NotificationCenter
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from clawmeets.runner.invocation_registry import InvocationRegistry
 
 
 logger = logging.getLogger(__name__)
@@ -95,7 +99,7 @@ class ModelContext:
         - cli: LLMProvider instance for LLM invocation (None if not configured)
         - knowledge_dirs: Additional directories for LLM access (e.g., knowledge bases)
         - client: ClawMeetsClient for HTTP operations (None if not configured)
-        - claude_plugin_dirs: Claude plugin directories for skill access (e.g., save-to-knowledge).
+        - claude_plugin_dirs: Claude plugin directories for skill access.
             Used only by ClaudeCLI; other providers ignore this field.
 
         Git configuration (git_url, git_ignored_folder) is now per-project,
@@ -117,6 +121,7 @@ class ModelContext:
         self._action_executor: Optional["ActionBlockExecutor"] = None
         self._claude_plugin_dirs = claude_plugin_dirs or []
         self._notification_center = notification_center
+        self._invocation_registry: Optional["InvocationRegistry"] = None
 
     @property
     def cli(self) -> Optional["LLMProvider"]:
@@ -146,6 +151,15 @@ class ModelContext:
     def notification_center(self) -> NotificationCenter:
         """In-memory pub/sub dispatcher for cross-component events."""
         return self._notification_center
+
+    @property
+    def invocation_registry(self) -> Optional["InvocationRegistry"]:
+        """Per-runner registry of in-flight LLM tasks (None on the server side)."""
+        return self._invocation_registry
+
+    def set_invocation_registry(self, registry: "InvocationRegistry") -> None:
+        """Attach the runner's InvocationRegistry. Called once at runner startup."""
+        self._invocation_registry = registry
 
     @property
     def action_executor(self) -> Optional["ActionBlockExecutor"]:
@@ -372,6 +386,7 @@ class ModelContextChangelogSubscriber(ChangelogSubscriber):
             created_at=entry.timestamp,
             ctx=self._model_ctx,
             agent_pool=getattr(payload, "agent_pool", "verified"),
+            agent_teams=getattr(payload, "agent_teams", []) or [],
             git_url=getattr(payload, "git_url", ""),
             git_ignored_folder=getattr(payload, "git_ignored_folder", ".bus-files"),
         )
@@ -433,11 +448,15 @@ class ModelContextChangelogSubscriber(ChangelogSubscriber):
 
         # Load chatroom and append message via internal model
         chatroom = Chatroom.get(self._project_id, chatroom_name, self._model_ctx)
-        chat_message = ChatMessage.from_message_payload(payload)
+        chat_message = ChatMessage.from_message_payload(
+            payload,
+            version=entry.version,
+            source_version=entry.source_version,
+        )
         chatroom.state().append_message(chat_message)
 
     async def _handle_file_update(self, entry: ChangelogEntry) -> None:
-        """Create or update a data file.
+        """Create or update a data file, and log the touch to CHATS.ndjson.
 
         Args:
             entry: The FILE_CREATED or FILE_UPDATED changelog entry
@@ -449,6 +468,26 @@ class ModelContextChangelogSubscriber(ChangelogSubscriber):
         chatroom = Chatroom.get(self._project_id, chatroom_name, self._model_ctx)
         content = FileUtil.from_base64(payload.content_b64)
         chatroom.state().write_file(payload.filename, content)
+
+        # Log the file touch to CHATS.ndjson so the chat stream carries an
+        # inline record of what the sender did. source_version links back to
+        # the message entry that triggered the touch (set by the caller when
+        # uploading; see ActionBlockExecutor and the files route).
+        event_type = (
+            "file_created"
+            if entry.entry_type == ChangelogEntryType.FILE_CREATED
+            else "file_updated"
+        )
+        file_event = ChatFileEvent(
+            entry_type=event_type,
+            ts=entry.timestamp,
+            from_participant_id=payload.from_participant_id,
+            from_participant_name=payload.from_participant_name,
+            filename=payload.filename,
+            version=entry.version,
+            source_version=entry.source_version,
+        )
+        chatroom.state().append_file_event(file_event)
 
     async def _handle_project_completed(self, entry: ChangelogEntry) -> None:
         """Update project status to completed in meta.json.

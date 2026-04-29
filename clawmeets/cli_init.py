@@ -2,10 +2,9 @@
 """
 clawmeets/cli_init.py
 
-Interactive setup wizard for clawmeets.
-
-Replaces scripts/setup.sh — generates ~/.clawmeets/config/{user}/settings.json
-and per-agent CLAUDE.md files, then registers agents with the server.
+Interactive setup wizard for clawmeets. Generates
+~/.clawmeets/config/{user}/settings.json and per-agent CLAUDE.md files,
+then registers agents with the server.
 
 Usage:
     clawmeets init
@@ -29,6 +28,7 @@ import typer
 
 RESERVED_NAMES = {"admin", "system", "root", "agent", "agents", "user", "users", "assistant"}
 NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+VALID_LLM_PROVIDERS = ("claude", "openai", "gemini")
 
 DEFAULT_SERVER = os.environ.get("CLAWMEETS_SERVER_URL", "https://clawmeets.ai")
 DEFAULT_DATA_DIR = os.environ.get("CLAWMEETS_DATA_DIR", "~/.clawmeets")
@@ -109,6 +109,18 @@ def _collect_agents() -> list[dict]:
 
         knowledge_dir = _prompt(f"    Knowledge directory", default=f"./{name}")
 
+        typer.echo("    LLM backend (optional; leave empty to use 'claude')")
+        llm_provider = ""
+        while True:
+            raw = _prompt("    LLM provider (claude / codex / gemini)", default="")
+            if not raw:
+                break
+            if raw.lower() in VALID_LLM_PROVIDERS:
+                llm_provider = raw.lower()
+                break
+            typer.echo(f"    Invalid provider. Choose one of: {', '.join(VALID_LLM_PROVIDERS)}")
+        llm_model = _prompt("    LLM model (optional, provider-specific — e.g. 'o3' for codex, 'gemini-2.5-pro' for gemini)", default="")
+
         typer.echo("    Detailed profile (optional, describe expertise. Enter empty line to finish):")
         profile_lines = []
         while True:
@@ -124,6 +136,8 @@ def _collect_agents() -> list[dict]:
             "capabilities": capabilities,
             "knowledge_dir": knowledge_dir,
             "discoverable": False,
+            "llm_provider": llm_provider,
+            "llm_model": llm_model,
             "_profile": profile,  # internal, used for CLAUDE.md generation
         })
         existing_names.add(name)
@@ -206,17 +220,28 @@ def _fetch_setup_template(url: str) -> dict:
         raise typer.Exit(1)
 
 
-def _generate_claude_md(agent: dict, output_dir: Path) -> Path:
-    """Generate a CLAUDE.md specialty profile for an agent. Returns the knowledge dir path."""
-    raw_kdir = agent["knowledge_dir"]
+def _resolve_knowledge_dir(raw_kdir: str, output_dir: Path) -> Path:
+    """Expand a setup.json knowledge_dir path against ~, absolute, or relative-to-output."""
     if raw_kdir.startswith("~"):
-        knowledge_dir = Path(raw_kdir).expanduser()
-    elif raw_kdir.startswith("/"):
-        knowledge_dir = Path(raw_kdir)
-    else:
-        knowledge_dir = output_dir / raw_kdir.lstrip("./")
+        return Path(raw_kdir).expanduser()
+    if raw_kdir.startswith("/"):
+        return Path(raw_kdir)
+    return output_dir / raw_kdir.lstrip("./")
 
+
+def _generate_claude_md(agent: dict, output_dir: Path) -> tuple[Path, bool]:
+    """Generate a CLAUDE.md specialty profile for an agent.
+
+    Returns (knowledge_dir, wrote). If `{knowledge_dir}/CLAUDE.md` already
+    exists it is left untouched — never clobber a user-edited profile on a
+    re-run of `clawmeets init`.
+    """
+    knowledge_dir = _resolve_knowledge_dir(agent["knowledge_dir"], output_dir)
     knowledge_dir.mkdir(parents=True, exist_ok=True)
+
+    claude_md_path = knowledge_dir / "CLAUDE.md"
+    if claude_md_path.exists():
+        return knowledge_dir, False
 
     # Format display name
     display_name = agent["name"].replace("_", " ").title()
@@ -261,8 +286,8 @@ def _generate_claude_md(agent: dict, output_dir: Path) -> Path:
 <!-- - `REPORT.md` - Analysis report with findings and recommendations -->
 <!-- - `PLAN.md` - Action plan with timeline and milestones -->
 """
-    (knowledge_dir / "CLAUDE.md").write_text(claude_md)
-    return knowledge_dir
+    claude_md_path.write_text(claude_md)
+    return knowledge_dir, True
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +303,51 @@ def _login(server: str, username: str, password: str) -> dict:
         return resp.json()
 
 
+def _fetch_assistant_token(server: str, jwt: str) -> str:
+    """Fetch the authenticated user's assistant token from the server.
+
+    Returns empty string on any failure so callers can fall through to
+    the existing "no token yet" behavior.
+    """
+    try:
+        with httpx.Client(base_url=server, timeout=30) as client:
+            resp = client.get(
+                "/auth/me/assistant-token",
+                headers={"Authorization": f"Bearer {jwt}"},
+            )
+            resp.raise_for_status()
+            return resp.json().get("assistant_token", "") or ""
+    except Exception as e:
+        typer.echo(f"  Warning: could not fetch assistant token automatically ({e}).", err=True)
+        return ""
+
+
+def _normalize_user_teams_from_setup(value) -> list[str]:
+    """Read a `user_teams` field from setup.json. Accepts a list of strings
+    or a comma-separated string for convenience. Returns a deduped, stripped
+    list with order preserved.
+    """
+    if value is None:
+        return []
+    if isinstance(value, str):
+        candidates = [t for t in value.split(",")]
+    elif isinstance(value, list):
+        candidates = value
+    else:
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in candidates:
+        if not isinstance(raw, str):
+            continue
+        stripped = raw.strip()
+        if not stripped or stripped in seen:
+            continue
+        seen.add(stripped)
+        out.append(stripped)
+    return out
+
+
 def _register_agents(
     server: str,
     token: str,
@@ -287,14 +357,18 @@ def _register_agents(
     """Register worker agents with the server and save credentials."""
     with httpx.Client(base_url=server, timeout=30) as client:
         for agent in agents:
+            agent_user_teams = _normalize_user_teams_from_setup(agent.get("user_teams"))
+            register_payload = {
+                "name": agent["name"],
+                "description": agent["description"],
+                "capabilities": agent["capabilities"],
+                "discoverable_through_registry": agent.get("discoverable", False),
+            }
+            if agent_user_teams:
+                register_payload["user_teams"] = agent_user_teams
             resp = client.post(
                 "/agents/register",
-                json={
-                    "name": agent["name"],
-                    "description": agent["description"],
-                    "capabilities": agent["capabilities"],
-                    "discoverable_through_registry": agent.get("discoverable", False),
-                },
+                json=register_payload,
                 headers={"Authorization": f"Bearer {token}"},
             )
             try:
@@ -314,10 +388,48 @@ def _register_agents(
             cred = {"agent_id": agent_id, "token": result["token"], "agent_name": registered_name}
             (agent_work_dir / "credential.json").write_text(json.dumps(cred, indent=2))
 
+            # Any sibling {registered_name}-<other_id>/ is a leftover from a
+            # previous registration of the same name — the server already
+            # dropped that agent, so the credentials inside are dead. Rename
+            # them to DELETED-* so `clawmeets start`'s _find_agent_dir lands
+            # on the fresh dir unambiguously (see cli_lifecycle._find_agent_dir).
+            if agents_dir.exists():
+                for sibling in agents_dir.iterdir():
+                    if not sibling.is_dir():
+                        continue
+                    if sibling == agent_work_dir:
+                        continue
+                    if sibling.name.startswith("DELETED-"):
+                        continue
+                    if not sibling.name.startswith(f"{registered_name}-"):
+                        continue
+                    target = agents_dir / f"DELETED-{sibling.name}"
+                    if target.exists():
+                        continue
+                    try:
+                        sibling.rename(target)
+                        typer.echo(f"  Archived stale {sibling.name} -> {target.name}")
+                    except OSError as e:
+                        typer.echo(f"  Warning: could not archive {sibling.name}: {e}", err=True)
+
             # Build local_settings from agent config
             local_settings = {}
             if agent.get("knowledge_dir"):
                 local_settings["knowledge_dir"] = agent["knowledge_dir"]
+            if agent.get("llm_provider"):
+                provider = agent["llm_provider"].lower()
+                if provider not in VALID_LLM_PROVIDERS:
+                    typer.echo(
+                        f"  Warning: skipping invalid llm_provider {agent['llm_provider']!r} for '{agent['name']}' "
+                        f"(expected one of {VALID_LLM_PROVIDERS})",
+                        err=True,
+                    )
+                else:
+                    local_settings["llm_provider"] = provider
+            if agent.get("llm_model"):
+                local_settings["llm_model"] = agent["llm_model"]
+            if "chrome" in agent:
+                local_settings["use_chrome"] = bool(agent["chrome"])
 
             # Persist local_settings on the server card too, so the Agent
             # Settings page and server-side callers see the same value the
@@ -347,17 +459,74 @@ def _register_agents(
                 "discoverable_through_registry": result.get("discoverable_through_registry", False),
                 "local_settings": local_settings,
             }
+            if agent_user_teams:
+                card["user_teams"] = agent_user_teams
             (agent_work_dir / "card.json").write_text(json.dumps(card, indent=2))
 
+            # Install any MCP servers listed in setup.json agents[].mcp_servers
+            # via the same HTTP path the web UI uses. OAuth still requires the
+            # user to run `clawmeets mcp auth <name>` on the runner.
+            mcp_servers = agent.get("mcp_servers") or []
+            if mcp_servers:
+                mcp_resp = client.post(
+                    f"/agents/{agent_id}/mcps",
+                    json={"mcps": mcp_servers},
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                if mcp_resp.status_code >= 400:
+                    typer.echo(
+                        f"  Warning: failed to install MCP servers "
+                        f"{mcp_servers} for '{registered_name}': {mcp_resp.text}",
+                        err=True,
+                    )
+                else:
+                    added = mcp_resp.json().get("added", [])
+                    if added:
+                        typer.echo(f"    MCP servers installed: {', '.join(added)}")
+
             typer.echo(f"  Registered '{registered_name}' ({agent_id[:8]}...)")
+
+
+def _build_assistant_local_settings(block: dict, label: str) -> dict:
+    """Build a local_settings dict from an assistant/agent config block.
+
+    Same validation rules as _register_agents: llm_provider must be in
+    VALID_LLM_PROVIDERS, otherwise warn + skip.
+    """
+    local_settings: dict = {}
+    if block.get("knowledge_dir"):
+        local_settings["knowledge_dir"] = block["knowledge_dir"]
+    if block.get("llm_provider"):
+        provider = block["llm_provider"].lower()
+        if provider not in VALID_LLM_PROVIDERS:
+            typer.echo(
+                f"  Warning: skipping invalid llm_provider {block['llm_provider']!r} for {label} "
+                f"(expected one of {VALID_LLM_PROVIDERS})",
+                err=True,
+            )
+        else:
+            local_settings["llm_provider"] = provider
+    if block.get("llm_model"):
+        local_settings["llm_model"] = block["llm_model"]
+    if "chrome" in block:
+        local_settings["use_chrome"] = bool(block["chrome"])
+    return local_settings
 
 
 def _setup_assistant_credentials(
     server: str,
     login_response: dict,
     agents_dir: Path,
+    local_settings: Optional[dict] = None,
+    capabilities_override: Optional[list[str]] = None,
+    description_override: Optional[str] = None,
 ) -> None:
-    """Save assistant credentials locally from login response."""
+    """Save assistant credentials locally from login response.
+
+    If local_settings / capabilities_override / description_override are
+    provided (from a setup.json assistant block), they are written into the
+    local card.json so the runner picks them up on the next `clawmeets start`.
+    """
     assistant_id = login_response.get("assistant_agent_id")
     if not assistant_id:
         return
@@ -389,23 +558,118 @@ def _setup_assistant_credentials(
     cred = {"agent_id": assistant_id, "token": assistant_token, "agent_name": assistant_name}
     (assistant_dir / "credential.json").write_text(json.dumps(cred, indent=2))
 
-    description = "Assistant agent"
+    description = description_override or "Assistant agent"
     registered_at = ""
     if assistants:
-        description = assistants[0].get("description", description)
+        if not description_override:
+            description = assistants[0].get("description", description)
         registered_at = assistants[0].get("registered_at", "")
 
-    card = {
+    card: dict = {
         "id": assistant_id,
         "name": assistant_name,
         "description": description,
-        "capabilities": [],
+        "capabilities": capabilities_override if capabilities_override is not None else [],
         "status": "online",
         "registered_at": registered_at,
         "discoverable_through_registry": False,
     }
+    if local_settings:
+        card["local_settings"] = local_settings
     (assistant_dir / "card.json").write_text(json.dumps(card, indent=2))
     typer.echo(f"  Set up assistant '{assistant_name}' locally.")
+
+
+def _apply_assistant_config(
+    server: str,
+    token: str,
+    login_response: dict,
+    assistant_block: dict,
+    output_dir: Path,
+) -> tuple[dict, Optional[list[str]], Optional[str]]:
+    """Apply an `assistant` block from setup.json to the logged-in user's
+    {username}-assistant agent on the server.
+
+    Steps:
+      1. PUT /agents/{assistant_id} with local_settings, capabilities, description.
+      2. POST /agents/{assistant_id}/mcps if mcp_servers is present.
+      3. Generate CLAUDE.md in the configured knowledge_dir, but only if one
+         does not already exist (never clobber user-edited profiles).
+
+    Returns (local_settings, capabilities_override, description_override) so
+    the caller can mirror them into the local card.json.
+    """
+    assistant_id = login_response.get("assistant_agent_id")
+    assistant_name = login_response.get("assistant_agent_name", "")
+    if not assistant_id or not assistant_name:
+        typer.echo("  Warning: login response missing assistant id/name; skipping assistant config.", err=True)
+        return {}, None, None
+
+    label = f"assistant '{assistant_name}'"
+    local_settings = _build_assistant_local_settings(assistant_block, label)
+
+    capabilities = assistant_block.get("capabilities")
+    description = assistant_block.get("description")
+
+    put_body: dict = {}
+    if local_settings:
+        put_body["local_settings"] = local_settings
+    if capabilities is not None:
+        put_body["capabilities"] = capabilities
+    if description is not None:
+        put_body["description"] = description
+
+    with httpx.Client(base_url=server, timeout=30) as client:
+        if put_body:
+            put_resp = client.put(
+                f"/agents/{assistant_id}",
+                json=put_body,
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            try:
+                put_resp.raise_for_status()
+                typer.echo(f"  Applied assistant config for '{assistant_name}'.")
+            except httpx.HTTPStatusError:
+                typer.echo(
+                    f"  Warning: failed to apply assistant config for '{assistant_name}': {put_resp.text}",
+                    err=True,
+                )
+
+        mcp_servers = assistant_block.get("mcp_servers") or []
+        if mcp_servers:
+            mcp_resp = client.post(
+                f"/agents/{assistant_id}/mcps",
+                json={"mcps": mcp_servers},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            if mcp_resp.status_code >= 400:
+                typer.echo(
+                    f"  Warning: failed to install MCP servers {mcp_servers} "
+                    f"for '{assistant_name}': {mcp_resp.text}",
+                    err=True,
+                )
+            else:
+                added = mcp_resp.json().get("added", [])
+                if added:
+                    typer.echo(f"    MCP servers installed: {', '.join(added)}")
+
+    # CLAUDE.md generation — _generate_claude_md skips if one already exists.
+    if assistant_block.get("knowledge_dir") or assistant_block.get("profile"):
+        synthetic_entry = {
+            "name": assistant_name,
+            "description": description or f"Assistant agent for {assistant_name}",
+            "capabilities": capabilities or [],
+            "knowledge_dir": assistant_block.get("knowledge_dir", f"./{assistant_name}"),
+            "profile": assistant_block.get("profile", ""),
+        }
+        kdir, wrote = _generate_claude_md(synthetic_entry, output_dir)
+        claude_md_path = kdir / "CLAUDE.md"
+        if wrote:
+            typer.echo(f"  Generated {claude_md_path}")
+        else:
+            typer.echo(f"  Skipped CLAUDE.md (already exists at {claude_md_path})")
+
+    return local_settings, capabilities, description
 
 
 # ---------------------------------------------------------------------------
@@ -424,6 +688,7 @@ def _write_settings_json(
     agents: list[dict],
     git_url: str,
     git_ignored_folder: str,
+    assistant_block: Optional[dict] = None,
 ) -> Path:
     """Generate settings.json, merging agents with any existing config. Returns the path."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -439,16 +704,22 @@ def _write_settings_json(
             pass
 
     # Build new agent entries
-    new_agents = [
-        {
+    new_agents = []
+    for a in agents:
+        entry: dict = {
             "name": a["name"],
             "description": a["description"],
             "capabilities": a["capabilities"],
             "discoverable": a.get("discoverable", False),
             "knowledge_dir": a["knowledge_dir"],
         }
-        for a in agents
-    ]
+        if a.get("llm_provider"):
+            entry["llm_provider"] = a["llm_provider"].lower()
+        if a.get("llm_model"):
+            entry["llm_model"] = a["llm_model"]
+        if "chrome" in a:
+            entry["chrome"] = bool(a["chrome"])
+        new_agents.append(entry)
 
     # Merge: new agents override existing ones with the same name
     new_names = {a["name"] for a in new_agents}
@@ -469,6 +740,8 @@ def _write_settings_json(
         config["git_url"] = git_url
     if git_url and git_ignored_folder:
         config["git_ignored_folder"] = git_ignored_folder
+    if assistant_block:
+        config["assistant"] = assistant_block
 
     path.write_text(json.dumps(config, indent=2))
     return path
@@ -492,6 +765,10 @@ def _save_token_to_settings_json(token: str, username: str, data_dir: Path) -> P
 def init_command(
     server: str = typer.Option(DEFAULT_SERVER, "--server", "-s", help="Server URL"),
     from_url: Optional[str] = typer.Option(None, "--from-url", help="URL to a setup.json template (skips agent definition)"),
+    llm_provider: Optional[str] = typer.Option(
+        None, "--llm-provider",
+        help="Override LLM provider for every agent (and the assistant) in this setup. One of: claude, openai, gemini. Wins over per-agent llm_provider in setup.json.",
+    ),
     non_interactive: bool = typer.Option(False, "--non-interactive", help="Skip interactive prompts (use flags)"),
     username: Optional[str] = typer.Option(None, "--username", "-u", help="Username (non-interactive)"),
     password: Optional[str] = typer.Option(None, "--password", "-p", help="Password (non-interactive)"),
@@ -527,6 +804,7 @@ def init_command(
         template_name = template.get("name", "Custom")
         template_desc = template.get("description", "")
         agents_list = template.get("agents", [])
+        assistant_block: Optional[dict] = template.get("assistant")
 
         if not agents_list:
             typer.echo("Error: Template contains no agent definitions.", err=True)
@@ -536,6 +814,8 @@ def init_command(
         if template_desc:
             typer.echo(f"  {template_desc}")
         typer.echo(f"  Agents:   {', '.join(a['name'] for a in agents_list)}\n")
+        if assistant_block:
+            typer.echo("  Assistant: config block present (will be applied to your personal assistant)\n")
 
         if non_interactive:
             if not username or not password:
@@ -545,7 +825,6 @@ def init_command(
             if name_err:
                 typer.echo(f"Error: {name_err}", err=True)
                 raise typer.Exit(1)
-            _assistant_token = assistant_token or ""
         else:
             typer.echo("--- Account Info ---")
             typer.echo(f"Enter the username and password you registered at {server.rstrip('/')}\n")
@@ -557,9 +836,7 @@ def init_command(
                 typer.echo("Error: Passwords do not match.", err=True)
                 raise typer.Exit(1)
 
-            typer.echo(f"\n  Find your assistant token at {server.rstrip('/')}/app under Account Settings.")
-            _assistant_token = _prompt("  Assistant token (leave empty to add later)", password=True)
-
+        _assistant_token = assistant_token or ""
         data_dir = DEFAULT_DATA_DIR
         git_url = ""
         git_ignored_folder = ""
@@ -578,6 +855,7 @@ def init_command(
         _assistant_token = assistant_token or ""
         data_dir = DEFAULT_DATA_DIR
         agents_list: list[dict] = []
+        assistant_block = None
         git_url = ""
         git_ignored_folder = ""
     else:
@@ -596,13 +874,28 @@ def init_command(
             typer.echo("Error: Passwords do not match.", err=True)
             raise typer.Exit(1)
 
-        typer.echo(f"\n  Find your assistant token at {server.rstrip('/')}/app under Account Settings.")
-        _assistant_token = _prompt("  Assistant token (leave empty to add later)", password=True)
-
+        _assistant_token = assistant_token or ""
         data_dir = _prompt("\n  Data directory", default=DEFAULT_DATA_DIR)
 
         agents_list = _collect_agents()
+        assistant_block = None
         git_url, git_ignored_folder = _collect_git_repo()
+
+    # ---- Apply --llm-provider override (wins over per-agent setup.json) ----
+    if llm_provider:
+        provider = llm_provider.lower()
+        if provider not in VALID_LLM_PROVIDERS:
+            typer.echo(
+                f"Error: --llm-provider must be one of {', '.join(VALID_LLM_PROVIDERS)} "
+                f"(got {llm_provider!r}).",
+                err=True,
+            )
+            raise typer.Exit(1)
+        for agent in agents_list:
+            agent["llm_provider"] = provider
+        if assistant_block:
+            assistant_block["llm_provider"] = provider
+        typer.echo(f"  LLM provider override: {provider} (applied to all agents)")
 
     # ---- Resolve data dir ----
     resolved_data_dir = Path(data_dir).expanduser()
@@ -616,7 +909,10 @@ def init_command(
         typer.echo("\n=== Setup Summary ===\n")
         typer.echo(f"  Server:   {server}")
         typer.echo(f"  Username: {username}")
-        typer.echo(f"  Assistant: {'token provided' if _assistant_token else 'no token (can be added later)'}")
+        if _assistant_token:
+            typer.echo("  Assistant: token provided (override)")
+        else:
+            typer.echo("  Assistant: will be fetched from server after login")
         typer.echo(f"  Data dir: {data_dir}")
         if git_url:
             typer.echo(f"  Git repo: {git_url}")
@@ -626,10 +922,36 @@ def init_command(
             typer.echo(f"    - {a['name']}: {a['description']}")
             typer.echo(f"      Capabilities: {', '.join(a['capabilities'])}")
             typer.echo(f"      Knowledge dir: {a['knowledge_dir']}")
+            if a.get("llm_provider") or a.get("llm_model"):
+                llm_bits = []
+                if a.get("llm_provider"):
+                    llm_bits.append(f"provider={a['llm_provider']}")
+                if a.get("llm_model"):
+                    llm_bits.append(f"model={a['llm_model']}")
+                typer.echo(f"      LLM: {', '.join(llm_bits)}")
         typer.echo("")
 
         if not typer.confirm("  Proceed?", default=True):
             raise typer.Abort()
+
+    # ---- Login ----
+    typer.echo("\n--- Registering with server ---")
+    try:
+        login_resp = _login(server, username, password)
+        token = login_resp["token"]
+    except httpx.HTTPStatusError as e:
+        typer.echo(f"  Login failed: {e.response.text}", err=True)
+        typer.echo("  Re-run `clawmeets init` once the issue is resolved.")
+        raise typer.Exit(1)
+    except httpx.ConnectError:
+        typer.echo(f"  Could not connect to {server}", err=True)
+        typer.echo("  Re-run `clawmeets init` once the server is reachable.")
+        raise typer.Exit(1)
+
+    # ---- Fetch assistant token (unless explicitly overridden via --assistant-token) ----
+    if not _assistant_token:
+        _assistant_token = _fetch_assistant_token(server, token)
+    login_resp["assistant_token"] = _assistant_token
 
     # ---- Generate settings.json ----
     typer.echo("\n--- Generating configuration ---")
@@ -643,36 +965,47 @@ def init_command(
         agents=agents_list,
         git_url=git_url,
         git_ignored_folder=git_ignored_folder,
+        assistant_block=assistant_block,
     )
     typer.echo(f"  Generated {settings_path}")
 
-    # ---- Generate CLAUDE.md files ----
+    # ---- Generate CLAUDE.md files (skipped per-agent if already present) ----
     for agent in agents_list:
-        kdir = _generate_claude_md(agent, output_dir)
-        typer.echo(f"  Generated {kdir / 'CLAUDE.md'}")
+        kdir, wrote = _generate_claude_md(agent, output_dir)
+        claude_md_path = kdir / "CLAUDE.md"
+        if wrote:
+            typer.echo(f"  Generated {claude_md_path}")
+        else:
+            typer.echo(f"  Skipped CLAUDE.md (already exists at {claude_md_path})")
 
-    # ---- Login ----
-    typer.echo("\n--- Registering with server ---")
-    try:
-        login_resp = _login(server, username, password)
-        token = login_resp["token"]
-    except httpx.HTTPStatusError as e:
-        typer.echo(f"  Login failed: {e.response.text}", err=True)
-        typer.echo("  Agents were not registered. You can register later with: clawmeets init")
-        typer.echo(f"\n  Configuration saved to {output_dir}/")
-        raise typer.Exit(1)
-    except httpx.ConnectError:
-        typer.echo(f"  Could not connect to {server}", err=True)
-        typer.echo("  Agents were not registered. You can register later with: clawmeets init")
-        typer.echo(f"\n  Configuration saved to {output_dir}/")
-        raise typer.Exit(1)
+    # ---- Apply assistant config (template's `assistant` block) ----
+    assistant_local_settings: dict = {}
+    assistant_capabilities: Optional[list[str]] = None
+    assistant_description: Optional[str] = None
+    if assistant_block:
+        (
+            assistant_local_settings,
+            assistant_capabilities,
+            assistant_description,
+        ) = _apply_assistant_config(server, token, login_resp, assistant_block, output_dir)
 
     # ---- Setup assistant credentials ----
-    _setup_assistant_credentials(server, login_resp, agents_dir)
+    _setup_assistant_credentials(
+        server,
+        login_resp,
+        agents_dir,
+        local_settings=assistant_local_settings or None,
+        capabilities_override=assistant_capabilities,
+        description_override=assistant_description,
+    )
 
     # ---- Register agents ----
     if agents_list:
         _register_agents(server, token, agents_list, agents_dir)
+
+    # Sample requests are NOT copied from the template into the user's team
+    # metadata. The TeamPage reads them live from `GET /templates/{name}` so
+    # the source of truth stays in templates/*/setup.json.
 
     # ---- Save token to settings.json and set current user ----
     config_path = _save_token_to_settings_json(token, username, resolved_data_dir)

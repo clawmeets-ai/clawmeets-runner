@@ -16,10 +16,13 @@ import subprocess
 import time
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from ..api.actions import ActionBlock
 from ..utils.notification_center import LLM_COMPLETE, LLM_ERROR, NotificationCenter
+
+if TYPE_CHECKING:
+    from ..runner.mcp_manager import McpManager
 from .base import (
     LLMInvocationError,
     LLMNotFoundError,
@@ -45,25 +48,27 @@ class ClaudeCLI(LLMProvider):
 
     def __init__(
         self,
-        action_schema: dict,
         claude_bin: str = "claude",
         claude_plugin_dirs: Optional[list[Path]] = None,
         use_chrome: bool = False,
+        mcp_manager: Optional["McpManager"] = None,
     ) -> None:
         """Initialize ClaudeCLI.
 
         Args:
-            action_schema: JSON schema for structured output validation.
-                Use WORKER_ACTION_SCHEMA for workers (reply, update_file only).
-                Use COORDINATOR_ACTION_SCHEMA for coordinators (all actions).
             claude_bin: Path to claude CLI binary
             claude_plugin_dirs: Directories to load as Claude plugins via --plugin-dir
             use_chrome: Enable Chrome browser integration via --chrome flag
+            mcp_manager: If provided, renders .mcp.json into each invocation's
+                working_dir so Claude Code picks up installed MCP servers.
+
+        The JSON action schema is selected per invocation and passed to
+        ``invoke(action_schema=...)``.
         """
         self._bin = claude_bin
-        self._action_schema = action_schema
         self._claude_plugin_dirs = claude_plugin_dirs or []
         self._use_chrome = use_chrome
+        self._mcp_manager = mcp_manager
 
     @classmethod
     def verify_cli(cls, claude_bin: str = "claude") -> None:
@@ -99,6 +104,7 @@ class ClaudeCLI(LLMProvider):
         prompt: str,
         working_dir: Path,
         additional_dirs: list[Path],
+        action_schema: dict,
     ) -> tuple[str, str, list[str]]:
         """Set up directories, write prompt file, and build command.
 
@@ -106,6 +112,11 @@ class ClaudeCLI(LLMProvider):
             Tuple of (prompt_file_abs, claude_cwd, cmd)
         """
         working_dir.mkdir(parents=True, exist_ok=True)
+
+        # Render .mcp.json into the cwd so Claude Code picks up installed MCP
+        # servers. No-op if no MCP manager or no installed servers.
+        if self._mcp_manager is not None:
+            self._mcp_manager.render_mcp_json(working_dir)
 
         # Write prompt to a temp file for debugging
         prompt_file = working_dir / ".agent-prompt.txt"
@@ -120,7 +131,7 @@ class ClaudeCLI(LLMProvider):
             "--permission-mode", "bypassPermissions",
             "--no-session-persistence",
             "--output-format", "json",
-            "--json-schema", json.dumps(self._action_schema),
+            "--json-schema", json.dumps(action_schema),
         ]
 
         for d in additional_dirs:
@@ -235,10 +246,15 @@ class ClaudeCLI(LLMProvider):
         log_dir: Path,
         additional_dirs: list[Path],
         notification_center: NotificationCenter,
+        action_schema: dict,
     ) -> tuple[ActionBlock, LLMUsage]:
-        """Invoke Claude CLI with the given prompt."""
+        """Invoke Claude CLI with the given prompt.
+
+        Uses asyncio.create_subprocess_exec so that cancelling the awaiting
+        task (e.g. via InvocationRegistry.cancel) terminates the subprocess.
+        """
         prompt_file_abs, claude_cwd, cmd = self._prepare_invocation(
-            prompt, working_dir, additional_dirs
+            prompt, working_dir, additional_dirs, action_schema
         )
 
         env = os.environ.copy()
@@ -247,50 +263,80 @@ class ClaudeCLI(LLMProvider):
         invoke_timeout = 600 if self._use_chrome else 300
 
         start_time = time.time()
+        proc: Optional[asyncio.subprocess.Process] = None
         try:
-            result = await asyncio.to_thread(
-                subprocess.run,
-                cmd,
-                input=prompt,
-                capture_output=True,
-                text=True,
-                cwd=claude_cwd,
-                env=env,
-                timeout=invoke_timeout,
-            )
-            elapsed = time.time() - start_time
-            logger.info(f"[claude-invoke] FINISHED in {elapsed:.1f}s, returncode={result.returncode}")
-            logger.info(f"[claude-invoke] stdout length={len(result.stdout)} chars")
-            if result.stderr:
-                logger.warning(f"[claude-invoke] stderr ({len(result.stderr)} chars): {result.stderr[:1000]}")
-
-            self._write_invocation_logs(log_dir, result.stdout, result.stderr)
-
-        except FileNotFoundError:
-            raise LLMNotFoundError(
-                self._bin,
-                install_hint="Install Claude Code: https://docs.anthropic.com/claude-code",
-            )
-        except subprocess.TimeoutExpired as e:
-            elapsed = time.time() - start_time
-            logger.error(f"[claude-invoke] TIMEOUT after {elapsed:.1f}s")
-            logger.error(f"[claude-invoke] partial stdout: {getattr(e, 'stdout', 'N/A')}")
-            logger.error(f"[claude-invoke] partial stderr: {getattr(e, 'stderr', 'N/A')}")
-            logger.error(f"[claude-invoke] prompt file saved at: {prompt_file_abs}")
-            error = LLMTimeoutError(
-                timeout_seconds=invoke_timeout,
-                prompt_file=prompt_file_abs,
-                working_dir=claude_cwd,
-                provider="Claude Code",
-            )
-            await notification_center.publish(LLM_ERROR, sandbox_dir=working_dir, error=error)
-            raise error
-
-        if result.returncode != 0:
-            logger.error(f"[claude-invoke] stdout on error: {result.stdout[:2000]}...")
-            error_detail = result.stderr or "(no stderr)"
             try:
-                data = json.loads(result.stdout.strip())
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=claude_cwd,
+                    env=env,
+                )
+            except FileNotFoundError:
+                raise LLMNotFoundError(
+                    self._bin,
+                    install_hint="Install Claude Code: https://docs.anthropic.com/claude-code",
+                )
+
+            try:
+                stdout_b, stderr_b = await asyncio.wait_for(
+                    proc.communicate(input=prompt.encode("utf-8")),
+                    timeout=invoke_timeout,
+                )
+            except asyncio.CancelledError:
+                proc.kill()
+                try:
+                    await proc.wait()
+                except Exception:
+                    pass
+                elapsed = time.time() - start_time
+                logger.info(f"[claude-invoke] CANCELLED after {elapsed:.1f}s")
+                raise
+            except asyncio.TimeoutError:
+                proc.kill()
+                try:
+                    await proc.wait()
+                except Exception:
+                    pass
+                elapsed = time.time() - start_time
+                logger.error(f"[claude-invoke] TIMEOUT after {elapsed:.1f}s")
+                logger.error(f"[claude-invoke] prompt file saved at: {prompt_file_abs}")
+                error = LLMTimeoutError(
+                    timeout_seconds=invoke_timeout,
+                    prompt_file=prompt_file_abs,
+                    working_dir=claude_cwd,
+                    provider="Claude Code",
+                )
+                await notification_center.publish(LLM_ERROR, sandbox_dir=working_dir, error=error)
+                raise error
+
+            stdout = stdout_b.decode("utf-8", errors="replace")
+            stderr = stderr_b.decode("utf-8", errors="replace")
+            returncode = proc.returncode if proc.returncode is not None else -1
+
+            elapsed = time.time() - start_time
+            logger.info(f"[claude-invoke] FINISHED in {elapsed:.1f}s, returncode={returncode}")
+            logger.info(f"[claude-invoke] stdout length={len(stdout)} chars")
+            if stderr:
+                logger.warning(f"[claude-invoke] stderr ({len(stderr)} chars): {stderr[:1000]}")
+
+            self._write_invocation_logs(log_dir, stdout, stderr)
+        finally:
+            # Defensive reap on any unexpected exit path
+            if proc is not None and proc.returncode is None:
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except Exception:
+                    pass
+
+        if returncode != 0:
+            logger.error(f"[claude-invoke] stdout on error: {stdout[:2000]}...")
+            error_detail = stderr or "(no stderr)"
+            try:
+                data = json.loads(stdout.strip())
                 if isinstance(data, list):
                     for item in data:
                         if isinstance(item, dict) and item.get("type") == "result":
@@ -300,18 +346,18 @@ class ClaudeCLI(LLMProvider):
             except (json.JSONDecodeError, KeyError):
                 pass
             error = LLMInvocationError(
-                f"Claude Code exited with code {result.returncode}:\n{error_detail}",
+                f"Claude Code exited with code {returncode}:\n{error_detail}",
                 prompt_file=prompt_file_abs,
                 working_dir=claude_cwd,
             )
             await notification_center.publish(LLM_ERROR, sandbox_dir=working_dir, error=error)
             raise error
 
-        result_text, usage, actions = self._parse_json_output(result.stdout)
+        result_text, usage, actions = self._parse_json_output(stdout)
 
         # Detect rate limit: returncode=0 but is_error=true with error="rate_limit"
         try:
-            data = json.loads(result.stdout.strip())
+            data = json.loads(stdout.strip())
             if isinstance(data, list):
                 for item in data:
                     if (

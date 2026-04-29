@@ -32,11 +32,11 @@ if TYPE_CHECKING:
 class ParticipantRole(str, Enum):
     """Role of a participant in the system.
 
-    Used by the reactive architecture to distinguish between
-    different types of participants (agents, assistants, users).
+    Used by the reactive architecture to distinguish humans from agents.
+    "Assistant" is no longer a separate role — an agent acts as coordinator
+    per-project when ``agent.id == project.coordinator_id``.
     """
-    AGENT = "agent"          # Public worker agent
-    ASSISTANT = "assistant"  # Private user-linked coordinator
+    AGENT = "agent"          # Agent (public or private); can be coordinator per-project
     USER = "user"            # Human user
 
 
@@ -139,15 +139,12 @@ class Participant(ABC):
             ctx: ModelContext for filesystem operations
 
         Returns:
-            Agent, Assistant, or User instance, or None if not found
+            Agent or User instance, or None if not found
         """
-        # Import concrete types here to avoid circular imports
         from clawmeets.models.agent import Agent
-        from clawmeets.models.assistant import Assistant
         from clawmeets.models.user import User
 
-        # Try each concrete type until one exists
-        for concrete_cls in [Agent, Assistant, User]:
+        for concrete_cls in [Agent, User]:
             participant = concrete_cls.get(participant_id, ctx)
             if participant is not None:
                 return participant
@@ -158,30 +155,22 @@ class Participant(ABC):
     def get_by_name(name: str, ctx: "ModelContext") -> Optional["Participant"]:
         """Load participant by name, returning the correct concrete type.
 
-        Searches across all participant types (Agent, Assistant, User).
+        Searches Agent names first, then User usernames.
 
         Args:
             name: The participant name to look up
             ctx: ModelContext for filesystem operations
 
         Returns:
-            Agent, Assistant, or User instance, or None if not found
+            Agent or User instance, or None if not found
         """
         from clawmeets.models.agent import Agent
-        from clawmeets.models.assistant import Assistant
         from clawmeets.models.user import User
 
-        # Check agents
         agent = Agent.get_by_name(name, ctx)
         if agent is not None:
             return agent
 
-        # Check assistants
-        assistant = Assistant.get_by_name(name, ctx)
-        if assistant is not None:
-            return assistant
-
-        # Check users (username)
         user = User.get_by_username(name, ctx)
         if user is not None:
             return user
@@ -262,6 +251,7 @@ class Participant(ABC):
         chatroom_name: str,
         message: "ChatMessage",
         addressed_to_me: bool,
+        trigger_version: int,
     ) -> None:
         """
         Called when a message is received in a chatroom.
@@ -271,6 +261,7 @@ class Participant(ABC):
             chatroom_name: The chatroom ID
             message: The message content (raw ChatMessage)
             addressed_to_me: True if message.expects_response_from includes this participant
+            trigger_version: Changelog version of this MESSAGE entry (use as source_version for any reply)
         """
         pass
 
@@ -284,6 +275,7 @@ class Participant(ABC):
         chatroom_name: str,
         filename: str,
         content: bytes,
+        trigger_version: int,
     ) -> None:
         """
         Called when a new file is created.
@@ -293,6 +285,7 @@ class Participant(ABC):
             chatroom_name: The chatroom name
             filename: The filename
             content: The file content as bytes
+            trigger_version: Changelog version of this FILE_CREATED entry
         """
         pass
 
@@ -302,6 +295,7 @@ class Participant(ABC):
         chatroom_name: str,
         filename: str,
         content: bytes,
+        trigger_version: int,
     ) -> None:
         """
         Called when an existing file is updated.
@@ -311,6 +305,7 @@ class Participant(ABC):
             chatroom_name: The chatroom name
             filename: The filename
             content: The updated file content as bytes
+            trigger_version: Changelog version of this FILE_UPDATED entry
         """
         pass
 
@@ -324,6 +319,7 @@ class Participant(ABC):
         chatroom_name: str,
         message_id: str,
         responded_participants: list[str],
+        trigger_version: int,
     ) -> None:
         """
         Called when all expected participants have responded (coordinator only).
@@ -333,6 +329,7 @@ class Participant(ABC):
             chatroom_name: The chatroom ID
             message_id: The original message ID that started the batch
             responded_participants: List of participant IDs that responded
+            trigger_version: Changelog version of this BATCH_COMPLETE entry (use as source_version for reply)
         """
         pass
 
@@ -343,6 +340,7 @@ class Participant(ABC):
         message_id: str,
         responded_participants: list[str],
         timed_out_participants: list[str],
+        trigger_version: int,
     ) -> None:
         """
         Called when some participants didn't respond in time (coordinator only).
@@ -353,6 +351,7 @@ class Participant(ABC):
             message_id: The original message ID
             responded_participants: List of participant IDs that responded
             timed_out_participants: List of participant IDs that timed out
+            trigger_version: Changelog version of this BATCH_TIMEOUT entry (use as source_version for reply)
         """
         pass
 
@@ -366,6 +365,7 @@ class Participant(ABC):
         chatroom_name: str,
         message: "ChatMessage",
         context_files: list[str],
+        trigger_version: int,
     ) -> None:
         """
         Called when coordinator receives first user message in a project.
@@ -383,6 +383,7 @@ class Participant(ABC):
             chatroom_name: The user-communication chatroom ID
             message: The first user message
             context_files: List of files in shared-context (excluding AGENTS.md, PLAN.md)
+            trigger_version: Changelog version of the MESSAGE entry (use as source_version for reply)
         """
         # Default: fall back to normal message handling
         await self.on_message(
@@ -390,6 +391,7 @@ class Participant(ABC):
             chatroom_name=chatroom_name,
             message=message,
             addressed_to_me=True,
+            trigger_version=trigger_version,
         )
 
     # ─────────────────────────────────────────────────────────

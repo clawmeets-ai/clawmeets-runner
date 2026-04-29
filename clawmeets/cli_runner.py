@@ -37,18 +37,19 @@ from clawmeets.api.control import ControlEnvelope, ControlMessageType
 from clawmeets.api.client import ClawMeetsClient
 from clawmeets.models.chat_message import ChatMessage
 from clawmeets.utils.file_io import FileUtil
+from clawmeets.utils.knowledge_dir import resolve_local_knowledge_dir
 from clawmeets.utils.notification_center import NotificationCenter
 from clawmeets.llm.base import LLMProvider
 from clawmeets.llm.claude_cli import ClaudeCLI
 from clawmeets.llm.codex_cli import CodexCLI
 from clawmeets.llm.gemini_cli import GeminiCLI
-from clawmeets.api.actions import WORKER_ACTION_SCHEMA, COORDINATOR_ACTION_SCHEMA
 from clawmeets.models.context import ModelContext
 from clawmeets.models.agent import Agent
-from clawmeets.models.assistant import Assistant
 from clawmeets.models.user import User, NotificationConfig
 from clawmeets.sync.console_subscriber import ConsoleOutputSubscriber, ConsoleConfig
 from clawmeets.runner.reactive_loop import ReactiveControlLoop
+from clawmeets.runner.mcp_manager import McpManager
+from clawmeets.runner.personal_skill_manager import PersonalSkillManager
 from clawmeets.runner.skill_manager import SkillManager
 
 # Backward compatibility alias
@@ -58,6 +59,19 @@ AgentRegistrationResult = AgentRegistrationResponse
 agent_app = typer.Typer(help="Agent commands", no_args_is_help=True)
 user_app  = typer.Typer(help="User commands",  no_args_is_help=True)
 dm_app    = typer.Typer(help="Direct message commands", no_args_is_help=True)
+mcp_app   = typer.Typer(help="MCP server commands (auth, list, status)", no_args_is_help=True)
+team_app  = typer.Typer(help="Manage user-defined teams on your agents (the TEAMS sidebar)", no_args_is_help=True)
+reflection_app = typer.Typer(help="Configure account-level reflection schedule (one cron, fans out to all your agents).", no_args_is_help=True)
+bootstrap_app = typer.Typer(help="Personalize your fresh agents from your own data (one-time, opt-in).", invoke_without_command=True)
+
+
+def _default_user_teams_from_env() -> list[str]:
+    """Parse $CLAWMEETS_AGENT_TEAMS into a list (comma-separated). Empty list
+    if unset. Used as the default for `clawmeets agent register --team` when
+    no flags are passed.
+    """
+    raw = os.environ.get("CLAWMEETS_AGENT_TEAMS", "")
+    return [t.strip() for t in raw.split(",") if t.strip()]
 
 
 # ---------------------------------------------------------------------------
@@ -89,7 +103,7 @@ def _print_json(data: dict | list) -> None:
     typer.echo(json.dumps(data, indent=2, default=str))
 
 
-_VALID_LLM_PROVIDERS = ("claude", "codex", "gemini")
+_VALID_LLM_PROVIDERS = ("claude", "openai", "gemini")
 
 
 def _build_initial_local_settings(
@@ -145,11 +159,16 @@ def agent_register(
     ),
     llm_provider: Optional[str] = typer.Option(
         None, "--llm-provider",
-        help="LLM backend for this agent: 'claude' (default), 'codex', or 'gemini'. Written to card.json local_settings.",
+        help="LLM backend for this agent: 'claude' (default), 'openai', or 'gemini'. Written to card.json local_settings.",
     ),
     llm_model: Optional[str] = typer.Option(
         None, "--llm-model",
         help="Provider-specific model name (e.g. 'o3' for Codex, 'gemini-2.5-pro' for Gemini). Written to card.json local_settings.",
+    ),
+    team: list[str] = typer.Option(
+        None, "--team",
+        help="User-defined team for this agent (repeatable; appears under the TEAMS sidebar). "
+             "Defaults to $CLAWMEETS_AGENT_TEAMS (comma-separated) if no --team flag is given.",
     ),
 ):
     """Register a new agent with the server (requires admin token).
@@ -227,15 +246,21 @@ def agent_register(
         typer.echo("Error: description is required (provide as argument or via --from-card)", err=True)
         raise typer.Exit(1)
 
+    user_teams = [t.strip() for t in (team or []) if t and t.strip()]
+    if not user_teams:
+        user_teams = _default_user_teams_from_env()
+    register_payload = {
+        "name": name,
+        "description": description,
+        "capabilities": caps_list,
+        "discoverable_through_registry": final_discoverable,
+    }
+    if user_teams:
+        register_payload["user_teams"] = user_teams
     with _http(server) as client:
         resp = client.post(
             "/agents/register",
-            json={
-                "name": name,
-                "description": description,
-                "capabilities": caps_list,
-                "discoverable_through_registry": final_discoverable,
-            },
+            json=register_payload,
             headers={"Authorization": f"Bearer {token}"},
         )
         result = _ok(resp)
@@ -269,6 +294,8 @@ def agent_register(
             "registered_at": result["registered_at"],
             "discoverable_through_registry": result.get("discoverable_through_registry", True),
         }
+        if user_teams:
+            card["user_teams"] = user_teams
         initial_local_settings = _build_initial_local_settings(llm_provider, llm_model)
         if initial_local_settings:
             card["local_settings"] = initial_local_settings
@@ -307,6 +334,412 @@ def agent_register(
 
 
 # ---------------------------------------------------------------------------
+# tag list / add / remove / set
+# ---------------------------------------------------------------------------
+
+
+def _resolve_user_session(
+    data_dir: Path,
+    explicit_token: Optional[str],
+    explicit_server: Optional[str],
+    as_user: Optional[str] = None,
+) -> tuple[str, str]:
+    """Return (server_url, token), filling in from the saved user session
+    when not given explicitly. Mirrors what `agent register` does so the
+    tag commands follow the same UX.
+    """
+    token = explicit_token
+    server = explicit_server
+    if not token or not server:
+        from clawmeets.cli_lifecycle import get_current_user, get_user_config_path
+        data_dir_p = Path(data_dir).expanduser()
+        resolved_user = as_user or get_current_user(data_dir_p)
+        if resolved_user:
+            cfg_path = get_user_config_path(data_dir_p, resolved_user)
+            if cfg_path.exists():
+                cfg = json.loads(cfg_path.read_text())
+                token = token or cfg.get("user", {}).get("token")
+                server = server or cfg.get("server_url")
+    server = server or DEFAULT_SERVER
+    if not token:
+        typer.echo(
+            "Error: not logged in. Run `clawmeets user login <user> <pass> --save` "
+            "or pass --token explicitly.",
+            err=True,
+        )
+        raise typer.Exit(1)
+    return _server_url(server), token
+
+
+def _resolve_agent_id(
+    client: httpx.Client, token: str, agent_ref: str
+) -> tuple[str, str]:
+    """Resolve an agent reference (id or name) to (id, name)."""
+    resp = client.get("/agents", headers={"Authorization": f"Bearer {token}"})
+    agents = _ok(resp)
+    for a in agents:
+        if a["id"] == agent_ref:
+            return a["id"], a["name"]
+    for a in agents:
+        if a["id"].startswith(agent_ref):
+            return a["id"], a["name"]
+    for a in agents:
+        if a["name"] == agent_ref:
+            return a["id"], a["name"]
+    lower = agent_ref.lower()
+    for a in agents:
+        if a["name"].lower() == lower:
+            return a["id"], a["name"]
+    typer.echo(f"Error: no agent matches {agent_ref!r}.", err=True)
+    raise typer.Exit(1)
+
+
+def _fetch_owned_agents(client: httpx.Client, token: str) -> list[dict]:
+    """Return the agents the current user owns (registered_by == self)."""
+    me_resp = client.get("/auth/user/me", headers={"Authorization": f"Bearer {token}"})
+    if me_resp.status_code != 200:
+        typer.echo(f"Error: could not load current user ({me_resp.text})", err=True)
+        raise typer.Exit(1)
+    me_id = me_resp.json().get("id")
+    agents_resp = client.get("/agents", headers={"Authorization": f"Bearer {token}"})
+    agents = _ok(agents_resp)
+    return [a for a in agents if a.get("registered_by") == me_id]
+
+
+@team_app.command("list")
+def team_list(
+    show_agents: bool = typer.Option(False, "--agents", "-a", help="Also list each team's agents"),
+    token: Optional[str] = typer.Option(None, "--token", "-t"),
+    server: Optional[str] = typer.Option(None, "--server", "-s"),
+    data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir"),
+):
+    """List unique teams across the agents you own (derived from agent state)."""
+    server_url, token = _resolve_user_session(data_dir, token, server)
+    with _http(server_url) as client:
+        owned = _fetch_owned_agents(client, token)
+    by_team: dict[str, list[str]] = {}
+    unassigned: list[str] = []
+    for agent in owned:
+        teams = agent.get("user_teams") or []
+        if not teams:
+            unassigned.append(agent["name"])
+            continue
+        for t in teams:
+            by_team.setdefault(t, []).append(agent["name"])
+    if not by_team and not unassigned:
+        typer.echo("No agents owned. Register one with `clawmeets agent register ...`.")
+        return
+    for team_name in sorted(by_team):
+        typer.echo(f"  {team_name}: {len(by_team[team_name])} agent(s)")
+        if show_agents:
+            for agent_name in sorted(by_team[team_name]):
+                typer.echo(f"    - {agent_name}")
+    if unassigned:
+        typer.echo(f"  (no team): {len(unassigned)} agent(s)")
+        if show_agents:
+            for agent_name in sorted(unassigned):
+                typer.echo(f"    - {agent_name}")
+
+
+def _put_user_teams(
+    client: httpx.Client,
+    token: str,
+    agent_id: str,
+    user_teams: list[str],
+) -> None:
+    resp = client.put(
+        f"/agents/{agent_id}",
+        json={"user_teams": user_teams},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    _ok(resp)
+
+
+@team_app.command("add")
+def team_add(
+    agent: str = typer.Argument(..., help="Agent name or id"),
+    team_name: str = typer.Argument(..., help="Team to add"),
+    token: Optional[str] = typer.Option(None, "--token", "-t"),
+    server: Optional[str] = typer.Option(None, "--server", "-s"),
+    data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir"),
+):
+    """Add a team to an agent (no-op if already present)."""
+    server_url, token = _resolve_user_session(data_dir, token, server)
+    with _http(server_url) as client:
+        agent_id, agent_name = _resolve_agent_id(client, token, agent)
+        current = client.get(
+            f"/agents/{agent_id}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        existing = _ok(current).get("user_teams") or []
+        if team_name in existing:
+            typer.echo(f"Agent '{agent_name}' already on team '{team_name}'.")
+            return
+        _put_user_teams(client, token, agent_id, [*existing, team_name])
+    typer.echo(f"Added agent '{agent_name}' to team '{team_name}'.")
+
+
+@team_app.command("remove")
+def team_remove(
+    agent: str = typer.Argument(..., help="Agent name or id"),
+    team_name: str = typer.Argument(..., help="Team to remove"),
+    token: Optional[str] = typer.Option(None, "--token", "-t"),
+    server: Optional[str] = typer.Option(None, "--server", "-s"),
+    data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir"),
+):
+    """Remove a team from an agent (no-op if absent)."""
+    server_url, token = _resolve_user_session(data_dir, token, server)
+    with _http(server_url) as client:
+        agent_id, agent_name = _resolve_agent_id(client, token, agent)
+        current = client.get(
+            f"/agents/{agent_id}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        existing = _ok(current).get("user_teams") or []
+        if team_name not in existing:
+            typer.echo(f"Agent '{agent_name}' is not on team '{team_name}'.")
+            return
+        _put_user_teams(
+            client,
+            token,
+            agent_id,
+            [t for t in existing if t != team_name],
+        )
+    typer.echo(f"Removed agent '{agent_name}' from team '{team_name}'.")
+
+
+@team_app.command("set")
+def team_set(
+    agent: str = typer.Argument(..., help="Agent name or id"),
+    team: list[str] = typer.Option(
+        None, "--team",
+        help="Team value (repeatable). Pass with no --team flags to clear all teams.",
+    ),
+    token: Optional[str] = typer.Option(None, "--token", "-t"),
+    server: Optional[str] = typer.Option(None, "--server", "-s"),
+    data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir"),
+):
+    """Replace an agent's team list with the given --team values (or clear)."""
+    server_url, token = _resolve_user_session(data_dir, token, server)
+    new_teams = [t.strip() for t in (team or []) if t and t.strip()]
+    with _http(server_url) as client:
+        agent_id, agent_name = _resolve_agent_id(client, token, agent)
+        _put_user_teams(client, token, agent_id, new_teams)
+    if new_teams:
+        typer.echo(f"Set teams on '{agent_name}': {', '.join(new_teams)}")
+    else:
+        typer.echo(f"Cleared teams on '{agent_name}'.")
+
+
+# ---------------------------------------------------------------------------
+# team create / delete / invite / disinvite / add-sample-requests
+# ---------------------------------------------------------------------------
+
+
+def _extract_sample_requests(template: dict) -> list[dict]:
+    """Pull the sample_requests list out of a setup.json template, validating
+    shape. Returns a list of {title, request, coordinator_hint?} dicts."""
+    raw = template.get("sample_requests") or []
+    out: list[dict] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        title = (entry.get("title") or "").strip()
+        request = (entry.get("request") or "").strip()
+        if not title or not request:
+            continue
+        item = {"title": title, "request": request}
+        hint = entry.get("coordinator_hint")
+        if hint:
+            item["coordinator_hint"] = str(hint).strip()
+        out.append(item)
+    return out
+
+
+@team_app.command("create")
+def team_create(
+    name: str = typer.Argument(..., help="Team name (matches agents' user_teams entry)"),
+    from_url: Optional[str] = typer.Option(
+        None, "--from-url",
+        help="Import sample requests from a setup.json URL / path (same format as `init --from-url`)",
+    ),
+    token: Optional[str] = typer.Option(None, "--token", "-t"),
+    server: Optional[str] = typer.Option(None, "--server", "-s"),
+    data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir"),
+):
+    """Create (or upsert) a team record on the server. If `--from-url` is
+    given, the template's sample_requests are attached to the team. Existing
+    sample_requests are preserved — re-running is idempotent (dedup by title).
+    """
+    server_url, token = _resolve_user_session(data_dir, token, server)
+
+    sample_requests: list[dict] = []
+    if from_url:
+        from clawmeets.cli_init import _fetch_setup_template
+        template = _fetch_setup_template(from_url)
+        sample_requests = _extract_sample_requests(template)
+
+    with _http(server_url) as client:
+        payload: dict = {"name": name}
+        if sample_requests:
+            payload["sample_requests"] = sample_requests
+        resp = client.post(
+            "/teams",
+            json=payload,
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        team = _ok(resp)
+    typer.echo(
+        f"Team '{team['name']}' ready "
+        f"({len(team['sample_requests'])} sample request(s), "
+        f"{team['member_count']} member(s))."
+    )
+
+
+@team_app.command("delete")
+def team_delete(
+    name: str = typer.Argument(..., help="Team name"),
+    remove_from_agents: bool = typer.Option(
+        False, "--remove-from-agents",
+        help="Also strip the team label from every agent that carries it",
+    ),
+    token: Optional[str] = typer.Option(None, "--token", "-t"),
+    server: Optional[str] = typer.Option(None, "--server", "-s"),
+    data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir"),
+):
+    """Delete a team's metadata. With `--remove-from-agents`, also strip the
+    label from every owned agent that carried it.
+    """
+    server_url, token = _resolve_user_session(data_dir, token, server)
+    params = {"remove_from_agents": "true" if remove_from_agents else "false"}
+    with _http(server_url) as client:
+        resp = client.delete(
+            f"/teams/{name}",
+            params=params,
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        result = _ok(resp)
+    extra = ""
+    if remove_from_agents:
+        extra = f" (removed label from {result.get('labels_removed_from_agents', 0)} agent(s))"
+    typer.echo(f"Deleted team '{name}'.{extra}")
+
+
+@team_app.command("invite")
+def team_invite(
+    team_name: str = typer.Argument(..., help="Team name"),
+    agents: list[str] = typer.Argument(..., help="Agent name(s) or id(s) to invite"),
+    token: Optional[str] = typer.Option(None, "--token", "-t"),
+    server: Optional[str] = typer.Option(None, "--server", "-s"),
+    data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir"),
+):
+    """Invite one or more agents to a team (adds the team label to each agent's
+    user_teams). No-op for agents already on the team.
+    """
+    server_url, token = _resolve_user_session(data_dir, token, server)
+    with _http(server_url) as client:
+        for agent in agents:
+            agent_id, agent_name = _resolve_agent_id(client, token, agent)
+            resp = client.post(
+                f"/teams/{team_name}/members",
+                json={"agent_id": agent_id},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            _ok(resp)
+            typer.echo(f"Invited '{agent_name}' to team '{team_name}'.")
+
+
+@team_app.command("disinvite")
+def team_disinvite(
+    team_name: str = typer.Argument(..., help="Team name"),
+    agents: list[str] = typer.Argument(..., help="Agent name(s) or id(s) to disinvite"),
+    token: Optional[str] = typer.Option(None, "--token", "-t"),
+    server: Optional[str] = typer.Option(None, "--server", "-s"),
+    data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir"),
+):
+    """Remove one or more agents from a team."""
+    server_url, token = _resolve_user_session(data_dir, token, server)
+    with _http(server_url) as client:
+        for agent in agents:
+            agent_id, agent_name = _resolve_agent_id(client, token, agent)
+            resp = client.delete(
+                f"/teams/{team_name}/members/{agent_id}",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            _ok(resp)
+            typer.echo(f"Removed '{agent_name}' from team '{team_name}'.")
+
+
+@team_app.command("add-sample-requests")
+def team_add_sample_requests(
+    team_name: str = typer.Argument(..., help="Team name"),
+    from_url: Optional[str] = typer.Option(
+        None, "--from-url",
+        help="Import sample requests from a setup.json URL / path",
+    ),
+    title: Optional[str] = typer.Option(
+        None, "--title", help="Title for a single inline sample request"
+    ),
+    request: Optional[str] = typer.Option(
+        None, "--request", help="Body for a single inline sample request"
+    ),
+    coordinator_hint: Optional[str] = typer.Option(
+        None, "--coordinator-hint",
+        help="Optional coordinator hint for the inline sample request",
+    ),
+    token: Optional[str] = typer.Option(None, "--token", "-t"),
+    server: Optional[str] = typer.Option(None, "--server", "-s"),
+    data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir"),
+):
+    """Add sample requests to a team, either inline (`--title` + `--request`)
+    or imported from a setup.json template (`--from-url`). The two modes can
+    be combined. Existing samples with the same title are replaced.
+    """
+    if not from_url and not (title and request):
+        typer.echo(
+            "Error: pass --from-url, or both --title and --request "
+            "(or both --from-url and an inline sample).",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    server_url, token = _resolve_user_session(data_dir, token, server)
+
+    to_add: list[dict] = []
+    if from_url:
+        from clawmeets.cli_init import _fetch_setup_template
+        template = _fetch_setup_template(from_url)
+        to_add.extend(_extract_sample_requests(template))
+    if title and request:
+        item = {"title": title.strip(), "request": request.strip()}
+        if coordinator_hint:
+            item["coordinator_hint"] = coordinator_hint.strip()
+        to_add.append(item)
+
+    if not to_add:
+        typer.echo(f"No sample requests to add to team '{team_name}'.")
+        return
+
+    with _http(server_url) as client:
+        # Ensure the team record exists first (upsert).
+        _ok(client.post(
+            "/teams",
+            json={"name": team_name},
+            headers={"Authorization": f"Bearer {token}"},
+        ))
+        for sample in to_add:
+            resp = client.post(
+                f"/teams/{team_name}/sample-requests",
+                json=sample,
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            _ok(resp)
+        typer.echo(
+            f"Added {len(to_add)} sample request(s) to team '{team_name}'."
+        )
+
+
+# ---------------------------------------------------------------------------
 # agent list
 # ---------------------------------------------------------------------------
 
@@ -341,6 +774,8 @@ def agent_run(
     knowledge_dir: Optional[Path] = typer.Option(None, "--knowledge-dir", "-k", help="Knowledge base directory (passed as --add-dir to Claude)"),
     claude_plugin_dir: Optional[list[Path]] = typer.Option(None, "--claude-plugin-dir", help="Claude plugin directory (passed as --plugin-dir to Claude CLI, repeatable)"),
     chrome: bool = typer.Option(False, "--chrome", help="Enable Chrome browser integration via Claude Code --chrome flag"),
+    user_config: Optional[Path] = typer.Option(None, "--user-config", help="Path to the owning user's settings.json; used on self-destruct when the server reports this agent was deleted."),
+    settings_name: Optional[str] = typer.Option(None, "--settings-name", help="Short agent name as it appears in settings.json agents[].name; paired with --user-config for self-destruct cleanup."),
     log_level: str = typer.Option("info"),
 ):
     """
@@ -362,12 +797,11 @@ def agent_run(
     agent-dir/sandbox, with project data accessible via --add-dir.
 
     When --knowledge-dir is specified, the directory is passed as an additional
-    --add-dir to Claude, enabling access to a knowledge base generated by
-    'clawmeets generate crawler'.
+    --add-dir to Claude, enabling access to that knowledge base.
 
     When --claude-plugin-dir is specified, the directory is passed as --plugin-dir
-    to Claude CLI, enabling access to Claude Code plugins/skills (e.g.,
-    save-to-knowledge). Can be repeated for multiple plugin directories.
+    to Claude CLI, enabling access to Claude Code plugins/skills. Can be repeated
+    for multiple plugin directories.
     """
     logging.basicConfig(
         level=log_level.upper(),
@@ -400,7 +834,13 @@ def agent_run(
     if claude_plugin_dir:
         typer.echo(f"Claude plugin dirs: {claude_plugin_dir}")
 
-    asyncio.run(_runner_loop(agent_name, agent_id, token, server, Path(agent_dir), working_dir, knowledge_dir, claude_plugin_dir or [], use_chrome=chrome))
+    asyncio.run(_runner_loop(
+        agent_name, agent_id, token, server, Path(agent_dir),
+        working_dir, knowledge_dir, claude_plugin_dir or [],
+        use_chrome=chrome,
+        user_config=user_config,
+        settings_name=settings_name,
+    ))
 
 
 async def _ws_heartbeat_task(ws, agent_id: str) -> None:
@@ -502,7 +942,7 @@ def user_register(
     data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir", help="Root data directory (assistant saved to {data_dir}/agents/)"),
     llm_provider: Optional[str] = typer.Option(
         None, "--llm-provider",
-        help="LLM backend for this user's assistant: 'claude' (default), 'codex', or 'gemini'.",
+        help="LLM backend for this user's assistant: 'claude' (default), 'openai', or 'gemini'.",
     ),
     llm_model: Optional[str] = typer.Option(
         None, "--llm-model",
@@ -541,6 +981,7 @@ def user_register(
         agent_id = result["assistant_agent_id"]
         agent_name = result["assistant_agent_name"]
         agent_token = result["assistant_token"]
+        user_id = result["user_id"]
 
         assistant_creds = {
             "agent_id": agent_id,
@@ -565,6 +1006,7 @@ def user_register(
             "status": "online",
             "registered_at": datetime.now(UTC).isoformat(),
             "discoverable_through_registry": False,
+            "registered_by": user_id,
         }
         initial_local_settings = _build_initial_local_settings(llm_provider, llm_model)
         if initial_local_settings:
@@ -585,7 +1027,7 @@ def user_create(
     data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir", help="Root data directory (assistant saved to {data_dir}/agents/)"),
     llm_provider: Optional[str] = typer.Option(
         None, "--llm-provider",
-        help="LLM backend for this user's assistant: 'claude' (default), 'codex', or 'gemini'.",
+        help="LLM backend for this user's assistant: 'claude' (default), 'openai', or 'gemini'.",
     ),
     llm_model: Optional[str] = typer.Option(
         None, "--llm-model",
@@ -617,6 +1059,7 @@ def user_create(
         agent_id = result["assistant_agent_id"]
         agent_name = result["assistant_agent_name"]
         agent_token = result["assistant_token"]
+        user_id = result["user_id"]
 
         # Build credentials structure for saving
         assistant_creds = {
@@ -643,6 +1086,7 @@ def user_create(
             "status": "online",
             "registered_at": result["user_created_at"],
             "discoverable_through_registry": False,
+            "registered_by": user_id,
         }
         initial_local_settings = _build_initial_local_settings(llm_provider, llm_model)
         if initial_local_settings:
@@ -875,7 +1319,11 @@ async def _user_listen_loop(
                 finally:
                     hb_task.cancel()
 
-        except (websockets.ConnectionClosed, OSError) as e:
+        except (websockets.WebSocketException, OSError) as e:
+            # Covers ConnectionClosed, InvalidStatus (HTTP 4xx/5xx on WS
+            # upgrade when the server is down), InvalidHandshake, and
+            # transport/DNS errors. All transient — reconnect rather than
+            # crash the runner.
             logging.warning(f"WebSocket disconnected: {e}. Reconnecting in {reconnect_delay}s…")
             await asyncio.sleep(reconnect_delay)
             reconnect_delay = min(reconnect_delay * 2, 60)
@@ -883,6 +1331,41 @@ async def _user_listen_loop(
             await loop_obj.stop()
             await http_client.aclose()
             break
+
+
+def _self_destruct(
+    agent_dir: Path,
+    user_config: Optional[Path],
+    settings_name: Optional[str],
+) -> None:
+    """Handle the server's 'participant not found' signal: rename the local
+    agent directory to DELETED-* and drop the corresponding entry from the
+    owning user's settings.json (when both pieces of context were provided).
+
+    Best-effort — logs and swallows filesystem errors so a runner shutting
+    down in response to deletion never stalls on cleanup.
+    """
+    logger = logging.getLogger("clawmeets")
+    if user_config and settings_name and user_config.exists():
+        try:
+            cfg = json.loads(user_config.read_text())
+            before = len(cfg.get("agents", []))
+            cfg["agents"] = [
+                a for a in cfg.get("agents", [])
+                if a.get("name") != settings_name
+            ]
+            if len(cfg["agents"]) != before:
+                user_config.write_text(json.dumps(cfg, indent=2))
+                logger.info(f"Removed '{settings_name}' from {user_config}")
+        except Exception as e:
+            logger.warning(f"Could not update {user_config}: {e}")
+    target = agent_dir.parent / f"DELETED-{agent_dir.name}"
+    if agent_dir.exists() and not target.exists():
+        try:
+            agent_dir.rename(target)
+            logger.info(f"Renamed {agent_dir.name} -> {target.name}")
+        except OSError as e:
+            logger.warning(f"Could not rename {agent_dir}: {e}")
 
 
 async def _runner_loop(
@@ -895,18 +1378,20 @@ async def _runner_loop(
     knowledge_dir: Optional[Path] = None,
     claude_plugin_dirs: Optional[list[Path]] = None,
     use_chrome: bool = False,
+    user_config: Optional[Path] = None,
+    settings_name: Optional[str] = None,
 ) -> None:
     """Run the reactive control loop for an agent."""
     agent_dir.mkdir(parents=True, exist_ok=True)
 
-    # Check card.json to determine if this is an assistant or worker agent
+    # Read card.json. Since the Agent/Assistant merge, every runner instantiates
+    # as Agent regardless of discoverability — coordinator behavior is decided
+    # per-project at runtime via agent.is_coordinator_for(project).
     card_path = agent_dir / "card.json"
     if not card_path.exists():
         typer.echo(f"Error: card.json not found at {card_path}", err=True)
         raise typer.Exit(1)
     card_data = json.loads(card_path.read_text())
-    # Assistants have discoverable_through_registry=False
-    is_assistant = not card_data.get("discoverable_through_registry", True)
 
     # Read local_settings from card.json (primary source, not synced with server).
     # CLI flags (--knowledge-dir, --chrome) serve as overrides for backward compat.
@@ -933,36 +1418,51 @@ async def _runner_loop(
     effective_knowledge_dir = knowledge_dir or local_settings.get("knowledge_dir", "")
     effective_use_chrome = use_chrome or local_settings.get("use_chrome", False)
 
-    # Determine action schema based on role
-    if is_assistant:
-        action_schema = COORDINATOR_ACTION_SCHEMA
-    else:
-        action_schema = WORKER_ACTION_SCHEMA
+    # Resolve relative knowledge_dir paths (e.g. "./owner") against the user's
+    # init-time config dir (~/.clawmeets/config/<username>/), where
+    # `clawmeets init` wrote CLAUDE.md. Absolute and ~-prefixed paths pass
+    # through unchanged. Falls back to legacy CWD-relative behavior only when
+    # --user-config is absent (shouldn't happen under cli_lifecycle).
+    user_config_dir: Optional[Path] = user_config.parent if user_config else None
 
     # Set up skill manager (downloads skills from server on startup)
     skill_manager = SkillManager(agent_dir)
 
+    # Set up personal-skill manager (agent-local, never synced; populated by
+    # the agent itself during scheduled reflection's Promote/Correct modes).
+    personal_skill_manager = PersonalSkillManager(agent_dir)
+
+    # Set up MCP manager (downloads manifests from server on startup;
+    # renders .mcp.json into each Claude invocation's cwd)
+    mcp_manager = McpManager(agent_dir)
+
     # Pick LLM provider from card.json local_settings ("claude" default;
-    # "codex" and "gemini" also supported). Skill-hub plugin dir is appended
-    # to explicit plugin dirs for Claude; other providers ignore plugin dirs.
-    all_plugin_dirs = list(claude_plugin_dirs or []) + [skill_manager.plugin_dir]
+    # "openai" and "gemini" also supported). Skill-hub and personal-skill-hub
+    # plugin dirs are appended to explicit plugin dirs for Claude; other
+    # providers ignore plugin dirs. Action schema is selected per invocation
+    # by the caller (Agent), based on whether this runner is coordinator of
+    # the project the message is in.
+    all_plugin_dirs = list(claude_plugin_dirs or []) + [
+        skill_manager.plugin_dir,
+        personal_skill_manager.plugin_dir,
+    ]
     llm_provider_name = (local_settings.get("llm_provider") or "claude").lower()
     llm_model = local_settings.get("llm_model") or None
     cli: LLMProvider
-    if llm_provider_name == "codex":
+    if llm_provider_name == "openai":
         CodexCLI.verify_cli()
-        cli = CodexCLI(action_schema=action_schema, model=llm_model)
-        typer.echo(f"LLM provider: codex (model={llm_model or 'default'})")
+        cli = CodexCLI(model=llm_model)
+        typer.echo(f"LLM provider: openai (model={llm_model or 'default'})")
     elif llm_provider_name == "gemini":
         GeminiCLI.verify_cli()
-        cli = GeminiCLI(action_schema=action_schema, model=llm_model)
+        cli = GeminiCLI(model=llm_model)
         typer.echo(f"LLM provider: gemini (model={llm_model or 'default'})")
     elif llm_provider_name == "claude":
         ClaudeCLI.verify_cli()
         cli = ClaudeCLI(
-            action_schema=action_schema,
             claude_plugin_dirs=all_plugin_dirs,
             use_chrome=effective_use_chrome,
+            mcp_manager=mcp_manager,
         )
         typer.echo(
             f"LLM provider: claude"
@@ -978,8 +1478,9 @@ async def _runner_loop(
 
     # Build knowledge_dirs list (e.g., knowledge bases)
     knowledge_dirs_list: list[Path] = []
-    if effective_knowledge_dir:
-        knowledge_dirs_list.append(Path(effective_knowledge_dir))
+    resolved = resolve_local_knowledge_dir(str(effective_knowledge_dir), user_config_dir) if effective_knowledge_dir else None
+    if resolved is not None:
+        knowledge_dirs_list.append(resolved)
 
     # Create HTTP client with auth
     http_client = httpx.AsyncClient(
@@ -1005,11 +1506,7 @@ async def _runner_loop(
         notification_center=notification_center,
     )
 
-    # Create appropriate participant type
-    if is_assistant:
-        participant = Assistant(id=agent_id, model_ctx=model_ctx)
-    else:
-        participant = Agent(id=agent_id, model_ctx=model_ctx)
+    participant = Agent(id=agent_id, model_ctx=model_ctx)
 
     # Build reactive control loop
     loop_obj = ReactiveControlLoop(
@@ -1018,6 +1515,8 @@ async def _runner_loop(
         model_ctx=model_ctx,
         extra_subscribers=[],
         skill_manager=skill_manager,
+        mcp_manager=mcp_manager,
+        user_config_dir=user_config_dir,
     )
 
     # Start the loop
@@ -1031,6 +1530,7 @@ async def _runner_loop(
     reconnect_delay = 2.0
 
     while True:
+        close_code: Optional[int] = None
         try:
             async with websockets.connect(ws_connect_url) as ws:
                 logging.getLogger("clawmeets").info(f"WebSocket connected to {ws_url}")
@@ -1042,6 +1542,14 @@ async def _runner_loop(
 
                 # Sync installed skills from server (catch-up on connect/reconnect)
                 await skill_manager.sync_from_server(client, agent_id)
+
+                # Sync installed MCP servers from server (catch-up on connect/reconnect)
+                await mcp_manager.sync_from_server(client, agent_id)
+
+                # Kick off auto-OAuth for any MCP server that landed via
+                # sync_from_server above but doesn't yet have a token (e.g.
+                # user clicked Install while this runner was offline).
+                loop_obj.auto_auth_pending_mcps()
 
                 # HTTP-based catch-up on connect
                 await loop_obj.catch_up()
@@ -1063,15 +1571,40 @@ async def _runner_loop(
                             logging.warning(f"Bad envelope: {e}")
                 finally:
                     hb_task.cancel()
+                close_code = ws.close_code
 
-        except (websockets.ConnectionClosed, OSError) as e:
-            logging.warning(f"WebSocket disconnected: {e}. Reconnecting in {reconnect_delay}s…")
+        except websockets.ConnectionClosed as e:
+            close_code = e.code
+            logging.warning(f"WebSocket disconnected (code={e.code}, reason={e.reason!r})")
+        except (websockets.WebSocketException, OSError) as e:
+            # Covers InvalidStatus (HTTP 4xx/5xx on WS upgrade — happens when
+            # the server is down and ngrok/proxy returns an error),
+            # InvalidHandshake, and transport/DNS errors. All transient —
+            # reconnect rather than crash the runner.
+            logging.warning(f"WebSocket connect/transport error: {e}. Reconnecting in {reconnect_delay}s…")
             await asyncio.sleep(reconnect_delay)
             reconnect_delay = min(reconnect_delay * 2, 60)
+            continue
         except asyncio.CancelledError:
             await loop_obj.stop()
             await http_client.aclose()
             break
+
+        # 4004 = server told us this participant no longer exists. Self-
+        # destruct rather than reconnect-loop; a fresh registration of the
+        # same name is a different agent with a different id.
+        if close_code == 4004:
+            logging.getLogger("clawmeets").warning(
+                f"Agent '{agent_name}' ({agent_id[:8]}…) was deleted server-side; cleaning up local state and exiting."
+            )
+            _self_destruct(agent_dir, user_config, settings_name)
+            await loop_obj.stop()
+            await http_client.aclose()
+            return
+
+        logging.warning(f"Reconnecting in {reconnect_delay}s…")
+        await asyncio.sleep(reconnect_delay)
+        reconnect_delay = min(reconnect_delay * 2, 60)
 
 
 # ---------------------------------------------------------------------------
@@ -1470,3 +2003,827 @@ def dm_unschedule(
         )
         _ok(resp)
         typer.echo(f"Scheduled message {schedule_id[:8]}... cancelled.")
+
+
+# ---------------------------------------------------------------------------
+# MCP commands (runner-local; operate on agent directories on this machine)
+# ---------------------------------------------------------------------------
+
+def _resolve_agent_dir(data_dir: Path, agent: str) -> Path:
+    """Find an agent's working directory under {data_dir}/agents/ by name or id.
+
+    Matches on either the full directory name ({name}-{id}) or a prefix match
+    where the prefix equals the agent name.
+    """
+    agents_dir = Path(data_dir).expanduser() / "agents"
+    if not agents_dir.exists():
+        typer.echo(f"Error: no agents directory at {agents_dir}", err=True)
+        raise typer.Exit(1)
+    matches = [
+        d for d in agents_dir.iterdir()
+        if d.is_dir() and (d.name == agent or d.name.startswith(f"{agent}-"))
+    ]
+    if not matches:
+        typer.echo(
+            f"Error: no agent matching {agent!r} under {agents_dir}. "
+            f"Available: {[d.name for d in agents_dir.iterdir() if d.is_dir()]}",
+            err=True,
+        )
+        raise typer.Exit(1)
+    if len(matches) > 1:
+        typer.echo(
+            f"Error: multiple agents match {agent!r}: {[d.name for d in matches]}. "
+            f"Pass the full directory name.",
+            err=True,
+        )
+        raise typer.Exit(1)
+    return matches[0]
+
+
+@mcp_app.command("auth")
+def mcp_auth(
+    mcp_name: str = typer.Argument(..., help="MCP server name (e.g. 'gmail', 'google-calendar')"),
+    agent: str = typer.Option(..., "--agent", "-a", help="Agent name (or {name}-{id} dirname)"),
+    data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir"),
+    credentials: Optional[Path] = typer.Option(
+        None, "--credentials",
+        help="Path to the Google OAuth installed-app client secrets JSON. Overrides "
+             "CLAWMEETS_GOOGLE_OAUTH_CREDENTIALS and ~/.clawmeets/google_oauth_client.json.",
+    ),
+):
+    """Authenticate an MCP server for an agent (one-time OAuth setup).
+
+    Opens the default browser, completes the installed-app OAuth flow against the
+    provider (e.g. Google), and writes the resulting token to
+    {agent_dir}/mcp-hub/servers/{mcp_name}/token.json (mode 0600). Tokens never
+    transit the ClawMeets server.
+    """
+    from clawmeets.runner.mcp_manager import McpManager
+
+    agent_dir = _resolve_agent_dir(data_dir, agent)
+    manager = McpManager(agent_dir)
+    manifest = manager.get_manifest(mcp_name)
+    if manifest is None:
+        typer.echo(
+            f"Error: MCP {mcp_name!r} is not installed for agent {agent!r}. "
+            f"Install it via the web UI or the /agents/{{id}}/mcps endpoint first.",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    auth = manifest.get("auth") or {}
+    method = auth.get("method")
+    if not method:
+        typer.echo(f"MCP {mcp_name!r} does not require authentication.")
+        raise typer.Exit(0)
+
+    if method == "google_oauth_installed":
+        from clawmeets.mcp.auth.google_oauth import GoogleOAuthError, run_installed_flow
+        scopes = auth.get("scopes") or []
+        if not scopes:
+            typer.echo(f"Error: no scopes defined in {mcp_name!r} manifest", err=True)
+            raise typer.Exit(1)
+        token_path = manager.token_path(mcp_name)
+        typer.echo(f"Starting Google OAuth for {mcp_name} (agent={agent_dir.name})")
+        typer.echo(f"  scopes: {scopes}")
+        typer.echo(f"  token:  {token_path}")
+        try:
+            run_installed_flow(scopes=scopes, token_path=token_path, client_secrets=credentials)
+        except GoogleOAuthError as e:
+            typer.echo(f"Error: {e}", err=True)
+            raise typer.Exit(1)
+        typer.echo(f"OK. {mcp_name} is now authenticated for {agent_dir.name}.")
+        return
+
+    typer.echo(f"Error: unsupported auth method {method!r} for {mcp_name!r}", err=True)
+    raise typer.Exit(1)
+
+
+@mcp_app.command("list")
+def mcp_list(
+    agent: str = typer.Option(..., "--agent", "-a", help="Agent name"),
+    data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir"),
+):
+    """List installed MCP servers for an agent, showing auth status."""
+    from clawmeets.runner.mcp_manager import McpManager
+
+    agent_dir = _resolve_agent_dir(data_dir, agent)
+    manager = McpManager(agent_dir)
+    installed = manager.installed_mcps()
+    if not installed:
+        typer.echo(f"No MCP servers installed for {agent_dir.name}.")
+        return
+    for name in installed:
+        status = "needs-auth" if manager.needs_auth(name) else "ready"
+        typer.echo(f"  {name:24s}  {status}")
+
+
+@mcp_app.command("status")
+def mcp_status(
+    mcp_name: str = typer.Argument(..., help="MCP server name"),
+    agent: str = typer.Option(..., "--agent", "-a", help="Agent name"),
+    data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir"),
+):
+    """Show the authentication status of one MCP server for an agent."""
+    from clawmeets.runner.mcp_manager import McpManager
+
+    agent_dir = _resolve_agent_dir(data_dir, agent)
+    manager = McpManager(agent_dir)
+    manifest = manager.get_manifest(mcp_name)
+    if manifest is None:
+        typer.echo(f"{mcp_name}: not installed for {agent_dir.name}")
+        raise typer.Exit(1)
+    auth = manifest.get("auth") or {}
+    if not auth.get("method"):
+        typer.echo(f"{mcp_name}: ready (no auth required)")
+        return
+    if manager.needs_auth(mcp_name):
+        typer.echo(
+            f"{mcp_name}: needs-auth — run `clawmeets mcp auth {mcp_name} "
+            f"--agent {agent}`"
+        )
+        raise typer.Exit(2)
+    typer.echo(f"{mcp_name}: ready (token at {manager.token_path(mcp_name)})")
+
+
+
+# ---------------------------------------------------------------------------
+# reflection commands (account-level)
+# ---------------------------------------------------------------------------
+
+@reflection_app.command("set")
+def reflection_set(
+    cron: str = typer.Option(..., "--cron", help="Reflect cron (e.g. '0 9 * * *' for daily 9am)."),
+    lint_cron: Optional[str] = typer.Option(
+        None, "--lint-cron",
+        help="Optional lint cron (e.g. '0 9 * * 1' for weekly Mon 9am). "
+        "Lint mode audits existing memory; reflect mode distills new lessons.",
+    ),
+    no_lint: bool = typer.Option(
+        False, "--no-lint",
+        help="Clear the lint cadence (disables structural lint pass). "
+        "Mutually exclusive with --lint-cron.",
+    ),
+    token: Optional[str] = typer.Option(None, "--token", "-t"),
+    server: Optional[str] = typer.Option(None, "--server", "-s"),
+    data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir"),
+):
+    """Create or update the account-level reflection schedule.
+
+    Reflect cadence (--cron) is required. Lint cadence is optional: pass
+    --lint-cron to enable, --no-lint to clear, or omit both to leave the
+    server-side lint setting unchanged.
+    """
+    if lint_cron and no_lint:
+        typer.echo("Error: --lint-cron and --no-lint are mutually exclusive.", err=True)
+        raise typer.Exit(1)
+
+    server_url, token = _resolve_user_session(data_dir, token, server)
+    with _http(server_url) as client:
+        # Look up the current lint cron so an unspecified --lint-cron preserves
+        # whatever the user already had.
+        existing_lint: Optional[str] = None
+        try:
+            current = client.get(
+                "/account/reflection-schedule",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            if current.status_code == 200 and current.content:
+                payload = current.json()
+                if payload:
+                    existing_lint = payload.get("lint_cron_expression")
+        except Exception:
+            pass
+
+        if no_lint:
+            new_lint = None
+        elif lint_cron:
+            new_lint = lint_cron
+        else:
+            new_lint = existing_lint
+
+        resp = client.put(
+            "/account/reflection-schedule",
+            json={
+                "cron_expression": cron,
+                "is_active": True,
+                "lint_cron_expression": new_lint,
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        result = _ok(resp)
+
+    typer.echo(
+        f"Reflect cron: {result['cron_expression']!r}  next: {result['next_fire_at']}"
+    )
+    if result.get("lint_cron_expression"):
+        typer.echo(
+            f"Lint cron:    {result['lint_cron_expression']!r}  next: {result.get('next_lint_fire_at')}"
+        )
+    else:
+        typer.echo("Lint cron:    (off)")
+
+
+@reflection_app.command("off")
+def reflection_off(
+    token: Optional[str] = typer.Option(None, "--token", "-t"),
+    server: Optional[str] = typer.Option(None, "--server", "-s"),
+    data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir"),
+):
+    """Deactivate the account-level reflection schedule."""
+    server_url, token = _resolve_user_session(data_dir, token, server)
+    with _http(server_url) as client:
+        resp = client.delete(
+            "/account/reflection-schedule",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        _ok(resp)
+    typer.echo("Reflection schedule deactivated.")
+
+
+@reflection_app.command("show")
+def reflection_show(
+    token: Optional[str] = typer.Option(None, "--token", "-t"),
+    server: Optional[str] = typer.Option(None, "--server", "-s"),
+    data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir"),
+):
+    """Show the current account-level reflection schedule."""
+    server_url, token = _resolve_user_session(data_dir, token, server)
+    with _http(server_url) as client:
+        resp = client.get(
+            "/account/reflection-schedule",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        result = _ok(resp) if resp.status_code != 200 or resp.content else None
+        # _ok() raises on non-2xx; if 200 with null body, result is None.
+        if resp.status_code == 200:
+            try:
+                result = resp.json()
+            except Exception:
+                result = None
+    if result is None:
+        typer.echo("No reflection schedule configured. Run `clawmeets reflection set --cron \"0 9 * * *\"` to enable.")
+        return
+    typer.echo(f"Active:           {result['is_active']}")
+    typer.echo(f"Reflect cron:     {result['cron_expression']}")
+    typer.echo(f"  last fired:     {result.get('last_fired_at') or 'never'}")
+    typer.echo(f"  next fire:      {result['next_fire_at']}")
+    lint_cron = result.get("lint_cron_expression")
+    if lint_cron:
+        typer.echo(f"Lint cron:        {lint_cron}")
+        typer.echo(f"  last fired:     {result.get('last_lint_fired_at') or 'never'}")
+        typer.echo(f"  next fire:      {result.get('next_lint_fire_at') or '—'}")
+    else:
+        typer.echo("Lint cron:        (off — pass --lint-cron to enable)")
+
+
+# ---------------------------------------------------------------------------
+# bootstrap (two-phase personalized first-fill)
+# ---------------------------------------------------------------------------
+#
+# `clawmeets bootstrap` is a one-shot orchestrator that personalizes a freshly
+# installed team from the user's own data:
+#
+#   Phase 1 — gather a profile dump from the user's Gmail + Calendar (or fall
+#             back to a 3-question prompt), DM it to the assistant; the
+#             assistant's reflect skill writes USER.md.
+#   Phase 2 — for each worker agent, do a deep-research pass on the agent's
+#             domain decorated by USER.md, DM it to the agent; the agent's
+#             reflect skill writes learnings/.
+#
+# All transport rides existing rails (DM POST + reflect-trigger marker). The
+# only new piece on the agent side is the Bootstrap mode added to reflect's
+# SKILL.md.
+
+_BOOTSTRAP_MARKER = "<!-- clawmeets:bootstrap-trigger -->"
+_PHASE1_TIMEOUT_DEFAULT = 300   # 5 min for assistant to write USER.md
+_PHASE2_TIMEOUT_DEFAULT = 600   # 10 min per worker (web research is slow)
+_GATHER_TIMEOUT = 600           # 10 min cap on a single `claude` gather call
+
+
+def _ensure_fresh_user_token(server_url: str, data_dir: Path, username: str, current_token: str) -> str:
+    """Verify the saved JWT still works; auto-refresh from saved password if expired.
+
+    `clawmeets init` saves both the JWT and the password into settings.json.
+    JWTs eventually expire; rather than telling users to manually re-login, we
+    silently re-issue using the saved password and persist the new token.
+    """
+    from clawmeets.cli_lifecycle import get_user_config_path
+
+    with httpx.Client(base_url=server_url, timeout=30) as c:
+        ping = c.get("/auth/user/me", headers={"Authorization": f"Bearer {current_token}"})
+        if ping.status_code == 200:
+            return current_token
+
+    cfg_path = get_user_config_path(Path(data_dir).expanduser(), username)
+    if not cfg_path.exists():
+        typer.echo(
+            f"Error: session expired and no saved config at {cfg_path}.\n"
+            f"Run `clawmeets user login {username} <password> --save` and retry.",
+            err=True,
+        )
+        raise typer.Exit(1)
+    try:
+        cfg = json.loads(cfg_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        typer.echo(f"Error: settings.json at {cfg_path} is corrupt; can't refresh.", err=True)
+        raise typer.Exit(1)
+    password = (cfg.get("user") or {}).get("password")
+    if not password:
+        typer.echo(
+            f"Error: session expired and no saved password to refresh with.\n"
+            f"Run `clawmeets user login {username} <password> --save` and retry.",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    with httpx.Client(base_url=server_url, timeout=30) as c:
+        resp = c.post("/auth/login", json={"username": username, "password": password})
+    if resp.status_code != 200:
+        typer.echo(f"Error: token refresh failed ({resp.text}).", err=True)
+        raise typer.Exit(1)
+    new_token = resp.json().get("token")
+    if not new_token:
+        typer.echo("Error: refresh succeeded but server returned no token.", err=True)
+        raise typer.Exit(1)
+
+    cfg.setdefault("user", {})["token"] = new_token
+    cfg_path.write_text(json.dumps(cfg, indent=2))
+    typer.echo("  (refreshed expired session)")
+    return new_token
+
+
+def _find_agent_dir_by_id(agents_dir: Path, agent_id: str) -> Optional[Path]:
+    """Locate `{agents_dir}/{name}-{agent_id}/`. Skips DELETED-* archives."""
+    if not agents_dir.is_dir():
+        return None
+    for entry in agents_dir.iterdir():
+        if not entry.is_dir() or entry.name.startswith("DELETED-"):
+            continue
+        if entry.name.endswith(f"-{agent_id}"):
+            return entry
+    return None
+
+
+def _resolve_agent_knowledge_dir(
+    server_card: Optional[dict],
+    agent_dir: Optional[Path],
+    user_config_dir: Path,
+) -> Optional[Path]:
+    """Read `local_settings.knowledge_dir`, preferring the server's card
+    (just-saved value) and falling back to the local card.json on disk
+    if the server doesn't expose it.
+
+    The runner mirrors AGENT_SETTINGS_CHANGE into local card.json, but the
+    web-UI save → broadcast → write cycle has a delay window. Reading the
+    server first means we pick up changes the user just made even when the
+    local card hasn't caught up yet.
+    """
+    raw = ""
+    if server_card:
+        raw = (server_card.get("local_settings") or {}).get("knowledge_dir") or ""
+    if not raw and agent_dir is not None:
+        card_path = agent_dir / "card.json"
+        if card_path.exists():
+            try:
+                card = json.loads(card_path.read_text())
+                raw = (card.get("local_settings") or {}).get("knowledge_dir") or ""
+            except (json.JSONDecodeError, OSError):
+                pass
+    if not raw:
+        return None
+    return resolve_local_knowledge_dir(str(raw), user_config_dir)
+
+
+def _check_gmail_calendar_ready(assistant_dir: Path) -> tuple[bool, list[str]]:
+    """Both Gmail + Calendar MCPs must be installed AND OAuthed. Returns
+    (ready, missing_reasons) so the caller can print actionable guidance."""
+    mcp_mgr = McpManager(assistant_dir)
+    installed = set(mcp_mgr.installed_mcps())
+    reasons: list[str] = []
+    for name in ("gmail", "google-calendar"):
+        if name not in installed:
+            reasons.append(f"{name} not installed (run `clawmeets mcp install {name}`)")
+        elif not mcp_mgr.has_token(name):
+            reasons.append(f"{name} not authed (run `clawmeets mcp auth {name}`)")
+    return (not reasons), reasons
+
+
+def _gather_user_profile_rich(assistant_dir: Path) -> str:
+    """Spawn a one-shot `claude` with the assistant's MCP stack and capture a
+    profile dump distilled from Gmail + Calendar.
+
+    Renders `.mcp.json` into a fresh tmp working dir (so we don't trample the
+    agent's running sandbox), seeds it with the assistant's MCP manifests +
+    tokens, and runs `claude --print` non-interactively.
+    """
+    import shutil as _shutil
+    import subprocess
+    import tempfile
+
+    if _shutil.which("claude") is None:
+        typer.echo("Error: `claude` CLI not on PATH. Bootstrap requires Claude Code installed on the runner.", err=True)
+        raise typer.Exit(1)
+
+    mcp_mgr = McpManager(assistant_dir)
+    with tempfile.TemporaryDirectory(prefix="clawmeets-bootstrap-") as td:
+        cwd = Path(td)
+        mcp_mgr.render_mcp_json(cwd)  # writes cwd/.mcp.json with gmail + gcal
+
+        prompt = (
+            "Use your Gmail and Calendar tools to gather signal on the user "
+            "(last ~90 days of sent mail, calendar events, recurring meetings, "
+            "frequent contacts). Output a single Markdown profile dump covering: "
+            "role + industry, geography, recurring contacts (who they are, what "
+            "they do), current priorities, voice/tone, any 'do not' preferences. "
+            "Do not include raw email bodies or PII beyond names — distill into "
+            "prose. 1500–3000 words. Output the dump only, no preamble."
+        )
+        cmd = [
+            "claude",
+            "--print",
+            "--permission-mode", "bypassPermissions",
+            prompt,
+        ]
+        typer.echo("  [phase 1] gathering Gmail + Calendar signal via claude (this can take a few minutes)…")
+        try:
+            proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=_GATHER_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            typer.echo(f"Error: gather call timed out after {_GATHER_TIMEOUT}s.", err=True)
+            raise typer.Exit(1)
+        if proc.returncode != 0:
+            typer.echo(f"Error: gather call failed (exit {proc.returncode}).", err=True)
+            if proc.stderr.strip():
+                typer.echo(proc.stderr.rstrip(), err=True)
+            raise typer.Exit(1)
+        return proc.stdout.strip() + "\n"
+
+
+def _gather_user_profile_degraded(non_interactive: bool, missing_reasons: list[str]) -> str:
+    """Interactive 3-question fallback when Gmail/Calendar aren't ready."""
+    if non_interactive:
+        typer.echo(
+            "Error: cannot run bootstrap without Gmail/Calendar in non-interactive mode.",
+            err=True,
+        )
+        for r in missing_reasons:
+            typer.echo(f"  - {r}", err=True)
+        typer.echo("Either install/auth those MCPs or drop --non-interactive.", err=True)
+        raise typer.Exit(1)
+
+    typer.echo(
+        "Gmail/Calendar isn't fully set up for your assistant, so I can't "
+        "auto-derive your profile. Three quick questions to bootstrap with —"
+    )
+    for r in missing_reasons:
+        typer.echo(f"  · {r}")
+    typer.echo("(answers stay local in USER.md)\n")
+    role = _prompt_required("  1. Role + industry (e.g. 'Senior PM at an AI infra startup')")
+    location = _prompt_required("  2. Where you're based (city / region / country)")
+    priority = _prompt_required("  3. Single biggest priority for the next 1–3 months")
+    return (
+        "# User profile (degraded bootstrap — user-provided)\n"
+        "\n"
+        f"- Role + industry: {role}\n"
+        f"- Location: {location}\n"
+        f"- Current priority: {priority}\n"
+    )
+
+
+def _prompt_required(text: str) -> str:
+    while True:
+        val = input(f"{text}: ").strip()
+        if val:
+            return val
+        typer.echo("    (required)")
+
+
+def _gather_agent_research(agent_name: str, description: str, capabilities: list[str], user_profile: str) -> str:
+    """Spawn a one-shot `claude` with web tools enabled, capture a deep-research
+    dump for one worker agent decorated by the user profile."""
+    import shutil as _shutil
+    import subprocess
+    import tempfile
+
+    if _shutil.which("claude") is None:
+        typer.echo("Error: `claude` CLI not on PATH.", err=True)
+        raise typer.Exit(1)
+
+    cap_line = ", ".join(capabilities) if capabilities else "(none listed)"
+    prompt = (
+        f"You are doing a deep-research dump for the `{agent_name}` agent.\n"
+        f"Agent description: {description}\n"
+        f"Capabilities: {cap_line}\n"
+        f"\n"
+        f"Decorate your research with this user profile — weight resources, "
+        f"comp data, regulations, and examples toward the user's segment:\n"
+        f"\n"
+        f"----- USER PROFILE -----\n"
+        f"{user_profile}\n"
+        f"----- END USER PROFILE -----\n"
+        f"\n"
+        f"Cover the 4–8 things the agent will actually be asked to do, "
+        f"frameworks/rules of thumb/tactics for each, common failure modes, "
+        f"and current public sources (cite URLs inline as [source: <url>]). "
+        f"Use web search aggressively for current data. 2000–4000 words. "
+        f"Output the dump only, no preamble."
+    )
+    with tempfile.TemporaryDirectory(prefix=f"clawmeets-bootstrap-{agent_name}-") as td:
+        cwd = Path(td)
+        cmd = [
+            "claude",
+            "--print",
+            "--permission-mode", "bypassPermissions",
+            prompt,
+        ]
+        try:
+            proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=_GATHER_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            typer.echo(f"  [{agent_name}] gather timed out after {_GATHER_TIMEOUT}s — skipping.", err=True)
+            return ""
+        if proc.returncode != 0:
+            typer.echo(f"  [{agent_name}] gather failed (exit {proc.returncode}) — skipping.", err=True)
+            if proc.stderr.strip():
+                typer.echo(proc.stderr.rstrip(), err=True)
+            return ""
+        return proc.stdout.strip() + "\n"
+
+
+def _post_bootstrap_dm(
+    client: httpx.Client,
+    user_jwt: str,
+    assistant_token: Optional[str],
+    dm_project_id: str,
+    target_agent_name: str,
+    body: str,
+) -> bool:
+    """Find or create dm-{name} chatroom, post a user message with the
+    bootstrap-trigger marker. Returns True on 2xx."""
+    chatroom = _find_or_create_dm_chatroom(client, dm_project_id, target_agent_name, assistant_token or user_jwt)
+    if not chatroom:
+        typer.echo(f"Error: could not find or create dm-{target_agent_name}", err=True)
+        return False
+    resp = client.post(
+        f"/projects/{dm_project_id}/chatrooms/{chatroom['name']}/user-message",
+        json={"content": body},
+        headers={"Authorization": f"Bearer {user_jwt}"},
+    )
+    if resp.status_code >= 400:
+        typer.echo(f"Error posting to dm-{target_agent_name}: {resp.text}", err=True)
+        return False
+    return True
+
+
+def _poll_for_file(path: Path, timeout_sec: int, label: str) -> bool:
+    """Poll until `path` exists with size > 0, or timeout. Prints a tasteful
+    one-line progress that updates every 10s."""
+    import time
+    start = time.time()
+    while True:
+        if path.exists() and path.stat().st_size > 0:
+            elapsed = int(time.time() - start)
+            typer.echo(f"  [{label}] done in {elapsed}s — {path}")
+            return True
+        elapsed = time.time() - start
+        if elapsed > timeout_sec:
+            typer.echo(f"  [{label}] TIMED OUT after {int(elapsed)}s waiting for {path}", err=True)
+            return False
+        # Sleep but show heartbeat every 10s
+        sleep_chunk = min(10.0, timeout_sec - elapsed)
+        if sleep_chunk <= 0:
+            continue
+        time.sleep(sleep_chunk)
+        if int(elapsed) % 30 < 10:  # ~every 30s
+            typer.echo(f"  [{label}] still waiting… ({int(elapsed)}s/{timeout_sec}s)")
+
+
+@bootstrap_app.callback()
+def bootstrap_command(
+    phase: str = typer.Option("all", "--phase", help="1, 2, or all (default)"),
+    agent: Optional[str] = typer.Option(None, "--agent", help="Limit Phase 2 to a single worker agent name"),
+    force: bool = typer.Option(False, "--force", help="Re-trigger even if files already exist (skill still gates the actual overwrite)"),
+    non_interactive: bool = typer.Option(False, "--non-interactive", help="Fail in degraded path instead of prompting"),
+    allow_missing_user_profile: bool = typer.Option(
+        False, "--allow-missing-user-profile",
+        help="Run Phase 2 even when USER.md is missing (research will be generic)",
+    ),
+    timeout: int = typer.Option(_PHASE1_TIMEOUT_DEFAULT, "--timeout", help="Per-agent poll timeout in seconds"),
+    username: Optional[str] = typer.Option(None, "-u", "--username", help="Username (default: current saved session)"),
+    password: Optional[str] = typer.Option(None, "-p", "--password", help="Password (default: from saved session)"),
+    server: Optional[str] = typer.Option(None, "--server", "-s"),
+    data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir"),
+):
+    """Personalize a freshly installed agent team using your own data.
+
+    Phase 1: assistant USER.md from your Gmail + Calendar (or 3-question fallback).
+    Phase 2: each worker agent's learnings/ from a deep-research pass shaped by USER.md.
+
+    Idempotent — re-running skips agents whose files are already populated. Use --force
+    to re-trigger; the reflect skill itself decides whether to overwrite (it doesn't,
+    by default, so delete USER.md or learnings/INDEX.md first if you really want a redo).
+
+    Run after `clawmeets init --from-url` and `clawmeets agent start`.
+    """
+    if phase not in ("1", "2", "all"):
+        typer.echo("Error: --phase must be one of: 1, 2, all", err=True)
+        raise typer.Exit(1)
+
+    # ----- Resolve session -----
+    server_url, user_jwt = _resolve_user_session(data_dir, None, server, as_user=username)
+
+    # We need both username (for DM-{username} project lookup) and the saved
+    # password is NOT required — a JWT is enough for the user-message POST.
+    # But _find_dm_project still needs `username`; pull it from the saved session.
+    if username is None:
+        from clawmeets.cli_lifecycle import get_current_user
+        username = get_current_user(Path(data_dir).expanduser())
+    if not username:
+        typer.echo("Error: no username known. Pass -u or run `clawmeets user login --save` first.", err=True)
+        raise typer.Exit(1)
+
+    data_dir_p = Path(data_dir).expanduser()
+    agents_dir = data_dir_p / "agents"
+    user_config_dir = data_dir_p / "config" / username
+
+    # Refresh the saved JWT if it's expired — `clawmeets init` saved the
+    # password too, so we can re-login transparently.
+    user_jwt = _ensure_fresh_user_token(server_url, data_dir_p, username, user_jwt)
+
+    with _http(server_url) as client:
+        # Inject the user JWT for `_find_dm_project` and friends (they all
+        # call `client.get/post` against `server_url`; we pass the bearer per
+        # call where needed).
+        client.headers.update({"Authorization": f"Bearer {user_jwt}"})
+
+        # ----- Resolve assistant -----
+        me_resp = client.get("/auth/user/me")
+        if me_resp.status_code != 200:
+            typer.echo(f"Error: could not load /auth/user/me ({me_resp.text})", err=True)
+            raise typer.Exit(1)
+        me = me_resp.json()
+        assistant_id = me.get("assistant_agent_id")
+        assistant_name = me.get("assistant_agent_name") or f"{username}-assistant"
+        if not assistant_id:
+            typer.echo("Error: user has no assistant agent on the server.", err=True)
+            raise typer.Exit(1)
+
+        assistant_dir = _find_agent_dir_by_id(agents_dir, assistant_id)
+        if assistant_dir is None:
+            typer.echo(
+                f"Error: no local agent dir for assistant id {assistant_id[:8]}…. "
+                f"Run `clawmeets init --from-url …` first to set up the assistant locally.",
+                err=True,
+            )
+            raise typer.Exit(1)
+
+        # Fetch the assistant's server-side card — that's where the just-saved
+        # web-UI value lives. Local card.json is the fallback.
+        asst_resp = client.get(f"/agents/{assistant_id}")
+        assistant_server_card = asst_resp.json() if asst_resp.status_code == 200 else None
+
+        assistant_kdir = _resolve_agent_knowledge_dir(assistant_server_card, assistant_dir, user_config_dir)
+        if assistant_kdir is None:
+            typer.echo(
+                f"Error: assistant has no knowledge_dir configured. "
+                f"Open the web UI agent settings page for '{assistant_name}', "
+                f"set the Knowledge Directory field (e.g. ./knowledge), click "
+                f"Save Changes, then re-run `clawmeets bootstrap`.",
+                err=True,
+            )
+            raise typer.Exit(1)
+
+        # ----- DM project -----
+        dm_project = _find_dm_project(client, username)
+        if not dm_project:
+            typer.echo(f"Error: DM project DM-{username} not found on server.", err=True)
+            raise typer.Exit(1)
+
+        # Assistant's own token (for chatroom creation only)
+        assistant_token: Optional[str] = None
+        cred_path = assistant_dir / "credential.json"
+        if cred_path.exists():
+            try:
+                assistant_token = json.loads(cred_path.read_text()).get("token")
+            except (json.JSONDecodeError, OSError):
+                pass
+
+        # ============================================================
+        # Phase 1
+        # ============================================================
+        if phase in ("1", "all"):
+            user_md_path = assistant_kdir / "USER.md"
+            if user_md_path.exists() and not force:
+                typer.echo(f"[phase 1] skipped — USER.md already exists at {user_md_path}")
+                typer.echo("           pass --force to re-trigger (skill still won't overwrite without `rm USER.md`)")
+            else:
+                typer.echo(f"[phase 1] personalizing assistant '{assistant_name}'")
+                ready, reasons = _check_gmail_calendar_ready(assistant_dir)
+                if ready:
+                    dump = _gather_user_profile_rich(assistant_dir)
+                else:
+                    dump = _gather_user_profile_degraded(non_interactive, reasons)
+
+                body = (
+                    f"{_BOOTSTRAP_MARKER}\n\n"
+                    "You're being bootstrapped. Treat the dump below as authoritative — "
+                    "distill into USER.md per the reflect skill's Bootstrap mode.\n\n"
+                    "== USER PROFILE DUMP ==\n"
+                    f"{dump}"
+                )
+                if not _post_bootstrap_dm(client, user_jwt, assistant_token, dm_project["id"], assistant_name, body):
+                    raise typer.Exit(1)
+                typer.echo(f"  [phase 1] dispatched to dm-{assistant_name}; waiting for USER.md…")
+                if not _poll_for_file(user_md_path, timeout, "phase 1"):
+                    typer.echo(
+                        "[phase 1] FAILED — USER.md was not produced. Make sure "
+                        "`clawmeets agent start` is running and the assistant is online.",
+                        err=True,
+                    )
+                    raise typer.Exit(1)
+
+        # ============================================================
+        # Phase 2
+        # ============================================================
+        if phase in ("2", "all"):
+            user_md_path = assistant_kdir / "USER.md"
+            if user_md_path.exists():
+                user_profile = user_md_path.read_text()
+            elif allow_missing_user_profile:
+                typer.echo("[phase 2] WARNING: USER.md missing, proceeding without personalization (--allow-missing-user-profile)")
+                user_profile = "(no user profile available; do generic research)"
+            else:
+                typer.echo(
+                    "Error: USER.md missing — run `clawmeets bootstrap --phase 1` first, "
+                    "or pass --allow-missing-user-profile to run unpersonalized.",
+                    err=True,
+                )
+                raise typer.Exit(1)
+
+            workers = _fetch_owned_agents(client, user_jwt)
+            workers = [a for a in workers if a.get("id") != assistant_id]
+            if agent:
+                workers = [a for a in workers if a.get("name") == agent]
+                if not workers:
+                    typer.echo(f"Error: no owned worker agent named {agent!r}.", err=True)
+                    raise typer.Exit(1)
+
+            if not workers:
+                typer.echo("[phase 2] no worker agents to bootstrap. Done.")
+                return
+
+            seeded = 0
+            skipped = 0
+            failed = 0
+            for w in workers:
+                w_id = w["id"]
+                w_name = w["name"]
+                w_dir = _find_agent_dir_by_id(agents_dir, w_id)
+                if w_dir is None:
+                    typer.echo(f"  [{w_name}] no local dir — skipping (was this agent registered locally?)")
+                    skipped += 1
+                    continue
+                # `w` came from /agents (server-side), so its local_settings reflects
+                # the latest UI save. Local card.json is the disk fallback.
+                w_kdir = _resolve_agent_knowledge_dir(w, w_dir, user_config_dir)
+                if w_kdir is None:
+                    typer.echo(f"  [{w_name}] no knowledge_dir set (web UI agent settings) — skipping")
+                    skipped += 1
+                    continue
+                index_path = w_kdir / "learnings" / "INDEX.md"
+                if index_path.exists() and not force:
+                    typer.echo(f"  [{w_name}] skipped — learnings/INDEX.md already exists")
+                    skipped += 1
+                    continue
+
+                typer.echo(f"[phase 2] {w_name}: gathering web research…")
+                dump = _gather_agent_research(
+                    w_name,
+                    w.get("description") or "",
+                    w.get("capabilities") or [],
+                    user_profile,
+                )
+                if not dump:
+                    failed += 1
+                    continue
+
+                body = (
+                    f"{_BOOTSTRAP_MARKER}\n\n"
+                    "You're being bootstrapped. Treat the dump below as authoritative — "
+                    "structure into learnings/ per the reflect skill's Bootstrap mode.\n\n"
+                    "== USER PROFILE (read-only context) ==\n"
+                    f"{user_profile}\n"
+                    f"== DEEP-RESEARCH DUMP ({w.get('description') or w_name}) ==\n"
+                    f"{dump}"
+                )
+                if not _post_bootstrap_dm(client, user_jwt, assistant_token, dm_project["id"], w_name, body):
+                    failed += 1
+                    continue
+                typer.echo(f"  [{w_name}] dispatched; waiting for learnings/INDEX.md…")
+                # Phase 2 timeout is longer than Phase 1 by default; respect --timeout for both.
+                phase2_timeout = max(timeout, _PHASE2_TIMEOUT_DEFAULT) if timeout == _PHASE1_TIMEOUT_DEFAULT else timeout
+                if _poll_for_file(index_path, phase2_timeout, w_name):
+                    seeded += 1
+                else:
+                    failed += 1
+
+            typer.echo(f"\n[phase 2] summary: bootstrapped={seeded} skipped={skipped} failed/timed-out={failed}")

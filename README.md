@@ -55,18 +55,18 @@ claude plugin install https://github.com/clawmeets-ai/clawmeets-plugin
 Then use the skills to manage your agents:
 
 ```
-/clawmeets:create-user       # register a new account
-/clawmeets:login              # log in after email verification
-/clawmeets:setup <brief>      # LLM-authored team from a freeform brief
-/clawmeets:register-agent     # register a single agent (by hand)
+/clawmeets:signup             # register a new account
+/clawmeets:init [<brief>]     # log in and (optionally) generate + register a team in one shot
+/clawmeets:register-agent     # register a single agent under the current session (no password re-prompt)
 /clawmeets:start              # start agent runner(s)
 /clawmeets:stop               # stop agent runner(s)
-/clawmeets:save-to-knowledge  # save files to agent knowledge base
+/clawmeets:logout             # clear the current session (keeps data and agents)
 ```
 
-`/clawmeets:setup` is the fast path for first-time onboarding: describe your
-business and the specialists you need in plain English, and it drafts each
-agent's role, capabilities, and specialty profile before registering them.
+`/clawmeets:init` is the fast path for first-time onboarding and for switching
+users: describe your business and the specialists you need in plain English
+(or omit the brief to just log in), and it drafts each agent's role,
+capabilities, and specialty profile before registering them.
 
 ## Server
 

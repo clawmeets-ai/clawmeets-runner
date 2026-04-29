@@ -4,7 +4,7 @@ clawmeets/sync/console_subscriber.py
 Console output subscriber for changelog events.
 
 This module provides a subscriber that prints formatted changelog events
-to the console with ANSI colors, matching the output style of project.sh.
+to the console with ANSI colors.
 """
 from __future__ import annotations
 
@@ -25,11 +25,11 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# ANSI Colors (matching project.sh)
+# ANSI Colors
 # ---------------------------------------------------------------------------
 
 class Colors:
-    """ANSI color codes matching project.sh format."""
+    """ANSI color codes for console output."""
     GREEN = '\033[0;32m'
     BLUE = '\033[0;34m'
     YELLOW = '\033[1;33m'
@@ -59,7 +59,7 @@ class ConsoleOutputSubscriber(ChangelogSubscriber):
     """
     Subscriber that prints formatted changelog events to the console.
 
-    Output format matches project.sh:
+    Output format:
     - [HH:MM:SS] #room-name agent-name: message content
     - [Sync] #room-name File synced: filename.md
     - [+] #room-name agent-name joined

@@ -62,6 +62,7 @@ class ActionBlockExecutor:
             Set of chatroom names that received reply actions.
         """
         replied_chatrooms: set[str] = set()
+        source_version = action_block.source_version
 
         for action in action_block.actions:
             action_type = action["type"]
@@ -72,6 +73,7 @@ class ActionBlockExecutor:
                     project_id=project_id,
                     chatroom_name=room_name,
                     content=action["content"],
+                    source_version=source_version,
                 )
                 logger.debug(f"Emitted reply to {room_name}")
                 replied_chatrooms.add(room_name)
@@ -83,6 +85,7 @@ class ActionBlockExecutor:
                     name=name,
                     participant_names=action["invite"],
                     init_message=action["init_message"],
+                    source_version=source_version,
                 )
                 logger.debug(f"Created chatroom {name}")
 
@@ -103,13 +106,17 @@ class ActionBlockExecutor:
                         chatroom_name=room_name,
                         filename=file_path,
                         content=full_path.read_bytes(),
+                        source_version=source_version,
                     )
                     logger.debug(f"Updated file {file_path} in {room_name}")
                 else:
                     logger.warning(f"File not found in sandbox: {sandbox_dir / file_path}")
 
             elif action_type == "project_completed":
-                await self._client.complete_project(project_id=project_id)
+                await self._client.complete_project(
+                    project_id=project_id,
+                    source_version=source_version,
+                )
                 logger.debug(f"Marked project {project_id} as completed")
 
         return replied_chatrooms

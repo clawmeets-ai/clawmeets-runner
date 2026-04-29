@@ -186,6 +186,7 @@ class LLMProvider(ABC):
         log_dir: Path,
         additional_dirs: list[Path],
         notification_center: NotificationCenter,
+        action_schema: dict,
     ) -> tuple[ActionBlock, LLMUsage]:
         """Invoke the LLM CLI with the given prompt.
 
@@ -196,6 +197,9 @@ class LLMProvider(ABC):
             additional_dirs: Extra directories the model should be able to read
                 (project_dir when different from working_dir, knowledge bases)
             notification_center: Dispatcher for LLM_COMPLETE / LLM_ERROR events
+            action_schema: JSON schema for structured output. Selected per
+                invocation by the caller based on operational mode
+                (WORKER_ACTION_SCHEMA vs COORDINATOR_ACTION_SCHEMA).
 
         Returns:
             Tuple of (action_block, usage_stats). action_block.actions may be

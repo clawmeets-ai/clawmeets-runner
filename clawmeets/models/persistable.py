@@ -26,6 +26,7 @@ All state is read from filesystem (card.json) on each property access.
 from __future__ import annotations
 
 import hashlib
+import logging
 import secrets
 from abc import ABC, abstractmethod
 from datetime import UTC, datetime
@@ -41,6 +42,11 @@ if TYPE_CHECKING:
     from typing_extensions import Self
 
     from .context import ModelContext
+
+
+logger = logging.getLogger("clawmeets.models.persistable")
+
+DELETED_DIR_PREFIX = "DELETED-"
 
 
 class PersistableParticipant(Participant, ABC):
@@ -112,9 +118,12 @@ class PersistableParticipant(Participant, ABC):
         role_dir = ctx.participants_dir / cls._role_subdir
         if not role_dir.exists():
             return []
+        # Skip soft-deleted directories (renamed to DELETED-* on hard delete)
         return sorted(
             d for d in role_dir.iterdir()
-            if d.is_dir() and (d / "card.json").exists()
+            if d.is_dir()
+            and not d.name.startswith(DELETED_DIR_PREFIX)
+            and (d / "card.json").exists()
         )
 
     @property
@@ -126,7 +135,10 @@ class PersistableParticipant(Participant, ABC):
         search_dir = self._model_ctx.participants_dir / self._role_subdir
         if not search_dir.exists():
             return None
-        matches = list(search_dir.glob(f"*-{self._id}"))
+        matches = [
+            m for m in search_dir.glob(f"*-{self._id}")
+            if not m.name.startswith(DELETED_DIR_PREFIX)
+        ]
         return matches[0] / "card.json" if matches else None
 
     def _load_card(self) -> dict:
@@ -223,9 +235,65 @@ class PersistableParticipant(Participant, ABC):
         return datetime(1970, 1, 1, tzinfo=UTC)
 
     @property
+    def last_reflected_at(self) -> Optional[datetime]:
+        """Timestamp of the last completed reflection cycle (None if never)."""
+        ts = self._load_card().get("last_reflected_at")
+        if ts:
+            try:
+                return datetime.fromisoformat(ts)
+            except ValueError:
+                pass
+        return None
+
+    def update_last_reflected_at(self, when: datetime) -> None:
+        """Persist a new last-reflection timestamp."""
+        card = self._load_card()
+        card["last_reflected_at"] = when.isoformat()
+        self._save_card(card)
+
+    @property
+    def last_linted_at(self) -> Optional[datetime]:
+        """Timestamp of the last completed lint pass (None if never)."""
+        ts = self._load_card().get("last_linted_at")
+        if ts:
+            try:
+                return datetime.fromisoformat(ts)
+            except ValueError:
+                pass
+        return None
+
+    def update_last_linted_at(self, when: datetime) -> None:
+        """Persist a new last-lint timestamp."""
+        card = self._load_card()
+        card["last_linted_at"] = when.isoformat()
+        self._save_card(card)
+
+    @property
     def is_discoverable(self) -> bool:
         """Whether this participant appears in the public registry."""
         return self._load_card().get("discoverable_through_registry", True)
+
+    @property
+    def user_teams(self) -> list[str]:
+        """Owner-defined teams used to group agents in the UI sidebar.
+
+        Team names are free-form strings — there is no per-user allowlist.
+        Empty list means the agent only appears in MY AGENTS, not under
+        any TEAMS sub-section.
+        """
+        raw = self._load_card().get("user_teams", []) or []
+        # Defensive cleanup: drop empties, dedupe (preserve order).
+        seen: set[str] = set()
+        out: list[str] = []
+        for value in raw:
+            if not isinstance(value, str):
+                continue
+            stripped = value.strip()
+            if not stripped or stripped in seen:
+                continue
+            seen.add(stripped)
+            out.append(stripped)
+        return out
 
     def get_project(self, project_id: str):
         """Load a project by ID.
@@ -297,12 +365,13 @@ class PersistableParticipant(Participant, ABC):
             return None
         name_lower = name.lower()
         for entry in search_dir.iterdir():
-            if entry.is_dir():
-                entry_name = entry.name.rsplit("-", 1)[0]
-                if entry_name.lower() == name_lower:
-                    data = FileUtil.read(entry / "card.json", "json")
-                    if data:
-                        return cls(data.get("id", ""), ctx)
+            if not entry.is_dir() or entry.name.startswith(DELETED_DIR_PREFIX):
+                continue
+            entry_name = entry.name.rsplit("-", 1)[0]
+            if entry_name.lower() == name_lower:
+                data = FileUtil.read(entry / "card.json", "json")
+                if data:
+                    return cls(data.get("id", ""), ctx)
         return None
 
     @classmethod
@@ -328,18 +397,27 @@ class PersistableParticipant(Participant, ABC):
         result = []
         for entry in cls._list_dirs(ctx):
             data = FileUtil.read(entry / "card.json", "json")
-            if data:
-                is_discoverable = data.get("discoverable_through_registry", True)
-                if viewer_is_admin:
-                    # Admin sees all agents
-                    result.append(cls(data["id"], ctx))
-                elif viewer_user_id:
-                    # Authenticated non-admin: own agents + discoverable agents
-                    if data.get("registered_by") == viewer_user_id or is_discoverable:
-                        result.append(cls(data["id"], ctx))
-                elif not discoverable_only or is_discoverable:
-                    # Unauthenticated: only discoverable agents
-                    result.append(cls(data["id"], ctx))
+            if not data:
+                continue
+            participant_id = data.get("id")
+            if not participant_id:
+                # Malformed card missing id (e.g. orphan from an older
+                # _apply_local_settings bug). Skip rather than crash.
+                logger.warning(
+                    f"Skipping card at {entry / 'card.json'}: missing 'id' field"
+                )
+                continue
+            is_discoverable = data.get("discoverable_through_registry", True)
+            if viewer_is_admin:
+                # Admin sees all agents
+                result.append(cls(participant_id, ctx))
+            elif viewer_user_id:
+                # Authenticated non-admin: own agents + discoverable agents
+                if data.get("registered_by") == viewer_user_id or is_discoverable:
+                    result.append(cls(participant_id, ctx))
+            elif not discoverable_only or is_discoverable:
+                # Unauthenticated: only discoverable agents
+                result.append(cls(participant_id, ctx))
         return result
 
     @classmethod
@@ -477,10 +555,9 @@ class PersistableParticipant(Participant, ABC):
         name: str,
         description: str,
         ctx: "ModelContext",
+        registered_by: str,
         discoverable: bool = True,
         capabilities: Optional[list[str]] = None,
-        linked_user_id: Optional[str] = None,
-        registered_by: Optional[str] = None,
     ) -> tuple["Self", str]:
         """Register a new participant. Returns (instance, token).
 
@@ -488,10 +565,11 @@ class PersistableParticipant(Participant, ABC):
             name: Participant name (no spaces)
             description: Participant description
             ctx: ModelContext for filesystem operations
+            registered_by: User ID of the owning user. Required — every
+                agent must be owned by exactly one user. The same field
+                drives AGENTS.md filtering (public + owner-visible).
             discoverable: Whether participant appears in public registry
             capabilities: List of capabilities
-            linked_user_id: User ID to link (for assistants only)
-            registered_by: User ID of the registrant
 
         Returns:
             Tuple of (participant instance, token)
@@ -526,10 +604,6 @@ class PersistableParticipant(Participant, ABC):
             "registered_by": registered_by,
             "is_verified": False,
         }
-
-        # Add linked_user_id for assistants
-        if linked_user_id is not None:
-            card_data["linked_user_id"] = linked_user_id
 
         # Save to filesystem (directories created by FileUtil.write)
         part_dir = cls._get_dir(ctx, name, participant_id)
@@ -569,7 +643,10 @@ class PersistableParticipant(Participant, ABC):
         search_dir = ctx.participants_dir / cls._role_subdir
         if not search_dir.exists():
             return False
-        matches = list(search_dir.glob(f"*-{participant_id}"))
+        matches = [
+            m for m in search_dir.glob(f"*-{participant_id}")
+            if not m.name.startswith(DELETED_DIR_PREFIX)
+        ]
         if not matches:
             return False
         cred_path = matches[0] / "credential.json"
@@ -666,7 +743,10 @@ class PersistableParticipant(Participant, ABC):
             discoverable_through_registry=self.is_discoverable,
             registered_by=self.registered_by,
             is_verified=self.is_verified,
+            user_teams=self.user_teams,
             local_settings=card.get("local_settings", {}),
+            last_reflected_at=self.last_reflected_at,
+            last_linted_at=self.last_linted_at,
         )
 
     def to_dict(self) -> dict:
@@ -683,6 +763,9 @@ class PersistableParticipant(Participant, ABC):
             "discoverable_through_registry": card.get("discoverable_through_registry", True),
             "registered_by": card.get("registered_by"),
             "is_verified": card.get("is_verified", False),
+            "user_teams": self.user_teams,
+            "last_reflected_at": card.get("last_reflected_at"),
+            "last_linted_at": card.get("last_linted_at"),
             "role": self.role.value,
         }
 

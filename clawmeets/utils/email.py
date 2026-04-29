@@ -5,14 +5,17 @@ Email sending utility with SendGrid support and console fallback.
 """
 import logging
 import os
+from typing import Optional
 
 logger = logging.getLogger("clawmeets.email")
 
 SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY")
 SENDGRID_FROM_EMAIL = os.environ.get("SENDGRID_FROM_EMAIL", "info@clawmeets.ai")
+SENDGRID_FROM_NAME = os.environ.get("SENDGRID_FROM_NAME", "ClawMeets AI")
 VERIFICATION_BASE_URL = os.environ.get(
     "CLAWMEETS_VERIFICATION_URL", "https://clawmeets.ai"
 )
+APP_BASE_URL = os.environ.get("CLAWMEETS_APP_URL", VERIFICATION_BASE_URL)
 
 
 async def send_verification_email(
@@ -50,21 +53,25 @@ async def send_notification_email(
     username: str,
     subject: str,
     body: str,
+    html_body: Optional[str] = None,
 ) -> None:
     """Send a notification email.
 
-    Uses SendGrid if SENDGRID_API_KEY is set, otherwise logs to console.
+    Sends plain text by default; when ``html_body`` is supplied, SendGrid
+    attaches both parts and the receiving client picks the richer one.
+    Falls back to console logging if ``SENDGRID_API_KEY`` is unset.
     """
     if SENDGRID_API_KEY:
-        await _send_notification_via_sendgrid(to_email, subject, body)
+        await _send_notification_via_sendgrid(to_email, subject, body, html_body)
     else:
-        _send_notification_via_console(to_email, username, subject, body)
+        _send_notification_via_console(to_email, username, subject, body, html_body)
 
 
 async def _send_notification_via_sendgrid(
     to_email: str,
     subject: str,
     body: str,
+    html_body: Optional[str] = None,
 ) -> None:
     """Send notification via SendGrid API."""
     try:
@@ -75,16 +82,18 @@ async def _send_notification_via_sendgrid(
             "SendGrid is not installed. Install with: pip install 'clawmeets[email]'\n"
             "Falling back to console output."
         )
-        _send_notification_via_console(to_email, "", subject, body)
+        _send_notification_via_console(to_email, "", subject, body, html_body)
         return
 
     sg = sendgrid.SendGridAPIClient(api_key=SENDGRID_API_KEY)
     message = Mail(
-        from_email=Email(SENDGRID_FROM_EMAIL),
+        from_email=Email(SENDGRID_FROM_EMAIL, SENDGRID_FROM_NAME),
         to_emails=To(to_email),
         subject=subject,
         plain_text_content=Content("text/plain", body),
     )
+    if html_body:
+        message.add_content(Content("text/html", html_body))
     try:
         response = sg.send(message)
         logger.info(
@@ -101,6 +110,7 @@ def _send_notification_via_console(
     username: str,
     subject: str,
     body: str,
+    html_body: Optional[str] = None,
 ) -> None:
     """Fallback: log notification email to console."""
     logger.info(
@@ -110,6 +120,8 @@ def _send_notification_via_console(
     print(f"To: {to_email}")
     print(f"Subject: {subject}")
     print(f"Body: {body}")
+    if html_body:
+        print(f"[HTML body suppressed in console — {len(html_body)} chars]")
     print(f"----------------------------------------------------\n")
 
 
@@ -128,7 +140,7 @@ async def _send_waitlist_via_sendgrid(to_email: str) -> None:
 
     sg = sendgrid.SendGridAPIClient(api_key=SENDGRID_API_KEY)
     message = Mail(
-        from_email=Email(SENDGRID_FROM_EMAIL),
+        from_email=Email(SENDGRID_FROM_EMAIL, SENDGRID_FROM_NAME),
         to_emails=To(to_email),
         subject="You're on the ClawMeets waitlist",
         plain_text_content=Content(
@@ -184,7 +196,7 @@ async def _send_via_sendgrid(
 
     sg = sendgrid.SendGridAPIClient(api_key=SENDGRID_API_KEY)
     message = Mail(
-        from_email=Email(SENDGRID_FROM_EMAIL),
+        from_email=Email(SENDGRID_FROM_EMAIL, SENDGRID_FROM_NAME),
         to_emails=To(to_email),
         subject="Verify your ClawMeets account",
         plain_text_content=Content(

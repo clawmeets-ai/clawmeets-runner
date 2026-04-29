@@ -18,10 +18,12 @@ from typing import TYPE_CHECKING, ClassVar, Optional
 
 from .participant import ParticipantRole, OperationalMode
 from .persistable import PersistableParticipant
-from ..api.actions import ActionBlock
+from ..api.actions import ActionBlock, COORDINATOR_ACTION_SCHEMA, WORKER_ACTION_SCHEMA
 from ..api.responses import AgentStatus
 from ..llm.base import LLMInvocationError, LLMRateLimitError, LLMTimeoutError
 from ..llm.prompt_builder import CoordinatorPromptBuilder, create_prompt_builder
+from ..runner.invocation_registry import invoke_with_registry as _invoke_with_registry
+from ..utils.agent_namespace import short_name
 from ..utils.file_io import FileUtil
 
 if TYPE_CHECKING:
@@ -78,6 +80,7 @@ class Agent(PersistableParticipant):
         cls,
         ctx: "ModelContext",
         exclude_ids: set[str],
+        owner_username: Optional[str] = None,
     ) -> int:
         """Sync all worker agents from server to local filesystem.
 
@@ -91,6 +94,8 @@ class Agent(PersistableParticipant):
         Args:
             ctx: ModelContext for filesystem access (must have client configured)
             exclude_ids: Set of agent IDs to skip (pass empty set if none)
+            owner_username: Username of the runner's owner. When set, agents
+                owned by this user render with short names in AGENTS.md.
 
         Returns:
             Number of agents synced
@@ -102,6 +107,7 @@ class Agent(PersistableParticipant):
             raise ValueError("ModelContext.client must be configured for sync_from_server")
         agents = await ctx.client.list_agents()
         synced_count = 0
+        owner_user_id: Optional[str] = None
         for agent_data in agents:
             agent_id = agent_data["id"]
             if agent_id in exclude_ids:
@@ -112,42 +118,89 @@ class Agent(PersistableParticipant):
             agent.update_card(**agent_data)
             synced_count += 1
 
+            # Locate the owner's user id by matching username against any
+            # agent registered by that user (agent name starts with
+            # ``{owner_username}-``). Avoids an extra server round-trip.
+            if (
+                owner_user_id is None
+                and owner_username
+                and agent_data.get("registered_by")
+                and agent_data.get("name", "").startswith(f"{owner_username}-")
+            ):
+                owner_user_id = agent_data["registered_by"]
+
         logger.info(f"Synced {synced_count} worker agents from server")
 
         # Generate global AGENTS.md file after syncing all agents
         all_agents = cls.list_all(ctx, discoverable_only=True)
-        cls._generate_agents_md(all_agents, ctx.participants_dir / "AGENTS.md")
+        cls._generate_agents_md(
+            all_agents,
+            ctx.participants_dir / "AGENTS.md",
+            owner_username=owner_username,
+            owner_user_id=owner_user_id,
+        )
 
         return synced_count
 
     @classmethod
-    def _generate_agents_md(cls, agents: list["Agent"], output_path: "Path") -> None:
+    def _generate_agents_md(
+        cls,
+        agents: list["Agent"],
+        output_path: "Path",
+        owner_username: Optional[str] = None,
+        owner_user_id: Optional[str] = None,
+    ) -> None:
         """Generate AGENTS.md file listing all available agents.
 
         This file is referenced by coordinators in their prompts to see
         which agents are available for delegation.
 
+        When ``owner_username``/``owner_user_id`` are provided, agents owned by
+        that user are listed by their short name (without the ``{owner}-``
+        prefix) so the coordinator can address them concisely. Other agents
+        keep their fully-qualified name.
+
         Args:
             agents: List of Agent objects
             output_path: Path to write AGENTS.md
+            owner_username: Runner owner's username (used to strip prefixes)
+            owner_user_id: Runner owner's user id (used to match registered_by)
         """
         if agents:
-            rows = [f"| {a.name} | {a.description} | {a.status.value} |" for a in agents]
+            rows: list[str] = []
+            for a in agents:
+                display = a.name
+                if owner_user_id and a.registered_by == owner_user_id:
+                    display = short_name(a.name, owner_username)
+                if display != a.name:
+                    rows.append(
+                        f"| {display} | {a.description} | {a.status.value} | (full name: `{a.name}`) |"
+                    )
+                else:
+                    rows.append(f"| {display} | {a.description} | {a.status.value} | |")
             table = "\n".join(rows)
         else:
-            table = "| (no agents registered) | - | - |"
+            table = "| (no agents registered) | - | - | |"
+
+        namespace_note = ""
+        if owner_username:
+            namespace_note = (
+                f"- Agents you own render by **short name**; address them with "
+                f"``@short-name`` (e.g. ``@researcher`` instead of "
+                f"``@{owner_username}-researcher``). Fully-qualified names also work.\n"
+            )
 
         content = f"""# Available Agents
 
-| Agent | Role | Status |
-|-------|------|--------|
+| Agent | Role | Status | Notes |
+|-------|------|--------|-------|
 {table}
 
 ## Notes
 - Use @mentions to delegate work: "@agent-name please do X"
 - Check agent status before delegating (online agents respond faster)
 - Agent names (not IDs) should be used in chatroom invites
-"""
+{namespace_note}"""
         FileUtil.write(output_path, content, "text")
         logger.debug(f"Generated AGENTS.md at {output_path}")
 
@@ -182,21 +235,59 @@ class Agent(PersistableParticipant):
         """Return AGENT role."""
         return ParticipantRole.AGENT
 
+    @property
+    def linked_user_id(self) -> Optional[str]:
+        """User this agent is linked to (alias for registered_by).
+
+        Returns the user ID of whoever registered this agent. Every agent is
+        owned by exactly one user; public agents are visible to all, private
+        agents (``discoverable_through_registry=false``) are visible only to
+        their owner's coordinator via AGENTS.md.
+        """
+        return self.registered_by
+
     async def on_message(
         self,
         project_id: str,
         chatroom_name: str,
         message: "ChatMessage",
         addressed_to_me: bool,
+        trigger_version: int,
     ) -> None:
-        """
-        Worker agents only respond when explicitly addressed.
-        Executes actions via the ActionBlockExecutor.
-        """
-        if not addressed_to_me:
-            return  # Skip - informational only
+        """Route a message based on the agent's role in this project.
 
-        await self._execute_task(project_id, chatroom_name, message)
+        If the agent is the project's coordinator, handle as coordinator
+        (user-communication → user-request handler; other rooms → coordinate).
+        Otherwise handle as worker (only when addressed).
+        """
+        from .project import Project
+        from .chatroom import Chatroom
+
+        project = Project.get(project_id, self._model_ctx)
+        if project is None:
+            logger.warning(
+                f"Agent {self.name}: project {project_id[:8]} not found locally; skipping message"
+            )
+            return
+
+        if self.is_coordinator_for(project):
+            chatroom = Chatroom.get(project_id, chatroom_name, self._model_ctx)
+            if chatroom is None:
+                logger.warning(
+                    f"Agent {self.name} (coordinator): chatroom {chatroom_name!r} not found "
+                    f"for project {project_id[:8]}; skipping"
+                )
+                return
+            if chatroom.is_user_communication_room:
+                await self._handle_user_request(project_id, chatroom_name, message, trigger_version)
+            elif addressed_to_me:
+                await self._coordinate(project_id, chatroom_name, message, trigger_version)
+            return
+
+        # Worker mode
+        if not addressed_to_me:
+            return
+        await self._execute_task(project_id, chatroom_name, message, trigger_version)
 
     async def _emit_acknowledgment(
         self,
@@ -219,6 +310,7 @@ class Agent(PersistableParticipant):
         project_id: str,
         chatroom_name: str,
         message: "ChatMessage",
+        trigger_version: int,
     ) -> None:
         """
         Execute the task requested in the message using Claude.
@@ -276,18 +368,22 @@ class Agent(PersistableParticipant):
             data_dir=data_dir,
             project_name=project.name,
             knowledge_dirs=self._model_ctx.knowledge_dirs,
+            is_dm=chatroom_name.startswith("dm-"),
         )
 
         # Execute using ClaudeCLI with retry for transient failures
         retry_delay = _INITIAL_RETRY_DELAY
         for attempt in range(_MAX_RETRIES + 1):
             try:
-                action_block, usage = await self._model_ctx.cli.invoke(
+                action_block, usage = await _invoke_with_registry(
+                    self._model_ctx,
+                    project_id,
+                    chatroom_name,
                     prompt,
-                    working_dir=sandbox_dir,
-                    log_dir=log_dir,
-                    additional_dirs=additional_dirs,
-                    notification_center=self._model_ctx.notification_center,
+                    sandbox_dir,
+                    log_dir,
+                    additional_dirs,
+                    action_schema=WORKER_ACTION_SCHEMA,
                 )
                 break  # Success
             except LLMRateLimitError as e:
@@ -319,12 +415,23 @@ class Agent(PersistableParticipant):
         )
 
         # Process using ActionBlockExecutor - executes actions via HTTP
-        # Workers don't need to track replied chatrooms
-        _ = await action_executor.process(
+        action_block.source_version = trigger_version
+        replied_chatrooms = await action_executor.process(
             action_block=action_block,
             project_id=project_id,
             sandbox_dir=sandbox_dir,
         )
+
+        # If the LLM didn't reply in the triggering chatroom, post a closure
+        # so the server marks this worker as responded and clears PendingWork.
+        # Without this, the typing indicator would persist until batch timeout.
+        if chatroom_name not in replied_chatrooms:
+            await self._model_ctx.client.post_message(
+                project_id=project_id,
+                chatroom_name=chatroom_name,
+                content="Message processed, no further action needed at the moment!",
+                source_version=trigger_version,
+            )
 
     async def _post_error_notification(
         self,
@@ -335,9 +442,10 @@ class Agent(PersistableParticipant):
     ) -> None:
         """Post an error notification to the chatroom when a task fails.
 
-        Posts with is_ack=True so the message appears in chat but does not
-        trigger batch completion (the batch will timeout instead, correctly
-        signaling that the worker didn't complete).
+        Posts with is_ack=False: the error is the worker's terminal report,
+        not a transient ack. Counting it as a batch response frees the
+        typing chip immediately and lets the coordinator pivot in seconds
+        instead of waiting for batch timeout.
         """
         if not self._model_ctx.client:
             return
@@ -354,7 +462,7 @@ class Agent(PersistableParticipant):
                 project_id=project_id,
                 chatroom_name=chatroom_name,
                 content=content,
-                is_ack=True,
+                is_ack=False,
             )
         except Exception:
             logger.error(f"Agent {agent_name}: failed to post error notification", exc_info=True)
@@ -369,6 +477,7 @@ class Agent(PersistableParticipant):
         chatroom_name: str,
         message_id: str,
         responded_participants: list[str],
+        trigger_version: int,
     ) -> None:
         """Handle batch completion when acting as coordinator.
 
@@ -385,7 +494,8 @@ class Agent(PersistableParticipant):
             f"responded: {responded_participants}"
         )
         await self._process_batch_results(
-            project_id, chatroom_name, message_id, responded_participants, timed_out=[]
+            project_id, chatroom_name, message_id, responded_participants, timed_out=[],
+            trigger_version=trigger_version,
         )
 
     async def on_batch_timeout(
@@ -395,6 +505,7 @@ class Agent(PersistableParticipant):
         message_id: str,
         responded_participants: list[str],
         timed_out_participants: list[str],
+        trigger_version: int,
     ) -> None:
         """Handle batch timeout when acting as coordinator.
 
@@ -410,7 +521,9 @@ class Agent(PersistableParticipant):
             f"responded: {responded_participants}, timed out: {timed_out_participants}"
         )
         await self._process_batch_results(
-            project_id, chatroom_name, message_id, responded_participants, timed_out=timed_out_participants
+            project_id, chatroom_name, message_id, responded_participants,
+            timed_out=timed_out_participants,
+            trigger_version=trigger_version,
         )
 
     async def on_first_user_request(
@@ -419,6 +532,7 @@ class Agent(PersistableParticipant):
         chatroom_name: str,
         message: "ChatMessage",
         context_files: list[str],
+        trigger_version: int,
     ) -> None:
         """Handle first user request when acting as coordinator.
 
@@ -437,6 +551,7 @@ class Agent(PersistableParticipant):
                 chatroom_name=chatroom_name,
                 message=message,
                 addressed_to_me=True,
+                trigger_version=trigger_version,
             )
             return
 
@@ -449,6 +564,7 @@ class Agent(PersistableParticipant):
             chatroom_name=chatroom_name,
             message=message,
             context_files=context_files,
+            trigger_version=trigger_version,
         )
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -462,6 +578,7 @@ class Agent(PersistableParticipant):
         message_id: str,
         responded_participants: list[str],
         timed_out: list[str],
+        trigger_version: int,
     ) -> None:
         """Process batch results as coordinator.
 
@@ -543,12 +660,15 @@ class Agent(PersistableParticipant):
         retry_delay = _INITIAL_RETRY_DELAY
         for attempt in range(_MAX_RETRIES + 1):
             try:
-                action_block, usage = await self._model_ctx.cli.invoke(
+                action_block, usage = await _invoke_with_registry(
+                    self._model_ctx,
+                    project_id,
+                    chatroom_name,
                     prompt,
-                    working_dir=sandbox_dir,
-                    log_dir=log_dir,
-                    additional_dirs=additional_dirs,
-                    notification_center=self._model_ctx.notification_center,
+                    sandbox_dir,
+                    log_dir,
+                    additional_dirs,
+                    action_schema=COORDINATOR_ACTION_SCHEMA,
                 )
                 break
             except LLMRateLimitError as e:
@@ -579,11 +699,18 @@ class Agent(PersistableParticipant):
             f"(cost=${usage.cost_usd:.4f})"
         )
 
-        _ = await action_executor.process(
+        action_block.source_version = trigger_version
+        replied_chatrooms = await action_executor.process(
             action_block=action_block,
             project_id=project_id,
             sandbox_dir=sandbox_dir,
         )
+
+        # If the coordinator moved on (created next milestone room, updated
+        # PLAN.md, etc.) without replying in this room, post a closure so
+        # the self-batch pending work clears and the typing chip goes away.
+        if chatroom_name not in replied_chatrooms:
+            await self._emit_no_action_message(project_id, chatroom_name, trigger_version)
 
     async def _invoke_coordinator_setup(
         self,
@@ -591,6 +718,7 @@ class Agent(PersistableParticipant):
         chatroom_name: str,
         message: "ChatMessage",
         context_files: list[str],
+        trigger_version: int,
     ) -> None:
         """Invoke Claude with coordinator setup prompt.
 
@@ -640,12 +768,15 @@ class Agent(PersistableParticipant):
         retry_delay = _INITIAL_RETRY_DELAY
         for attempt in range(_MAX_RETRIES + 1):
             try:
-                action_block, usage = await self._model_ctx.cli.invoke(
+                action_block, usage = await _invoke_with_registry(
+                    self._model_ctx,
+                    project_id,
+                    chatroom_name,
                     prompt,
-                    working_dir=sandbox_dir,
-                    log_dir=log_dir,
-                    additional_dirs=additional_dirs,
-                    notification_center=self._model_ctx.notification_center,
+                    sandbox_dir,
+                    log_dir,
+                    additional_dirs,
+                    action_schema=COORDINATOR_ACTION_SCHEMA,
                 )
                 break
             except LLMRateLimitError as e:
@@ -676,9 +807,162 @@ class Agent(PersistableParticipant):
             f"(cost=${usage.cost_usd:.4f})"
         )
 
-        _ = await action_executor.process(
+        action_block.source_version = trigger_version
+        replied_chatrooms = await action_executor.process(
             action_block=action_block,
             project_id=project_id,
             sandbox_dir=sandbox_dir,
         )
 
+        # Close out the triggering room if the LLM didn't reply there —
+        # keeps the self-batch pending work from getting stuck and the
+        # typing indicator from pinning on the coordinator until timeout.
+        if chatroom_name not in replied_chatrooms:
+            await self._emit_no_action_message(project_id, chatroom_name, trigger_version)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Coordinator Live-Message Methods (when Agent is project coordinator)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def _handle_user_request(
+        self,
+        project_id: str,
+        chatroom_name: str,
+        message: "ChatMessage",
+        trigger_version: int,
+    ) -> None:
+        """Handle a live message in user-communication (non-first-user-request)."""
+        await self._invoke_coordinator_response(project_id, chatroom_name, message, trigger_version)
+
+    async def _coordinate(
+        self,
+        project_id: str,
+        chatroom_name: str,
+        message: "ChatMessage",
+        trigger_version: int,
+    ) -> None:
+        """Handle coordination messages in work chatrooms (addressed to coordinator)."""
+        await self._invoke_coordinator_response(project_id, chatroom_name, message, trigger_version)
+
+    async def _invoke_coordinator_response(
+        self,
+        project_id: str,
+        chatroom_name: str,
+        message: "ChatMessage",
+        trigger_version: int,
+    ) -> None:
+        """Invoke Claude with the coordinator prompt for a live message.
+
+        Used for both user-communication responses and in-room coordination
+        after first-user-request / batch-complete paths have been handled
+        elsewhere.
+        """
+        name = self.name
+
+        if not self._model_ctx.cli:
+            raise RuntimeError(f"Agent {name} (coordinator): CLI not configured")
+
+        action_executor = self._model_ctx.action_executor
+        if not action_executor:
+            raise RuntimeError(f"Agent {name} (coordinator): Action executor not configured")
+
+        await self._emit_acknowledgment(project_id, chatroom_name)
+
+        from .project import Project
+        project = Project.get(project_id, self._model_ctx)
+
+        data_dir = self._model_ctx.project_dir(project_id, project.name)
+        sandbox_dir = self._model_ctx.sandbox_dir(project_id, project.name)
+        log_dir = self._model_ctx.llm_log_dir(project_id, project.name)
+
+        additional_dirs: list[Path] = []
+        if data_dir != sandbox_dir:
+            additional_dirs.append(data_dir)
+        additional_dirs.extend(self._model_ctx.knowledge_dirs)
+
+        prompt_builder = create_prompt_builder(
+            OperationalMode.COORDINATOR,
+            git_ignored_folder=project.git_ignored_folder if project.git_url else None,
+        )
+        assert isinstance(prompt_builder, CoordinatorPromptBuilder)
+
+        prompt = prompt_builder.build_prompt(
+            name=self.name,
+            description=self.description,
+            project_id=project_id,
+            chatroom_name=chatroom_name,
+            from_participant_name=message.from_participant_name or message.from_participant_id,
+            message_content=message.content,
+            data_dir=data_dir,
+            project_name=project.name,
+            knowledge_dirs=self._model_ctx.knowledge_dirs,
+        )
+
+        retry_delay = _INITIAL_RETRY_DELAY
+        for attempt in range(_MAX_RETRIES + 1):
+            try:
+                action_block, usage = await _invoke_with_registry(
+                    self._model_ctx,
+                    project_id,
+                    chatroom_name,
+                    prompt,
+                    sandbox_dir,
+                    log_dir,
+                    additional_dirs,
+                    action_schema=COORDINATOR_ACTION_SCHEMA,
+                )
+                break
+            except LLMRateLimitError as e:
+                logger.warning(
+                    f"Agent {name} (coordinator): rate limited "
+                    f"(type={e.rate_limit_type}, resets={e.resets_at_human})"
+                )
+                await self._post_error_notification(project_id, chatroom_name, name, e)
+                raise
+            except LLMInvocationError as e:
+                if attempt < _MAX_RETRIES and _is_transient_error(e):
+                    logger.warning(
+                        f"Agent {name} (coordinator): transient failure "
+                        f"(attempt {attempt + 1}/{_MAX_RETRIES + 1}), retrying in {retry_delay}s: {e}"
+                    )
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 2
+                else:
+                    await self._post_error_notification(project_id, chatroom_name, name, e)
+                    raise
+
+        logger.info(
+            f"Agent {name} (coordinator): Claude invocation complete "
+            f"(cost=${usage.cost_usd:.4f}, tokens in={usage.input_tokens} out={usage.output_tokens})"
+        )
+
+        action_block.source_version = trigger_version
+        replied_chatrooms = await action_executor.process(
+            action_block=action_block,
+            project_id=project_id,
+            sandbox_dir=sandbox_dir,
+        )
+
+        if chatroom_name not in replied_chatrooms:
+            await self._emit_no_action_message(project_id, chatroom_name, trigger_version)
+
+    async def _emit_no_action_message(
+        self,
+        project_id: str,
+        chatroom_name: str,
+        source_version: int,
+    ) -> None:
+        """Post a closure reply when the LLM produced no reply action for this room.
+
+        Posted non-ack so the server's record_response marks this participant
+        as responded, clears PendingWork, and fires BATCH_COMPLETE.
+        """
+        if not self._model_ctx.client:
+            raise RuntimeError(f"Agent {self.name}: Client not configured, cannot emit no-action message")
+
+        await self._model_ctx.client.post_message(
+            project_id=project_id,
+            chatroom_name=chatroom_name,
+            content="Message processed, no further action needed at the moment!",
+            source_version=source_version,
+        )

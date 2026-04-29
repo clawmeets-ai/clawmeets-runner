@@ -45,7 +45,10 @@ class AgentResponse(BaseModel):
     discoverable_through_registry: bool = True
     registered_by: Optional[str] = None
     is_verified: bool = False
+    user_teams: list[str] = Field(default_factory=list)  # Owner-defined team labels
     local_settings: dict = Field(default_factory=dict)  # knowledge_dir, use_chrome
+    last_reflected_at: Optional[datetime] = None  # Last successful reflection cycle
+    last_linted_at: Optional[datetime] = None  # Last successful lint pass
 
 
 class AgentSearchResponse(BaseModel):

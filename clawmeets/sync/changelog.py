@@ -80,10 +80,18 @@ class MessagePayload(ChatroomPayload):
 
 
 class FilePayload(ChatroomPayload):
-    """Payload for FILE_CREATED and FILE_UPDATED entries in unified changelog."""
+    """Payload for FILE_CREATED and FILE_UPDATED entries in unified changelog.
+
+    from_participant_id / from_participant_name attribute the file touch to
+    its uploader so CHATS.ndjson can log who touched the file (used by the
+    web UI's inline file pills). Older payloads without these fields default
+    to empty strings for backward compat.
+    """
     filename: str
     content_b64: str  # Base64-encoded file content (required)
     sha256: str       # SHA256 hash of the content (required)
+    from_participant_id: str = ""  # Uploader's participant ID (empty = unknown / legacy)
+    from_participant_name: str = ""  # Uploader's display name
 
 
 class RoomCreatedParticipant(BaseModel):
@@ -143,6 +151,7 @@ class ProjectCreatedPayload(BaseModel):
     request: str
     created_by: str  # user_id of creator (required - derived from auth)
     agent_pool: str = "verified"  # "owned", "verified", or "all"
+    agent_teams: list[str] = Field(default_factory=list)  # Only consider agents with any of these user_teams; empty = no team filter
     git_url: str = ""  # Git repo URL (empty = no git)
     git_ignored_folder: str = ".bus-files"  # Folder for non-git deliverables
 
@@ -184,6 +193,7 @@ class ChangelogEntry(BaseModel):
     entry_type: ChangelogEntryType
     timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
     payload: ChangelogPayload
+    source_version: int | None = None  # Version of the entry that triggered this one (reply-to link)
 
     @model_validator(mode="before")
     @classmethod

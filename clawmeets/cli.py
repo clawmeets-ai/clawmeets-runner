@@ -11,7 +11,7 @@ from typing import Optional
 
 import typer
 
-from clawmeets.cli_runner import agent_app, user_app, dm_app
+from clawmeets.cli_runner import agent_app, user_app, dm_app, mcp_app, reflection_app
 from clawmeets.cli_init import init_command
 from clawmeets.cli_lifecycle import start_command, stop_command, status_command
 
@@ -53,6 +53,8 @@ app.command("status")(status_command)
 app.add_typer(agent_app, name="agent")
 app.add_typer(user_app,  name="user")
 app.add_typer(dm_app,    name="dm")
+app.add_typer(mcp_app,   name="mcp")
+app.add_typer(reflection_app, name="reflection")
 
 
 def main():

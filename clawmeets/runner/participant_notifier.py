@@ -124,9 +124,16 @@ class ParticipantNotifier(ChangelogSubscriber):
         # So count == 1 means this is the first message
         project = self._participant.get_project(project_id)
 
-        # Skip assistant callbacks for DM projects - they're handled differently
+        # In DM projects the coordinator (assistant) is a member of every
+        # agent's dm-{name} sub-room, but it should only reply when it's the
+        # actual addressee — i.e. for its own dm-{assistant-name} room. We
+        # key on `expects_response_from` (authoritative) rather than matching
+        # room names against `self.name`, because for the runner's own
+        # participant `self.name` reads from a card path that doesn't apply
+        # to the self-card and returns "".
         if project.is_dm_project and self._participant.is_coordinator_for(project):
-            return
+            if self._participant.id not in payload.expects_response_from:
+                return
 
         is_first_user_message = (
             self._participant.is_coordinator_for(project) and
@@ -149,6 +156,7 @@ class ParticipantNotifier(ChangelogSubscriber):
                 chatroom_name=payload.chatroom_name,
                 message=message,
                 context_files=context_files,
+                trigger_version=entry.version,
             )
         else:
             addressed = self._participant.id in payload.expects_response_from
@@ -158,6 +166,7 @@ class ParticipantNotifier(ChangelogSubscriber):
                 chatroom_name=payload.chatroom_name,
                 message=message,
                 addressed_to_me=addressed,
+                trigger_version=entry.version,
             )
 
     async def _notify_file_created(
@@ -173,6 +182,7 @@ class ParticipantNotifier(ChangelogSubscriber):
             chatroom_name=payload.chatroom_name,
             filename=payload.filename,
             content=base64.b64decode(payload.content_b64),
+            trigger_version=entry.version,
         )
 
     async def _notify_file_updated(
@@ -188,6 +198,7 @@ class ParticipantNotifier(ChangelogSubscriber):
             chatroom_name=payload.chatroom_name,
             filename=payload.filename,
             content=base64.b64decode(payload.content_b64),
+            trigger_version=entry.version,
         )
 
     async def _notify_project_completed(
@@ -217,6 +228,7 @@ class ParticipantNotifier(ChangelogSubscriber):
             chatroom_name=payload.chatroom_name,
             message_id=payload.message_id,
             responded_participants=payload.responded_participants,
+            trigger_version=entry.version,
         )
 
     async def _notify_batch_timeout(
@@ -237,6 +249,7 @@ class ParticipantNotifier(ChangelogSubscriber):
             message_id=payload.message_id,
             responded_participants=payload.responded_participants,
             timed_out_participants=payload.timed_out_participants,
+            trigger_version=entry.version,
         )
 
     def _extract_payload(self, entry: ChangelogEntry, payload_type: type):

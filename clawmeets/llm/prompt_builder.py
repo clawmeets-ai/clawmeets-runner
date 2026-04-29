@@ -75,6 +75,52 @@ class PromptBuilder:
         """Build documentation for available actions. Override in subclasses."""
         raise NotImplementedError("Subclasses must implement build_actions_doc()")
 
+    def _build_memory_section(self, name: str) -> str:
+        """Role-aware MEMORY block describing knowledge_dir's reflection layout.
+
+        The user's personal assistant is the agent named ``{username}-assistant``.
+        That agent maintains both ``USER.md`` and ``learnings/``. Worker agents
+        maintain only ``learnings/``.
+
+        This block is purely declarative — agents read these files at any time,
+        but writes only happen during scheduled reflection (via the
+        ``/clawmeets:reflect`` skill).
+        """
+        is_assistant = name.endswith("-assistant")
+        if is_assistant:
+            return """
+== MEMORY ==
+Your knowledge_dir holds your durable memory:
+- USER.md                what you know about this user (you are their assistant)
+- learnings/INDEX.md     one-line lessons + links to topic pages
+- learnings/log.md       append-only "## [YYYY-MM-DD] event | title" entries
+- learnings/<topic>.md   drill-down pages
+
+You also have a personal skill hub at the agent root:
+- personal-skill-hub/skills/INDEX.md   procedures you've codified during reflection
+
+Each entry in that INDEX is callable as /personal:<name> — check it before
+re-deriving a familiar procedure from scratch. To update memory or codify a
+new procedure, follow the /clawmeets:reflect skill — invoked only on scheduled
+reflection messages, not during normal turns.
+"""
+        return """
+== MEMORY ==
+Your knowledge_dir holds your durable memory:
+- learnings/INDEX.md     one-line lessons in your domain + links to topic pages
+- learnings/log.md       append-only "## [YYYY-MM-DD] event | title" entries
+- learnings/<topic>.md   drill-down pages
+
+You also have a personal skill hub at the agent root:
+- personal-skill-hub/skills/INDEX.md   procedures you've codified during reflection
+
+Each entry in that INDEX is callable as /personal:<name> — check it before
+re-deriving a familiar procedure from scratch. To update memory or codify a
+new procedure, follow the /clawmeets:reflect skill — invoked only on scheduled
+reflection messages, not during normal turns. User-identity facts (general
+preferences, personal info) live with the user's assistant, not here.
+"""
+
     def _build_git_guidance(self) -> str:
         """Build git-specific file guidance when git_ignored_folder is configured."""
         if not self._git_ignored_folder:
@@ -136,6 +182,7 @@ Use update_file for BOTH types - the system handles git vs changelog separation 
         cap_section = f"\nCapabilities: {capabilities_line}" if capabilities_line else ""
 
         knowledge_section = ""
+        memory_section = ""
         if knowledge_dirs:
             paths = "\n".join(f"- {d}" for d in knowledge_dirs)
             knowledge_section = f"""
@@ -146,6 +193,7 @@ Your persistent knowledge base directories:
 You can read AND write files here. Changes persist across projects.
 Use this to store learnings and reference material that improves your work over time.
 """
+            memory_section = self._build_memory_section(name)
 
         return f"""You are {name}, an AI agent.
 Description: {description}{cap_section}
@@ -156,7 +204,7 @@ Chatroom: {chatroom_name}
 == SYNCED PROJECT FILES (read-only) ==
 Files synced from server, available in {data_dir}:
 {file_manifest}
-{knowledge_section}
+{knowledge_section}{memory_section}
 == YOUR WORKING DIRECTORY ==
 Use relative paths to write files. Files you write will be synced to the server and shared with all participants.
 
@@ -263,6 +311,7 @@ You can read them but should not modify them directly - write to your working di
         data_dir: Path,
         project_name: str,
         knowledge_dirs: list[Path] | None = None,
+        is_dm: bool = False,
     ) -> str:
         """
         Build a worker-specific prompt.
@@ -281,11 +330,17 @@ You can read them but should not modify them directly - write to your working di
             data_dir: Data directory (synced, read-only)
             project_name: Human-readable project name
             knowledge_dirs: Optional knowledge base directories (read-write, persistent)
+            is_dm: When True, use the direct-message guidance (no coordinator,
+                no PLAN.md, no milestones, no acceptance-criteria reply format)
 
         Returns:
             Complete worker prompt
         """
-        worker_guidance = self._build_worker_guidance()
+        guidance = (
+            self._build_dm_guidance()
+            if is_dm
+            else self._build_worker_guidance()
+        )
         capabilities_line = ", ".join(self._capabilities) if self._capabilities else "general"
 
         return self._build_base_prompt(
@@ -296,7 +351,7 @@ You can read them but should not modify them directly - write to your working di
             from_participant_name=from_participant_name,
             message_content=message_content,
             data_dir=data_dir,
-            role_guidance=worker_guidance,
+            role_guidance=guidance,
             capabilities_line=capabilities_line,
             project_name=project_name,
             knowledge_dirs=knowledge_dirs,
@@ -361,6 +416,41 @@ The coordinator will either:
 - Accept your assumption (you proceed on next invocation)
 - Redirect with updated instructions
 - Escalate to the user if domain knowledge is needed
+"""
+
+    def _build_dm_guidance(self) -> str:
+        """Build guidance for a direct-message (1:1 with user) conversation.
+
+        DMs have no coordinator, no PLAN.md, no milestones, and no other
+        agents in the room. Drop the coordinator-delegation framing and
+        structured reply template that the worker prompt uses.
+        """
+        return """
+== DIRECT MESSAGE CONVERSATION ==
+You are in a 1:1 direct message with the user. There is no project plan,
+no milestones, and no other agents in this conversation. The user is
+talking to you directly within your area of expertise.
+
+== HOW TO RESPOND ==
+1. Answer or do what the user asks, within your capabilities.
+2. If the request is outside your expertise, say so plainly. Do NOT
+   pretend to delegate to other agents — no one else can see this
+   conversation, and @mentions you write here are ignored by the system.
+3. If you need to produce a file (report, design, document, etc.), write
+   it in your working directory and emit an update_file action. The file
+   will appear in this DM for the user to read and download.
+4. Respond conversationally. Do NOT use a Task / Status / Deliverables /
+   Acceptance Criteria template — that structure is for coordinated
+   project work, not direct messages.
+
+== WHAT NOT TO DO ==
+- Do NOT create or reference PLAN.md — it does not apply here.
+- Do NOT frame your work as "Milestone 1 / Milestone 2 …" unless the
+  user explicitly asked for a plan.
+- Do NOT @mention other agents as if delegating — you cannot delegate
+  from a DM.
+- Do NOT ask the user clarifying questions reflexively. If the request
+  is actionable, act; only ask when truly blocked.
 """
 
 
@@ -562,6 +652,7 @@ chatrooms with the agents you need using the create_room action.
         actions_doc = self.build_actions_doc()
 
         knowledge_section = ""
+        memory_section = ""
         if knowledge_dirs:
             paths = "\n".join(f"- {d}" for d in knowledge_dirs)
             knowledge_section = f"""
@@ -572,6 +663,7 @@ Your persistent knowledge base directories:
 You can read AND write files here. Changes persist across projects.
 Use this to store learnings and reference material that improves your work over time.
 """
+            memory_section = self._build_memory_section(name)
 
         return f"""You are {name}, the COORDINATOR for project "{project_name}".
 
@@ -629,7 +721,7 @@ Read these files to understand project context before planning.
 == SYNCED PROJECT FILES (read-only) ==
 Files synced from server, available in {data_dir}:
 {file_manifest}
-{knowledge_section}
+{knowledge_section}{memory_section}
 == PLAN.md STRUCTURE ==
 Your PLAN.md MUST define milestones with CONCRETE DELIVERABLES, ACCEPTANCE CRITERIA, and WORKROOMS:
 

@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>ClawMeets — Chess</title>
+  <style>
+    :root {
+      --light: #eadbbd;
+      --dark: #8b6b45;
+      --bg: #1a1a1a;
+      --fg: #e8e8e8;
+      --muted: #9a9a9a;
+      --accent: #d4a055;
+      --check: #c84040;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; padding: 24px;
+      font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg); color: var(--fg);
+      display: flex; flex-wrap: wrap; gap: 32px; justify-content: center;
+    }
+    .board-wrap { display: flex; flex-direction: column; gap: 8px; }
+    .meta { max-width: 320px; min-width: 240px; display: flex; flex-direction: column; gap: 12px; }
+    h1 { margin: 0 0 8px; font-size: 18px; font-weight: 600; letter-spacing: 0.5px; }
+    .tag { display: inline-block; padding: 2px 8px; border-radius: 3px; font-size: 12px;
+           background: #333; color: var(--fg); margin-right: 6px; }
+    .tag.active { background: var(--accent); color: #000; }
+    .tag.check { background: var(--check); color: #fff; }
+    .board {
+      display: grid;
+      grid-template-columns: 20px repeat(8, 56px);
+      grid-template-rows: repeat(8, 56px) 20px;
+      font-family: "Segoe UI Symbol", "Apple Color Emoji", sans-serif;
+    }
+    .sq {
+      display: flex; align-items: center; justify-content: center;
+      font-size: 40px; line-height: 1; user-select: none;
+    }
+    .sq.light { background: var(--light); color: #000; }
+    .sq.dark { background: var(--dark); color: #000; }
+    .sq.white-piece { color: #fff; text-shadow: 0 0 2px #000, 0 0 2px #000; }
+    .sq.black-piece { color: #000; text-shadow: 0 0 2px #fff, 0 0 2px #fff; }
+    .coord {
+      display: flex; align-items: center; justify-content: center;
+      color: var(--muted); font-size: 11px;
+    }
+    .fen {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 11px; color: var(--muted);
+      word-break: break-all; padding: 8px; background: #111; border-radius: 4px;
+    }
+    .history {
+      max-height: 420px; overflow-y: auto;
+      padding: 8px; background: #111; border-radius: 4px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+    }
+    .history .row { display: grid; grid-template-columns: 36px 1fr 1fr; gap: 6px; }
+    .history .num { color: var(--muted); }
+    .history .w, .history .b { color: var(--fg); }
+    .history .row:last-child { color: var(--accent); font-weight: 600; }
+    .narration {
+      max-height: 240px; overflow-y: auto;
+      padding: 8px; background: #111; border-radius: 4px;
+      font-size: 12px; line-height: 1.45;
+    }
+    .narration .nrow { display: grid; grid-template-columns: 44px 1fr; gap: 6px; margin-bottom: 6px; }
+    .narration .nrow:last-child { margin-bottom: 0; }
+    .narration .nlbl { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+    .narration .ntxt { color: var(--fg); }
+    .narration .nrow:last-child .ntxt { color: var(--accent); }
+    .result {
+      padding: 10px 12px; background: #2d2416; border: 1px solid var(--accent);
+      border-radius: 4px; font-size: 13px;
+    }
+    .status {
+      color: var(--muted); font-size: 11px; font-style: italic;
+    }
+  </style>
+</head>
+<body>
+  <div class="board-wrap">
+    <h1>ClawMeets — Chess</h1>
+    <div class="board" id="board"></div>
+    <div class="status" id="status">Waiting for state…</div>
+  </div>
+  <div class="meta">
+    <div id="tags"></div>
+    <div id="result" style="display: none"></div>
+    <div><strong>FEN</strong><div class="fen" id="fen">—</div></div>
+    <div><strong>Moves</strong><div class="history" id="history">—</div></div>
+    <div><strong>Commentary</strong><div class="narration" id="narration">—</div></div>
+  </div>
+
+  <script>
+  (function () {
+    const PIECES = {
+      K: "\u2654", Q: "\u2655", R: "\u2656", B: "\u2657", N: "\u2658", P: "\u2659",
+      k: "\u265A", q: "\u265B", r: "\u265C", b: "\u265D", n: "\u265E", p: "\u265F"
+    };
+
+    function parseFen(fen) {
+      const board = [];
+      const placement = (fen || "").split(" ")[0] || "";
+      const ranks = placement.split("/");
+      for (let r = 0; r < 8; r++) {
+        const row = [];
+        const s = ranks[r] || "";
+        for (const ch of s) {
+          if (ch >= "1" && ch <= "8") {
+            for (let i = 0; i < parseInt(ch, 10); i++) row.push(null);
+          } else {
+            row.push(ch);
+          }
+        }
+        while (row.length < 8) row.push(null);
+        board.push(row);
+      }
+      while (board.length < 8) board.push([null, null, null, null, null, null, null, null]);
+      return board;
+    }
+
+    function renderBoard(fen) {
+      const grid = parseFen(fen);
+      const el = document.getElementById("board");
+      el.innerHTML = "";
+      const files = ["a", "b", "c", "d", "e", "f", "g", "h"];
+      // 8 rows, each prefixed by rank label
+      for (let r = 0; r < 8; r++) {
+        const rank = 8 - r;
+        const lbl = document.createElement("div");
+        lbl.className = "coord";
+        lbl.textContent = String(rank);
+        el.appendChild(lbl);
+        for (let c = 0; c < 8; c++) {
+          const sq = document.createElement("div");
+          const isLight = (r + c) % 2 === 0;
+          sq.className = "sq " + (isLight ? "light" : "dark");
+          const piece = grid[r][c];
+          if (piece) {
+            sq.textContent = PIECES[piece] || "?";
+            sq.className += (piece === piece.toUpperCase()) ? " white-piece" : " black-piece";
+          }
+          el.appendChild(sq);
+        }
+      }
+      // bottom row: blank + file letters
+      const pad = document.createElement("div");
+      pad.className = "coord";
+      el.appendChild(pad);
+      for (const f of files) {
+        const lbl = document.createElement("div");
+        lbl.className = "coord";
+        lbl.textContent = f;
+        el.appendChild(lbl);
+      }
+    }
+
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+    }
+
+    function renderNarration(state) {
+      const el = document.getElementById("narration");
+      const items = state.narration || [];
+      if (!items.length) {
+        el.textContent = "—";
+        return;
+      }
+      const rows = items.map(n => {
+        const label = n.move_number
+          ? `${n.move_number}${n.color === "white" ? "." : "…"}`
+          : "—";
+        return `<div class="nrow"><span class="nlbl">${escapeHtml(label)}</span><span class="ntxt">${escapeHtml(n.text || "")}</span></div>`;
+      });
+      el.innerHTML = rows.join("");
+      el.scrollTop = el.scrollHeight;
+    }
+
+    function renderMeta(state) {
+      const tags = document.getElementById("tags");
+      const parts = [];
+      parts.push(`<span class="tag">${state.white_name || "white"} vs ${state.black_name || "black"}</span>`);
+      if (!state.is_game_over && state.active_color) {
+        parts.push(`<span class="tag active">${state.active_color} to move</span>`);
+      }
+      if (state.in_check) {
+        parts.push(`<span class="tag check">check</span>`);
+      }
+      if (state.move_number) {
+        parts.push(`<span class="tag">move ${state.move_number}</span>`);
+      }
+      tags.innerHTML = parts.join("");
+
+      const result = document.getElementById("result");
+      if (state.is_game_over) {
+        result.style.display = "block";
+        result.className = "result";
+        const reason = state.result_reason ? ` (${state.result_reason})` : "";
+        result.textContent = `Game over — ${state.result}${reason}`;
+      } else {
+        result.style.display = "none";
+      }
+
+      document.getElementById("fen").textContent = state.fen || "—";
+
+      const hist = document.getElementById("history");
+      const moves = state.move_history || [];
+      if (!moves.length) {
+        hist.textContent = "—";
+      } else {
+        const rows = [];
+        for (let i = 0; i < moves.length; i += 2) {
+          const w = moves[i] ? moves[i].san : "";
+          const b = moves[i + 1] ? moves[i + 1].san : "";
+          const n = Math.floor(i / 2) + 1;
+          rows.push(`<div class="row"><span class="num">${n}.</span><span class="w">${w}</span><span class="b">${b}</span></div>`);
+        }
+        hist.innerHTML = rows.join("");
+        hist.scrollTop = hist.scrollHeight;
+      }
+    }
+
+    let lastUpdated = null;
+    let lastError = null;
+    let inflight = false;
+
+    // Chrome blocks fetch() from file:// origins (CORS). A <script src="./x.js">
+    // element has no such restriction — so we load state via a tiny JS wrapper
+    // published by the gamemaster (`board_state.js`) that assigns the state
+    // dict onto window.__CHESS_STATE. Cache-busting via a timestamp query
+    // forces the browser to re-execute the script each tick.
+    function tick() {
+      if (inflight) return;
+      inflight = true;
+      const s = document.createElement("script");
+      s.src = "./board_state.js?t=" + Date.now();
+      s.onload = () => {
+        const state = window.__CHESS_STATE;
+        if (state && state.updated_at !== lastUpdated) {
+          renderBoard(state.fen);
+          renderMeta(state);
+          renderNarration(state);
+          lastUpdated = state.updated_at;
+        }
+        if (state) {
+          document.getElementById("status").textContent = "Live — last update " + (state.updated_at || "—");
+        }
+        lastError = null;
+        s.remove();
+        inflight = false;
+      };
+      s.onerror = () => {
+        const msg = "board_state.js not reachable";
+        if (msg !== lastError) {
+          document.getElementById("status").textContent = "Waiting for board_state.js — open this page after gamemaster publishes it.";
+          lastError = msg;
+        }
+        s.remove();
+        inflight = false;
+      };
+      document.head.appendChild(s);
+    }
+
+    renderBoard("8/8/8/8/8/8/8/8");
+    tick();
+    setInterval(tick, 1500);
+  })();
+  </script>
+</body>
+</html>
