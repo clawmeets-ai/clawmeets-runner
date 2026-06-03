@@ -28,6 +28,7 @@ from .changelog import (
     ChangelogEntry,
     ChangelogEntryType,
     RoomCreatedPayload,
+    RoomDeletedPayload,
 )
 from .subscriber import ChangelogSubscriber
 
@@ -127,6 +128,9 @@ class GitSandboxSubscriber(ChangelogSubscriber):
 
         if entry.entry_type == ChangelogEntryType.ROOM_CREATED:
             await self._handle_room_created(entry, project_name)
+
+        elif entry.entry_type == ChangelogEntryType.ROOM_DELETED:
+            await self._handle_room_deleted(entry, project_name)
 
         elif entry.entry_type == ChangelogEntryType.BATCH_COMPLETE:
             await self._handle_batch_complete(entry, project_name)
@@ -285,6 +289,51 @@ class GitSandboxSubscriber(ChangelogSubscriber):
         except RuntimeError:
             # Branch may already exist (idempotent replay)
             await _run_git_async(sandbox, "checkout", chatroom_branch, check=False)
+
+    async def _handle_room_deleted(
+        self,
+        entry: ChangelogEntry,
+        project_name: str,
+    ) -> None:
+        """Delete chatroom branch on rerun (local + remote).
+
+        Idempotent: missing branches are no-ops. System rooms
+        (``shared-context``, ``user-communication``) never get a chatroom
+        branch in the first place, so this naturally skips them via the
+        defensive guard at the top.
+        """
+        payload: RoomDeletedPayload = entry.payload  # type: ignore[assignment]
+        room_name = payload.chatroom_name
+        if room_name in ("shared-context", "user-communication"):
+            return
+
+        sandbox = self._sandbox_dir
+        if not (sandbox / ".git").exists():
+            return
+
+        chatroom_branch = f"chatroom/{project_name}/{room_name}"
+
+        # Get off the chatroom branch if we're currently on it (can't delete HEAD).
+        current = await _run_git_async(
+            sandbox, "rev-parse", "--abbrev-ref", "HEAD", check=False,
+        )
+        if current.strip() == chatroom_branch:
+            project_branch = f"project/{project_name}"
+            await _run_git_async(sandbox, "checkout", project_branch, check=False)
+
+        # Local delete (force, since the branch may not be merged on this clone).
+        await _run_git_async(
+            sandbox, "branch", "-D", chatroom_branch, check=False,
+        )
+
+        # Remote delete only if the coordinator owns the project remote.
+        if self._is_coordinator and self._git_url:
+            await _run_git_async(
+                sandbox, "push", "origin", "--delete", chatroom_branch,
+                check=False,
+            )
+
+        logger.info(f"ROOM_DELETED: dropped chatroom branch {chatroom_branch}")
 
     async def _handle_batch_complete(
         self,

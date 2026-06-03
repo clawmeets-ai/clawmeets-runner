@@ -38,3 +38,15 @@ def resolve_local_knowledge_dir(raw: str, user_config_dir: Optional[Path]) -> Op
     if user_config_dir is None:
         return Path(raw)
     return user_config_dir / raw
+
+
+def resolve_local_dwh_dir(raw: str, user_config_dir: Optional[Path]) -> Optional[Path]:
+    """Resolve a dwh_dir string from card.json local_settings.
+
+    Same semantics as ``resolve_local_knowledge_dir`` — absolute and
+    ``~``-prefixed paths are honored verbatim, relative paths join to
+    ``user_config_dir``. The data warehouse is typically a network
+    shared file system mount across runners, so absolute paths
+    (``/mnt/dwh``) are the common case.
+    """
+    return resolve_local_knowledge_dir(raw, user_config_dir)

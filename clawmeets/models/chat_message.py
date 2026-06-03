@@ -7,6 +7,7 @@ This module is part of Layer 1 (depends on Layer 0 sync/changelog).
 It provides:
 - ChatMessage: regular chat messages (entry_type="message")
 - ChatFileEvent: file-touched events (entry_type="file_created" | "file_updated")
+- ChatBatchTimeoutEvent: batch-timeout events (entry_type="batch_timeout")
 - ChatLogEntry: discriminated union for CHATS.ndjson lines
 """
 from __future__ import annotations
@@ -104,10 +105,36 @@ class ChatFileEvent(BaseModel):
     source_version: int | None = None  # Message entry this file belongs to
 
 
+class ChatBatchTimeoutEvent(BaseModel):
+    """One batch-timeout row in CHATS.ndjson.
+
+    Emitted alongside BATCH_TIMEOUT changelog entries so the chat stream
+    carries a structured signal that a batch of @mentioned workers did not
+    respond in time. The web UI uses this row to flip the per-recipient
+    chip from "AWAITING" to "TIMED OUT" — without it, the chip has no way
+    to distinguish a still-waiting batch from a terminated one.
+
+    ``message_id`` points at the @mention message that opened the batch
+    (matches the chip's per-message keying). ``source_version`` mirrors
+    the changelog entry's source_version, which points at that same
+    @mention's changelog version.
+    """
+    model_config = {"frozen": True}
+
+    entry_type: Literal["batch_timeout"] = "batch_timeout"
+    ts: datetime
+    message_id: str
+    coordinator_id: str
+    responded_participants: list[str] = Field(default_factory=list)
+    timed_out_participants: list[str] = Field(default_factory=list)
+    version: int | None = None
+    source_version: int | None = None
+
+
 # Discriminated union of log-entry rows persisted to CHATS.ndjson.
 # Existing rows without `entry_type` default to ChatMessage (entry_type="message").
 ChatLogEntry = Annotated[
-    Union[ChatMessage, ChatFileEvent],
+    Union[ChatMessage, ChatFileEvent, ChatBatchTimeoutEvent],
     Field(discriminator="entry_type"),
 ]
 

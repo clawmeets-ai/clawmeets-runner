@@ -12,6 +12,7 @@ import asyncio
 import logging
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from croniter import croniter
 from pydantic import BaseModel
@@ -24,27 +25,41 @@ if TYPE_CHECKING:
 logger = logging.getLogger("clawmeets.models.scheduled_message")
 
 
-def compute_next_fire(cron_expression: str, after: datetime) -> datetime:
+def compute_next_fire(
+    cron_expression: str, after: datetime, tz: str = "UTC"
+) -> datetime:
     """Compute the next fire time after a given datetime using croniter.
+
+    The cron expression is interpreted in ``tz`` (an IANA name like
+    ``"Asia/Taipei"``), so ``"0 9 * * *"`` with ``tz="Asia/Taipei"`` fires at
+    9am Taipei. The returned datetime is always converted back to UTC for
+    storage.
 
     Args:
         cron_expression: Standard cron expression or preset (@hourly, @daily, @weekly)
-        after: Compute next fire time after this datetime
+        after: Compute next fire time after this datetime (any tz-aware datetime)
+        tz: IANA timezone the cron should be interpreted in. Defaults to UTC.
 
     Returns:
-        Next fire datetime (UTC)
+        Next fire datetime (UTC, tz-aware)
 
     Raises:
-        ValueError: If cron_expression is invalid
+        ValueError: If cron_expression or tz is invalid
     """
     if not croniter.is_valid(cron_expression):
         raise ValueError(f"Invalid cron expression: {cron_expression!r}")
-    cron = croniter(cron_expression, after)
-    next_dt = cron.get_next(datetime)
-    # Ensure UTC
-    if next_dt.tzinfo is None:
-        next_dt = next_dt.replace(tzinfo=UTC)
-    return next_dt
+    try:
+        zone = ZoneInfo(tz)
+    except (ZoneInfoNotFoundError, ValueError, TypeError) as exc:
+        raise ValueError(f"Invalid timezone: {tz!r}") from exc
+    after_local = after.astimezone(zone)
+    cron = croniter(cron_expression, after_local)
+    next_local = cron.get_next(datetime)
+    # croniter may strip tzinfo on some versions; re-anchor in the user's zone
+    # before converting to UTC so we never interpret a naive datetime as UTC.
+    if next_local.tzinfo is None:
+        next_local = next_local.replace(tzinfo=zone)
+    return next_local.astimezone(UTC)
 
 
 def validate_cron_expression(cron_expression: str) -> bool:
@@ -52,8 +67,22 @@ def validate_cron_expression(cron_expression: str) -> bool:
     return croniter.is_valid(cron_expression)
 
 
+def validate_timezone(tz: str) -> bool:
+    """Check if a string is a valid IANA timezone name."""
+    try:
+        ZoneInfo(tz)
+        return True
+    except (ZoneInfoNotFoundError, ValueError, TypeError):
+        return False
+
+
 class ScheduledMessage(BaseModel):
-    """A scheduled message that fires on a cron schedule."""
+    """A scheduled message that fires on a cron schedule.
+
+    ``timezone`` is the IANA name the cron expression is evaluated in (default
+    ``"UTC"`` for backward compat with rows written before the field existed).
+    All timestamps (``next_fire_at``, ``last_fired_at``, ...) remain UTC.
+    """
 
     id: str
     user_id: str
@@ -62,11 +91,13 @@ class ScheduledMessage(BaseModel):
     chatroom_name: str
     content: str
     cron_expression: str
+    timezone: str = "UTC"
     end_at: Optional[datetime] = None
     created_at: datetime
     last_fired_at: Optional[datetime] = None
     next_fire_at: datetime
     is_active: bool = True
+    idle_only: bool = False
 
 
 class ScheduledMessageStore:
@@ -166,12 +197,39 @@ class ScheduledMessageStore:
                 if msg.id == msg_id:
                     msg.last_fired_at = now
                     try:
-                        msg.next_fire_at = compute_next_fire(msg.cron_expression, now)
+                        msg.next_fire_at = compute_next_fire(
+                            msg.cron_expression, now, msg.timezone
+                        )
                     except ValueError:
                         logger.error(f"Invalid cron for scheduled message {msg_id}, deactivating")
                         msg.is_active = False
                         break
                     # Check if past end_at
+                    if msg.end_at and msg.next_fire_at > msg.end_at:
+                        msg.is_active = False
+                    break
+            self._save_all_ndjson_sync(messages)
+
+    async def update_next_fire_only(self, msg_id: str, now: datetime) -> None:
+        """Advance ``next_fire_at`` without recording a fire.
+
+        Mirrors :meth:`update_after_fire` but skips the ``last_fired_at`` write.
+        Used by the idle gate when a scheduled fire is deferred because the
+        target project is busy: we still need to push ``next_fire_at`` forward
+        so the scheduler doesn't keep re-evaluating the same overdue cron tick.
+        """
+        async with self._lock:
+            messages = self._load_all_sync()
+            for msg in messages:
+                if msg.id == msg_id:
+                    try:
+                        msg.next_fire_at = compute_next_fire(
+                            msg.cron_expression, now, msg.timezone
+                        )
+                    except ValueError:
+                        logger.error(f"Invalid cron for scheduled message {msg_id}, deactivating")
+                        msg.is_active = False
+                        break
                     if msg.end_at and msg.next_fire_at > msg.end_at:
                         msg.is_active = False
                     break

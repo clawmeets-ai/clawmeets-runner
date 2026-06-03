@@ -92,6 +92,7 @@ class GeminiCLI(LLMProvider):
         self,
         gemini_bin: str = "gemini",
         model: Optional[str] = None,
+        agent_env: Optional[dict[str, str]] = None,
     ) -> None:
         """Initialize GeminiCLI.
 
@@ -99,6 +100,9 @@ class GeminiCLI(LLMProvider):
             gemini_bin: Path to gemini CLI binary
             model: Optional model override (e.g. "gemini-2.5-pro"); None uses
                 Gemini's default.
+            agent_env: Extra environment variables exposed to every Gemini
+                subprocess (CLAWMEETS_AGENT_ID / CLAWMEETS_AGENT_TOKEN /
+                CLAWMEETS_SERVER_URL). See ClaudeCLI for rationale.
 
         Gemini cannot enforce a JSON schema at the CLI level; the schema is
         embedded in the prompt (via the existing prompt builder) and parsed
@@ -107,7 +111,7 @@ class GeminiCLI(LLMProvider):
         """
         self._bin = gemini_bin
         self._model = model
-        # Gemini has no Chrome integration; use_chrome stays False (inherited).
+        self._agent_env = dict(agent_env or {})
 
     @classmethod
     def verify_cli(cls, gemini_bin: str = "gemini") -> None:
@@ -333,8 +337,9 @@ class GeminiCLI(LLMProvider):
         ) = self._prepare_invocation(prompt, working_dir, additional_dirs)
 
         env = os.environ.copy()
+        env.update(self._agent_env)
 
-        invoke_timeout = 300
+        invoke_timeout = 1800
 
         start_time = time.time()
         proc: Optional[asyncio.subprocess.Process] = None

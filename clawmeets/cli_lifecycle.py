@@ -351,14 +351,12 @@ def start_command(
         # Read agent-specific config from card.json local_settings
         # (config.json is deprecated — local_settings in card.json is the primary source)
         knowledge_dir = ""
-        use_chrome = False
         card_path = agent_dir / "card.json"
         if card_path.exists():
             try:
                 card_data = json.loads(card_path.read_text())
                 local_settings = card_data.get("local_settings", {})
                 knowledge_dir = local_settings.get("knowledge_dir", "")
-                use_chrome = local_settings.get("use_chrome", False)
             except json.JSONDecodeError:
                 pass
 
@@ -367,8 +365,6 @@ def start_command(
 
         if knowledge_dir:
             cmd.extend(["--knowledge-dir", knowledge_dir])
-        if use_chrome:
-            cmd.append("--chrome")
         if claude_plugin_dir:
             cmd.extend(["--claude-plugin-dir", claude_plugin_dir])
 

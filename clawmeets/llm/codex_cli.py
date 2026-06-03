@@ -90,6 +90,7 @@ class CodexCLI(LLMProvider):
         codex_bin: str = "codex",
         model: Optional[str] = None,
         sandbox_mode: str = "workspace-write",
+        agent_env: Optional[dict[str, str]] = None,
     ) -> None:
         """Initialize CodexCLI.
 
@@ -100,6 +101,9 @@ class CodexCLI(LLMProvider):
                 the agent modify its own sandbox (clawmeets already isolates
                 sandboxes per agent). Other options: "read-only",
                 "danger-full-access".
+            agent_env: Extra environment variables exposed to every Codex
+                subprocess (CLAWMEETS_AGENT_ID / CLAWMEETS_AGENT_TOKEN /
+                CLAWMEETS_SERVER_URL). See ClaudeCLI for rationale.
 
         The JSON action schema is selected per invocation and passed to
         ``invoke(action_schema=...)``.
@@ -107,7 +111,7 @@ class CodexCLI(LLMProvider):
         self._bin = codex_bin
         self._model = model
         self._sandbox_mode = sandbox_mode
-        # Codex has no Chrome integration; use_chrome stays False (inherited).
+        self._agent_env = dict(agent_env or {})
 
     @classmethod
     def verify_cli(cls, codex_bin: str = "codex") -> None:
@@ -327,8 +331,9 @@ class CodexCLI(LLMProvider):
         ) = self._prepare_invocation(prompt, working_dir, additional_dirs, action_schema)
 
         env = os.environ.copy()
+        env.update(self._agent_env)
 
-        invoke_timeout = 300
+        invoke_timeout = 1800
 
         start_time = time.time()
         proc: Optional[asyncio.subprocess.Process] = None

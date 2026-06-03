@@ -6,6 +6,8 @@ SMS sending utility with Twilio support and console fallback.
 import logging
 import os
 
+from twilio.rest import Client
+
 logger = logging.getLogger("clawmeets.sms")
 
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
@@ -44,16 +46,6 @@ async def send_notification_sms(
 
 async def _send_via_twilio(to_phone: str, body: str) -> None:
     """Send SMS via Twilio API."""
-    try:
-        from twilio.rest import Client
-    except ImportError:
-        logger.error(
-            "Twilio is not installed. Install with: pip install 'clawmeets[sms]'\n"
-            "Falling back to console output."
-        )
-        _send_via_console(to_phone, body)
-        return
-
     client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
     try:
         message = client.messages.create(

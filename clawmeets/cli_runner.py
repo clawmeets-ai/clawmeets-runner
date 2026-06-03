@@ -26,7 +26,7 @@ import os
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import httpx
 import typer
@@ -37,7 +37,7 @@ from clawmeets.api.control import ControlEnvelope, ControlMessageType
 from clawmeets.api.client import ClawMeetsClient
 from clawmeets.models.chat_message import ChatMessage
 from clawmeets.utils.file_io import FileUtil
-from clawmeets.utils.knowledge_dir import resolve_local_knowledge_dir
+from clawmeets.utils.knowledge_dir import resolve_local_knowledge_dir, resolve_local_dwh_dir
 from clawmeets.utils.notification_center import NotificationCenter
 from clawmeets.llm.base import LLMProvider
 from clawmeets.llm.claude_cli import ClaudeCLI
@@ -49,6 +49,7 @@ from clawmeets.models.user import User, NotificationConfig
 from clawmeets.sync.console_subscriber import ConsoleOutputSubscriber, ConsoleConfig
 from clawmeets.runner.reactive_loop import ReactiveControlLoop
 from clawmeets.runner.mcp_manager import McpManager
+from clawmeets.runner.knowledge_pack_manager import KnowledgePackManager
 from clawmeets.runner.personal_skill_manager import PersonalSkillManager
 from clawmeets.runner.skill_manager import SkillManager
 
@@ -59,10 +60,36 @@ AgentRegistrationResult = AgentRegistrationResponse
 agent_app = typer.Typer(help="Agent commands", no_args_is_help=True)
 user_app  = typer.Typer(help="User commands",  no_args_is_help=True)
 dm_app    = typer.Typer(help="Direct message commands", no_args_is_help=True)
+front_desk_app = typer.Typer(
+    help=(
+        "Front Desk commands. A Front Desk project is a long-lived, DM-shaped "
+        "channel whose coordinator is the targeted agent — it can spawn worker "
+        "rooms with other agents (per the agent's invite allowlist) instead of "
+        "running solo. Internal (your own assistant) and external (someone else's "
+        "discoverable agent) channels share the same shape."
+    ),
+    no_args_is_help=True,
+)
 mcp_app   = typer.Typer(help="MCP server commands (auth, list, status)", no_args_is_help=True)
 team_app  = typer.Typer(help="Manage user-defined teams on your agents (the TEAMS sidebar)", no_args_is_help=True)
+knowledge_pack_app = typer.Typer(
+    help=(
+        "Manage your knowledge packs — named, user-curated markdown bundles you "
+        "can install on any of your agents. Once installed, they render in the "
+        "agent's AUTHORITATIVE memory layer."
+    ),
+    no_args_is_help=True,
+)
 reflection_app = typer.Typer(help="Configure account-level reflection schedule (one cron, fans out to all your agents).", no_args_is_help=True)
-bootstrap_app = typer.Typer(help="Personalize your fresh agents from your own data (one-time, opt-in).", invoke_without_command=True)
+bootstrap_app = typer.Typer(
+    help=(
+        "Personalize your fresh agents from your own data (one-time, opt-in). "
+        "Two subcommands: `assistant` (Phase 1 — writes USER.md from your Gmail + Calendar) "
+        "then `agent` (Phase 2 — each worker writes learnings/ from a deep-research pass shaped by USER.md). "
+        "Run `assistant` first, watch the chat for completion, then run `agent`."
+    ),
+    no_args_is_help=True,
+)
 
 
 def _default_user_teams_from_env() -> list[str]:
@@ -106,9 +133,49 @@ def _print_json(data: dict | list) -> None:
 _VALID_LLM_PROVIDERS = ("claude", "openai", "gemini")
 
 
+def _build_llm_provider(
+    provider: str,
+    model: Optional[str],
+    *,
+    plugin_dirs: list[Path],
+    mcp_manager: Optional["McpManager"],
+    agent_env: dict[str, str],
+) -> LLMProvider:
+    """Construct a fresh CLI for the given provider+model.
+
+    Shared by the startup path and the AGENT_SETTINGS_CHANGE hot-swap path
+    so both build identical instances. ``verify_cli()`` raises
+    ``LLMNotFoundError`` if the binary isn't on PATH; an unknown provider
+    name raises ``LLMNotFoundError`` here too, so the reactive loop can
+    surface both failure modes uniformly.
+    """
+    from clawmeets.llm.base import LLMNotFoundError
+
+    normalized = (provider or "claude").lower()
+    if normalized == "openai":
+        CodexCLI.verify_cli()
+        return CodexCLI(model=model, agent_env=agent_env)
+    if normalized == "gemini":
+        GeminiCLI.verify_cli()
+        return GeminiCLI(model=model, agent_env=agent_env)
+    if normalized == "claude":
+        ClaudeCLI.verify_cli()
+        return ClaudeCLI(
+            claude_plugin_dirs=plugin_dirs,
+            mcp_manager=mcp_manager,
+            agent_env=agent_env,
+            model=model,
+        )
+    raise LLMNotFoundError(
+        f"unknown llm_provider {provider!r} "
+        f"(expected one of {_VALID_LLM_PROVIDERS})"
+    )
+
+
 def _build_initial_local_settings(
     llm_provider: Optional[str],
     llm_model: Optional[str],
+    dwh_dir: Optional[str] = None,
 ) -> dict:
     """Build the local_settings block for a freshly generated card.json.
 
@@ -127,6 +194,8 @@ def _build_initial_local_settings(
         settings["llm_provider"] = normalized
     if llm_model:
         settings["llm_model"] = llm_model
+    if dwh_dir:
+        settings["dwh_dir"] = dwh_dir
     return settings
 
 
@@ -164,6 +233,11 @@ def agent_register(
     llm_model: Optional[str] = typer.Option(
         None, "--llm-model",
         help="Provider-specific model name (e.g. 'o3' for Codex, 'gemini-2.5-pro' for Gemini). Written to card.json local_settings.",
+    ),
+    dwh_dir: Optional[str] = typer.Option(
+        None, "--dwh-dir",
+        help="Personal data-warehouse root for this agent (typically a network shared file system mount, e.g. /mnt/dwh). "
+             "Written to card.json local_settings; rendered into the agent prompt.",
     ),
     team: list[str] = typer.Option(
         None, "--team",
@@ -280,8 +354,15 @@ def agent_register(
         agent_work_dir.mkdir(parents=True, exist_ok=True)
         cred_path = agent_work_dir / "credential.json"
 
-    cred_path.write_text(json.dumps(result, indent=2, default=str))
-    typer.echo(f"Credentials saved to {cred_path}")
+    # Re-register returns token=None so a server-side rotate doesn't silently
+    # invalidate any running runner's in-memory credential. First-time
+    # register always returns a token; write the file then. Card-only updates
+    # (description/teams/capabilities) below still happen either way.
+    if result.get("token"):
+        cred_path.write_text(json.dumps(result, indent=2, default=str))
+        typer.echo(f"Credentials saved to {cred_path}")
+    else:
+        typer.echo(f"Re-registered; existing credentials at {cred_path} preserved.")
 
     # Create card.json with agent metadata (unless using custom save path)
     if not save:
@@ -296,7 +377,7 @@ def agent_register(
         }
         if user_teams:
             card["user_teams"] = user_teams
-        initial_local_settings = _build_initial_local_settings(llm_provider, llm_model)
+        initial_local_settings = _build_initial_local_settings(llm_provider, llm_model, dwh_dir)
         if initial_local_settings:
             card["local_settings"] = initial_local_settings
         card_path = agent_work_dir / "card.json"
@@ -740,8 +821,288 @@ def team_add_sample_requests(
 
 
 # ---------------------------------------------------------------------------
+# knowledge-pack list / create / edit / delete / install / uninstall
+# ---------------------------------------------------------------------------
+
+
+def _read_file_content_arg(content_file: Optional[Path]) -> str:
+    if content_file is None:
+        return ""
+    if not content_file.exists():
+        typer.echo(f"Error: --content-file {content_file} does not exist", err=True)
+        raise typer.Exit(1)
+    return content_file.read_text()
+
+
+def _read_file_b64_arg(content_file: Optional[Path]) -> str:
+    """Read a file as raw bytes and return base64-encoded ASCII. Used for
+    knowledge-pack uploads, which now treat every file as opaque bytes."""
+    import base64 as _b64
+    if content_file is None:
+        return ""
+    if not content_file.exists():
+        typer.echo(f"Error: --content-file {content_file} does not exist", err=True)
+        raise typer.Exit(1)
+    return _b64.b64encode(content_file.read_bytes()).decode("ascii")
+
+
+@knowledge_pack_app.command("list")
+def knowledge_pack_list(
+    token: Optional[str] = typer.Option(None, "--token", "-t"),
+    server: Optional[str] = typer.Option(None, "--server", "-s"),
+    data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir"),
+):
+    """List every knowledge pack you own."""
+    server_url, token = _resolve_user_session(data_dir, token, server)
+    with _http(server_url) as client:
+        resp = client.get(
+            "/knowledge-packs",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        packs = _ok(resp)
+    if not packs:
+        typer.echo("No knowledge packs. Create one with `clawmeets knowledge-pack create ...`.")
+        return
+    for pack in packs:
+        files = pack.get("files") or {}
+        total_bytes = 0
+        for entry in files.values():
+            b64 = (entry or {}).get("content_b64") if isinstance(entry, dict) else ""
+            b64 = b64 or ""
+            pad = 2 if b64.endswith("==") else (1 if b64.endswith("=") else 0)
+            total_bytes += max(0, (len(b64) * 3 // 4) - pad)
+        typer.echo(
+            f"  {pack['slug']} — {pack.get('name', pack['slug'])} "
+            f"({len(files)} file(s), {total_bytes}B)"
+        )
+        if pack.get("description"):
+            typer.echo(f"      {pack['description']}")
+        for fname in sorted(files.keys()):
+            typer.echo(f"      - {fname} ({len(files[fname] or '')}B)")
+
+
+@knowledge_pack_app.command("create")
+def knowledge_pack_create(
+    slug: str = typer.Argument(..., help="Slug (lowercase, hyphens/underscores allowed)"),
+    name: str = typer.Option(..., "--name", help="Human-readable pack name"),
+    description: str = typer.Option("", "--description", help="One-line trigger hint shown in the agent's KNOWLEDGE_PACKS.md index"),
+    file: Optional[list[str]] = typer.Option(
+        None, "--file",
+        help="Seed a file in the new pack (repeatable). Format: '<path-in-pack>:<local-path>'. The path-in-pack may contain '/' for nested layout; the local file is read as bytes (text or binary).",
+    ),
+    token: Optional[str] = typer.Option(None, "--token", "-t"),
+    server: Optional[str] = typer.Option(None, "--server", "-s"),
+    data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir"),
+):
+    """Create a new knowledge pack in your registry."""
+    files: dict[str, str] = {}
+    for spec in file or []:
+        if ":" not in spec:
+            typer.echo(f"Error: --file must be '<path-in-pack>:<local-path>', got {spec!r}", err=True)
+            raise typer.Exit(1)
+        fname, fpath = spec.split(":", 1)
+        files[fname.strip()] = _read_file_b64_arg(Path(fpath.strip()))
+
+    server_url, token = _resolve_user_session(data_dir, token, server)
+    with _http(server_url) as client:
+        resp = client.post(
+            "/knowledge-packs",
+            json={
+                "slug": slug,
+                "name": name,
+                "description": description,
+                "files": files,
+            },
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        pack = _ok(resp)
+    typer.echo(f"Created knowledge pack '{pack['slug']}' ({len(pack.get('files') or {})} file(s)).")
+
+
+@knowledge_pack_app.command("edit")
+def knowledge_pack_edit(
+    slug: str = typer.Argument(..., help="Slug to edit"),
+    name: Optional[str] = typer.Option(None, "--name", help="New human-readable name"),
+    description: Optional[str] = typer.Option(None, "--description", help="New one-line trigger hint"),
+    token: Optional[str] = typer.Option(None, "--token", "-t"),
+    server: Optional[str] = typer.Option(None, "--server", "-s"),
+    data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir"),
+):
+    """Patch an existing pack's metadata (name / description). For file-level
+    edits use ``knowledge-pack add-file`` / ``remove-file``.
+    """
+    payload: dict = {}
+    if name is not None:
+        payload["name"] = name
+    if description is not None:
+        payload["description"] = description
+    if not payload:
+        typer.echo("Error: pass at least one of --name, --description", err=True)
+        raise typer.Exit(1)
+
+    server_url, token = _resolve_user_session(data_dir, token, server)
+    with _http(server_url) as client:
+        resp = client.put(
+            f"/knowledge-packs/{slug}",
+            json=payload,
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        pack = _ok(resp)
+    typer.echo(f"Updated knowledge pack '{pack['slug']}' (updated_at={pack.get('updated_at')}).")
+
+
+@knowledge_pack_app.command("add-file")
+def knowledge_pack_add_file(
+    slug: str = typer.Argument(..., help="Pack slug"),
+    filepath: str = typer.Argument(..., help="Path inside the pack (e.g. tactics.md or notes/intro.md)"),
+    content_file: Path = typer.Option(..., "--content-file", help="Local file to upload (text or binary)"),
+    token: Optional[str] = typer.Option(None, "--token", "-t"),
+    server: Optional[str] = typer.Option(None, "--server", "-s"),
+    data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir"),
+):
+    """Add (or replace) a file inside a pack. Re-broadcasts to installed agents."""
+    content_b64 = _read_file_b64_arg(content_file)
+    server_url, token = _resolve_user_session(data_dir, token, server)
+    with _http(server_url) as client:
+        resp = client.put(
+            f"/knowledge-packs/{slug}/files/{filepath}",
+            json={"content_b64": content_b64},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        pack = _ok(resp)
+    typer.echo(
+        f"Saved file '{filepath}' in pack '{pack['slug']}' "
+        f"(pack now has {len(pack.get('files') or {})} file(s))."
+    )
+
+
+@knowledge_pack_app.command("remove-file")
+def knowledge_pack_remove_file(
+    slug: str = typer.Argument(..., help="Pack slug"),
+    filepath: str = typer.Argument(..., help="Path to remove (e.g. tactics.md or notes/intro.md)"),
+    token: Optional[str] = typer.Option(None, "--token", "-t"),
+    server: Optional[str] = typer.Option(None, "--server", "-s"),
+    data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir"),
+):
+    """Remove a file from a pack."""
+    server_url, token = _resolve_user_session(data_dir, token, server)
+    with _http(server_url) as client:
+        resp = client.delete(
+            f"/knowledge-packs/{slug}/files/{filepath}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        pack = _ok(resp)
+    typer.echo(
+        f"Removed file '{filepath}' from pack '{pack['slug']}' "
+        f"({len(pack.get('files') or {})} file(s) remain)."
+    )
+
+
+@knowledge_pack_app.command("delete")
+def knowledge_pack_delete(
+    slug: str = typer.Argument(..., help="Slug to delete"),
+    token: Optional[str] = typer.Option(None, "--token", "-t"),
+    server: Optional[str] = typer.Option(None, "--server", "-s"),
+    data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir"),
+):
+    """Delete a pack and uninstall it from every agent that has it."""
+    server_url, token = _resolve_user_session(data_dir, token, server)
+    with _http(server_url) as client:
+        resp = client.delete(
+            f"/knowledge-packs/{slug}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        result = _ok(resp)
+    n = len(result.get("uninstalled_from") or [])
+    typer.echo(f"Deleted '{slug}' (uninstalled from {n} agent(s)).")
+
+
+@knowledge_pack_app.command("install")
+def knowledge_pack_install(
+    agent: str = typer.Argument(..., help="Agent name or id"),
+    slugs: list[str] = typer.Argument(..., help="One or more pack slugs to install"),
+    token: Optional[str] = typer.Option(None, "--token", "-t"),
+    server: Optional[str] = typer.Option(None, "--server", "-s"),
+    data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir"),
+):
+    """Install one or more knowledge packs on an agent."""
+    server_url, token = _resolve_user_session(data_dir, token, server)
+    with _http(server_url) as client:
+        agent_id, agent_name = _resolve_agent_id(client, token, agent)
+        resp = client.post(
+            f"/agents/{agent_id}/knowledge-packs",
+            json={"packs": slugs},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        result = _ok(resp)
+    added = result.get("added") or []
+    if added:
+        typer.echo(f"Installed on '{agent_name}': {', '.join(added)}")
+    else:
+        typer.echo(f"No new packs installed on '{agent_name}' (already present).")
+
+
+@knowledge_pack_app.command("uninstall")
+def knowledge_pack_uninstall(
+    agent: str = typer.Argument(..., help="Agent name or id"),
+    slug: str = typer.Argument(..., help="Pack slug to uninstall"),
+    token: Optional[str] = typer.Option(None, "--token", "-t"),
+    server: Optional[str] = typer.Option(None, "--server", "-s"),
+    data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir"),
+):
+    """Uninstall a knowledge pack from an agent."""
+    server_url, token = _resolve_user_session(data_dir, token, server)
+    with _http(server_url) as client:
+        agent_id, agent_name = _resolve_agent_id(client, token, agent)
+        resp = client.delete(
+            f"/agents/{agent_id}/knowledge-packs/{slug}",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        _ok(resp)
+    typer.echo(f"Uninstalled '{slug}' from '{agent_name}'.")
+
+
+# ---------------------------------------------------------------------------
 # agent list
 # ---------------------------------------------------------------------------
+
+@agent_app.command("set-dwh-dir")
+def agent_set_dwh_dir(
+    agent: str = typer.Argument(..., help="Agent name or id"),
+    dwh_dir: str = typer.Argument(..., help="Personal data-warehouse root (e.g. /mnt/dwh). Pass empty string to clear."),
+    token: Optional[str] = typer.Option(None, "--token", "-t"),
+    server: Optional[str] = typer.Option(None, "--server", "-s"),
+    data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir"),
+):
+    """Set the dwh_dir on an agent's local_settings (in-place merge).
+
+    Reads the current local_settings via GET /agents/{id}, sets/clears
+    ``dwh_dir``, and PUTs back. Triggers AGENT_SETTINGS_CHANGE so a running
+    runner picks it up on the next LLM invocation.
+    """
+    server_url, token = _resolve_user_session(data_dir, token, server)
+    with _http(server_url) as client:
+        agent_id, agent_name = _resolve_agent_id(client, token, agent)
+        current = _ok(client.get(
+            f"/agents/{agent_id}",
+            headers={"Authorization": f"Bearer {token}"},
+        ))
+        local_settings = dict(current.get("local_settings") or {})
+        if dwh_dir:
+            local_settings["dwh_dir"] = dwh_dir
+        else:
+            local_settings.pop("dwh_dir", None)
+        put_resp = client.put(
+            f"/agents/{agent_id}",
+            json={"local_settings": local_settings},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        _ok(put_resp)
+    if dwh_dir:
+        typer.echo(f"Set dwh_dir={dwh_dir!r} on agent '{agent_name}'.")
+    else:
+        typer.echo(f"Cleared dwh_dir on agent '{agent_name}'.")
+
 
 @agent_app.command("list")
 def agent_list(
@@ -773,7 +1134,6 @@ def agent_run(
     working_dir: Optional[Path] = typer.Option(None, "--working-dir", "-w", help="Sandbox directory for Claude (default: agent-dir/sandbox)"),
     knowledge_dir: Optional[Path] = typer.Option(None, "--knowledge-dir", "-k", help="Knowledge base directory (passed as --add-dir to Claude)"),
     claude_plugin_dir: Optional[list[Path]] = typer.Option(None, "--claude-plugin-dir", help="Claude plugin directory (passed as --plugin-dir to Claude CLI, repeatable)"),
-    chrome: bool = typer.Option(False, "--chrome", help="Enable Chrome browser integration via Claude Code --chrome flag"),
     user_config: Optional[Path] = typer.Option(None, "--user-config", help="Path to the owning user's settings.json; used on self-destruct when the server reports this agent was deleted."),
     settings_name: Optional[str] = typer.Option(None, "--settings-name", help="Short agent name as it appears in settings.json agents[].name; paired with --user-config for self-destruct cleanup."),
     log_level: str = typer.Option("info"),
@@ -837,7 +1197,6 @@ def agent_run(
     asyncio.run(_runner_loop(
         agent_name, agent_id, token, server, Path(agent_dir),
         working_dir, knowledge_dir, claude_plugin_dir or [],
-        use_chrome=chrome,
         user_config=user_config,
         settings_name=settings_name,
     ))
@@ -948,6 +1307,10 @@ def user_register(
         None, "--llm-model",
         help="Provider-specific model name (e.g. 'o3' for Codex, 'gemini-2.5-pro' for Gemini).",
     ),
+    dwh_dir: Optional[str] = typer.Option(
+        None, "--dwh-dir",
+        help="Personal data-warehouse root for the assistant (typically a network shared file system mount, e.g. /mnt/dwh).",
+    ),
 ):
     """Self-register a new user account (requires invitation code).
 
@@ -1008,7 +1371,7 @@ def user_register(
             "discoverable_through_registry": False,
             "registered_by": user_id,
         }
-        initial_local_settings = _build_initial_local_settings(llm_provider, llm_model)
+        initial_local_settings = _build_initial_local_settings(llm_provider, llm_model, dwh_dir)
         if initial_local_settings:
             card["local_settings"] = initial_local_settings
         card_path = assistant_dir / "card.json"
@@ -1032,6 +1395,10 @@ def user_create(
     llm_model: Optional[str] = typer.Option(
         None, "--llm-model",
         help="Provider-specific model name (e.g. 'o3' for Codex, 'gemini-2.5-pro' for Gemini).",
+    ),
+    dwh_dir: Optional[str] = typer.Option(
+        None, "--dwh-dir",
+        help="Personal data-warehouse root for the assistant (typically a network shared file system mount, e.g. /mnt/dwh).",
     ),
 ):
     """Create a new user with assistant agent (requires admin token).
@@ -1088,7 +1455,7 @@ def user_create(
             "discoverable_through_registry": False,
             "registered_by": user_id,
         }
-        initial_local_settings = _build_initial_local_settings(llm_provider, llm_model)
+        initial_local_settings = _build_initial_local_settings(llm_provider, llm_model, dwh_dir)
         if initial_local_settings:
             card["local_settings"] = initial_local_settings
         card_path = assistant_dir / "card.json"
@@ -1377,7 +1744,6 @@ async def _runner_loop(
     working_dir: Optional[Path] = None,
     knowledge_dir: Optional[Path] = None,
     claude_plugin_dirs: Optional[list[Path]] = None,
-    use_chrome: bool = False,
     user_config: Optional[Path] = None,
     settings_name: Optional[str] = None,
 ) -> None:
@@ -1394,7 +1760,7 @@ async def _runner_loop(
     card_data = json.loads(card_path.read_text())
 
     # Read local_settings from card.json (primary source, not synced with server).
-    # CLI flags (--knowledge-dir, --chrome) serve as overrides for backward compat.
+    # CLI flags (--knowledge-dir) serve as overrides for backward compat.
     local_settings = card_data.get("local_settings", {}) or {}
 
     # Migration: older cards stored llm_provider/llm_model at the top level.
@@ -1416,7 +1782,6 @@ async def _runner_loop(
         typer.echo("Migrated llm_provider/llm_model into local_settings in card.json")
 
     effective_knowledge_dir = knowledge_dir or local_settings.get("knowledge_dir", "")
-    effective_use_chrome = use_chrome or local_settings.get("use_chrome", False)
 
     # Resolve relative knowledge_dir paths (e.g. "./owner") against the user's
     # init-time config dir (~/.clawmeets/config/<username>/), where
@@ -1446,41 +1811,60 @@ async def _runner_loop(
         skill_manager.plugin_dir,
         personal_skill_manager.plugin_dir,
     ]
+    # Identity exposed to every LLM subprocess so Bash-shelled `clawmeets ...`
+    # commands inside the agent can authenticate as this agent without
+    # re-resolving credentials. Read by project-skill invocations like
+    # `clawmeets project create ... --token $CLAWMEETS_AGENT_TOKEN`.
+    # CLAWMEETS_AGENT_DIR is the absolute path of this agent's root directory
+    # (~/.clawmeets/agents/<name>-<id>/), used to anchor personal-skill-hub
+    # writes — the LLM's cwd is the per-project sandbox, and knowledge_dir
+    # can be configured anywhere, so neither is a reliable anchor.
+    agent_env = {
+        "CLAWMEETS_AGENT_ID": agent_id,
+        "CLAWMEETS_AGENT_TOKEN": token,
+        "CLAWMEETS_SERVER_URL": server_http,
+        "CLAWMEETS_AGENT_DIR": str(agent_dir),
+    }
+
     llm_provider_name = (local_settings.get("llm_provider") or "claude").lower()
     llm_model = local_settings.get("llm_model") or None
-    cli: LLMProvider
-    if llm_provider_name == "openai":
-        CodexCLI.verify_cli()
-        cli = CodexCLI(model=llm_model)
-        typer.echo(f"LLM provider: openai (model={llm_model or 'default'})")
-    elif llm_provider_name == "gemini":
-        GeminiCLI.verify_cli()
-        cli = GeminiCLI(model=llm_model)
-        typer.echo(f"LLM provider: gemini (model={llm_model or 'default'})")
-    elif llm_provider_name == "claude":
-        ClaudeCLI.verify_cli()
-        cli = ClaudeCLI(
-            claude_plugin_dirs=all_plugin_dirs,
-            use_chrome=effective_use_chrome,
+
+    # Factory closes over runner-scoped args (plugin dirs, MCP manager,
+    # agent env). Shared by the startup path here and the reactive
+    # loop's hot-swap path so both build identical CLI instances.
+    def cli_factory(provider: str, model: Optional[str]) -> LLMProvider:
+        return _build_llm_provider(
+            provider,
+            model,
+            plugin_dirs=all_plugin_dirs,
             mcp_manager=mcp_manager,
+            agent_env=agent_env,
         )
+
+    try:
+        cli = cli_factory(llm_provider_name, llm_model)
+    except Exception as e:
         typer.echo(
-            f"LLM provider: claude"
-            + (f" (model={llm_model})" if llm_model else "")
-        )
-    else:
-        typer.echo(
-            f"Error: unknown llm_provider '{llm_provider_name}' in "
-            f"card.json local_settings (expected one of {_VALID_LLM_PROVIDERS})",
+            f"Error: failed to construct LLM provider "
+            f"({llm_provider_name!r}, model={llm_model!r}): {e}",
             err=True,
         )
         raise typer.Exit(1)
+    typer.echo(
+        f"LLM provider: {llm_provider_name}"
+        + (f" (model={llm_model})" if llm_model else "")
+    )
 
     # Build knowledge_dirs list (e.g., knowledge bases)
     knowledge_dirs_list: list[Path] = []
     resolved = resolve_local_knowledge_dir(str(effective_knowledge_dir), user_config_dir) if effective_knowledge_dir else None
     if resolved is not None:
         knowledge_dirs_list.append(resolved)
+
+    # Resolve dwh_dir (personal data warehouse root, typically network-shared).
+    # None when unset — the prompt block is omitted in that case.
+    raw_dwh_dir = local_settings.get("dwh_dir") or ""
+    resolved_dwh_dir = resolve_local_dwh_dir(str(raw_dwh_dir), user_config_dir) if raw_dwh_dir else None
 
     # Create HTTP client with auth
     http_client = httpx.AsyncClient(
@@ -1504,9 +1888,16 @@ async def _runner_loop(
         client=client,
         claude_plugin_dirs=all_plugin_dirs,
         notification_center=notification_center,
+        dwh_dir=resolved_dwh_dir,
     )
 
     participant = Agent(id=agent_id, model_ctx=model_ctx)
+
+    # Set up knowledge-pack manager (writes user-curated packs to
+    # {agent_dir}/knowledge_packs/<slug>/; index lives at
+    # {agent_dir}/memory/KNOWLEDGE_PACKS.md alongside the other
+    # AUTHORITATIVE indexes)
+    knowledge_pack_manager = KnowledgePackManager(model_ctx)
 
     # Build reactive control loop
     loop_obj = ReactiveControlLoop(
@@ -1516,7 +1907,9 @@ async def _runner_loop(
         extra_subscribers=[],
         skill_manager=skill_manager,
         mcp_manager=mcp_manager,
+        knowledge_pack_manager=knowledge_pack_manager,
         user_config_dir=user_config_dir,
+        cli_factory=cli_factory,
     )
 
     # Start the loop
@@ -1545,6 +1938,9 @@ async def _runner_loop(
 
                 # Sync installed MCP servers from server (catch-up on connect/reconnect)
                 await mcp_manager.sync_from_server(client, agent_id)
+
+                # Sync installed knowledge packs from server (catch-up on connect/reconnect)
+                await knowledge_pack_manager.sync_from_server(client, agent_id)
 
                 # Kick off auto-OAuth for any MCP server that landed via
                 # sync_from_server above but doesn't yet have a token (e.g.
@@ -2006,6 +2402,81 @@ def dm_unschedule(
 
 
 # ---------------------------------------------------------------------------
+# Front Desk commands
+# ---------------------------------------------------------------------------
+
+@front_desk_app.command("ensure")
+def front_desk_ensure(
+    agent_full_name: str = typer.Argument(..., help="Agent's full registry name, e.g. chuswine-customer_support"),
+    username: str = typer.Option(..., "-u", "--username", help="Your username (the requester)"),
+    password: str = typer.Option(..., "-p", "--password", help="Your password"),
+    server: str = typer.Option(DEFAULT_SERVER, "--server", "-s"),
+):
+    """Ensure a Front Desk project exists for the named agent.
+
+    Idempotent. Returns the existing project if one already exists; otherwise
+    creates a new one named ``{your_username}-fd-{agent_short_name}`` on the
+    agent owner's side. Prints the project name + id.
+
+    Example:
+        clawmeets front-desk ensure chuswine-customer_support -u chengtao -p ****
+    """
+    with _http(server) as client:
+        resp = client.post("/auth/login", json={"username": username, "password": password})
+        try:
+            login_result = _ok(resp)
+        except SystemExit:
+            typer.echo("Error: Invalid username or password", err=True)
+            raise typer.Exit(1)
+        token = login_result["token"]
+        resp = client.post(
+            f"/me/front-desk/{agent_full_name}/ensure",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        project = _ok(resp)
+        typer.echo(f"{project['name']} (id={project['id']})")
+
+
+@front_desk_app.command("send")
+def front_desk_send(
+    agent_full_name: str = typer.Argument(..., help="Agent's full registry name, e.g. chuswine-customer_support"),
+    message: str = typer.Argument(..., help="Message content"),
+    username: str = typer.Option(..., "-u", "--username", help="Your username (the requester)"),
+    password: str = typer.Option(..., "-p", "--password", help="Your password"),
+    server: str = typer.Option(DEFAULT_SERVER, "--server", "-s"),
+):
+    """Send a message to a Front Desk channel's user-communication chatroom.
+
+    Ensures the Front Desk project exists, then posts to user-communication.
+
+    Example:
+        clawmeets front-desk send chuswine-customer_support "Hi, can you help?" -u chengtao -p ****
+    """
+    with _http(server) as client:
+        resp = client.post("/auth/login", json={"username": username, "password": password})
+        try:
+            login_result = _ok(resp)
+        except SystemExit:
+            typer.echo("Error: Invalid username or password", err=True)
+            raise typer.Exit(1)
+        token = login_result["token"]
+
+        resp = client.post(
+            f"/me/front-desk/{agent_full_name}/ensure",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        project = _ok(resp)
+
+        resp = client.post(
+            f"/projects/{project['id']}/chatrooms/user-communication/user-message",
+            json={"content": message},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        _ok(resp)
+        typer.echo(f"Sent to {project['name']}")
+
+
+# ---------------------------------------------------------------------------
 # MCP commands (runner-local; operate on agent directories on this machine)
 # ---------------------------------------------------------------------------
 
@@ -2144,6 +2615,73 @@ def mcp_status(
         )
         raise typer.Exit(2)
     typer.echo(f"{mcp_name}: ready (token at {manager.token_path(mcp_name)})")
+
+
+@mcp_app.command("install")
+def mcp_install(
+    agent: str = typer.Argument(..., help="Agent name or id"),
+    mcps: List[str] = typer.Argument(..., help="One or more MCP names to install"),
+    token: Optional[str] = typer.Option(None, "--token", "-t"),
+    server: Optional[str] = typer.Option(None, "--server", "-s"),
+    data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir"),
+):
+    """Install one or more MCP servers on an agent."""
+    server_url, token = _resolve_user_session(data_dir, token, server)
+    with _http(server_url) as client:
+        agent_id, agent_name = _resolve_agent_id(client, token, agent)
+        resp = client.post(
+            f"/agents/{agent_id}/mcps",
+            json={"mcps": mcps},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        result = _ok(resp)
+    added = result.get("added") or []
+    if added:
+        typer.echo(f"Installed on '{agent_name}': {', '.join(added)}")
+    else:
+        typer.echo(f"No new MCPs installed on '{agent_name}' (already present).")
+
+
+@mcp_app.command("set-config")
+def mcp_set_config(
+    agent: str = typer.Argument(..., help="Agent name or id"),
+    mcp_name: str = typer.Argument(..., help="MCP server name"),
+    config_file: Path = typer.Argument(..., help="JSON file with the config payload"),
+    token: Optional[str] = typer.Option(None, "--token", "-t"),
+    server: Optional[str] = typer.Option(None, "--server", "-s"),
+    data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir"),
+):
+    """Set the per-agent config for an MCP server (uploads JSON from a file).
+
+    Persists to card.json.local_settings.mcp_configs[mcp_name] and broadcasts
+    AGENT_SETTINGS_CHANGE so the runner writes through to
+    {agent_dir}/mcp-hub/configs/<mcp_name>.json.
+    """
+    if not config_file.is_file():
+        typer.echo(f"Error: config file not found: {config_file}", err=True)
+        raise typer.Exit(1)
+    try:
+        payload = json.loads(config_file.read_text())
+    except json.JSONDecodeError as e:
+        typer.echo(f"Error: {config_file} is not valid JSON: {e}", err=True)
+        raise typer.Exit(1)
+    if not isinstance(payload, dict):
+        typer.echo(
+            f"Error: config root must be a JSON object, got {type(payload).__name__}",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    server_url, token = _resolve_user_session(data_dir, token, server)
+    with _http(server_url) as client:
+        agent_id, agent_name = _resolve_agent_id(client, token, agent)
+        resp = client.put(
+            f"/agents/{agent_id}/mcps/{mcp_name}/config",
+            json={"config": payload},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        _ok(resp)
+    typer.echo(f"Set config for {mcp_name!r} on '{agent_name}'.")
 
 
 
@@ -2295,10 +2833,60 @@ def reflection_show(
 # only new piece on the agent side is the Bootstrap mode added to reflect's
 # SKILL.md.
 
-_BOOTSTRAP_MARKER = "<!-- clawmeets:bootstrap-trigger -->"
-_PHASE1_TIMEOUT_DEFAULT = 300   # 5 min for assistant to write USER.md
-_PHASE2_TIMEOUT_DEFAULT = 600   # 10 min per worker (web research is slow)
-_GATHER_TIMEOUT = 600           # 10 min cap on a single `claude` gather call
+_REFERENCES_MARKER = "<!-- clawmeets:references-trigger -->"
+
+
+def _list_reference_files(kdir: Path) -> list[Path]:
+    """List user-pre-seeded reference files under a knowledge_dir.
+
+    Returns sorted relative paths (relative to kdir), excluding:
+      - USER.md, REFERENCES.md (agent-authored memory / index)
+      - CLAUDE.md, README.md (Claude Code instructions / human-facing readme)
+      - learnings/ (subtree, agent-authored)
+      - skills/ (subtree, Claude Code plugin slash-commands)
+      - config/ (subtree, runner config)
+      - dotfiles and __pycache__
+
+    Follows symlinked directories so shared knowledge trees (e.g.
+    `Knowledge/Core -> ../../shared/Knowledge/Core`) are walked. Tracks
+    realpath of visited directories to avoid cycles.
+    """
+    if not kdir.exists() or not kdir.is_dir():
+        return []
+    excluded_top_dirs = {"learnings", "skills", "config"}
+    excluded_files = {"USER.md", "REFERENCES.md", "CLAUDE.md", "README.md"}
+    out: list[Path] = []
+    seen_real_dirs: set[str] = set()
+
+    for dirpath, dirnames, filenames in os.walk(kdir, followlinks=True):
+        # Cycle protection: if a symlink loops back to an already-visited
+        # real directory, prune and continue.
+        real = os.path.realpath(dirpath)
+        if real in seen_real_dirs:
+            dirnames[:] = []
+            continue
+        seen_real_dirs.add(real)
+
+        rel_dir = Path(os.path.relpath(dirpath, kdir))
+
+        # Prune subdirectories in-place: dotdirs, __pycache__, and
+        # excluded top-level dirs.
+        dirnames[:] = [
+            d for d in dirnames
+            if not d.startswith(".")
+            and d != "__pycache__"
+            and not (rel_dir == Path(".") and d in excluded_top_dirs)
+        ]
+
+        for fn in filenames:
+            if fn in excluded_files:
+                continue
+            if fn.startswith("."):
+                continue
+            rel_file = rel_dir / fn if rel_dir != Path(".") else Path(fn)
+            out.append(rel_file)
+
+    return sorted(out)
 
 
 def _ensure_fresh_user_token(server_url: str, data_dir: Path, username: str, current_token: str) -> str:
@@ -2395,435 +2983,325 @@ def _resolve_agent_knowledge_dir(
     return resolve_local_knowledge_dir(str(raw), user_config_dir)
 
 
-def _check_gmail_calendar_ready(assistant_dir: Path) -> tuple[bool, list[str]]:
-    """Both Gmail + Calendar MCPs must be installed AND OAuthed. Returns
-    (ready, missing_reasons) so the caller can print actionable guidance."""
-    mcp_mgr = McpManager(assistant_dir)
-    installed = set(mcp_mgr.installed_mcps())
-    reasons: list[str] = []
-    for name in ("gmail", "google-calendar"):
-        if name not in installed:
-            reasons.append(f"{name} not installed (run `clawmeets mcp install {name}`)")
-        elif not mcp_mgr.has_token(name):
-            reasons.append(f"{name} not authed (run `clawmeets mcp auth {name}`)")
-    return (not reasons), reasons
-
-
-def _gather_user_profile_rich(assistant_dir: Path) -> str:
-    """Spawn a one-shot `claude` with the assistant's MCP stack and capture a
-    profile dump distilled from Gmail + Calendar.
-
-    Renders `.mcp.json` into a fresh tmp working dir (so we don't trample the
-    agent's running sandbox), seeds it with the assistant's MCP manifests +
-    tokens, and runs `claude --print` non-interactively.
-    """
-    import shutil as _shutil
-    import subprocess
-    import tempfile
-
-    if _shutil.which("claude") is None:
-        typer.echo("Error: `claude` CLI not on PATH. Bootstrap requires Claude Code installed on the runner.", err=True)
-        raise typer.Exit(1)
-
-    mcp_mgr = McpManager(assistant_dir)
-    with tempfile.TemporaryDirectory(prefix="clawmeets-bootstrap-") as td:
-        cwd = Path(td)
-        mcp_mgr.render_mcp_json(cwd)  # writes cwd/.mcp.json with gmail + gcal
-
-        prompt = (
-            "Use your Gmail and Calendar tools to gather signal on the user "
-            "(last ~90 days of sent mail, calendar events, recurring meetings, "
-            "frequent contacts). Output a single Markdown profile dump covering: "
-            "role + industry, geography, recurring contacts (who they are, what "
-            "they do), current priorities, voice/tone, any 'do not' preferences. "
-            "Do not include raw email bodies or PII beyond names — distill into "
-            "prose. 1500–3000 words. Output the dump only, no preamble."
-        )
-        cmd = [
-            "claude",
-            "--print",
-            "--permission-mode", "bypassPermissions",
-            prompt,
-        ]
-        typer.echo("  [phase 1] gathering Gmail + Calendar signal via claude (this can take a few minutes)…")
-        try:
-            proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=_GATHER_TIMEOUT)
-        except subprocess.TimeoutExpired:
-            typer.echo(f"Error: gather call timed out after {_GATHER_TIMEOUT}s.", err=True)
-            raise typer.Exit(1)
-        if proc.returncode != 0:
-            typer.echo(f"Error: gather call failed (exit {proc.returncode}).", err=True)
-            if proc.stderr.strip():
-                typer.echo(proc.stderr.rstrip(), err=True)
-            raise typer.Exit(1)
-        return proc.stdout.strip() + "\n"
-
-
-def _gather_user_profile_degraded(non_interactive: bool, missing_reasons: list[str]) -> str:
-    """Interactive 3-question fallback when Gmail/Calendar aren't ready."""
-    if non_interactive:
-        typer.echo(
-            "Error: cannot run bootstrap without Gmail/Calendar in non-interactive mode.",
-            err=True,
-        )
-        for r in missing_reasons:
-            typer.echo(f"  - {r}", err=True)
-        typer.echo("Either install/auth those MCPs or drop --non-interactive.", err=True)
-        raise typer.Exit(1)
-
-    typer.echo(
-        "Gmail/Calendar isn't fully set up for your assistant, so I can't "
-        "auto-derive your profile. Three quick questions to bootstrap with —"
-    )
-    for r in missing_reasons:
-        typer.echo(f"  · {r}")
-    typer.echo("(answers stay local in USER.md)\n")
-    role = _prompt_required("  1. Role + industry (e.g. 'Senior PM at an AI infra startup')")
-    location = _prompt_required("  2. Where you're based (city / region / country)")
-    priority = _prompt_required("  3. Single biggest priority for the next 1–3 months")
-    return (
-        "# User profile (degraded bootstrap — user-provided)\n"
-        "\n"
-        f"- Role + industry: {role}\n"
-        f"- Location: {location}\n"
-        f"- Current priority: {priority}\n"
-    )
-
-
-def _prompt_required(text: str) -> str:
-    while True:
-        val = input(f"{text}: ").strip()
-        if val:
-            return val
-        typer.echo("    (required)")
-
-
-def _gather_agent_research(agent_name: str, description: str, capabilities: list[str], user_profile: str) -> str:
-    """Spawn a one-shot `claude` with web tools enabled, capture a deep-research
-    dump for one worker agent decorated by the user profile."""
-    import shutil as _shutil
-    import subprocess
-    import tempfile
-
-    if _shutil.which("claude") is None:
-        typer.echo("Error: `claude` CLI not on PATH.", err=True)
-        raise typer.Exit(1)
-
-    cap_line = ", ".join(capabilities) if capabilities else "(none listed)"
-    prompt = (
-        f"You are doing a deep-research dump for the `{agent_name}` agent.\n"
-        f"Agent description: {description}\n"
-        f"Capabilities: {cap_line}\n"
-        f"\n"
-        f"Decorate your research with this user profile — weight resources, "
-        f"comp data, regulations, and examples toward the user's segment:\n"
-        f"\n"
-        f"----- USER PROFILE -----\n"
-        f"{user_profile}\n"
-        f"----- END USER PROFILE -----\n"
-        f"\n"
-        f"Cover the 4–8 things the agent will actually be asked to do, "
-        f"frameworks/rules of thumb/tactics for each, common failure modes, "
-        f"and current public sources (cite URLs inline as [source: <url>]). "
-        f"Use web search aggressively for current data. 2000–4000 words. "
-        f"Output the dump only, no preamble."
-    )
-    with tempfile.TemporaryDirectory(prefix=f"clawmeets-bootstrap-{agent_name}-") as td:
-        cwd = Path(td)
-        cmd = [
-            "claude",
-            "--print",
-            "--permission-mode", "bypassPermissions",
-            prompt,
-        ]
-        try:
-            proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=_GATHER_TIMEOUT)
-        except subprocess.TimeoutExpired:
-            typer.echo(f"  [{agent_name}] gather timed out after {_GATHER_TIMEOUT}s — skipping.", err=True)
-            return ""
-        if proc.returncode != 0:
-            typer.echo(f"  [{agent_name}] gather failed (exit {proc.returncode}) — skipping.", err=True)
-            if proc.stderr.strip():
-                typer.echo(proc.stderr.rstrip(), err=True)
-            return ""
-        return proc.stdout.strip() + "\n"
-
-
-def _post_bootstrap_dm(
+def _bootstrap_resolve(
     client: httpx.Client,
     user_jwt: str,
-    assistant_token: Optional[str],
-    dm_project_id: str,
-    target_agent_name: str,
-    body: str,
-) -> bool:
-    """Find or create dm-{name} chatroom, post a user message with the
-    bootstrap-trigger marker. Returns True on 2xx."""
-    chatroom = _find_or_create_dm_chatroom(client, dm_project_id, target_agent_name, assistant_token or user_jwt)
-    if not chatroom:
-        typer.echo(f"Error: could not find or create dm-{target_agent_name}", err=True)
-        return False
-    resp = client.post(
-        f"/projects/{dm_project_id}/chatrooms/{chatroom['name']}/user-message",
-        json={"content": body},
-        headers={"Authorization": f"Bearer {user_jwt}"},
-    )
-    if resp.status_code >= 400:
-        typer.echo(f"Error posting to dm-{target_agent_name}: {resp.text}", err=True)
-        return False
-    return True
+    username: str,
+    data_dir_p: Path,
+) -> tuple[str, str, Path, Path, dict, Optional[str]]:
+    """Resolve the bits both bootstrap subcommands need from the server.
 
+    Returns (assistant_id, assistant_name, assistant_dir, assistant_kdir,
+    dm_project, assistant_token).
 
-def _poll_for_file(path: Path, timeout_sec: int, label: str) -> bool:
-    """Poll until `path` exists with size > 0, or timeout. Prints a tasteful
-    one-line progress that updates every 10s."""
-    import time
-    start = time.time()
-    while True:
-        if path.exists() and path.stat().st_size > 0:
-            elapsed = int(time.time() - start)
-            typer.echo(f"  [{label}] done in {elapsed}s — {path}")
-            return True
-        elapsed = time.time() - start
-        if elapsed > timeout_sec:
-            typer.echo(f"  [{label}] TIMED OUT after {int(elapsed)}s waiting for {path}", err=True)
-            return False
-        # Sleep but show heartbeat every 10s
-        sleep_chunk = min(10.0, timeout_sec - elapsed)
-        if sleep_chunk <= 0:
-            continue
-        time.sleep(sleep_chunk)
-        if int(elapsed) % 30 < 10:  # ~every 30s
-            typer.echo(f"  [{label}] still waiting… ({int(elapsed)}s/{timeout_sec}s)")
-
-
-@bootstrap_app.callback()
-def bootstrap_command(
-    phase: str = typer.Option("all", "--phase", help="1, 2, or all (default)"),
-    agent: Optional[str] = typer.Option(None, "--agent", help="Limit Phase 2 to a single worker agent name"),
-    force: bool = typer.Option(False, "--force", help="Re-trigger even if files already exist (skill still gates the actual overwrite)"),
-    non_interactive: bool = typer.Option(False, "--non-interactive", help="Fail in degraded path instead of prompting"),
-    allow_missing_user_profile: bool = typer.Option(
-        False, "--allow-missing-user-profile",
-        help="Run Phase 2 even when USER.md is missing (research will be generic)",
-    ),
-    timeout: int = typer.Option(_PHASE1_TIMEOUT_DEFAULT, "--timeout", help="Per-agent poll timeout in seconds"),
-    username: Optional[str] = typer.Option(None, "-u", "--username", help="Username (default: current saved session)"),
-    password: Optional[str] = typer.Option(None, "-p", "--password", help="Password (default: from saved session)"),
-    server: Optional[str] = typer.Option(None, "--server", "-s"),
-    data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir"),
-):
-    """Personalize a freshly installed agent team using your own data.
-
-    Phase 1: assistant USER.md from your Gmail + Calendar (or 3-question fallback).
-    Phase 2: each worker agent's learnings/ from a deep-research pass shaped by USER.md.
-
-    Idempotent — re-running skips agents whose files are already populated. Use --force
-    to re-trigger; the reflect skill itself decides whether to overwrite (it doesn't,
-    by default, so delete USER.md or learnings/INDEX.md first if you really want a redo).
-
-    Run after `clawmeets init --from-url` and `clawmeets agent start`.
+    Exits via typer.Exit on any failure. Caller has already injected the
+    user JWT into client.headers and refreshed the token if needed.
     """
-    if phase not in ("1", "2", "all"):
-        typer.echo("Error: --phase must be one of: 1, 2, all", err=True)
+    agents_dir = data_dir_p / "agents"
+    user_config_dir = data_dir_p / "config" / username
+
+    me_resp = client.get("/auth/user/me")
+    if me_resp.status_code != 200:
+        typer.echo(f"Error: could not load /auth/user/me ({me_resp.text})", err=True)
+        raise typer.Exit(1)
+    me = me_resp.json()
+    assistant_id = me.get("assistant_agent_id")
+    assistant_name = me.get("assistant_agent_name") or f"{username}-assistant"
+    if not assistant_id:
+        typer.echo("Error: user has no assistant agent on the server.", err=True)
         raise typer.Exit(1)
 
-    # ----- Resolve session -----
-    server_url, user_jwt = _resolve_user_session(data_dir, None, server, as_user=username)
+    assistant_dir = _find_agent_dir_by_id(agents_dir, assistant_id)
+    if assistant_dir is None:
+        typer.echo(
+            f"Error: no local agent dir for assistant id {assistant_id[:8]}…. "
+            f"Run `clawmeets init --from-url …` first to set up the assistant locally.",
+            err=True,
+        )
+        raise typer.Exit(1)
 
-    # We need both username (for DM-{username} project lookup) and the saved
-    # password is NOT required — a JWT is enough for the user-message POST.
-    # But _find_dm_project still needs `username`; pull it from the saved session.
+    asst_resp = client.get(f"/agents/{assistant_id}")
+    assistant_server_card = asst_resp.json() if asst_resp.status_code == 200 else None
+
+    assistant_kdir = _resolve_agent_knowledge_dir(assistant_server_card, assistant_dir, user_config_dir)
+    if assistant_kdir is None:
+        typer.echo(
+            f"Error: assistant has no knowledge_dir configured. "
+            f"Open the web UI agent settings page for '{assistant_name}', "
+            f"set the Knowledge Directory field (e.g. ./knowledge), click "
+            f"Save Changes, then re-run `clawmeets bootstrap`.",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    dm_project = _find_dm_project(client, username)
+    if not dm_project:
+        typer.echo(f"Error: DM project DM-{username} not found on server.", err=True)
+        raise typer.Exit(1)
+
+    assistant_token: Optional[str] = None
+    cred_path = assistant_dir / "credential.json"
+    if cred_path.exists():
+        try:
+            assistant_token = json.loads(cred_path.read_text()).get("token")
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    return assistant_id, assistant_name, assistant_dir, assistant_kdir, dm_project, assistant_token
+
+
+def _bootstrap_session_setup(
+    data_dir: Path,
+    server: Optional[str],
+    username: Optional[str],
+) -> tuple[str, str, str, Path]:
+    """Resolve server URL, user JWT, username, and data_dir_p. Exits on failure."""
+    server_url, user_jwt = _resolve_user_session(data_dir, None, server, as_user=username)
     if username is None:
         from clawmeets.cli_lifecycle import get_current_user
         username = get_current_user(Path(data_dir).expanduser())
     if not username:
         typer.echo("Error: no username known. Pass -u or run `clawmeets user login --save` first.", err=True)
         raise typer.Exit(1)
-
     data_dir_p = Path(data_dir).expanduser()
+    user_jwt = _ensure_fresh_user_token(server_url, data_dir_p, username, user_jwt)
+    return server_url, user_jwt, username, data_dir_p
+
+
+@bootstrap_app.command("references")
+def bootstrap_references(
+    agents: List[str] = typer.Option(
+        [], "--agent",
+        help="Agent name (full or short, e.g. 'marketer' or 'chengtao-marketer'). Repeatable; omit to index all owned agents incl. assistant.",
+    ),
+    force: bool = typer.Option(False, "--force", help="Re-trigger agents whose REFERENCES.md already exists (skill still gates the actual overwrite)"),
+    username: Optional[str] = typer.Option(None, "-u", "--username", help="Username (default: current saved session)"),
+    password: Optional[str] = typer.Option(None, "-p", "--password", help="Password (default: from saved session)"),
+    server: Optional[str] = typer.Option(None, "--server", "-s"),
+    data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir"),
+):
+    """Build REFERENCES.md from user-pre-seeded files in each agent's knowledge_dir.
+
+    For each owned agent (or just the named ones), lists files under the agent's
+    knowledge_dir (excluding USER.md, REFERENCES.md, learnings/, dotfiles) and
+    posts a references-trigger DM with the file paths. The agent's
+    /clawmeets:references skill reads each file and writes a one-line
+    "when to invoke" entry per file into knowledge_dir/REFERENCES.md.
+
+    Idempotent: skips agents whose REFERENCES.md already exists. Use --force
+    to re-trigger. Skips agents with no reference files (no LLM call).
+
+    Re-run after adding or removing reference files to refresh the index.
+    """
+    server_url, user_jwt, username, data_dir_p = _bootstrap_session_setup(data_dir, server, username)
     agents_dir = data_dir_p / "agents"
     user_config_dir = data_dir_p / "config" / username
 
-    # Refresh the saved JWT if it's expired — `clawmeets init` saved the
-    # password too, so we can re-login transparently.
-    user_jwt = _ensure_fresh_user_token(server_url, data_dir_p, username, user_jwt)
-
     with _http(server_url) as client:
-        # Inject the user JWT for `_find_dm_project` and friends (they all
-        # call `client.get/post` against `server_url`; we pass the bearer per
-        # call where needed).
         client.headers.update({"Authorization": f"Bearer {user_jwt}"})
+        (
+            _assistant_id,
+            _assistant_name,
+            _assistant_dir,
+            _assistant_kdir,
+            dm_project,
+            assistant_token,
+        ) = _bootstrap_resolve(client, user_jwt, username, data_dir_p)
 
-        # ----- Resolve assistant -----
-        me_resp = client.get("/auth/user/me")
-        if me_resp.status_code != 200:
-            typer.echo(f"Error: could not load /auth/user/me ({me_resp.text})", err=True)
-            raise typer.Exit(1)
-        me = me_resp.json()
-        assistant_id = me.get("assistant_agent_id")
-        assistant_name = me.get("assistant_agent_name") or f"{username}-assistant"
-        if not assistant_id:
-            typer.echo("Error: user has no assistant agent on the server.", err=True)
-            raise typer.Exit(1)
+        all_agents = _fetch_owned_agents(client, user_jwt)
 
-        assistant_dir = _find_agent_dir_by_id(agents_dir, assistant_id)
-        if assistant_dir is None:
-            typer.echo(
-                f"Error: no local agent dir for assistant id {assistant_id[:8]}…. "
-                f"Run `clawmeets init --from-url …` first to set up the assistant locally.",
-                err=True,
-            )
-            raise typer.Exit(1)
+        if agents:
+            from clawmeets.utils.agent_namespace import short_name
 
-        # Fetch the assistant's server-side card — that's where the just-saved
-        # web-UI value lives. Local card.json is the fallback.
-        asst_resp = client.get(f"/agents/{assistant_id}")
-        assistant_server_card = asst_resp.json() if asst_resp.status_code == 200 else None
-
-        assistant_kdir = _resolve_agent_knowledge_dir(assistant_server_card, assistant_dir, user_config_dir)
-        if assistant_kdir is None:
-            typer.echo(
-                f"Error: assistant has no knowledge_dir configured. "
-                f"Open the web UI agent settings page for '{assistant_name}', "
-                f"set the Knowledge Directory field (e.g. ./knowledge), click "
-                f"Save Changes, then re-run `clawmeets bootstrap`.",
-                err=True,
-            )
-            raise typer.Exit(1)
-
-        # ----- DM project -----
-        dm_project = _find_dm_project(client, username)
-        if not dm_project:
-            typer.echo(f"Error: DM project DM-{username} not found on server.", err=True)
-            raise typer.Exit(1)
-
-        # Assistant's own token (for chatroom creation only)
-        assistant_token: Optional[str] = None
-        cred_path = assistant_dir / "credential.json"
-        if cred_path.exists():
-            try:
-                assistant_token = json.loads(cred_path.read_text()).get("token")
-            except (json.JSONDecodeError, OSError):
-                pass
-
-        # ============================================================
-        # Phase 1
-        # ============================================================
-        if phase in ("1", "all"):
-            user_md_path = assistant_kdir / "USER.md"
-            if user_md_path.exists() and not force:
-                typer.echo(f"[phase 1] skipped — USER.md already exists at {user_md_path}")
-                typer.echo("           pass --force to re-trigger (skill still won't overwrite without `rm USER.md`)")
-            else:
-                typer.echo(f"[phase 1] personalizing assistant '{assistant_name}'")
-                ready, reasons = _check_gmail_calendar_ready(assistant_dir)
-                if ready:
-                    dump = _gather_user_profile_rich(assistant_dir)
-                else:
-                    dump = _gather_user_profile_degraded(non_interactive, reasons)
-
-                body = (
-                    f"{_BOOTSTRAP_MARKER}\n\n"
-                    "You're being bootstrapped. Treat the dump below as authoritative — "
-                    "distill into USER.md per the reflect skill's Bootstrap mode.\n\n"
-                    "== USER PROFILE DUMP ==\n"
-                    f"{dump}"
+            def _matches(card: dict, needle: str) -> bool:
+                name = card.get("name") or ""
+                short = short_name(name, username)
+                lower_needle = needle.lower()
+                return (
+                    name == needle
+                    or name.lower() == lower_needle
+                    or short == needle
+                    or short.lower() == lower_needle
                 )
-                if not _post_bootstrap_dm(client, user_jwt, assistant_token, dm_project["id"], assistant_name, body):
-                    raise typer.Exit(1)
-                typer.echo(f"  [phase 1] dispatched to dm-{assistant_name}; waiting for USER.md…")
-                if not _poll_for_file(user_md_path, timeout, "phase 1"):
-                    typer.echo(
-                        "[phase 1] FAILED — USER.md was not produced. Make sure "
-                        "`clawmeets agent start` is running and the assistant is online.",
-                        err=True,
-                    )
-                    raise typer.Exit(1)
 
-        # ============================================================
-        # Phase 2
-        # ============================================================
-        if phase in ("2", "all"):
-            user_md_path = assistant_kdir / "USER.md"
-            if user_md_path.exists():
-                user_profile = user_md_path.read_text()
-            elif allow_missing_user_profile:
-                typer.echo("[phase 2] WARNING: USER.md missing, proceeding without personalization (--allow-missing-user-profile)")
-                user_profile = "(no user profile available; do generic research)"
-            else:
+            matched: list[dict] = []
+            unmatched: list[str] = []
+            for needle in agents:
+                hits = [a for a in all_agents if _matches(a, needle)]
+                if not hits:
+                    unmatched.append(needle)
+                else:
+                    matched.extend(hits)
+            if unmatched:
                 typer.echo(
-                    "Error: USER.md missing — run `clawmeets bootstrap --phase 1` first, "
-                    "or pass --allow-missing-user-profile to run unpersonalized.",
+                    f"Error: no owned agent matches: {', '.join(repr(u) for u in unmatched)}. "
+                    f"Tried full name and short name (with '{username}-' prefix stripped).",
                     err=True,
                 )
                 raise typer.Exit(1)
+            seen: set[str] = set()
+            targets = [a for a in matched if not (a["id"] in seen or seen.add(a["id"]))]
+        else:
+            targets = all_agents
 
-            workers = _fetch_owned_agents(client, user_jwt)
-            workers = [a for a in workers if a.get("id") != assistant_id]
-            if agent:
-                workers = [a for a in workers if a.get("name") == agent]
-                if not workers:
-                    typer.echo(f"Error: no owned worker agent named {agent!r}.", err=True)
-                    raise typer.Exit(1)
+        if not targets:
+            typer.echo("[bootstrap references] no agents to index. Done.")
+            return
 
-            if not workers:
-                typer.echo("[phase 2] no worker agents to bootstrap. Done.")
-                return
+        dispatched = 0
+        skipped = 0
+        failed = 0
+        for a in targets:
+            a_id = a["id"]
+            a_name = a["name"]
+            a_dir = _find_agent_dir_by_id(agents_dir, a_id)
+            if a_dir is None:
+                typer.echo(f"  [{a_name}] no local dir — skipping (was this agent registered locally?)")
+                skipped += 1
+                continue
+            a_kdir = _resolve_agent_knowledge_dir(a, a_dir, user_config_dir)
+            if a_kdir is None:
+                typer.echo(f"  [{a_name}] no knowledge_dir set (web UI agent settings) — skipping")
+                skipped += 1
+                continue
+            references_path = a_dir / "memory" / "REFERENCES.md"
+            if references_path.exists() and not force:
+                typer.echo(f"  [{a_name}] skipped — REFERENCES.md already exists")
+                skipped += 1
+                continue
+            files = _list_reference_files(a_kdir)
+            if not files:
+                typer.echo(f"  [{a_name}] no reference files to index — skipping")
+                skipped += 1
+                continue
 
-            seeded = 0
-            skipped = 0
-            failed = 0
-            for w in workers:
-                w_id = w["id"]
-                w_name = w["name"]
-                w_dir = _find_agent_dir_by_id(agents_dir, w_id)
-                if w_dir is None:
-                    typer.echo(f"  [{w_name}] no local dir — skipping (was this agent registered locally?)")
-                    skipped += 1
-                    continue
-                # `w` came from /agents (server-side), so its local_settings reflects
-                # the latest UI save. Local card.json is the disk fallback.
-                w_kdir = _resolve_agent_knowledge_dir(w, w_dir, user_config_dir)
-                if w_kdir is None:
-                    typer.echo(f"  [{w_name}] no knowledge_dir set (web UI agent settings) — skipping")
-                    skipped += 1
-                    continue
-                index_path = w_kdir / "learnings" / "INDEX.md"
-                if index_path.exists() and not force:
-                    typer.echo(f"  [{w_name}] skipped — learnings/INDEX.md already exists")
-                    skipped += 1
-                    continue
+            # Inline ABSOLUTE paths in the trigger so the agent can pass them
+            # verbatim to Read and embed them in REFERENCES.md (its Read tool
+            # resolves absolute paths regardless of working directory).
+            file_lines = "\n".join(f"- {a_kdir / p}" for p in files)
+            body = (
+                f"{_REFERENCES_MARKER}\n\n"
+                "You're being bootstrapped to index reference files. Build "
+                "REFERENCES.md per the /clawmeets:references skill.\n\n"
+                "== REFERENCE FILES (absolute paths) ==\n"
+                f"{file_lines}\n"
+            )
+            if not _post_bootstrap_dm(client, user_jwt, assistant_token, dm_project["id"], a_name, body):
+                failed += 1
+                continue
+            typer.echo(f"  [{a_name}] dispatched ({len(files)} files).")
+            dispatched += 1
 
-                typer.echo(f"[phase 2] {w_name}: gathering web research…")
-                dump = _gather_agent_research(
-                    w_name,
-                    w.get("description") or "",
-                    w.get("capabilities") or [],
-                    user_profile,
-                )
-                if not dump:
-                    failed += 1
-                    continue
+        typer.echo(
+            f"\n[bootstrap references] summary: dispatched={dispatched} skipped={skipped} failed={failed}."
+        )
+        if dispatched:
+            typer.echo(
+                "  Each agent takes ~1–2 minutes to write REFERENCES.md. "
+                "Watch the chat UI for the agent's reply."
+            )
 
-                body = (
-                    f"{_BOOTSTRAP_MARKER}\n\n"
-                    "You're being bootstrapped. Treat the dump below as authoritative — "
-                    "structure into learnings/ per the reflect skill's Bootstrap mode.\n\n"
-                    "== USER PROFILE (read-only context) ==\n"
-                    f"{user_profile}\n"
-                    f"== DEEP-RESEARCH DUMP ({w.get('description') or w_name}) ==\n"
-                    f"{dump}"
-                )
-                if not _post_bootstrap_dm(client, user_jwt, assistant_token, dm_project["id"], w_name, body):
-                    failed += 1
-                    continue
-                typer.echo(f"  [{w_name}] dispatched; waiting for learnings/INDEX.md…")
-                # Phase 2 timeout is longer than Phase 1 by default; respect --timeout for both.
-                phase2_timeout = max(timeout, _PHASE2_TIMEOUT_DEFAULT) if timeout == _PHASE1_TIMEOUT_DEFAULT else timeout
-                if _poll_for_file(index_path, phase2_timeout, w_name):
-                    seeded += 1
-                else:
-                    failed += 1
 
-            typer.echo(f"\n[phase 2] summary: bootstrapped={seeded} skipped={skipped} failed/timed-out={failed}")
+@bootstrap_app.command("browser")
+def bootstrap_browser(
+    data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir"),
+):
+    """Install Chromium for the playwright-browser skill (one-time per machine).
+
+    Verifies Node.js >= 20 (prints a platform-specific install hint and exits 1
+    if missing), then runs `npx playwright install chromium` (~150 MB download;
+    Playwright skips browsers that are already cached). On Linux also runs
+    `npx playwright install-deps chromium`. Touches a marker file at
+    {data_dir}/.playwright_bootstrapped so the skill's preflight can answer
+    instantly.
+
+    Idempotent: safe to re-run any time. Browsers are global state on the
+    runner machine; auth state stays per-agent under each agent's
+    personal-skill-hub/_playwright/storage/.
+    """
+    import platform
+    import shutil
+    import subprocess
+    import sys
+
+    typer.echo("[bootstrap browser] checking Node.js…")
+    node_bin = shutil.which("node")
+    if node_bin is None:
+        typer.echo("Error: Node.js not found on PATH.", err=True)
+        system = platform.system()
+        if system == "Darwin":
+            typer.echo("  Install: brew install node", err=True)
+        elif system == "Linux":
+            typer.echo(
+                "  Install: curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash - && "
+                "sudo apt install -y nodejs",
+                err=True,
+            )
+        else:
+            typer.echo("  Install: https://nodejs.org/en/download/", err=True)
+        raise typer.Exit(1)
+
+    try:
+        version_proc = subprocess.run(
+            [node_bin, "--version"], capture_output=True, text=True, timeout=10
+        )
+    except subprocess.TimeoutExpired:
+        typer.echo("Error: `node --version` timed out after 10s.", err=True)
+        raise typer.Exit(1)
+    raw_version = (version_proc.stdout or "").strip().lstrip("v")
+    try:
+        major = int(raw_version.split(".", 1)[0])
+    except ValueError:
+        typer.echo(
+            f"Error: could not parse Node version from {version_proc.stdout!r}.",
+            err=True,
+        )
+        raise typer.Exit(1)
+    if major < 20:
+        typer.echo(
+            f"Error: Node.js >= 20 required (found v{raw_version}). "
+            "Upgrade and re-run.",
+            err=True,
+        )
+        raise typer.Exit(1)
+    typer.echo(f"  Node.js v{raw_version} OK")
+
+    npx_bin = shutil.which("npx")
+    if npx_bin is None:
+        typer.echo("Error: `npx` not on PATH (ships with Node.js).", err=True)
+        raise typer.Exit(1)
+
+    typer.echo("[bootstrap browser] installing Chromium via npx playwright install chromium…")
+    typer.echo("  (~150 MB download on first run; subsequent runs are instant)")
+    install_proc = subprocess.run(
+        [npx_bin, "--yes", "playwright", "install", "chromium"],
+        stdout=sys.stdout,
+        stderr=sys.stderr,
+    )
+    if install_proc.returncode != 0:
+        typer.echo("Error: `playwright install chromium` failed.", err=True)
+        raise typer.Exit(install_proc.returncode)
+
+    if platform.system() == "Linux":
+        typer.echo("[bootstrap browser] installing system libs (Linux only)…")
+        deps_proc = subprocess.run(
+            [npx_bin, "--yes", "playwright", "install-deps", "chromium"],
+            stdout=sys.stdout,
+            stderr=sys.stderr,
+        )
+        if deps_proc.returncode != 0:
+            typer.echo(
+                "Warning: `playwright install-deps chromium` failed; "
+                "headed browser may not start. Re-run with sudo if needed.",
+                err=True,
+            )
+
+    data_dir_p = Path(data_dir).expanduser()
+    data_dir_p.mkdir(parents=True, exist_ok=True)
+    marker = data_dir_p / ".playwright_bootstrapped"
+    marker.touch()
+    typer.echo(f"[bootstrap browser] done. Marker: {marker}")
+    typer.echo(
+        "  Install the playwright-browser skill on any agent that needs browser "
+        "automation (Agent settings → Skills → playwright-browser)."
+    )

@@ -236,6 +236,69 @@ class ClawMeetsClient:
         resp.raise_for_status()
         return resp.json()
 
+    async def post_mcp_auth_init(
+        self,
+        agent_id: str,
+        mcp_name: str,
+        state: str,
+        auth_url: str,
+    ) -> None:
+        """Register a pending MCP OAuth flow with the server.
+
+        Tells the server which agent is awaiting which MCP's consent and
+        hands over the authorization URL so the server can push a "Continue
+        with Google" link to the agent's owner. The server later forwards
+        the resulting code back to this runner over WebSocket.
+        """
+        url = f"{self._base_url}/agents/{agent_id}/mcps/{mcp_name}/auth-init"
+        resp = await self._http.post(
+            url, json={"state": state, "auth_url": auth_url}
+        )
+        resp.raise_for_status()
+        logger.debug(f"Registered MCP auth-init for {mcp_name} (state={state[:8]}…)")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Cross-agent tunnel operations (Primitive 3 router decorator)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def ensure_front_desk(self, agent_full_name: str) -> dict[str, Any]:
+        """Ensure a Front Desk project exists with ``agent_full_name`` as
+        coordinator. Authenticates as this client's agent (X-Agent-ID header is
+        already on every request from the runner).
+
+        Returns the Project dict as serialized by the server.
+        """
+        url = f"{self._base_url}/me/front-desk/{agent_full_name}/ensure"
+        resp = await self._http.post(url)
+        resp.raise_for_status()
+        return resp.json()
+
+    async def list_tunnels(self) -> list[dict[str, Any]]:
+        """List tunnel bindings the calling agent is associated with."""
+        url = f"{self._base_url}/tunnels"
+        resp = await self._http.get(url)
+        resp.raise_for_status()
+        return resp.json()
+
+    async def create_tunnel(
+        self,
+        local_project_id: str,
+        local_room: str,
+        fd_project_id: str,
+    ) -> dict[str, Any]:
+        """Create a binding from ``(local_project_id, local_room)`` to
+        ``fd_project_id``'s user-communication room.
+        """
+        url = f"{self._base_url}/tunnels"
+        payload = {
+            "local_project_id": local_project_id,
+            "local_room": local_room,
+            "fd_project_id": fd_project_id,
+        }
+        resp = await self._http.post(url, json=payload)
+        resp.raise_for_status()
+        return resp.json()
+
     async def get_changelog(
         self,
         project_id: str,

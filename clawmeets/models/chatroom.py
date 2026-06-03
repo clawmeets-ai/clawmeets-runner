@@ -34,7 +34,13 @@ from pydantic import BaseModel, Field, PrivateAttr, computed_field
 
 from ..utils.file_io import FileUtil
 from ..utils.validation import validate_name
-from .chat_message import ChatFileEvent, ChatLogEntry, ChatMessage, parse_log_line
+from .chat_message import (
+    ChatBatchTimeoutEvent,
+    ChatFileEvent,
+    ChatLogEntry,
+    ChatMessage,
+    parse_log_line,
+)
 from .participant import Participant
 
 if TYPE_CHECKING:
@@ -135,6 +141,21 @@ class Chatroom(BaseModel):
         entries = FileUtil.read(self.participants_path, "ndjson")
         return [entry["agent_id"] for entry in entries]
 
+    def is_external_member(self, agent_id: str) -> bool:
+        """True if ``agent_id`` is in PARTICIPANTS.ndjson with ``external=true``.
+
+        Used by the runner-side notifier to skip LLM invocation for foreign
+        memberships (the FD tunnel delivers the message via FD instead).
+        Returns False for legacy rows missing the ``external`` field.
+        """
+        if not self.participants_path.exists():
+            return False
+        entries = FileUtil.read(self.participants_path, "ndjson")
+        for entry in entries:
+            if entry.get("agent_id") == agent_id:
+                return bool(entry.get("external", False))
+        return False
+
     @property
     def is_shared_context_room(self) -> bool:
         """Check if this is the shared-context room for project-wide knowledge."""
@@ -164,6 +185,29 @@ class Chatroom(BaseModel):
         if not self.is_dm_chatroom:
             return None
         return self.name[3:]  # Remove "dm-" prefix
+
+    @property
+    def last_cleared_at(self) -> Optional[datetime]:
+        """When the chatroom history was last cleared, if ever.
+
+        Read from meta.json; written by ChatroomState.clear_history(). None
+        means the room has never been cleared.
+        """
+        data = FileUtil.read(self.meta_path, "json", default=None)
+        if not data:
+            return None
+        raw = data.get("last_cleared_at")
+        if not raw:
+            return None
+        return datetime.fromisoformat(raw)
+
+    @property
+    def last_cleared_through_version(self) -> Optional[int]:
+        """Changelog version that the last clear superseded, if ever."""
+        data = FileUtil.read(self.meta_path, "json", default=None)
+        if not data:
+            return None
+        return data.get("last_cleared_through_version")
 
     # -------------------------------------------------------------------------
     # Association Methods (lookup-based, no caching)
@@ -432,6 +476,7 @@ class ChatroomState:
                 "agent_id": participant["id"],
                 "agent_name": participant["name"],
                 "invited_at": created_at.isoformat() if created_at else None,
+                "external": bool(participant.get("external", False)),
             }
             FileUtil.write(
                 participants_path,
@@ -447,7 +492,14 @@ class ChatroomState:
         object.__setattr__(instance, "_ctx", ctx)
         return instance
 
-    def add_participant(self, participant_id: str, participant_name: str, timestamp: datetime) -> None:
+    def add_participant(
+        self,
+        participant_id: str,
+        participant_name: str,
+        timestamp: datetime,
+        *,
+        external: bool = False,
+    ) -> None:
         """Add a participant to an existing chatroom's PARTICIPANTS.ndjson.
 
         Idempotent: no-op if participant is already a member.
@@ -456,6 +508,9 @@ class ChatroomState:
             participant_id: The participant's ID
             participant_name: The participant's display name
             timestamp: When the participant was added
+            external: True if this membership is a ghost — the participant's
+                runner is expected to skip processing this chatroom (the FD
+                tunnel handles delivery instead).
         """
         if participant_id in self._chatroom.participants:
             return  # Already a member
@@ -463,6 +518,7 @@ class ChatroomState:
             "agent_id": participant_id,
             "agent_name": participant_name,
             "invited_at": timestamp.isoformat() if timestamp else None,
+            "external": bool(external),
         }
         FileUtil.write(
             self._chatroom.participants_path,
@@ -503,6 +559,21 @@ class ChatroomState:
             atomic=False,
         )
 
+    def append_batch_timeout(self, event: ChatBatchTimeoutEvent) -> None:
+        """Append a batch-timeout event to CHATS.ndjson.
+
+        Args:
+            event: The ChatBatchTimeoutEvent to append
+        """
+        FileUtil.write(
+            self._chatroom.chats_path,
+            event.model_dump(by_alias=True),
+            "ndjson",
+            mode="a",
+            ensure_dir=True,
+            atomic=False,
+        )
+
     def write_file(self, filename: str, content: bytes) -> None:
         """Write a file to the files/ directory.
 
@@ -512,3 +583,41 @@ class ChatroomState:
         """
         file_path = self._chatroom.files_dir / filename
         FileUtil.write(file_path, content, "bytes", atomic=False)
+
+    def clear_history(
+        self,
+        archive_filename: Optional[str],
+        cleared_at: datetime,
+        cleared_through_version: int,
+    ) -> None:
+        """Wipe CHATS.ndjson, archiving prior contents alongside.
+
+        Idempotent rewrite triggered by the CHATROOM_CLEARED changelog entry —
+        invoked identically on the server (where the entry was minted) and on
+        every runner that syncs the entry, so all sides end up with the same
+        empty CHATS.ndjson plus the same .bak sibling.
+
+        Args:
+            archive_filename: Name to move existing CHATS.ndjson to (relative
+                to chatroom dir). None when CHATS.ndjson was already empty
+                or missing — nothing is moved in that case.
+            cleared_at: Timestamp to stamp into meta.json.
+            cleared_through_version: Changelog version this clear supersedes;
+                stamped into meta.json so consumers can show "cleared at vN".
+        """
+        import shutil
+
+        chats_path = self._chatroom.chats_path
+        if archive_filename and chats_path.exists() and chats_path.stat().st_size > 0:
+            archive_path = chats_path.parent / archive_filename
+            shutil.move(str(chats_path), str(archive_path))
+        # Touch an empty CHATS.ndjson so subsequent appends land cleanly even
+        # if the original was missing or just got moved.
+        chats_path.parent.mkdir(parents=True, exist_ok=True)
+        chats_path.write_text("", encoding="utf-8")
+
+        # Stamp meta.json with clear info (preserves all other fields).
+        meta = FileUtil.read(self._chatroom.meta_path, "json", default=None) or {}
+        meta["last_cleared_at"] = cleared_at.isoformat()
+        meta["last_cleared_through_version"] = cleared_through_version
+        FileUtil.write(self._chatroom.meta_path, meta, "json", atomic=True)

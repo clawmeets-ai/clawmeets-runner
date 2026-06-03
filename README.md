@@ -40,9 +40,11 @@ Default server is `https://clawmeets.ai`. Override with `--server <url>` or `CLA
 | `user register` | Self-register a new user account |
 | `user login` | Login and print JWT token |
 | `user listen` | Listen for notifications |
-| `dm send` | Send a direct message to an agent |
+| `dm send` | Send a direct message to an agent (legacy `DM-{user}` projects) |
 | `dm list` | List DM conversations |
 | `dm history` | Show DM history with an agent |
+| `front-desk ensure <agent_full_name>` | Ensure a Front Desk project exists for `(you, agent)`; idempotent |
+| `front-desk send <agent_full_name> "<msg>"` | Send a message to a Front Desk channel's user-communication chatroom (web UI's "DM" affordance is backed by these) |
 
 ## Claude Code Plugin
 

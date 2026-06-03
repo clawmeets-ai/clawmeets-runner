@@ -46,9 +46,12 @@ class AgentResponse(BaseModel):
     registered_by: Optional[str] = None
     is_verified: bool = False
     user_teams: list[str] = Field(default_factory=list)  # Owner-defined team labels
-    local_settings: dict = Field(default_factory=dict)  # knowledge_dir, use_chrome
+    local_settings: dict = Field(default_factory=dict)  # knowledge_dir, llm_provider, llm_model
     last_reflected_at: Optional[datetime] = None  # Last successful reflection cycle
     last_linted_at: Optional[datetime] = None  # Last successful lint pass
+    last_synced_at: Optional[datetime] = None  # Last successful DWH sync trigger reply
+    front_desk_invitable_agents: list[str] = Field(default_factory=list)  # Agent IDs this agent may invite as workers when coordinating a Front Desk project
+    front_desk_invitable_teams: list[str] = Field(default_factory=list)  # User-team labels this agent may invite as workers when coordinating a Front Desk project (composes via OR with front_desk_invitable_agents)
 
 
 class AgentSearchResponse(BaseModel):
@@ -63,14 +66,20 @@ class AgentRegistrationResponse(BaseModel):
     """Flat response from agent registration.
 
     Use agent_id to lookup the full Agent if needed.
+
+    ``token`` is None on the re-register path: re-registration is meant to be
+    idempotent (e.g. ``clawmeets init`` re-runs) and must not silently
+    invalidate the in-memory credential of any already-running runner.
+    Token rotation is a deliberate op (delete + register-fresh).
     """
     agent_id: str
     agent_name: str
-    token: str
+    token: Optional[str] = None
     description: str
     status: AgentStatus = AgentStatus.OFFLINE
     registered_at: datetime
     discoverable_through_registry: bool = True
+    user_teams: list[str] = Field(default_factory=list)
 
 
 class CreateUserResponse(BaseModel):
@@ -129,3 +138,14 @@ class ParticipantProjectResponse(BaseModel):
     coordinator_id: str
     git_url: str = ""
     is_viewer: bool = False
+    # Front Desk + general project ownership context. The frontend uses these
+    # to render the sidebar's Front Desk section asymmetrically (owner side
+    # vs. requester side) without a second round-trip.
+    created_by: Optional[str] = None
+    requester_id: Optional[str] = None
+    requester_kind: Optional[str] = None  # "user" | "agent" — discriminator for resolving requester_id
+    surface: Optional[str] = None  # "regular" | "dm" | "front_desk" — explicit project shape
+    # True when the requesting participant is the Front Desk requester (not the
+    # owner) on this project — i.e. external case where the project is hosted
+    # on someone else's runner.
+    is_requester: bool = False

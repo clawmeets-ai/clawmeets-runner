@@ -269,9 +269,75 @@ class PersistableParticipant(Participant, ABC):
         self._save_card(card)
 
     @property
+    def last_synced_at(self) -> Optional[datetime]:
+        """Timestamp of the last completed DWH sync cycle (None if never).
+
+        Set when this agent replies to a ``<!-- clawmeets:<source>-sync-trigger -->``
+        DM. ETL replies do NOT touch this field — sync and ETL track separately
+        because a DWH agent can sync without doing any derivation, and the
+        assistant can derive without ever syncing.
+        """
+        ts = self._load_card().get("last_synced_at")
+        if ts:
+            try:
+                return datetime.fromisoformat(ts)
+            except ValueError:
+                pass
+        return None
+
+    def update_last_synced_at(self, when: datetime) -> None:
+        """Persist a new last-sync timestamp."""
+        card = self._load_card()
+        card["last_synced_at"] = when.isoformat()
+        self._save_card(card)
+
+    @property
     def is_discoverable(self) -> bool:
         """Whether this participant appears in the public registry."""
         return self._load_card().get("discoverable_through_registry", True)
+
+    @property
+    def front_desk_invitable_agents(self) -> list[str]:
+        """Agent IDs this agent may invite as workers in a Front Desk project.
+
+        Composed via OR with ``front_desk_invitable_teams``: an agent passes
+        the allowlist if its id is here OR if any of its ``user_teams`` is
+        listed there. Empty on both = no delegation; the coordinator must
+        reply directly. Defaults to empty for newly created agents.
+        """
+        raw = self._load_card().get("front_desk_invitable_agents", []) or []
+        seen: set[str] = set()
+        out: list[str] = []
+        for value in raw:
+            if not isinstance(value, str):
+                continue
+            stripped = value.strip()
+            if not stripped or stripped in seen:
+                continue
+            seen.add(stripped)
+            out.append(stripped)
+        return out
+
+    @property
+    def front_desk_invitable_teams(self) -> list[str]:
+        """User-team labels this agent may invite as workers in a Front Desk project.
+
+        Composed via OR with ``front_desk_invitable_agents``: any owned agent
+        carrying one of these team labels passes the allowlist. Empty on both
+        = no delegation. Defaults to empty for newly created agents.
+        """
+        raw = self._load_card().get("front_desk_invitable_teams", []) or []
+        seen: set[str] = set()
+        out: list[str] = []
+        for value in raw:
+            if not isinstance(value, str):
+                continue
+            stripped = value.strip()
+            if not stripped or stripped in seen:
+                continue
+            seen.add(stripped)
+            out.append(stripped)
+        return out
 
     @property
     def user_teams(self) -> list[str]:
@@ -747,6 +813,9 @@ class PersistableParticipant(Participant, ABC):
             local_settings=card.get("local_settings", {}),
             last_reflected_at=self.last_reflected_at,
             last_linted_at=self.last_linted_at,
+            last_synced_at=self.last_synced_at,
+            front_desk_invitable_agents=self.front_desk_invitable_agents,
+            front_desk_invitable_teams=self.front_desk_invitable_teams,
         )
 
     def to_dict(self) -> dict:
@@ -766,6 +835,9 @@ class PersistableParticipant(Participant, ABC):
             "user_teams": self.user_teams,
             "last_reflected_at": card.get("last_reflected_at"),
             "last_linted_at": card.get("last_linted_at"),
+            "last_synced_at": card.get("last_synced_at"),
+            "front_desk_invitable_agents": self.front_desk_invitable_agents,
+            "front_desk_invitable_teams": self.front_desk_invitable_teams,
             "role": self.role.value,
         }
 

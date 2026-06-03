@@ -75,50 +75,111 @@ class PromptBuilder:
         """Build documentation for available actions. Override in subclasses."""
         raise NotImplementedError("Subclasses must implement build_actions_doc()")
 
-    def _build_memory_section(self, name: str) -> str:
-        """Role-aware MEMORY block describing knowledge_dir's reflection layout.
+    def _build_memory_section(self, name: str, agent_dir: Path) -> str:
+        """Role-aware KNOWLEDGE PRECEDENCE block.
 
-        The user's personal assistant is the agent named ``{username}-assistant``.
-        That agent maintains both ``USER.md`` and ``learnings/``. Worker agents
-        maintain only ``learnings/``.
+        All agent-authored memory lives under ``{agent_dir}/memory/``
+        (assistant's `USER.md`, `REFERENCES.md`, `KNOWLEDGE_PACKS.md`,
+        `learnings/INDEX.md` + topic pages). Installed knowledge packs
+        live alongside at ``{agent_dir}/knowledge_packs/`` — the index in
+        memory/ links into that sibling with absolute paths.
 
-        This block is purely declarative — agents read these files at any time,
-        but writes only happen during scheduled reflection (via the
+        The user's personal assistant is the agent named
+        ``{username}-assistant``. That agent maintains both ``USER.md`` and
+        ``learnings/``. Worker agents maintain only ``learnings/``.
+
+        This block is purely declarative — agents read these files at any
+        time, but writes only happen during scheduled reflection (via the
         ``/clawmeets:reflect`` skill).
         """
+        memory_dir = f"{agent_dir}/memory"
         is_assistant = name.endswith("-assistant")
         if is_assistant:
-            return """
-== MEMORY ==
-Your knowledge_dir holds your durable memory:
-- USER.md                what you know about this user (you are their assistant)
-- learnings/INDEX.md     one-line lessons + links to topic pages
-- learnings/log.md       append-only "## [YYYY-MM-DD] event | title" entries
-- learnings/<topic>.md   drill-down pages
+            return f"""
+== KNOWLEDGE PRECEDENCE (binding) ==
 
-You also have a personal skill hub at the agent root:
-- personal-skill-hub/skills/INDEX.md   procedures you've codified during reflection
+Your agent memory (under {memory_dir}/) has two independent layers, with
+strict precedence at runtime:
 
-Each entry in that INDEX is callable as /personal:<name> — check it before
-re-deriving a familiar procedure from scratch. To update memory or codify a
-new procedure, follow the /clawmeets:reflect skill — invoked only on scheduled
-reflection messages, not during normal turns.
+1. AUTHORITATIVE — files the user has authored or that you have curated about
+   the user themselves:
+   - {memory_dir}/USER.md            what you know about this user (you are their assistant)
+   - {memory_dir}/REFERENCES.md      index of user-pre-seeded reference files
+                                     in the user's knowledge_dir (each entry
+                                     tells you when to consult it)
+   - {memory_dir}/KNOWLEDGE_PACKS.md index of knowledge packs the user has
+                                     explicitly installed on you (each entry
+                                     names a curated pack with absolute paths
+                                     into {agent_dir}/knowledge_packs/)
+   For ANY question about the user themselves OR the user's actual world
+   (their business, product, life, projects, preferences, domain facts),
+   the answer comes from these files. Do not synthesize from learnings/
+   on user-world or user-personal questions.
+
+2. FALLBACK — your distilled learnings, indexed at
+   {memory_dir}/learnings/INDEX.md. This is your general background —
+   industry frameworks, field context, regulations, comp data — things
+   that are true about the *field*, not about *this user*. Use learnings/
+   for field/industry questions, not user-specific ones.
+
+The two layers are decoupled — neither indexes or references the other.
+When a question spans both: start with the authoritative layer for the
+user-world facts, then consult learnings/ for any generic context that
+fills gaps the authoritative files don't cover.
+
+Other memory files:
+- {memory_dir}/learnings/log.md       append-only "## [YYYY-MM-DD] event | title"
+- {memory_dir}/learnings/<topic>.md   drill-down pages, cross-linked from INDEX.md
+
+When you receive a DM tagged with one of these HTML-comment markers, follow
+the matching skill — they are the only times you should write to memory:
+- <!-- clawmeets:reflect-trigger -->                /clawmeets:reflect
+- <!-- clawmeets:lint-trigger -->                   /clawmeets:lint
+- <!-- clawmeets:references-trigger -->             /clawmeets:references
+- <!-- clawmeets:interview-trigger -->              /clawmeets:interview
+- <!-- clawmeets:rerun-{{slug}} --> [optional ask]  /clawmeets:rerun-project
 """
-        return """
-== MEMORY ==
-Your knowledge_dir holds your durable memory:
-- learnings/INDEX.md     one-line lessons in your domain + links to topic pages
-- learnings/log.md       append-only "## [YYYY-MM-DD] event | title" entries
-- learnings/<topic>.md   drill-down pages
+        return f"""
+== KNOWLEDGE PRECEDENCE (binding) ==
 
-You also have a personal skill hub at the agent root:
-- personal-skill-hub/skills/INDEX.md   procedures you've codified during reflection
+Your agent memory (under {memory_dir}/) has two independent layers, with
+strict precedence at runtime:
 
-Each entry in that INDEX is callable as /personal:<name> — check it before
-re-deriving a familiar procedure from scratch. To update memory or codify a
-new procedure, follow the /clawmeets:reflect skill — invoked only on scheduled
-reflection messages, not during normal turns. User-identity facts (general
-preferences, personal info) live with the user's assistant, not here.
+1. AUTHORITATIVE — the user's pre-seeded reference files
+   ({memory_dir}/REFERENCES.md) and any knowledge packs the user has
+   explicitly installed on you ({memory_dir}/KNOWLEDGE_PACKS.md — an index
+   with absolute paths into {agent_dir}/knowledge_packs/). Together these
+   are the user's own description of their world (their business, product,
+   customers, operations, positioning, domain facts). For ANY question
+   about the user's actual world, the answer comes from these files. Do
+   not synthesize from learnings/ on user-world questions.
+
+2. FALLBACK — your distilled learnings, indexed at
+   {memory_dir}/learnings/INDEX.md. This is your general background —
+   industry frameworks, field context, regulations, comp data — things
+   that are true about the *field*, not about *this user*. Use learnings/
+   for field/industry questions, not user-specific ones.
+
+The two layers are decoupled — neither indexes or references the other.
+When a question spans both ("how should I price X for account Y"): start
+with the authoritative layer (REFERENCES.md, KNOWLEDGE_PACKS.md) for the
+user-world facts (account tier, pricing rules, installed tactics), then
+consult learnings/ for any generic industry context that fills gaps the
+seeded files don't cover.
+
+Other memory files:
+- {memory_dir}/learnings/log.md       append-only "## [YYYY-MM-DD] event | title"
+- {memory_dir}/learnings/<topic>.md   drill-down pages, cross-linked from INDEX.md
+
+User-identity facts (general preferences, personal info) live with the
+user's assistant, not here.
+
+When you receive a DM tagged with one of these HTML-comment markers, follow
+the matching skill — they are the only times you should write to memory:
+- <!-- clawmeets:reflect-trigger -->                /clawmeets:reflect
+- <!-- clawmeets:lint-trigger -->                   /clawmeets:lint
+- <!-- clawmeets:references-trigger -->             /clawmeets:references
+- <!-- clawmeets:personalize-trigger -->            /clawmeets:personalize
 """
 
     def _build_git_guidance(self) -> str:
@@ -150,8 +211,12 @@ Use update_file for BOTH types - the system handles git vs changelog separation 
         data_dir: Path,
         role_guidance: str,
         project_name: str,
+        agent_dir: Path,
         capabilities_line: str = "",
         knowledge_dirs: list[Path] | None = None,
+        dwh_dir: Optional[Path] = None,
+        mcp_config_files: dict[str, Path] | None = None,
+        skill_config_files: dict[str, Path] | None = None,
     ) -> str:
         """
         Build the base prompt structure used by both worker and coordinator.
@@ -172,6 +237,11 @@ Use update_file for BOTH types - the system handles git vs changelog separation 
             capabilities_line: Optional capabilities line for workers
             project_name: Human-readable project name
             knowledge_dirs: Optional list of knowledge base directories (read-write, persistent)
+            mcp_config_files: Per-installed-MCP config paths (rendered into
+                ``MCP CONFIG FILES`` block).
+            skill_config_files: Per-installed-skill config paths (rendered
+                into ``SKILL CONFIG FILES`` block — the LLM Reads these
+                before deciding whether to invoke each skill).
 
         Returns:
             Complete prompt string
@@ -181,19 +251,71 @@ Use update_file for BOTH types - the system handles git vs changelog separation 
 
         cap_section = f"\nCapabilities: {capabilities_line}" if capabilities_line else ""
 
+        # User-curated reference material (their own notes, PDFs, docs).
         knowledge_section = ""
-        memory_section = ""
         if knowledge_dirs:
             paths = "\n".join(f"- {d}" for d in knowledge_dirs)
             knowledge_section = f"""
-== KNOWLEDGE BASE (read-write) ==
-Your persistent knowledge base directories:
+== KNOWLEDGE BASE (user-curated reference material — read-only browsing) ==
 {paths}
 
-You can read AND write files here. Changes persist across projects.
-Use this to store learnings and reference material that improves your work over time.
+User-pre-seeded files. The index of these files lives at
+{agent_dir}/memory/REFERENCES.md with absolute paths; consult it to decide
+which to read.
 """
-            memory_section = self._build_memory_section(name)
+
+        # Agent-authored memory under {agent_dir}/memory/ — always present
+        # on the runner.
+        agent_memory_section = f"""
+== AGENT MEMORY (durable state — read/write, runner-managed) ==
+{agent_dir}/memory/
+
+Holds your USER.md (assistant only), REFERENCES.md, KNOWLEDGE_PACKS.md,
+and learnings/. See KNOWLEDGE PRECEDENCE below for how to use them.
+"""
+
+        # Installed knowledge packs (server-synced content under its own dir).
+        packs_section = f"""
+== KNOWLEDGE PACKS (installed; auto-synced from server) ==
+{agent_dir}/knowledge_packs/
+
+Pack content (text and binary). The index at
+{agent_dir}/memory/KNOWLEDGE_PACKS.md links into here with absolute paths.
+"""
+
+        memory_section = self._build_memory_section(name, agent_dir)
+
+        dwh_section = ""
+        if dwh_dir is not None:
+            dwh_section = f"""
+== DATA WAREHOUSE ==
+{dwh_dir}
+"""
+
+        # Per-MCP config file paths — pass these verbatim as `config_file`
+        # to sync tools.
+        mcp_configs_section = ""
+        if mcp_config_files:
+            mcp_lines = "\n".join(
+                f"- {mcp}: {path}" for mcp, path in sorted(mcp_config_files.items())
+            )
+            mcp_configs_section = f"""
+== MCP CONFIG FILES (pass these paths to sync tools as `config_file`) ==
+{mcp_lines}
+"""
+
+        # Per-skill config file paths — READ these before invoking a skill so
+        # operator-set per-skill policy (e.g. clawmeets-consult's
+        # `invoke_when`, `providers.<n>.use_for`) actually informs routing.
+        skill_configs_section = ""
+        if skill_config_files:
+            skill_lines = "\n".join(
+                f"- {skill}: {path}" for skill, path in sorted(skill_config_files.items())
+            )
+            skill_configs_section = f"""
+== SKILL CONFIG FILES (operator-set per-agent policy — Read before invoking a skill) ==
+{skill_lines}
+"""
 
         return f"""You are {name}, an AI agent.
 Description: {description}{cap_section}
@@ -204,7 +326,7 @@ Chatroom: {chatroom_name}
 == SYNCED PROJECT FILES (read-only) ==
 Files synced from server, available in {data_dir}:
 {file_manifest}
-{knowledge_section}{memory_section}
+{knowledge_section}{agent_memory_section}{packs_section}{memory_section}{mcp_configs_section}{skill_configs_section}{dwh_section}
 == YOUR WORKING DIRECTORY ==
 Use relative paths to write files. Files you write will be synced to the server and shared with all participants.
 
@@ -221,6 +343,11 @@ FILE PATHS: Use relative paths from your working directory (e.g. report.md, subd
 CRITICAL: Your output MUST be valid JSON matching the structured output schema.
 After analyzing the situation, output your actions as a JSON object with an "actions" array.
 Include multiple actions if needed. If no action is required, output: {{"actions": []}}
+
+Emit ALL of your actions in a single structured-output response. If you realize
+mid-turn that another action is needed, add it to the same actions array — a
+second structured-output call in the same turn may REPLACE the first, not
+append to it.
 """
 
 
@@ -297,6 +424,26 @@ Step 2 - Emit the update_file action with the SAME path:
 
 NOTE: Existing project files are available READ-ONLY from the synced directory.
 You can read them but should not modify them directly - write to your working directory instead.
+
+== MEMORY FILES — DIFFERENT RULE ==
+The "Write then update_file" pattern above is ONLY for chatroom-visible
+deliverables in your sandbox.
+
+Files under your agent's `memory/` directory (USER.md, REFERENCES.md,
+KNOWLEDGE_PACKS.md, learnings/<topic>.md) and under your agent's
+`knowledge_packs/<slug>/...` directory are AUTHORITATIVE memory and
+stay invisible to chat by design.
+
+For memory files:
+- Use the Write tool ONLY (write directly to the absolute memory path
+  shown in the AGENT MEMORY block above, e.g.
+  `Write(file_path="<agent_dir>/memory/USER.md", content="...")`).
+- Do NOT emit `update_file` afterwards. `update_file` is exclusively for
+  sandbox-relative chatroom files; emitting it for a memory file would
+  broadcast memory state into the chat (leak) and the upload itself
+  fails server-side because absolute paths produce malformed URLs.
+- The file persists on the runner's filesystem and the next prompt
+  invocation will see it. No publish step required.
 """
         return doc + self._build_git_guidance()
 
@@ -310,8 +457,12 @@ You can read them but should not modify them directly - write to your working di
         message_content: str,
         data_dir: Path,
         project_name: str,
+        agent_dir: Path,
         knowledge_dirs: list[Path] | None = None,
         is_dm: bool = False,
+        dwh_dir: Optional[Path] = None,
+        mcp_config_files: dict[str, Path] | None = None,
+        skill_config_files: dict[str, Path] | None = None,
     ) -> str:
         """
         Build a worker-specific prompt.
@@ -332,6 +483,15 @@ You can read them but should not modify them directly - write to your working di
             knowledge_dirs: Optional knowledge base directories (read-write, persistent)
             is_dm: When True, use the direct-message guidance (no coordinator,
                 no PLAN.md, no milestones, no acceptance-criteria reply format)
+            mcp_config_files: Per-MCP runtime config file paths (mapping
+                MCP name -> file path under ``{agent_dir}/mcp-hub/configs/``).
+                Surfaced in the prompt's ``MCP CONFIG FILES`` block so the
+                agent passes them verbatim as ``config_file`` to sync tools.
+            skill_config_files: Per-installed-skill config file paths
+                (mapping skill name -> file path under
+                ``{agent_dir}/skill-hub/configs/``). Surfaced in the prompt's
+                ``SKILL CONFIG FILES`` block so the LLM Reads operator-set
+                per-skill policy before invoking each skill.
 
         Returns:
             Complete worker prompt
@@ -354,7 +514,11 @@ You can read them but should not modify them directly - write to your working di
             role_guidance=guidance,
             capabilities_line=capabilities_line,
             project_name=project_name,
+            agent_dir=agent_dir,
             knowledge_dirs=knowledge_dirs,
+            dwh_dir=dwh_dir,
+            mcp_config_files=mcp_config_files,
+            skill_config_files=skill_config_files,
         )
 
     def _build_worker_guidance(self) -> str:
@@ -492,6 +656,11 @@ OUTPUT FORMAT (required structure):
 
 If no actions needed, output: {"actions": []}
 
+Emit ALL of your actions in a single structured-output response. If you realize
+mid-turn that another action is needed, add it to the same actions array — a
+second structured-output call in the same turn may REPLACE the first, not
+append to it.
+
 == @MENTION ADDRESSING ==
 Messages are shared with ALL participants in the room as context — everyone can read them.
 @mentions control WHO RESPONDS:
@@ -534,6 +703,26 @@ Step 2 - Emit the update_file action with the SAME path:
 
 NOTE: Existing project files are available READ-ONLY from the synced directory.
 You can read them but should not modify them directly - write to your working directory instead.
+
+== MEMORY FILES — DIFFERENT RULE ==
+The "Write then update_file" pattern above is ONLY for chatroom-visible
+deliverables in your sandbox.
+
+Files under your agent's `memory/` directory (USER.md, REFERENCES.md,
+KNOWLEDGE_PACKS.md, learnings/<topic>.md) and under your agent's
+`knowledge_packs/<slug>/...` directory are AUTHORITATIVE memory and
+stay invisible to chat by design.
+
+For memory files:
+- Use the Write tool ONLY (write directly to the absolute memory path
+  shown in the AGENT MEMORY block above, e.g.
+  `Write(file_path="<agent_dir>/memory/USER.md", content="...")`).
+- Do NOT emit `update_file` afterwards. `update_file` is exclusively for
+  sandbox-relative chatroom files; emitting it for a memory file would
+  broadcast memory state into the chat (leak) and the upload itself
+  fails server-side because absolute paths produce malformed URLs.
+- The file persists on the runner's filesystem and the next prompt
+  invocation will see it. No publish step required.
 """
         return doc + self._build_git_guidance()
 
@@ -547,7 +736,13 @@ You can read them but should not modify them directly - write to your working di
         message_content: str,
         data_dir: Path,
         project_name: str,
+        agent_dir: Path,
         knowledge_dirs: list[Path] | None = None,
+        dwh_dir: Optional[Path] = None,
+        is_front_desk: bool = False,
+        invitable_agents: Optional[list[str]] = None,
+        mcp_config_files: dict[str, Path] | None = None,
+        skill_config_files: dict[str, Path] | None = None,
     ) -> str:
         """
         Build a coordinator-specific prompt.
@@ -566,12 +761,24 @@ You can read them but should not modify them directly - write to your working di
             data_dir: Data directory (synced, read-only)
             project_name: Human-readable project name
             knowledge_dirs: Optional knowledge base directories (read-write, persistent)
+            is_front_desk: When True, use the soft Front Desk guidance (no PLAN.md,
+                no milestones, treat each message as self-contained)
+            invitable_agents: Names of agents this coordinator may invite as workers
+                in this project. Resolved live every turn from project filters
+                (or the FD allowlist when ``is_front_desk`` is True). ``None``
+                means no filter is set — the coordinator is free to invite any
+                agent listed in AGENTS.md.
 
         Returns:
             Complete coordinator prompt
         """
-        agents_section = self._build_agents_section(data_dir)
-        coordinator_guidance = self._build_coordinator_guidance(agents_section)
+        if is_front_desk:
+            coordinator_guidance = self._build_front_desk_guidance(invitable_agents or [])
+        else:
+            agents_section = self._build_agents_section(data_dir)
+            coordinator_guidance = self._build_coordinator_guidance(agents_section)
+            if invitable_agents is not None:
+                coordinator_guidance += self._build_project_invitable_block(invitable_agents)
 
         return self._build_base_prompt(
             name=name,
@@ -583,8 +790,43 @@ You can read them but should not modify them directly - write to your working di
             data_dir=data_dir,
             role_guidance=coordinator_guidance,
             project_name=project_name,
+            agent_dir=agent_dir,
             knowledge_dirs=knowledge_dirs,
+            dwh_dir=dwh_dir,
+            mcp_config_files=mcp_config_files,
+            skill_config_files=skill_config_files,
         )
+
+    def _build_project_invitable_block(self, invitable_agents: list[str]) -> str:
+        """Project-level hard allowlist block for the coordinator prompt.
+
+        Surfaced when the project carries a non-empty ``agent_teams`` /
+        ``agent_names`` filter. The list is resolved fresh every turn against
+        the owner's current agent set, so a new agent added to an allowed
+        team becomes invitable on the very next turn (no restart). The server
+        enforces the same allowlist at chatroom-create — invites outside the
+        list will be rejected.
+        """
+        if invitable_agents:
+            body = (
+                "Agents you may invite as workers in this project:\n"
+                + "\n".join(f"  - {n}" for n in invitable_agents)
+                + "\nThe server enforces this list; inviting any other agent will fail."
+            )
+        else:
+            body = (
+                "The project's agent filter currently matches NO agents (the\n"
+                "owner narrowed by team/name but no agents qualify). Reply\n"
+                "directly to the user; do not attempt to invite workers — the\n"
+                "server will reject any create_room. Ask the user to broaden\n"
+                "the filter (or add an agent to one of the listed teams) if\n"
+                "delegation is needed."
+            )
+        return f"""
+
+== PROJECT INVITABLE-AGENT ALLOWLIST ==
+{body}
+"""
 
     def _build_agents_section(self, data_dir: Path) -> str:
         """Build available agents section referencing AGENTS.md file.
@@ -623,7 +865,12 @@ chatrooms with the agents you need using the create_room action.
         data_dir: Path,
         context_files: list[str],
         project_name: str,
+        agent_dir: Path,
         knowledge_dirs: list[Path] | None = None,
+        dwh_dir: Optional[Path] = None,
+        invitable_agents: Optional[list[str]] = None,
+        mcp_config_files: dict[str, Path] | None = None,
+        skill_config_files: dict[str, Path] | None = None,
     ) -> str:
         """Build setup prompt for first user request.
 
@@ -642,28 +889,78 @@ chatrooms with the agents you need using the create_room action.
             context_files: List of context files in shared-context
             project_name: Human-readable project name
             knowledge_dirs: Optional knowledge base directories (read-write, persistent)
+            invitable_agents: When set, the project carries a hard allowlist
+                — these are the only agents the coordinator may invite this
+                turn. ``None`` = no filter (any agent in AGENTS.md is fair
+                game). The same list is enforced server-side at chatroom
+                creation, so the first delegation respects the filter.
 
         Returns:
             Complete setup prompt
         """
         context_files_list = "\n".join(f"  - {f}" for f in context_files) if context_files else "  (none)"
         agents_section = self._build_agents_section(data_dir)
+        if invitable_agents is not None:
+            agents_section += self._build_project_invitable_block(invitable_agents)
         file_manifest = self.build_file_manifest(data_dir)
         actions_doc = self.build_actions_doc()
 
         knowledge_section = ""
-        memory_section = ""
         if knowledge_dirs:
             paths = "\n".join(f"- {d}" for d in knowledge_dirs)
             knowledge_section = f"""
-== KNOWLEDGE BASE (read-write) ==
-Your persistent knowledge base directories:
+== KNOWLEDGE BASE (user-curated reference material — read-only browsing) ==
 {paths}
 
-You can read AND write files here. Changes persist across projects.
-Use this to store learnings and reference material that improves your work over time.
+User-pre-seeded files. The index of these files lives at
+{agent_dir}/memory/REFERENCES.md with absolute paths; consult it to decide
+which to read.
 """
-            memory_section = self._build_memory_section(name)
+
+        agent_memory_section = f"""
+== AGENT MEMORY (durable state — read/write, runner-managed) ==
+{agent_dir}/memory/
+
+Holds your USER.md (assistant only), REFERENCES.md, KNOWLEDGE_PACKS.md,
+and learnings/. See KNOWLEDGE PRECEDENCE below for how to use them.
+"""
+
+        packs_section = f"""
+== KNOWLEDGE PACKS (installed; auto-synced from server) ==
+{agent_dir}/knowledge_packs/
+
+Pack content (text and binary). The index at
+{agent_dir}/memory/KNOWLEDGE_PACKS.md links into here with absolute paths.
+"""
+
+        memory_section = self._build_memory_section(name, agent_dir)
+
+        dwh_section = ""
+        if dwh_dir is not None:
+            dwh_section = f"""
+== DATA WAREHOUSE ==
+{dwh_dir}
+"""
+
+        mcp_configs_section = ""
+        if mcp_config_files:
+            mcp_lines = "\n".join(
+                f"- {mcp}: {path}" for mcp, path in sorted(mcp_config_files.items())
+            )
+            mcp_configs_section = f"""
+== MCP CONFIG FILES (pass these paths to sync tools as `config_file`) ==
+{mcp_lines}
+"""
+
+        skill_configs_section = ""
+        if skill_config_files:
+            skill_lines = "\n".join(
+                f"- {skill}: {path}" for skill, path in sorted(skill_config_files.items())
+            )
+            skill_configs_section = f"""
+== SKILL CONFIG FILES (operator-set per-agent policy — Read before invoking a skill) ==
+{skill_lines}
+"""
 
         return f"""You are {name}, the COORDINATOR for project "{project_name}".
 
@@ -721,7 +1018,7 @@ Read these files to understand project context before planning.
 == SYNCED PROJECT FILES (read-only) ==
 Files synced from server, available in {data_dir}:
 {file_manifest}
-{knowledge_section}{memory_section}
+{knowledge_section}{agent_memory_section}{packs_section}{memory_section}{mcp_configs_section}{skill_configs_section}{dwh_section}
 == PLAN.md STRUCTURE ==
 Your PLAN.md MUST define milestones with CONCRETE DELIVERABLES, ACCEPTANCE CRITERIA, and WORKROOMS:
 
@@ -830,6 +1127,99 @@ FILE PATHS: Use relative paths from your working directory (e.g. PLAN.md, report
 
 CRITICAL: Your output MUST be valid JSON matching the structured output schema.
 Update BOTH files and delegate to workers in ONE response.
+
+Emit ALL of your actions in a single structured-output response. If you realize
+mid-turn that another action is needed (e.g. a user-communication update you
+forgot), add it to the same actions array — a second structured-output call in
+the same turn may REPLACE the first, not append to it.
+"""
+
+    def _build_front_desk_guidance(self, invitable_agents: list[str]) -> str:
+        """Soft coordinator guidance for Front Desk projects.
+
+        Drops PLAN.md / milestones / acceptance-criteria framing — wrong shape
+        for the casual DM-style channel a Front Desk surfaces. Treats each user
+        message as self-contained, defaults to direct reply, only spawns a
+        worker room when the work genuinely needs one.
+
+        ``invitable_agents`` is the allowlist enforced server-side at chatroom
+        creation; surface it in the prompt so the model picks valid invitees
+        instead of getting rejected and confusing the user.
+        """
+        if invitable_agents:
+            allowlist_block = (
+                "Agents you may invite as workers in this Front Desk channel:\n"
+                + "\n".join(f"  - {n}" for n in invitable_agents)
+                + "\nThe server enforces this list; inviting any other agent will fail."
+            )
+        else:
+            allowlist_block = (
+                "You currently have NO agents enabled for delegation in this Front Desk channel.\n"
+                "Reply directly to the requester. Do not attempt create_room — it will be rejected.\n"
+                "(The owner can enable invitable agents in Front Desk Settings.)"
+            )
+
+        return f"""
+== FRONT DESK COORDINATOR ROLE ==
+This project is a Front Desk channel — a long-lived, DM-shaped conversation
+between the requester and you. There is no PLAN.md, no milestones, no
+acceptance criteria, no handoff to a human team. Each user message in
+user-communication is a self-contained request.
+
+== HOW TO RESPOND ==
+1. **Default to a direct reply** in user-communication. Most requests are
+   conversational and do not need a worker.
+2. **Only create_room** when the work genuinely benefits from a separate
+   workspace: parallel investigation, multi-step research producing a
+   deliverable, or a task that needs a specialist's tools. For a single
+   factual answer or a short summary, just reply.
+3. **When delegating**, create one workroom per task. Inside the workroom,
+   give the worker a clear ask and any context they need (workers cannot
+   see other rooms). When the worker replies, summarize back into
+   user-communication for the requester.
+4. **Never write to PLAN.md**. It does not apply to Front Desk projects.
+5. **Never use milestone-* room names or "Task / Status / Deliverables"
+   reply templates** — those are for traditional projects. Reply
+   conversationally.
+
+== INVITABLE AGENTS (allowlist) ==
+{allowlist_block}
+
+Use @mentions in the workroom's init_message to address the invited agent(s).
+
+== WHEN TO REPLY DIRECTLY ==
+- The requester asks a question you can answer from your knowledge_dir or memory
+- The requester asks for a quick summary, opinion, or recommendation
+- The requester is socializing or following up on prior work
+- No allowlist is configured (you have no one to delegate to)
+
+== WHEN TO create_room ==
+- The work needs a specialist's capabilities (e.g. data analysis, code work,
+  long-form writing) and the relevant agent is in your allowlist
+- The work needs a fresh sandbox (file output, multi-step exploration)
+- The requester explicitly asked for a teammate's input
+
+== STRUCTURED OUTPUT ==
+Same JSON action format as any coordinator response. Typical shapes:
+
+Direct reply (most common):
+{{"actions": [
+  {{"type": "reply", "room": "user-communication", "content": "<answer>"}}
+]}}
+
+Delegate then acknowledge:
+{{"actions": [
+  {{"type": "create_room", "name": "research-q1-2026",
+    "invite": ["researcher"],
+    "init_message": "@researcher Please investigate <topic>. Return a short summary; no need for a deliverable file unless it helps."}},
+  {{"type": "reply", "room": "user-communication",
+    "content": "I've asked the researcher to look into this; I'll come back with their findings."}}
+]}}
+
+When the worker replies in the workroom (you'll get a BATCH_COMPLETE),
+summarize back to the requester in user-communication. Keep the worker's
+detailed reply in the workroom; the requester only sees what you write
+to user-communication.
 """
 
     def _build_coordinator_guidance(
@@ -974,17 +1364,34 @@ INVITING AGENTS TO CHATROOMS:
 Use "create_room" action to create a new chatroom and invite specific agents:
 {create_room_example}
 
+YOU LEAD EVERY ROOM YOU CREATE. Workers can only reply when YOU @mention them —
+they cannot @mention each other or address other agents. If a room needs more
+turns, you drive them.
+
 Note: All invited agents see the init_message as context. Only @mentioned agents respond.
-  CORRECT: invite: ["pm", "persona-a", "persona-b"], init_message: "@pm Interview the personas in this room..."
-    → PM responds; personas read the instructions as context and wait to be addressed by PM
-  WRONG:   invite: ["pm", "persona-a", "persona-b"], init_message: "@pm @persona-a @persona-b Interview instructions..."
-    → All 3 respond simultaneously instead of PM leading the conversation
+  WRONG: invite: ["pm", "persona-a", "persona-b"], init_message: "@pm Interview the personas in this room..."
+    → PM cannot address the personas in later turns (workers don't @mention).
+       The personas wait forever; the room stalls.
+  WRONG: invite: ["pm", "persona-a", "persona-b"], init_message: "@pm @persona-a @persona-b Interview instructions..."
+    → All 3 respond simultaneously to the same prompt — not an interview.
+
+  CORRECT (parallel, when workers don't depend on each other):
+    invite: ["persona-a", "persona-b"], init_message: "@persona-a @persona-b Please answer: <questions>"
+    → Both answer in the same batch.
+
+  CORRECT (sequential — multiple coordinator turns, you drive the handoff):
+    Turn 1: invite ["pm"], "@pm Draft 3 interview questions for our target personas."
+    Turn 2 (after PM replies): invite ["persona-a", "persona-b"], paste PM's
+            questions into the init_message, then "@persona-a @persona-b Please
+            answer the above."
 
 BEST PRACTICES FOR COORDINATORS:
 - Define milestones with specific deliverables (file names and criteria)
 - Create one workroom per milestone for clear scope
 - Match tasks to the most suitable agents based on their descriptions
 - Use @mentions in your message content to explicitly delegate work
+- Never ask a worker to "lead" a room or "address" other agents — workers
+  can't @mention. Run multiple coordinator turns instead.
 - Update PLAN.md after each batch to track progress and learnings
 
 == USER COLLABORATION (USER-COMMUNICATION CHATROOM) ==

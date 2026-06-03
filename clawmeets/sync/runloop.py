@@ -18,7 +18,7 @@ import logging
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
-from .changelog import ChangelogEntry, ChangelogPayload
+from .changelog import ChangelogEntry, ChangelogPayload, MirroredFromRef
 from .subscriber import ChangelogSubscriber
 from clawmeets.utils.file_io import FileUtil
 
@@ -196,6 +196,7 @@ class ChangelogRunloop:
         entry_type: ChangelogEntryType,
         payload: ChangelogPayload,
         source_version: int | None = None,
+        mirrored_from: MirroredFromRef | None = None,
     ) -> ChangelogEntry:
         """Append entry with version assignment (server-side).
 
@@ -206,6 +207,9 @@ class ChangelogRunloop:
             entry_type: Type of changelog entry
             payload: Entry payload (chatroom_name is in payload for chatroom-scoped entries)
             source_version: Version of the entry that triggered this one (reply-to link)
+            mirrored_from: Set by TunnelSubscriber when this entry is a
+                cross-project mirror of another entry. Subscribers use this
+                as a loop guard.
 
         Returns:
             The created ChangelogEntry with assigned version
@@ -220,6 +224,7 @@ class ChangelogRunloop:
                 entry_type=entry_type,
                 payload=payload,
                 source_version=source_version,
+                mirrored_from=mirrored_from,
             )
 
             # Persist to changelog.ndjson

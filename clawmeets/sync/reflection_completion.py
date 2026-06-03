@@ -1,23 +1,29 @@
 """
 clawmeets/sync/reflection_completion.py
-Detect reflection / lint trigger replies and update Agent timestamps.
+Detect reflection / lint / DWH-sync trigger replies and update Agent timestamps.
 
-The reflection scheduler posts trigger messages tagged with HTML-comment
-markers (one for reflect, one for lint). When an agent replies to a trigger
-(its reply's source_version points at the trigger), this subscriber loads
-the source message from the chatroom's CHATS.ndjson, branches on which
-marker is present, and updates the corresponding cursor on the agent card:
+The reflection scheduler and DWH ScheduledMessage entries post trigger
+messages tagged with HTML-comment markers. When an agent replies to a
+trigger (its reply's source_version points at the trigger), this subscriber
+loads the source message from the chatroom's CHATS.ndjson, branches on
+which marker is present, and updates the corresponding cursor on the agent
+card:
 
-- ``REFLECT_TRIGGER_MARKER`` → ``Agent.update_last_reflected_at()``
-- ``LINT_TRIGGER_MARKER``    → ``Agent.update_last_linted_at()``
+- ``REFLECT_TRIGGER_MARKER``       → ``Agent.update_last_reflected_at()``
+- ``LINT_TRIGGER_MARKER``          → ``Agent.update_last_linted_at()``
+- ``*-sync-trigger`` (regex match) → ``Agent.update_last_synced_at()``
+
+ETL replies do **not** update any cursor — derivation tracks its watermark
+inside the skill's own state file under ``dwh_dir``.
 
 Markers are duplicated here (rather than imported from
-``clawmeets.server.reflection_scheduler``) to keep this Layer 0 / Layer 1
-module free of any server import.
+``clawmeets.server.reflection_scheduler`` / ``server.routes.messages``) to
+keep this Layer 0 / Layer 1 module free of any server import.
 """
 from __future__ import annotations
 
 import logging
+import re
 from typing import TYPE_CHECKING
 
 from clawmeets.models.chat_message import ChatMessage
@@ -34,9 +40,22 @@ logger = logging.getLogger("clawmeets.sync.reflection_completion")
 REFLECT_TRIGGER_MARKER = "<!-- clawmeets:reflect-trigger -->"
 LINT_TRIGGER_MARKER = "<!-- clawmeets:lint-trigger -->"
 
+# Long-running skill-trigger markers that should bump ``last_synced_at`` on
+# successful reply: ``<!-- clawmeets:<name>-(sync|ideate|grade|produce)-trigger -->``.
+# Mirror of clawmeets.server.routes.messages.PERSONAL_DATA_TRIGGER_RE, but
+# anchored anywhere in the source message (not just at the start) since the
+# trigger marker is allowed to be embedded in a longer body. ETL triggers
+# (the same family with -etl-) deliberately do NOT match here — only the
+# scheduled syncers and the marketing-pipeline phases bump ``last_synced_at``;
+# ETL tracks its watermark inside its own state file under ``dwh_dir``.
+SYNC_TRIGGER_RE = re.compile(
+    r"<!--\s*clawmeets:[\w-]+-(?:sync|ideate|grade|produce(?:-[\w-]+)?)-trigger\s*-->"
+)
+
 
 class ReflectionCompletionSubscriber(ChangelogSubscriber):
-    """Update Agent.last_reflected_at / last_linted_at on memory-loop replies.
+    """Update Agent.last_reflected_at / last_linted_at / last_synced_at on
+    trigger replies.
 
     Cheap path: only inspects MESSAGE entries that
       (a) live in a DM room (name starts with `dm-`),
@@ -82,12 +101,15 @@ class ReflectionCompletionSubscriber(ChangelogSubscriber):
         if source_msg is None:
             return
 
-        # Branch on which marker is in the source. Reflect and lint are
-        # mutually exclusive — the scheduler emits one or the other.
+        # Branch on which marker is in the source. Reflect, lint, and sync
+        # are mutually exclusive — the scheduler / ScheduledMessage emits one
+        # at a time.
         if REFLECT_TRIGGER_MARKER in source_msg.content:
             mode = "reflect"
         elif LINT_TRIGGER_MARKER in source_msg.content:
             mode = "lint"
+        elif SYNC_TRIGGER_RE.search(source_msg.content):
+            mode = "sync"
         else:
             return
 
@@ -105,10 +127,16 @@ class ReflectionCompletionSubscriber(ChangelogSubscriber):
                 f"Updated last_reflected_at for agent={agent.name!r} "
                 f"to {payload.ts.isoformat()}"
             )
-        else:  # mode == "lint"
+        elif mode == "lint":
             agent.update_last_linted_at(payload.ts)
             logger.info(
                 f"Updated last_linted_at for agent={agent.name!r} "
+                f"to {payload.ts.isoformat()}"
+            )
+        else:  # mode == "sync"
+            agent.update_last_synced_at(payload.ts)
+            logger.info(
+                f"Updated last_synced_at for agent={agent.name!r} "
                 f"to {payload.ts.isoformat()}"
             )
 

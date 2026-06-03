@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
+import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Optional
 
@@ -23,6 +25,7 @@ from ..api.responses import AgentStatus
 from ..llm.base import LLMInvocationError, LLMRateLimitError, LLMTimeoutError
 from ..llm.prompt_builder import CoordinatorPromptBuilder, create_prompt_builder
 from ..runner.invocation_registry import invoke_with_registry as _invoke_with_registry
+from ..runner.router_decorator import route_to_foreign_agents
 from ..utils.agent_namespace import short_name
 from ..utils.file_io import FileUtil
 
@@ -47,6 +50,27 @@ def _is_transient_error(error: LLMInvocationError) -> bool:
         return True
     msg = str(error).lower()
     return any(indicator in msg for indicator in _TRANSIENT_INDICATORS)
+
+
+_TRIGGER_MARKER_RE = re.compile(r"<!--\s*clawmeets:[a-z0-9-]+-trigger\s*-->")
+
+
+def _resume_marker_for_dm(chatroom, agent_name: str) -> Optional[str]:
+    """Return the trigger marker carried by the agent's most recent reply.
+
+    Marker-driven skills (/clawmeets:personalize, /clawmeets:interview)
+    activate on description match against the inbound message. On a
+    follow-up turn the user's reply carries no marker, so the skill would
+    stop firing. The SKILL.md convention asks the agent to echo the marker
+    on every interim reply; we surface that signal back into the next
+    turn's inbound by prepending it, restoring routing across turns.
+    Returns None if no prior agent reply carries a marker.
+    """
+    for msg in reversed(chatroom.get_messages()):
+        if msg.from_participant_name == agent_name:
+            m = _TRIGGER_MARKER_RE.search(msg.content)
+            return m.group(0) if m else None
+    return None
 
 
 class Agent(PersistableParticipant):
@@ -106,10 +130,12 @@ class Agent(PersistableParticipant):
         if ctx.client is None:
             raise ValueError("ModelContext.client must be configured for sync_from_server")
         agents = await ctx.client.list_agents()
+        server_ids: set[str] = set()
         synced_count = 0
         owner_user_id: Optional[str] = None
         for agent_data in agents:
             agent_id = agent_data["id"]
+            server_ids.add(agent_id)
             if agent_id in exclude_ids:
                 continue
 
@@ -131,6 +157,19 @@ class Agent(PersistableParticipant):
 
         logger.info(f"Synced {synced_count} worker agents from server")
 
+        # Self-heal: prune local peer cards whose id is no longer in the
+        # registry. Covers deletions missed while the runner was offline
+        # (envelope never delivered) and retroactively cleans any stale
+        # cards from before AGENT_REGISTRY_CHANGE(delete) was wired up.
+        pruned_count = 0
+        for peer in cls.list_all(ctx, viewer_is_admin=True):
+            if peer.id in server_ids or peer.id in exclude_ids:
+                continue
+            if cls.prune_peer_card(peer.id, ctx):
+                pruned_count += 1
+        if pruned_count:
+            logger.info(f"Pruned {pruned_count} stale peer card(s) missing from registry")
+
         # Generate global AGENTS.md file after syncing all agents
         all_agents = cls.list_all(ctx, discoverable_only=True)
         cls._generate_agents_md(
@@ -141,6 +180,38 @@ class Agent(PersistableParticipant):
         )
 
         return synced_count
+
+    @classmethod
+    def prune_peer_card(cls, agent_id: str, ctx: "ModelContext") -> bool:
+        """Hard-delete a peer agent's local card directory.
+
+        Called by:
+          - the runner's ``AGENT_REGISTRY_CHANGE(action="delete")`` handler,
+            for surgical pruning the moment a peer is deleted server-side;
+          - ``sync_from_server``'s diff-and-prune step, to self-heal at
+            startup / on every full sync.
+
+        Idempotent: a missing directory returns False without raising. The
+        only file-system side effect is ``shutil.rmtree`` on every matching
+        peer dir (there should be exactly one in practice).
+
+        Args:
+            agent_id: ID of the peer agent whose local card should be removed
+            ctx: ModelContext for filesystem access
+
+        Returns:
+            True if any directory was removed, False if no match existed.
+        """
+        role_dir = ctx.participants_dir / cls._role_subdir
+        if not role_dir.exists():
+            return False
+        matches = [d for d in role_dir.glob(f"*-{agent_id}") if d.is_dir()]
+        if not matches:
+            return False
+        for d in matches:
+            shutil.rmtree(d)
+            logger.info(f"Pruned peer card: {d.name}")
+        return True
 
     @classmethod
     def _generate_agents_md(
@@ -234,6 +305,71 @@ class Agent(PersistableParticipant):
     def role(self) -> ParticipantRole:
         """Return AGENT role."""
         return ParticipantRole.AGENT
+
+    def _resolve_invitable_agents_for_prompt(
+        self,
+        project: "Project",
+    ) -> Optional[list[str]]:
+        """Resolve the per-turn invitable-agent list for the coordinator prompt.
+
+        Two surfaces share the same shape ``(allowed_teams, allowed_names)``:
+          - Front Desk projects → ``self.front_desk_invitable_{teams,agents}``,
+            scoped to this coordinator's owner.
+          - Regular projects with a non-empty filter set → ``project.agent_{teams,names}``,
+            scoped to ``project.created_by``.
+          - Regular projects with no filter → returns ``None`` (the prompt
+            falls back to AGENTS.md as the discovery surface).
+
+        Resolution is owner-scoped (only agents the owner registered) and
+        uses ``matches_invitable`` so teams expand to live members at every
+        call — adding a new agent to an allowed team makes them invitable
+        on the next coordinator turn without restart.
+
+        Skips entries whose agent record isn't synced locally yet (the
+        chatroom-create gate enforces strictly; the prompt surface is
+        best-effort discovery).
+        """
+        from clawmeets.utils.agent_filter import resolve_invitable_agents
+
+        if project.is_front_desk_project:
+            allowed_teams = self.front_desk_invitable_teams
+            allowed_names = self.front_desk_invitable_agents
+            viewer_owner_id = self.registered_by
+        elif project.agent_teams or project.agent_names:
+            allowed_teams = project.agent_teams
+            allowed_names = project.agent_names
+            viewer_owner_id = project.created_by
+        else:
+            return None
+
+        # Pool: owner's full agent set (admin viewer skips the discoverable
+        # filter so non-discoverable owned agents are visible).
+        candidates = [
+            a
+            for a in Agent.list_all(self._model_ctx, viewer_is_admin=True)
+            if a.registered_by == viewer_owner_id and a.id != self.id
+        ]
+        matched = resolve_invitable_agents(
+            candidates,
+            list(allowed_teams),
+            list(allowed_names),
+            viewer_owner_id,
+        )
+
+        names: list[str] = []
+        for other in matched:
+            # Strip ``{owner}-`` prefix when the agent is owned by the same
+            # user (display name); cross-owner agents keep the full registry
+            # name. Mirrors the historic Front Desk display rule.
+            if (
+                viewer_owner_id
+                and other.registered_by == viewer_owner_id
+                and "-" in other.name
+            ):
+                names.append(other.name.split("-", 1)[1])
+            else:
+                names.append(short_name(other.name, None))
+        return names
 
     @property
     def linked_user_id(self) -> Optional[str]:
@@ -357,6 +493,16 @@ class Agent(PersistableParticipant):
             git_ignored_folder=project.git_ignored_folder if project.git_url else None,
         )
 
+        is_dm = chatroom_name.startswith("dm-")
+        inbound_content = message.content
+        if is_dm:
+            from .chatroom import Chatroom
+            chatroom = Chatroom.get(project_id, chatroom_name, self._model_ctx)
+            if chatroom is not None:
+                resume_marker = _resume_marker_for_dm(chatroom, self.name)
+                if resume_marker and resume_marker not in inbound_content:
+                    inbound_content = f"{resume_marker}\n{inbound_content}"
+
         # Build prompt - extract message fields for Layer 0 compatibility
         prompt = prompt_builder.build_prompt(
             name=self.name,
@@ -364,11 +510,15 @@ class Agent(PersistableParticipant):
             project_id=project_id,
             chatroom_name=chatroom_name,
             from_participant_name=message.from_participant_name or message.from_participant_id,
-            message_content=message.content,
+            message_content=inbound_content,
             data_dir=data_dir,
             project_name=project.name,
+            agent_dir=self._model_ctx.base_dir,
             knowledge_dirs=self._model_ctx.knowledge_dirs,
-            is_dm=chatroom_name.startswith("dm-"),
+            dwh_dir=self._model_ctx.dwh_dir,
+            is_dm=is_dm,
+            mcp_config_files=self._model_ctx.installed_mcp_config_files(),
+            skill_config_files=self._model_ctx.installed_skill_config_files(),
         )
 
         # Execute using ClaudeCLI with retry for transient failures
@@ -456,7 +606,11 @@ class Agent(PersistableParticipant):
                 reset_info = f" Resets at {error.resets_at_human}." if error.resets_at_human else ""
                 content = f"I've hit a rate limit and cannot continue.{reset_info}"
             else:
-                content = f"I encountered an error and couldn't complete this task: {type(error).__name__}"
+                detail = str(error).strip()
+                max_len = 500
+                if len(detail) > max_len:
+                    detail = detail[:max_len] + "…"
+                content = f"I encountered an error and couldn't complete this task:\n{detail}"
 
             await self._model_ctx.client.post_message(
                 project_id=project_id,
@@ -643,6 +797,7 @@ class Agent(PersistableParticipant):
         batch_content += "\n\nIMPORTANT: Update PLAN.md with your assessment (PASS/FAIL per acceptance criterion) BEFORE deciding next steps."
 
         # Build prompt - agents are referenced via AGENTS.md file
+        is_front_desk = project.is_front_desk_project
         prompt = coordinator_builder.build_prompt(
             name=self.name,
             description=self.description,
@@ -652,7 +807,13 @@ class Agent(PersistableParticipant):
             message_content=batch_content,
             data_dir=data_dir,
             project_name=project.name,
+            agent_dir=self._model_ctx.base_dir,
             knowledge_dirs=self._model_ctx.knowledge_dirs,
+            dwh_dir=self._model_ctx.dwh_dir,
+            is_front_desk=is_front_desk,
+            invitable_agents=self._resolve_invitable_agents_for_prompt(project),
+            mcp_config_files=self._model_ctx.installed_mcp_config_files(),
+            skill_config_files=self._model_ctx.installed_skill_config_files(),
         )
 
         await self._emit_acknowledgment(project_id, chatroom_name)
@@ -700,6 +861,13 @@ class Agent(PersistableParticipant):
         )
 
         action_block.source_version = trigger_version
+        await route_to_foreign_agents(
+            action_block=action_block,
+            model_ctx=self._model_ctx,
+            project_id=project_id,
+            requester_agent_id=self.id,
+            requester_agent_owner_id=self.registered_by or "",
+        )
         replied_chatrooms = await action_executor.process(
             action_block=action_block,
             project_id=project_id,
@@ -752,18 +920,49 @@ class Agent(PersistableParticipant):
 
         await self._emit_acknowledgment(project_id, chatroom_name)
 
-        # Build setup prompt - agents are referenced via AGENTS.md file
-        prompt = coordinator_builder.build_setup_prompt(
-            name=self.name,
-            description=self.description,
-            project_id=project_id,
-            chatroom_name=chatroom_name,
-            message_content=message.content,
-            data_dir=data_dir,
-            context_files=context_files,
-            project_name=project.name,
-            knowledge_dirs=self._model_ctx.knowledge_dirs,
-        )
+        # Front Desk projects skip the PLAN.md / milestones setup prompt — wrong
+        # shape for a casual DM-style channel. Use the soft live coordinator
+        # prompt instead so the first message is treated like any other.
+        if project.is_front_desk_project:
+            prompt = coordinator_builder.build_prompt(
+                name=self.name,
+                description=self.description,
+                project_id=project_id,
+                chatroom_name=chatroom_name,
+                from_participant_name=message.from_participant_name or message.from_participant_id,
+                message_content=message.content,
+                data_dir=data_dir,
+                project_name=project.name,
+                agent_dir=self._model_ctx.base_dir,
+                knowledge_dirs=self._model_ctx.knowledge_dirs,
+                dwh_dir=self._model_ctx.dwh_dir,
+                is_front_desk=True,
+                invitable_agents=self._resolve_invitable_agents_for_prompt(project),
+                mcp_config_files=self._model_ctx.installed_mcp_config_files(),
+                skill_config_files=self._model_ctx.installed_skill_config_files(),
+            )
+        else:
+            # Build setup prompt - agents are referenced via AGENTS.md file.
+            # Pass the same allowlist resolver so the FIRST delegation respects
+            # any project agent_teams/agent_names filter (the server-side
+            # chatroom-create gate enforces it either way; passing it here
+            # avoids the coordinator picking unreachable invitees on turn 1).
+            prompt = coordinator_builder.build_setup_prompt(
+                name=self.name,
+                description=self.description,
+                project_id=project_id,
+                chatroom_name=chatroom_name,
+                message_content=message.content,
+                data_dir=data_dir,
+                context_files=context_files,
+                project_name=project.name,
+                agent_dir=self._model_ctx.base_dir,
+                knowledge_dirs=self._model_ctx.knowledge_dirs,
+                dwh_dir=self._model_ctx.dwh_dir,
+                invitable_agents=self._resolve_invitable_agents_for_prompt(project),
+                mcp_config_files=self._model_ctx.installed_mcp_config_files(),
+                skill_config_files=self._model_ctx.installed_skill_config_files(),
+            )
 
         retry_delay = _INITIAL_RETRY_DELAY
         for attempt in range(_MAX_RETRIES + 1):
@@ -808,6 +1007,13 @@ class Agent(PersistableParticipant):
         )
 
         action_block.source_version = trigger_version
+        await route_to_foreign_agents(
+            action_block=action_block,
+            model_ctx=self._model_ctx,
+            project_id=project_id,
+            requester_agent_id=self.id,
+            requester_agent_owner_id=self.registered_by or "",
+        )
         replied_chatrooms = await action_executor.process(
             action_block=action_block,
             project_id=project_id,
@@ -886,6 +1092,7 @@ class Agent(PersistableParticipant):
         )
         assert isinstance(prompt_builder, CoordinatorPromptBuilder)
 
+        is_front_desk = project.is_front_desk_project
         prompt = prompt_builder.build_prompt(
             name=self.name,
             description=self.description,
@@ -895,7 +1102,13 @@ class Agent(PersistableParticipant):
             message_content=message.content,
             data_dir=data_dir,
             project_name=project.name,
+            agent_dir=self._model_ctx.base_dir,
             knowledge_dirs=self._model_ctx.knowledge_dirs,
+            dwh_dir=self._model_ctx.dwh_dir,
+            is_front_desk=is_front_desk,
+            invitable_agents=self._resolve_invitable_agents_for_prompt(project),
+            mcp_config_files=self._model_ctx.installed_mcp_config_files(),
+            skill_config_files=self._model_ctx.installed_skill_config_files(),
         )
 
         retry_delay = _INITIAL_RETRY_DELAY
@@ -937,6 +1150,13 @@ class Agent(PersistableParticipant):
         )
 
         action_block.source_version = trigger_version
+        await route_to_foreign_agents(
+            action_block=action_block,
+            model_ctx=self._model_ctx,
+            project_id=project_id,
+            requester_agent_id=self.id,
+            requester_agent_owner_id=self.registered_by or "",
+        )
         replied_chatrooms = await action_executor.process(
             action_block=action_block,
             project_id=project_id,

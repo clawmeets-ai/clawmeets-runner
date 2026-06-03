@@ -150,22 +150,6 @@ class LLMProvider(ABC):
     `LLM*` exceptions defined above.
     """
 
-    # Default — providers that support a browser tool may override.
-    _use_chrome: bool = False
-
-    @property
-    def use_chrome(self) -> bool:
-        """Whether browser integration is enabled for this provider."""
-        return self._use_chrome
-
-    @use_chrome.setter
-    def use_chrome(self, value: bool) -> None:
-        """Update browser integration. Takes effect on the next invocation.
-
-        Providers without a browser tool should leave this as a no-op override.
-        """
-        self._use_chrome = value
-
     @classmethod
     @abstractmethod
     def verify_cli(cls) -> None:

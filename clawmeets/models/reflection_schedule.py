@@ -40,12 +40,14 @@ class ReflectionSchedule(BaseModel):
 
     Lint cadence is opt-in: ``lint_cron_expression == None`` disables the lint
     fan-out even when the reflect cron is active. Setting ``is_active = False``
-    disables both.
+    disables both. Both crons are interpreted in ``timezone`` (IANA name,
+    default ``"UTC"`` for backward compat).
     """
 
     user_id: str
     username: str
     cron_expression: str
+    timezone: str = "UTC"
     is_active: bool = True
     created_at: datetime
     last_fired_at: Optional[datetime] = None
@@ -113,12 +115,14 @@ class ReflectionScheduleStore:
         is_active: bool = True,
         end_at: Optional[datetime] = None,
         lint_cron_expression: Optional[str] = None,
+        timezone: str = "UTC",
     ) -> ReflectionSchedule:
         """Create or update the user's reflection schedule.
 
         Validates both crons. Recomputes ``next_fire_at`` from now. Recomputes
-        ``next_lint_fire_at`` only when ``lint_cron_expression`` differs from
-        the stored value (so toggling reflect doesn't reset lint progress).
+        ``next_lint_fire_at`` only when ``lint_cron_expression`` *or*
+        ``timezone`` differs from the stored value (so toggling reflect doesn't
+        reset lint progress, but a TZ edit does shift both cursors).
         Pass ``lint_cron_expression=None`` to clear lint cadence.
         Preserves ``last_fired_at`` / ``last_lint_fired_at`` on update.
         """
@@ -128,7 +132,7 @@ class ReflectionScheduleStore:
             raise ValueError(f"Invalid lint cron expression: {lint_cron_expression!r}")
 
         now = datetime.now(UTC)
-        next_fire = compute_next_fire(cron_expression, now)
+        next_fire = compute_next_fire(cron_expression, now, timezone)
 
         async with self._lock:
             schedules = self._load_all_sync()
@@ -138,18 +142,17 @@ class ReflectionScheduleStore:
                     existing = s
                     break
             if existing is not None:
+                tz_changed = existing.timezone != timezone
                 existing.username = username
                 existing.cron_expression = cron_expression
+                existing.timezone = timezone
                 existing.is_active = is_active
                 existing.next_fire_at = next_fire
                 existing.end_at = end_at
-                # Only recompute next_lint_fire_at when the cron actually changed —
-                # avoids skipping a pending lint fire just because the user
-                # re-saved an unchanged settings form.
-                if lint_cron_expression != existing.lint_cron_expression:
+                if lint_cron_expression != existing.lint_cron_expression or tz_changed:
                     existing.lint_cron_expression = lint_cron_expression
                     existing.next_lint_fire_at = (
-                        compute_next_fire(lint_cron_expression, now)
+                        compute_next_fire(lint_cron_expression, now, timezone)
                         if lint_cron_expression
                         else None
                     )
@@ -161,13 +164,14 @@ class ReflectionScheduleStore:
                     user_id=user_id,
                     username=username,
                     cron_expression=cron_expression,
+                    timezone=timezone,
                     is_active=is_active,
                     created_at=now,
                     next_fire_at=next_fire,
                     end_at=end_at,
                     lint_cron_expression=lint_cron_expression,
                     next_lint_fire_at=(
-                        compute_next_fire(lint_cron_expression, now)
+                        compute_next_fire(lint_cron_expression, now, timezone)
                         if lint_cron_expression
                         else None
                     ),
@@ -197,7 +201,9 @@ class ReflectionScheduleStore:
                 if s.user_id == user_id:
                     s.last_fired_at = now
                     try:
-                        s.next_fire_at = compute_next_fire(s.cron_expression, now)
+                        s.next_fire_at = compute_next_fire(
+                            s.cron_expression, now, s.timezone
+                        )
                     except ValueError:
                         logger.error(
                             f"Invalid cron for reflection schedule user={user_id}, deactivating"
@@ -224,7 +230,9 @@ class ReflectionScheduleStore:
                         break
                     s.last_lint_fired_at = now
                     try:
-                        s.next_lint_fire_at = compute_next_fire(s.lint_cron_expression, now)
+                        s.next_lint_fire_at = compute_next_fire(
+                            s.lint_cron_expression, now, s.timezone
+                        )
                     except ValueError:
                         logger.error(
                             f"Invalid lint cron for reflection schedule user={user_id}, "

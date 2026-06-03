@@ -15,6 +15,8 @@ import re
 from typing import Optional
 from urllib.parse import quote
 
+from markdown_it import MarkdownIt
+
 from ..models.project import Project
 
 logger = logging.getLogger("clawmeets.email_templates")
@@ -44,109 +46,11 @@ _FONT_STACK = (
 # ---------------------------------------------------------------------------
 
 def _render_markdown_html(text: str) -> str:
-    """Render markdown to HTML, preferring markdown-it-py when available."""
+    """Render markdown to HTML via markdown-it-py."""
     if not text:
         return ""
-    try:
-        from markdown_it import MarkdownIt  # type: ignore
-    except ImportError:
-        return _render_markdown_fallback(text)
     md = MarkdownIt("commonmark", {"breaks": True, "linkify": True})
     return md.render(text).strip()
-
-
-def _render_markdown_fallback(text: str) -> str:
-    """Minimal markdown-to-HTML converter for when markdown-it-py is missing.
-
-    Handles the subset agents actually use: paragraphs, blank-line breaks,
-    `**bold**`, `*italic*`, ``code``, `[text](url)`, `#`-headings, `-`/`*`
-    bullets, and `1.`-numbered lists. Unknown syntax passes through as text.
-    """
-    lines = text.splitlines()
-    out: list[str] = []
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        stripped = line.strip()
-
-        if not stripped:
-            i += 1
-            continue
-
-        # Heading
-        m = re.match(r"^(#{1,6})\s+(.+)$", stripped)
-        if m:
-            level = len(m.group(1))
-            content = _inline(m.group(2))
-            out.append(f"<h{level} style=\"margin:16px 0 8px;color:{_COLOR_HEADING};\">{content}</h{level}>")
-            i += 1
-            continue
-
-        # Unordered list
-        if re.match(r"^[-*]\s+", stripped):
-            items: list[str] = []
-            while i < len(lines) and re.match(r"^[-*]\s+", lines[i].strip()):
-                item = re.sub(r"^[-*]\s+", "", lines[i].strip())
-                items.append(f"<li style=\"margin:4px 0;\">{_inline(item)}</li>")
-                i += 1
-            out.append(
-                f"<ul style=\"margin:8px 0;padding-left:20px;color:{_COLOR_BODY};\">"
-                + "".join(items)
-                + "</ul>"
-            )
-            continue
-
-        # Ordered list
-        if re.match(r"^\d+\.\s+", stripped):
-            items = []
-            while i < len(lines) and re.match(r"^\d+\.\s+", lines[i].strip()):
-                item = re.sub(r"^\d+\.\s+", "", lines[i].strip())
-                items.append(f"<li style=\"margin:4px 0;\">{_inline(item)}</li>")
-                i += 1
-            out.append(
-                f"<ol style=\"margin:8px 0;padding-left:22px;color:{_COLOR_BODY};\">"
-                + "".join(items)
-                + "</ol>"
-            )
-            continue
-
-        # Paragraph (consume until blank line)
-        buf: list[str] = [stripped]
-        i += 1
-        while i < len(lines) and lines[i].strip() and not re.match(
-            r"^(#{1,6}\s|[-*]\s|\d+\.\s)", lines[i].strip()
-        ):
-            buf.append(lines[i].strip())
-            i += 1
-        joined = " ".join(buf)
-        out.append(
-            f"<p style=\"margin:12px 0;color:{_COLOR_BODY};line-height:1.55;\">"
-            f"{_inline(joined)}</p>"
-        )
-
-    return "\n".join(out)
-
-
-def _inline(text: str) -> str:
-    """Apply inline markdown: bold, italic, code, links. Escapes HTML."""
-    escaped = _html.escape(text)
-    # Links: [text](url) — do before emphasis so bracket chars aren't munged
-    escaped = re.sub(
-        r"\[([^\]]+)\]\(([^)]+)\)",
-        lambda m: f"<a href=\"{m.group(2)}\" style=\"color:{_COLOR_BRAND_MEETS};text-decoration:underline;\">{m.group(1)}</a>",
-        escaped,
-    )
-    # Inline code
-    escaped = re.sub(
-        r"`([^`]+)`",
-        r"<code style=\"background:#f3f4f6;padding:1px 4px;border-radius:3px;font-family:'SF Mono',Menlo,monospace;font-size:0.9em;\">\1</code>",
-        escaped,
-    )
-    # Bold
-    escaped = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", escaped)
-    # Italic (single *; avoid matching inside the bold already converted)
-    escaped = re.sub(r"(?<!\*)\*(?!\s)([^*]+?)(?<!\s)\*(?!\*)", r"<em>\1</em>", escaped)
-    return escaped
 
 
 def _strip_markdown(text: str) -> str:

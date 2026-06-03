@@ -22,6 +22,14 @@ logger = logging.getLogger("clawmeets.runner.mcp.auth")
 
 DEFAULT_CLIENT_SECRETS = Path.home() / ".clawmeets" / "google_oauth_client.json"
 
+# Relax oauthlib's strict scope-equality check on token exchange. Google
+# legitimately returns a broader scope set than requested when the same
+# Google account has prior incremental grants to the same OAuth client
+# (e.g. user installs Gmail, consents, then installs Calendar — Google
+# bundles both into the second token). Without this, fetch_token raises
+# `Scope has changed from "gmail.modify" to "calendar gmail.modify"`.
+os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
+
 
 class GoogleOAuthError(RuntimeError):
     pass
@@ -88,6 +96,114 @@ def run_installed_flow(
     token_path.write_text(creds.to_json())
     os.chmod(token_path, stat.S_IRUSR | stat.S_IWUSR)  # 0600
     logger.info(f"Wrote Google OAuth token to {token_path} (0600)")
+
+
+def build_authorization_url(
+    scopes: list[str],
+    redirect_uri: str,
+    state: str,
+    client_secrets: Optional[Path] = None,
+) -> tuple[str, str]:
+    """Build a Google OAuth consent URL for the relay flow.
+
+    Unlike ``run_installed_flow``, this does NOT bind a local callback server
+    or open a browser. The runner calls this to mint a URL the user opens in
+    their own browser; Google redirects the user to ``redirect_uri`` (the
+    ClawMeets server's ``/oauth/mcp/callback``) carrying the same ``state``
+    token. The runner later receives the auth code over its WebSocket and
+    finishes the exchange via ``exchange_code``.
+
+    Returns ``(auth_url, code_verifier)``. Google's ``Flow.authorization_url``
+    enables PKCE by default — it generates a fresh ``code_verifier`` and
+    embeds the corresponding ``code_challenge`` in the URL. The token
+    exchange must present the same ``code_verifier``, so the caller is
+    responsible for stashing it on the runner side and passing it back to
+    ``exchange_code``. The verifier is a client-side secret and must not
+    cross the relay server.
+
+    The OAuth client at ``client_secrets`` must be a Google "Web application"
+    client with ``redirect_uri`` registered as an authorized redirect URI.
+    """
+    try:
+        from google_auth_oauthlib.flow import Flow
+    except ImportError as exc:
+        raise GoogleOAuthError(
+            "google-auth-oauthlib is required for MCP OAuth flows but missing — "
+            "the clawmeets runner should bundle it by default. "
+            "Try: pip install --upgrade clawmeets"
+        ) from exc
+
+    secrets_path = _resolve_client_secrets(client_secrets)
+    if not secrets_path.exists():
+        raise GoogleOAuthError(
+            f"Google OAuth client secrets not found at {secrets_path}.\n"
+            f"For the relay flow, create an OAuth client (Web application) in "
+            f"Google Cloud Console with the ClawMeets server's "
+            f"/oauth/mcp/callback registered as an authorized redirect URI, "
+            f"then save the credentials JSON to that path."
+        )
+
+    flow = Flow.from_client_secrets_file(str(secrets_path), scopes=scopes)
+    flow.redirect_uri = redirect_uri
+    # Don't pass include_granted_scopes — it asks Google to fold in any other
+    # scopes this OAuth client has already obtained for this Google account,
+    # which makes the returned token broader than what we requested and trips
+    # oauthlib's strict scope check at fetch_token time. Each MCP install
+    # should yield a self-scoped token.
+    auth_url, _ = flow.authorization_url(
+        access_type="offline",
+        prompt="consent",
+        state=state,
+    )
+    code_verifier = flow.code_verifier or ""
+    return auth_url, code_verifier
+
+
+def exchange_code(
+    code: str,
+    scopes: list[str],
+    redirect_uri: str,
+    token_path: Path,
+    code_verifier: str | None = None,
+    client_secrets: Optional[Path] = None,
+) -> None:
+    """Exchange an authorization code for tokens and write them to disk.
+
+    Counterpart to ``build_authorization_url``: called by the runner once the
+    server forwards the OAuth ``code`` over WebSocket. Writes the resulting
+    token JSON at ``token_path`` with mode 0600. The server never sees the
+    access or refresh tokens.
+
+    ``code_verifier`` must be the same value returned from the matching
+    ``build_authorization_url`` call (PKCE). Required when the upstream
+    URL was built with PKCE enabled (Google's default).
+    """
+    try:
+        from google_auth_oauthlib.flow import Flow
+    except ImportError as exc:
+        raise GoogleOAuthError(
+            "google-auth-oauthlib is required for MCP OAuth flows but missing — "
+            "the clawmeets runner should bundle it by default. "
+            "Try: pip install --upgrade clawmeets"
+        ) from exc
+
+    secrets_path = _resolve_client_secrets(client_secrets)
+    if not secrets_path.exists():
+        raise GoogleOAuthError(
+            f"Google OAuth client secrets not found at {secrets_path}."
+        )
+
+    flow = Flow.from_client_secrets_file(str(secrets_path), scopes=scopes)
+    flow.redirect_uri = redirect_uri
+    if code_verifier:
+        flow.code_verifier = code_verifier
+    flow.fetch_token(code=code)
+    creds = flow.credentials
+
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+    token_path.write_text(creds.to_json())
+    os.chmod(token_path, stat.S_IRUSR | stat.S_IWUSR)  # 0600
+    logger.info(f"Wrote Google OAuth token to {token_path} (0600) via relay flow")
 
 
 def load_credentials(token_path: Path, scopes: list[str]):

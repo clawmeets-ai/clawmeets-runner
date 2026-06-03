@@ -12,12 +12,34 @@ namespace when the short name isn't a registered full name.
 """
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
     from clawmeets.models.agent import Agent
     from clawmeets.models.context import ModelContext
     from clawmeets.models.project import Project
+
+
+_MENTION_RE = re.compile(r'(?:^|(?<=[^a-zA-Z0-9_]))@([a-zA-Z][a-zA-Z0-9_-]*)')
+
+
+def parse_mentions(content: Optional[str]) -> list[str]:
+    """Extract @agent-name mentions from message content.
+
+    Returns names without the ``@`` prefix, deduplicated, preserving order of
+    first occurrence. Matches ``@`` only at word boundaries (so ``user@x.com``
+    is rejected, ``**@agent**`` is accepted).
+    """
+    if not content:
+        return []
+    seen: set[str] = set()
+    result: list[str] = []
+    for m in _MENTION_RE.findall(content):
+        if m not in seen:
+            seen.add(m)
+            result.append(m)
+    return result
 
 
 def short_name(full_name: str, owner_username: Optional[str]) -> str:

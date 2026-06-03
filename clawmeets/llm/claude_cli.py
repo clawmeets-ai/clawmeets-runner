@@ -50,25 +50,34 @@ class ClaudeCLI(LLMProvider):
         self,
         claude_bin: str = "claude",
         claude_plugin_dirs: Optional[list[Path]] = None,
-        use_chrome: bool = False,
         mcp_manager: Optional["McpManager"] = None,
+        agent_env: Optional[dict[str, str]] = None,
+        model: Optional[str] = None,
     ) -> None:
         """Initialize ClaudeCLI.
 
         Args:
             claude_bin: Path to claude CLI binary
             claude_plugin_dirs: Directories to load as Claude plugins via --plugin-dir
-            use_chrome: Enable Chrome browser integration via --chrome flag
             mcp_manager: If provided, renders .mcp.json into each invocation's
                 working_dir so Claude Code picks up installed MCP servers.
+            agent_env: Extra environment variables exposed to every Claude
+                subprocess. Used to surface the running agent's identity
+                (CLAWMEETS_AGENT_ID / CLAWMEETS_AGENT_TOKEN /
+                CLAWMEETS_SERVER_URL) so Bash-shelled commands inside Claude
+                (e.g. ``clawmeets project create ... --token $...``) can
+                authenticate as this agent without re-resolving credentials.
+            model: If set, passed to the Claude CLI as ``--model <name>`` per
+                invocation. None falls back to Claude Code's configured default.
 
         The JSON action schema is selected per invocation and passed to
         ``invoke(action_schema=...)``.
         """
         self._bin = claude_bin
         self._claude_plugin_dirs = claude_plugin_dirs or []
-        self._use_chrome = use_chrome
         self._mcp_manager = mcp_manager
+        self._agent_env = dict(agent_env or {})
+        self._model = model
 
     @classmethod
     def verify_cli(cls, claude_bin: str = "claude") -> None:
@@ -134,14 +143,14 @@ class ClaudeCLI(LLMProvider):
             "--json-schema", json.dumps(action_schema),
         ]
 
+        if self._model:
+            cmd.extend(["--model", self._model])
+
         for d in additional_dirs:
             cmd.extend(["--add-dir", str(d.expanduser().resolve())])
 
         for d in self._claude_plugin_dirs:
             cmd.extend(["--plugin-dir", str(d.expanduser().resolve())])
-
-        if self._use_chrome:
-            cmd.append("--chrome")
 
         logger.info(f"[claude-invoke] START: invoking Claude CLI via stdin")
         logger.info(f"[claude-invoke] command: {' '.join(cmd)}")
@@ -226,14 +235,49 @@ class ClaudeCLI(LLMProvider):
                 f"cache_read={usage.cache_read_tokens} cache_create={usage.cache_creation_tokens}"
             )
 
-            structured = result_data.get("structured_output")
-            if structured and isinstance(structured, dict):
-                actions = structured.get("actions", [])
-                if actions:
-                    logger.info(f"[claude-invoke] structured_output.actions: {len(actions)} action(s)")
-                return result_text, usage, actions
+            # Aggregate actions across EVERY StructuredOutput tool_use, not just
+            # the last. Claude can split actions across multiple calls in one
+            # turn; result.structured_output only carries the most recent call,
+            # which silently drops earlier actions.
+            merged_actions: list[dict] = []
+            if isinstance(data, list):
+                for item in data:
+                    if not isinstance(item, dict) or item.get("type") != "assistant":
+                        continue
+                    msg = item.get("message") or {}
+                    if not isinstance(msg, dict):
+                        continue
+                    for c in msg.get("content", []):
+                        if not isinstance(c, dict):
+                            continue
+                        if c.get("type") != "tool_use" or c.get("name") != "StructuredOutput":
+                            continue
+                        inp = c.get("input") or {}
+                        actions = inp.get("actions") if isinstance(inp, dict) else None
+                        if isinstance(actions, list):
+                            merged_actions.extend(actions)
 
-            return result_text, usage, []
+            structured = result_data.get("structured_output")
+            final_actions = (
+                structured.get("actions", [])
+                if isinstance(structured, dict)
+                else []
+            )
+
+            if merged_actions:
+                if len(merged_actions) != len(final_actions):
+                    logger.info(
+                        f"[claude-invoke] merged {len(merged_actions)} action(s) across "
+                        f"StructuredOutput tool_use events; result.structured_output only "
+                        f"reported {len(final_actions)} (using merged set)"
+                    )
+                else:
+                    logger.info(f"[claude-invoke] structured_output.actions: {len(merged_actions)} action(s)")
+                return result_text, usage, merged_actions
+
+            if final_actions:
+                logger.info(f"[claude-invoke] structured_output.actions: {len(final_actions)} action(s)")
+            return result_text, usage, final_actions
 
         except json.JSONDecodeError as e:
             logger.warning(f"[claude-invoke] Failed to parse JSON output: {e}, returning raw stdout")
@@ -259,8 +303,12 @@ class ClaudeCLI(LLMProvider):
 
         env = os.environ.copy()
         env["CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD"] = "1"
+        # Surface the agent's identity to any Bash-shelled CLI calls inside
+        # Claude (e.g. /personal:<project-skill> shelling `clawmeets project
+        # create ... --token $CLAWMEETS_AGENT_TOKEN`).
+        env.update(self._agent_env)
 
-        invoke_timeout = 600 if self._use_chrome else 300
+        invoke_timeout = 1800
 
         start_time = time.time()
         proc: Optional[asyncio.subprocess.Process] = None

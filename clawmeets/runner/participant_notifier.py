@@ -119,6 +119,12 @@ class ParticipantNotifier(ChangelogSubscriber):
         if payload.from_participant_id == self._participant.id:
             return
 
+        # P4: skip foreign memberships. If our own PARTICIPANTS row in this
+        # chatroom is `external=true`, the TunnelSubscriber is mirroring this
+        # message to our FD project — we process it there, not here.
+        if self._is_external_in(project_id, payload.chatroom_name):
+            return
+
         # Check for first user message in user-communication (coordinator only)
         # Lazy check: ModelContext (priority 0) writes message before this runs (priority 200)
         # So count == 1 means this is the first message
@@ -160,6 +166,18 @@ class ParticipantNotifier(ChangelogSubscriber):
             )
         else:
             addressed = self._participant.id in payload.expects_response_from
+            # In a DM chatroom `dm-{name}` the chatroom name itself binds the
+            # addressee to the agent named `{name}` — `expects_response_from`
+            # is redundant. This matters when the previous same-name agent
+            # was deleted and re-registered: any pending message frozen with
+            # the deleted id in `expects_response_from` still belongs to the
+            # currently-live successor. Symmetric to the coordinator-side DM
+            # gate above (lines 140-142).
+            if (
+                not addressed
+                and payload.chatroom_name == f"dm-{self._participant.name}"
+            ):
+                addressed = True
             message = ChatMessage.from_message_payload(payload)
             await self._participant.on_message(
                 project_id=project_id,
@@ -177,6 +195,9 @@ class ParticipantNotifier(ChangelogSubscriber):
         """Notify of file creation."""
         payload = self._extract_payload(entry, FilePayload)
 
+        if self._is_external_in(project_id, payload.chatroom_name):
+            return
+
         await self._participant.on_file_created(
             project_id=project_id,
             chatroom_name=payload.chatroom_name,
@@ -193,6 +214,9 @@ class ParticipantNotifier(ChangelogSubscriber):
         """Notify of file update."""
         payload = self._extract_payload(entry, FilePayload)
 
+        if self._is_external_in(project_id, payload.chatroom_name):
+            return
+
         await self._participant.on_file_updated(
             project_id=project_id,
             chatroom_name=payload.chatroom_name,
@@ -200,6 +224,24 @@ class ParticipantNotifier(ChangelogSubscriber):
             content=base64.b64decode(payload.content_b64),
             trigger_version=entry.version,
         )
+
+    def _is_external_in(self, project_id: str, chatroom_name: str) -> bool:
+        """True iff this participant's PARTICIPANTS row in this chatroom carries ``external=true``.
+
+        Foreign agents invited into another user's project's chatrooms get this
+        flag; their notifier skips processing locally because the FD tunnel is
+        delivering the same message to their FD project where they handle it.
+        Returns False for missing chatrooms / legacy rows (safe default).
+        """
+        from clawmeets.models.chatroom import Chatroom
+
+        try:
+            chatroom = Chatroom.get(project_id, chatroom_name, self._participant._model_ctx)
+        except (ValueError, AttributeError):
+            return False
+        if chatroom is None:
+            return False
+        return chatroom.is_external_member(self._participant.id)
 
     async def _notify_project_completed(
         self,

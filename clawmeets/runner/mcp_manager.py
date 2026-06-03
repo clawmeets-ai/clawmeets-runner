@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger("clawmeets.runner")
 
 TOKEN_PLACEHOLDER = "{{token_path}}"
+AGENT_DIR_PLACEHOLDER = "{{agent_dir}}"
 
 
 class McpManager:
@@ -175,14 +176,18 @@ class McpManager:
                 continue
 
             token_path = str(self.token_path(mcp_name))
-            env = {
-                k: v.replace(TOKEN_PLACEHOLDER, token_path) if isinstance(v, str) else v
-                for k, v in (launch.get("env") or {}).items()
-            }
-            args = [
-                a.replace(TOKEN_PLACEHOLDER, token_path) if isinstance(a, str) else a
-                for a in (launch.get("args") or [])
-            ]
+            agent_dir = str(self.mcp_hub_dir.parent)
+
+            def _render(v):
+                if not isinstance(v, str):
+                    return v
+                return (
+                    v.replace(TOKEN_PLACEHOLDER, token_path)
+                     .replace(AGENT_DIR_PLACEHOLDER, agent_dir)
+                )
+
+            env = {k: _render(v) for k, v in (launch.get("env") or {}).items()}
+            args = [_render(a) for a in (launch.get("args") or [])]
             servers[mcp_name] = {
                 "command": command,
                 "args": args,

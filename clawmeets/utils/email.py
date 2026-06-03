@@ -7,6 +7,9 @@ import logging
 import os
 from typing import Optional
 
+import sendgrid
+from sendgrid.helpers.mail import Mail, Email, To, Content, Bcc
+
 logger = logging.getLogger("clawmeets.email")
 
 SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY")
@@ -74,17 +77,6 @@ async def _send_notification_via_sendgrid(
     html_body: Optional[str] = None,
 ) -> None:
     """Send notification via SendGrid API."""
-    try:
-        import sendgrid
-        from sendgrid.helpers.mail import Mail, Email, To, Content
-    except ImportError:
-        logger.error(
-            "SendGrid is not installed. Install with: pip install 'clawmeets[email]'\n"
-            "Falling back to console output."
-        )
-        _send_notification_via_console(to_email, "", subject, body, html_body)
-        return
-
     sg = sendgrid.SendGridAPIClient(api_key=SENDGRID_API_KEY)
     message = Mail(
         from_email=Email(SENDGRID_FROM_EMAIL, SENDGRID_FROM_NAME),
@@ -127,17 +119,6 @@ def _send_notification_via_console(
 
 async def _send_waitlist_via_sendgrid(to_email: str) -> None:
     """Send waitlist confirmation via SendGrid API."""
-    try:
-        import sendgrid
-        from sendgrid.helpers.mail import Mail, Email, To, Content, Bcc
-    except ImportError:
-        logger.error(
-            "SendGrid is not installed. Install with: pip install 'clawmeets[email]'\n"
-            "Falling back to console output."
-        )
-        _send_waitlist_via_console(to_email)
-        return
-
     sg = sendgrid.SendGridAPIClient(api_key=SENDGRID_API_KEY)
     message = Mail(
         from_email=Email(SENDGRID_FROM_EMAIL, SENDGRID_FROM_NAME),
@@ -183,17 +164,6 @@ async def _send_via_sendgrid(
     verification_url: str,
 ) -> None:
     """Send via SendGrid API."""
-    try:
-        import sendgrid
-        from sendgrid.helpers.mail import Mail, Email, To, Content
-    except ImportError:
-        logger.error(
-            "SendGrid is not installed. Install with: pip install 'clawmeets[email]'\n"
-            "Falling back to console output."
-        )
-        _send_via_console(to_email, username, verification_url)
-        return
-
     sg = sendgrid.SendGridAPIClient(api_key=SENDGRID_API_KEY)
     message = Mail(
         from_email=Email(SENDGRID_FROM_EMAIL, SENDGRID_FROM_NAME),

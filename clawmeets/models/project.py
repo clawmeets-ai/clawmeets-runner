@@ -26,16 +26,50 @@ they flow through the distributed changelog system.
 """
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Literal, Optional
 
-from pydantic import BaseModel, Field, PrivateAttr
+from pydantic import BaseModel, Field, PrivateAttr, computed_field, model_validator
 
 from ..sync.changelog import ProjectStatus
 from ..utils.file_io import FileUtil
 from ..utils.validation import validate_name
 from .participant import Participant
+
+
+# Front Desk project name format: {requester_username}-fd-{agent_short_name}
+# Both username and agent short name use the existing validate_name() character
+# set (alphanumerics, dashes, underscores). The literal `-fd-` token is the
+# separator. Match is anchored.
+FRONT_DESK_NAME_RE = re.compile(r"^([a-z0-9][a-z0-9_-]*)-fd-([a-z0-9][a-z0-9_-]*)$")
+
+
+# Project surface — the explicit project shape that replaces name-pattern predicates.
+# Adding a new DM-shaped use case is one new value here, consulted uniformly by
+# server auth / prompt-builder / frontend / action-schema selection.
+ProjectSurface = Literal["regular", "dm", "front_desk"]
+
+
+def parse_front_desk_name(name: str) -> tuple[str, str] | None:
+    """Parse a Front Desk project name into (requester_username, agent_short_name).
+
+    Returns None if the name does not match the Front Desk pattern.
+    """
+    m = FRONT_DESK_NAME_RE.match(name)
+    if not m:
+        return None
+    return m.group(1), m.group(2)
+
+
+def _derive_surface_from_name(name: str) -> ProjectSurface:
+    """Back-fill `surface` for legacy on-disk projects that predate the field."""
+    if name.startswith("DM-"):
+        return "dm"
+    if FRONT_DESK_NAME_RE.match(name):
+        return "front_desk"
+    return "regular"
 
 if TYPE_CHECKING:
     from .context import ModelContext
@@ -59,12 +93,28 @@ class Project(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     created_by: str               # user_id of creator (derived from auth)
     agent_pool: str = Field(default="verified")  # "owned", "verified", or "all"
-    agent_teams: list[str] = Field(default_factory=list)  # Restrict invite pool to agents carrying any of these user_teams; empty = no team filter
+    agent_teams: list[str] = Field(default_factory=list)  # Hard allowlist by user_team; pairs with agent_names. Empty teams + empty names = no filter (everyone in pool is invitable).
+    agent_names: list[str] = Field(default_factory=list)  # Hard allowlist by agent display name (id, full name, or owner-relative short name); pairs with agent_teams. OR semantics across both lists.
     git_url: str = Field(default="")  # Git repo URL (empty = no git)
     git_ignored_folder: str = Field(default=".bus-files")  # Folder for non-git deliverables
+    requester_id: str | None = None   # External user OR agent who initiated a Front Desk project; equal to created_by when internal-user
+    requester_kind: Literal["user", "agent"] | None = None  # Discriminator for resolving requester_id. None for non-FD projects.
+    surface: ProjectSurface = "regular"  # Explicit project shape; "regular" | "dm" | "front_desk"
 
     # Private runtime state (not serialized)
     _ctx: Optional["ModelContext"] = PrivateAttr(default=None)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _backfill_surface_from_name(cls, data):
+        """Derive `surface` from the project name for legacy on-disk projects.
+
+        New projects always set `surface` explicitly via their creation route;
+        this only fires for meta.json files written before the field existed.
+        """
+        if isinstance(data, dict) and "name" in data and not data.get("surface"):
+            data["surface"] = _derive_surface_from_name(data["name"])
+        return data
 
     @property
     def ctx(self) -> "ModelContext":
@@ -84,12 +134,19 @@ class Project(BaseModel):
     # Derived Properties (always read fresh from filesystem)
     # -------------------------------------------------------------------------
 
+    @computed_field
     @property
     def status(self) -> ProjectStatus:
         """Project status (always reads fresh from meta.json).
 
+        Decorated with ``@computed_field`` so Pydantic includes it in
+        ``model_dump()`` / serialized HTTP responses (otherwise the
+        ``GET /projects/{id}`` payload would silently omit ``status``,
+        and frontend gates like ``project.status === ProjectStatus.COMPLETED``
+        would never match).
+
         Returns:
-            ProjectStatus.ACTIVE or ProjectStatus.COMPLETED
+            ProjectStatus.ACTIVE or ProjectStatus.COMPLETED or ProjectStatus.FAILED
         """
         data = FileUtil.read(self.meta_path, "json")
         return ProjectStatus(data["status"])
@@ -124,12 +181,36 @@ class Project(BaseModel):
 
     @property
     def is_dm_project(self) -> bool:
-        """Check if this is a DM (direct message) project.
+        """Check if this is a DM (direct message) project."""
+        return self.surface == "dm"
 
-        DM projects are named "DM-{username}" and are used for direct
-        messaging between users and agents.
+    @property
+    def is_front_desk_project(self) -> bool:
+        """Check if this is a Front Desk project.
+
+        The long-lived coordinator channel that backs the DM-shaped UI for both
+        internal (requester == owner) and external (requester != owner) flows.
         """
-        return self.name.startswith("DM-")
+        return self.surface == "front_desk"
+
+    @property
+    def front_desk_parts(self) -> tuple[str, str] | None:
+        """Return ``(requester_username, agent_short_name)`` for Front Desk projects.
+
+        Returns ``None`` for projects that don't match the Front Desk name pattern.
+        """
+        return parse_front_desk_name(self.name)
+
+    def is_user_requester(self, user_id: str) -> bool:
+        """True when ``user_id`` is the authorized human requester.
+
+        Treats projects without an explicit ``requester_kind`` as user-shaped
+        (legacy default). Agent-as-requester FD projects return False here —
+        the agent-bearer auth path handles them separately.
+        """
+        if self.requester_id is None or self.requester_id != user_id:
+            return False
+        return self.requester_kind in (None, "user")
 
     # -------------------------------------------------------------------------
     # Association Methods (lookup-based, no caching)
@@ -382,8 +463,12 @@ class ProjectState:
         ctx: "ModelContext",
         agent_pool: str = "verified",
         agent_teams: list[str] | None = None,
+        agent_names: list[str] | None = None,
         git_url: str = "",
         git_ignored_folder: str = ".bus-files",
+        requester_id: str | None = None,
+        requester_kind: Literal["user", "agent"] | None = None,
+        surface: ProjectSurface = "regular",
     ) -> Project:
         """Create a new project with directories and meta.json.
 
@@ -402,7 +487,8 @@ class ProjectState:
             created_at: Creation timestamp
             ctx: ModelContext for filesystem operations
             agent_pool: Agent pool mode ("owned", "verified", or "all")
-            agent_teams: Optional list of user_teams; only agents carrying any of these teams are offered for invitation (empty/None = no team filter)
+            agent_teams: Optional list of user_teams; agents carrying any of these teams pass the allowlist (composed via OR with agent_names; empty/None on both = no filter)
+            agent_names: Optional list of agent display names (id, full name, or owner-relative short name); agents matching any pass the allowlist (composed via OR with agent_teams; empty/None on both = no filter)
 
         Returns:
             The created Project instance
@@ -429,8 +515,12 @@ class ProjectState:
             "created_by": created_by,
             "agent_pool": agent_pool,
             "agent_teams": list(agent_teams) if agent_teams else [],
+            "agent_names": list(agent_names) if agent_names else [],
             "git_url": git_url,
             "git_ignored_folder": git_ignored_folder,
+            "requester_id": requester_id,
+            "requester_kind": requester_kind,
+            "surface": surface,
         }
         FileUtil.write(meta_dir / "meta.json", project_data, "json", atomic=True)
 
@@ -444,6 +534,17 @@ class ProjectState:
         meta_path = self._project.meta_path
         project_dict = FileUtil.read(meta_path, "json")
         project_dict["status"] = "completed"
+        FileUtil.write(meta_path, project_dict, "json", atomic=True)
+
+    def reactivate(self) -> None:
+        """Flip project status back to ACTIVE in meta.json.
+
+        Counterpart to ``complete()`` — runs when a user posts into a
+        completed task's user-communication, resuming the conversation.
+        """
+        meta_path = self._project.meta_path
+        project_dict = FileUtil.read(meta_path, "json")
+        project_dict["status"] = "active"
         FileUtil.write(meta_path, project_dict, "json", atomic=True)
 
     def add_participant(self, participant_id: str) -> None:

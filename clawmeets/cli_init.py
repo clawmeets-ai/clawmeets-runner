@@ -16,6 +16,7 @@ import json
 import os
 import re
 import sys
+import urllib.parse
 from pathlib import Path
 from typing import Optional
 
@@ -32,6 +33,38 @@ VALID_LLM_PROVIDERS = ("claude", "openai", "gemini")
 
 DEFAULT_SERVER = os.environ.get("CLAWMEETS_SERVER_URL", "https://clawmeets.ai")
 DEFAULT_DATA_DIR = os.environ.get("CLAWMEETS_DATA_DIR", "~/.clawmeets")
+
+
+def _detect_clawmeets_plugin_dir() -> str:
+    """Locate the bundled `plugins/clawmeets/` directory.
+
+    Two cases, checked in order:
+
+    1. **Pip-installed (also uv tool / pipx)** — the runner ships the
+       plugin at ``clawmeets/_clawmeets_plugin/`` (see
+       ``scripts/build-runner-package.sh`` + the ``package-data`` entry
+       in ``packaging/runner/pyproject.toml``). Same ``__file__.parent``
+       location regardless of installer.
+    2. **Source-repo dev** — the package lives in a checkout that also
+       has ``plugins/clawmeets/`` as a sibling of the ``clawmeets/``
+       module dir. Walk up from ``__file__`` looking for the
+       ``.claude-plugin/plugin.json`` marker.
+
+    Returns "" if neither matches; ``init_command`` then prints a
+    warning and continues without writing ``claude_plugin_dir``.
+    """
+    here = Path(__file__).resolve()
+
+    bundled = here.parent / "_clawmeets_plugin" / ".claude-plugin" / "plugin.json"
+    if bundled.exists():
+        return str(bundled.parent.parent)
+
+    for parent in here.parents:
+        candidate = parent / "plugins" / "clawmeets" / ".claude-plugin" / "plugin.json"
+        if candidate.exists():
+            return str(candidate.parent.parent)
+
+    return ""
 
 # ---------------------------------------------------------------------------
 # Validation
@@ -84,6 +117,46 @@ def _prompt_validated_name(text: str, label: str, *, existing: set[str] | None =
             typer.echo(f"  Agent '{name}' already added. Choose a different name.")
             continue
         return name
+
+
+def _resolve_credentials(
+    username: Optional[str],
+    password: Optional[str],
+    *,
+    non_interactive: bool,
+) -> tuple[str, str]:
+    """Resolve (username, password) honoring CLI flags before prompting.
+
+    - Flag-supplied values short-circuit the prompt — including the
+      ``Confirm password`` step (you already typed it on the command line).
+    - In ``--non-interactive`` mode, both must be flag-supplied.
+    - Otherwise, only the missing field(s) are prompted for.
+    """
+    if username:
+        err = _validate_name(username, "username")
+        if err:
+            typer.echo(f"Error: {err}", err=True)
+            raise typer.Exit(1)
+    if non_interactive:
+        if not username or not password:
+            typer.echo(
+                "Error: --username and --password are required with --non-interactive",
+                err=True,
+            )
+            raise typer.Exit(1)
+        return username, password
+
+    if not username:
+        username = _prompt_validated_name("  Username", "username")
+    else:
+        typer.echo(f"  Username: {username}")
+    if not password:
+        password = _prompt_required("  Password", password=True)
+        password_confirm = _prompt_required("  Confirm password", password=True)
+        if password != password_confirm:
+            typer.echo("Error: Passwords do not match.", err=True)
+            raise typer.Exit(1)
+    return username, password
 
 
 # ---------------------------------------------------------------------------
@@ -385,8 +458,14 @@ def _register_agents(
             agent_work_dir = agents_dir / f"{registered_name}-{agent_id}"
             agent_work_dir.mkdir(parents=True, exist_ok=True)
 
-            cred = {"agent_id": agent_id, "token": result["token"], "agent_name": registered_name}
-            (agent_work_dir / "credential.json").write_text(json.dumps(cred, indent=2))
+            # Re-register returns token=None (server keeps the existing one)
+            # so that idempotent `clawmeets init` re-runs don't invalidate
+            # any already-running runner's in-memory credential. First-time
+            # register always returns a token; write it then.
+            new_token = result.get("token")
+            if new_token:
+                cred = {"agent_id": agent_id, "token": new_token, "agent_name": registered_name}
+                (agent_work_dir / "credential.json").write_text(json.dumps(cred, indent=2))
 
             # Any sibling {registered_name}-<other_id>/ is a leftover from a
             # previous registration of the same name — the server already
@@ -428,8 +507,9 @@ def _register_agents(
                     local_settings["llm_provider"] = provider
             if agent.get("llm_model"):
                 local_settings["llm_model"] = agent["llm_model"]
-            if "chrome" in agent:
-                local_settings["use_chrome"] = bool(agent["chrome"])
+            agent_dwh_dir = agent.get("dwh_dir") or os.environ.get("CLAWMEETS_DWH_DIR", "")
+            if agent_dwh_dir:
+                local_settings["dwh_dir"] = agent_dwh_dir
 
             # Persist local_settings on the server card too, so the Agent
             # Settings page and server-side callers see the same value the
@@ -459,8 +539,11 @@ def _register_agents(
                 "discoverable_through_registry": result.get("discoverable_through_registry", False),
                 "local_settings": local_settings,
             }
-            if agent_user_teams:
-                card["user_teams"] = agent_user_teams
+            # Server may have merged with pre-existing teams on re-register
+            # (re-init is additive for user_teams); prefer the server's view.
+            final_teams = result.get("user_teams") or agent_user_teams
+            if final_teams:
+                card["user_teams"] = final_teams
             (agent_work_dir / "card.json").write_text(json.dumps(card, indent=2))
 
             # Install any MCP servers listed in setup.json agents[].mcp_servers
@@ -484,6 +567,24 @@ def _register_agents(
                     if added:
                         typer.echo(f"    MCP servers installed: {', '.join(added)}")
 
+            skills = agent.get("skills") or []
+            if skills:
+                skill_resp = client.post(
+                    f"/agents/{agent_id}/skills",
+                    json={"skills": skills},
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                if skill_resp.status_code >= 400:
+                    typer.echo(
+                        f"  Warning: failed to install skills "
+                        f"{skills} for '{registered_name}': {skill_resp.text}",
+                        err=True,
+                    )
+                else:
+                    added = skill_resp.json().get("added", [])
+                    if added:
+                        typer.echo(f"    Skills installed: {', '.join(added)}")
+
             typer.echo(f"  Registered '{registered_name}' ({agent_id[:8]}...)")
 
 
@@ -492,6 +593,11 @@ def _build_assistant_local_settings(block: dict, label: str) -> dict:
 
     Same validation rules as _register_agents: llm_provider must be in
     VALID_LLM_PROVIDERS, otherwise warn + skip.
+
+    `dwh_dir` falls back to the ``CLAWMEETS_DWH_DIR`` environment variable
+    when the block does not set it explicitly — lets a user run
+    ``CLAWMEETS_DWH_DIR=/mnt/dwh clawmeets init --from-url …`` once and
+    have every agent in the template land on the same warehouse.
     """
     local_settings: dict = {}
     if block.get("knowledge_dir"):
@@ -508,8 +614,9 @@ def _build_assistant_local_settings(block: dict, label: str) -> dict:
             local_settings["llm_provider"] = provider
     if block.get("llm_model"):
         local_settings["llm_model"] = block["llm_model"]
-    if "chrome" in block:
-        local_settings["use_chrome"] = bool(block["chrome"])
+    dwh_dir = block.get("dwh_dir") or os.environ.get("CLAWMEETS_DWH_DIR", "")
+    if dwh_dir:
+        local_settings["dwh_dir"] = dwh_dir
     return local_settings
 
 
@@ -543,7 +650,21 @@ def _setup_assistant_credentials(
 
     assistant_name = login_response.get("assistant_agent_name", "")
     if not assistant_name:
-        return
+        # Older servers (or `/auth/login` before the contract was tightened)
+        # only returned `assistant_agent_id`. Fetch the name on its own so a
+        # newer client + older server still creates the local credential dir.
+        try:
+            with httpx.Client(base_url=server, timeout=30) as _client:
+                resp = _client.get(
+                    f"/agents/{assistant_id}",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                resp.raise_for_status()
+                assistant_name = resp.json().get("name", "") or ""
+        except (httpx.HTTPStatusError, httpx.HTTPError):
+            assistant_name = ""
+        if not assistant_name:
+            return
 
     assistant_dir = agents_dir / f"{assistant_name}-{assistant_id}"
     if assistant_dir.exists():
@@ -601,9 +722,31 @@ def _apply_assistant_config(
     """
     assistant_id = login_response.get("assistant_agent_id")
     assistant_name = login_response.get("assistant_agent_name", "")
-    if not assistant_id or not assistant_name:
-        typer.echo("  Warning: login response missing assistant id/name; skipping assistant config.", err=True)
+    if not assistant_id:
+        typer.echo("  Warning: login response missing assistant_agent_id; skipping assistant config.", err=True)
         return {}, None, None
+    if not assistant_name:
+        # Older servers (or `/auth/login` before this contract was tightened)
+        # only returned `assistant_agent_id`. Fetch the name on its own so
+        # newer clients keep working against older deployments.
+        try:
+            with httpx.Client(base_url=server, timeout=30) as _client:
+                resp = _client.get(
+                    f"/agents/{assistant_id}",
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+                resp.raise_for_status()
+                assistant_name = resp.json().get("name", "") or ""
+        except (httpx.HTTPStatusError, httpx.HTTPError):
+            assistant_name = ""
+        if not assistant_name:
+            typer.echo(
+                "  Warning: could not resolve assistant name from server; "
+                "skipping assistant config (PUT to /agents/{id} would have "
+                "no agent name to label in logs).",
+                err=True,
+            )
+            return {}, None, None
 
     label = f"assistant '{assistant_name}'"
     local_settings = _build_assistant_local_settings(assistant_block, label)
@@ -653,6 +796,24 @@ def _apply_assistant_config(
                 if added:
                     typer.echo(f"    MCP servers installed: {', '.join(added)}")
 
+        skills = assistant_block.get("skills") or []
+        if skills:
+            skill_resp = client.post(
+                f"/agents/{assistant_id}/skills",
+                json={"skills": skills},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            if skill_resp.status_code >= 400:
+                typer.echo(
+                    f"  Warning: failed to install skills {skills} "
+                    f"for '{assistant_name}': {skill_resp.text}",
+                    err=True,
+                )
+            else:
+                added = skill_resp.json().get("added", [])
+                if added:
+                    typer.echo(f"    Skills installed: {', '.join(added)}")
+
     # CLAUDE.md generation — _generate_claude_md skips if one already exists.
     if assistant_block.get("knowledge_dir") or assistant_block.get("profile"):
         synthetic_entry = {
@@ -672,6 +833,46 @@ def _apply_assistant_config(
     return local_settings, capabilities, description
 
 
+def _ensure_assistant_frontdesk_project(
+    server: str,
+    token: str,
+    assistant_full_name: str,
+) -> None:
+    """Create (or no-op return) the user's Front Desk project for their assistant.
+
+    Calls ``POST /me/front-desk/{assistant_full_name}/ensure``, which is
+    idempotent server-side: returns the existing
+    ``{username}-fd-{assistant_short_name}`` project if present, otherwise
+    creates it with the standard ``shared-context`` / ``user-communication``
+    rooms. Best-effort — a failure here logs a warning but does not abort
+    init, since the project can always be created later from the dashboard.
+    """
+    if not assistant_full_name:
+        typer.echo(
+            "  Warning: skipping Front Desk project (no assistant name in login response).",
+            err=True,
+        )
+        return
+    try:
+        with httpx.Client(base_url=server, timeout=30) as client:
+            resp = client.post(
+                f"/me/front-desk/{assistant_full_name}/ensure",
+                json={},
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            resp.raise_for_status()
+            proj_name = resp.json().get("name", "")
+            if proj_name:
+                typer.echo(f"  Ensured Front Desk project: {proj_name}")
+            else:
+                typer.echo(f"  Ensured Front Desk project for '{assistant_full_name}'.")
+    except httpx.HTTPError as e:
+        typer.echo(
+            f"  Warning: could not ensure Front Desk project for '{assistant_full_name}': {e}",
+            err=True,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Config file generation
 # ---------------------------------------------------------------------------
@@ -689,6 +890,7 @@ def _write_settings_json(
     git_url: str,
     git_ignored_folder: str,
     assistant_block: Optional[dict] = None,
+    claude_plugin_dir: str = "",
 ) -> Path:
     """Generate settings.json, merging agents with any existing config. Returns the path."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -742,6 +944,11 @@ def _write_settings_json(
         config["git_ignored_folder"] = git_ignored_folder
     if assistant_block:
         config["assistant"] = assistant_block
+    if claude_plugin_dir:
+        # Read by `cli_lifecycle.py:318` and forwarded to
+        # `clawmeets agent run --claude-plugin-dir ...` so the agent's
+        # Claude subprocess registers /clawmeets:* slash commands.
+        config["claude_plugin_dir"] = claude_plugin_dir
 
     path.write_text(json.dumps(config, indent=2))
     return path
@@ -773,6 +980,15 @@ def init_command(
     username: Optional[str] = typer.Option(None, "--username", "-u", help="Username (non-interactive)"),
     password: Optional[str] = typer.Option(None, "--password", "-p", help="Password (non-interactive)"),
     assistant_token: Optional[str] = typer.Option(None, "--assistant-token", help="Assistant token (non-interactive)"),
+    claude_plugin_dir: Optional[Path] = typer.Option(
+        None, "--claude-plugin-dir",
+        help=(
+            "Path to the clawmeets Claude Code plugin (the dir containing "
+            "`.claude-plugin/plugin.json`). Auto-detected from the installed "
+            "package if not given. Pass an explicit path to point at a "
+            "Claude Code marketplace install or an out-of-tree checkout."
+        ),
+    ),
 ) -> None:
     """Interactive setup wizard: configure agents and register with the server.
 
@@ -793,6 +1009,27 @@ def init_command(
             --username alice --password secret --assistant-token abc123
     """
     typer.echo("\n=== ClawMeets Setup Wizard ===\n")
+
+    # If --server was left at the default but --from-url points at a
+    # different host, the template URL is the source of truth — that's the
+    # documented "<server>/templates/<id>/setup.json targets this
+    # deployment directly" pattern. Login against the URL's host instead
+    # of clawmeets.ai so an account registered against e.g. an ngrok
+    # tunnel doesn't get rejected by the wrong server.
+    if from_url and server == DEFAULT_SERVER:
+        try:
+            parsed = urllib.parse.urlsplit(from_url)
+        except ValueError:
+            parsed = None
+        if parsed and parsed.scheme in ("http", "https") and parsed.netloc:
+            url_origin = f"{parsed.scheme}://{parsed.netloc}"
+            if url_origin.rstrip("/") != server.rstrip("/"):
+                typer.echo(
+                    f"  Using server from --from-url: {url_origin}\n"
+                    f"  (pass --server to override; default is {DEFAULT_SERVER})\n"
+                )
+                server = url_origin
+
     typer.echo(f"  Before continuing, make sure you have an account at {server.rstrip('/')}/app/signup.")
     typer.echo("  If you haven't registered yet, sign up there first and verify your email.\n")
 
@@ -817,24 +1054,12 @@ def init_command(
         if assistant_block:
             typer.echo("  Assistant: config block present (will be applied to your personal assistant)\n")
 
-        if non_interactive:
-            if not username or not password:
-                typer.echo("Error: --username and --password are required with --non-interactive", err=True)
-                raise typer.Exit(1)
-            name_err = _validate_name(username, "username")
-            if name_err:
-                typer.echo(f"Error: {name_err}", err=True)
-                raise typer.Exit(1)
-        else:
+        if not non_interactive:
             typer.echo("--- Account Info ---")
             typer.echo(f"Enter the username and password you registered at {server.rstrip('/')}\n")
-
-            username = _prompt_validated_name("  Username", "username")
-            password = _prompt_required("  Password", password=True)
-            password_confirm = _prompt_required("  Confirm password", password=True)
-            if password != password_confirm:
-                typer.echo("Error: Passwords do not match.", err=True)
-                raise typer.Exit(1)
+        username, password = _resolve_credentials(
+            username, password, non_interactive=non_interactive,
+        )
 
         _assistant_token = assistant_token or ""
         data_dir = DEFAULT_DATA_DIR
@@ -849,9 +1074,9 @@ def init_command(
         typer.echo("--- Account Info ---")
         typer.echo(f"Enter the username and password you registered at {server.rstrip('/')}\n")
 
-        if not username or not password:
-            typer.echo("Error: --username and --password required in non-interactive mode", err=True)
-            raise typer.Exit(1)
+        username, password = _resolve_credentials(
+            username, password, non_interactive=True,
+        )
         _assistant_token = assistant_token or ""
         data_dir = DEFAULT_DATA_DIR
         agents_list: list[dict] = []
@@ -867,12 +1092,9 @@ def init_command(
         typer.echo("--- Account Info ---")
         typer.echo(f"Enter the username and password you registered at {server.rstrip('/')}\n")
 
-        username = _prompt_validated_name("  Username", "username")
-        password = _prompt_required("  Password", password=True)
-        password_confirm = _prompt_required("  Confirm password", password=True)
-        if password != password_confirm:
-            typer.echo("Error: Passwords do not match.", err=True)
-            raise typer.Exit(1)
+        username, password = _resolve_credentials(
+            username, password, non_interactive=False,
+        )
 
         _assistant_token = assistant_token or ""
         data_dir = _prompt("\n  Data directory", default=DEFAULT_DATA_DIR)
@@ -955,6 +1177,13 @@ def init_command(
 
     # ---- Generate settings.json ----
     typer.echo("\n--- Generating configuration ---")
+    # Resolve plugin dir: explicit flag > auto-detect > empty.
+    if claude_plugin_dir is not None:
+        resolved_plugin_dir = str(Path(claude_plugin_dir).expanduser().resolve())
+        plugin_origin = "from --claude-plugin-dir"
+    else:
+        resolved_plugin_dir = _detect_clawmeets_plugin_dir()
+        plugin_origin = "auto-detected"
     settings_path = _write_settings_json(
         output_dir,
         server_url=server,
@@ -966,8 +1195,19 @@ def init_command(
         git_url=git_url,
         git_ignored_folder=git_ignored_folder,
         assistant_block=assistant_block,
+        claude_plugin_dir=resolved_plugin_dir,
     )
     typer.echo(f"  Generated {settings_path}")
+    if resolved_plugin_dir:
+        typer.echo(f"  Plugin: {resolved_plugin_dir} ({plugin_origin})")
+    else:
+        typer.echo(
+            "  Warning: no clawmeets Claude Code plugin found. /clawmeets:* "
+            "slash commands won't be available to your agents until you "
+            "either install via Claude Code's marketplace "
+            "(`/plugin install clawmeets@clawmeets`) or re-run "
+            "`clawmeets init --claude-plugin-dir <path>`."
+        )
 
     # ---- Generate CLAUDE.md files (skipped per-agent if already present) ----
     for agent in agents_list:
@@ -998,6 +1238,20 @@ def init_command(
         capabilities_override=assistant_capabilities,
         description_override=assistant_description,
     )
+
+    # ---- Ensure Front Desk project for the assistant (opt-in via setup.json) ----
+    # Template authors enable this by setting
+    # ``"assistant": { ..., "create_frontdesk_project": true }`` in setup.json,
+    # which materializes the {username}-fd-assistant project alongside the
+    # private DM-{username} project the registration flow already created.
+    # Off by default so the plain interactive `clawmeets init` (no template)
+    # doesn't silently grow an extra project the user didn't ask for.
+    if assistant_block and assistant_block.get("create_frontdesk_project"):
+        _ensure_assistant_frontdesk_project(
+            server,
+            token,
+            login_resp.get("assistant_agent_name", ""),
+        )
 
     # ---- Register agents ----
     if agents_list:

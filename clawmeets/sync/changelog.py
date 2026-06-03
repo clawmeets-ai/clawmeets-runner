@@ -29,10 +29,13 @@ class ChangelogEntryType(str, Enum):
     FILE_CREATED = "file_created"    # File created/uploaded
     FILE_UPDATED = "file_updated"    # File modified
     ROOM_CREATED = "room_created"    # Chatroom created
+    ROOM_DELETED = "room_deleted"    # Chatroom deleted (used by project rerun)
     PROJECT_COMPLETED = "project_completed"  # Project completed
+    PROJECT_REACTIVATED = "project_reactivated"  # Completed/failed task resumed by user message
     BATCH_COMPLETE = "batch_complete"  # All expected agents responded
     BATCH_TIMEOUT = "batch_timeout"    # Some agents didn't respond in time
     PARTICIPANT_ADDED = "participant_added"  # Participant added to existing room
+    CHATROOM_CLEARED = "chatroom_cleared"    # All messages in a chatroom wiped by user
 
 
 class ProjectStatus(str, Enum):
@@ -53,8 +56,9 @@ class ChatroomPayload(BaseModel):
     BATCH_TIMEOUT) inherit from this class and include chatroom_name in
     the payload.
 
-    Project-level entries (PROJECT_CREATED, PROJECT_COMPLETED) do NOT
-    inherit from this class and have no chatroom_name.
+    Project-level entries (PROJECT_CREATED, PROJECT_COMPLETED,
+    PROJECT_REACTIVATED) do NOT inherit from this class and have no
+    chatroom_name.
     """
     chatroom_name: str
 
@@ -98,6 +102,7 @@ class RoomCreatedParticipant(BaseModel):
     """Participant info for room creation."""
     id: str
     name: str
+    external: bool = False  # True ⇒ foreign agent; their runner's notifier skips processing this membership (the FD tunnel handles delivery)
 
 
 class RoomCreatedPayload(ChatroomPayload):
@@ -106,12 +111,35 @@ class RoomCreatedPayload(ChatroomPayload):
     participants: list[RoomCreatedParticipant] = Field(default_factory=list)
 
 
+class RoomDeletedPayload(ChatroomPayload):
+    """Payload for ROOM_DELETED entries in unified changelog.
+
+    Emitted by the project rerun flow to wipe non-system work rooms from a
+    persistent reusable project. Subscribers must be idempotent: deleting an
+    already-absent dir / branch is a no-op. `shared-context` and
+    `user-communication` are never deletable through this entry — callers
+    are expected to enforce that, and subscribers do the same defensively.
+    """
+    # chatroom_name inherited from ChatroomPayload
+    pass
+
+
 class ProjectCompletedPayload(BaseModel):
     """Payload for PROJECT_COMPLETED entries in unified changelog.
 
     Project-level entry - no chatroom_name field.
     """
     pass  # No fields needed - the entry type itself indicates completion
+
+
+class ProjectReactivatedPayload(BaseModel):
+    """Payload for PROJECT_REACTIVATED entries — project-level, no chatroom_name.
+
+    Emitted when a user posts a message into a completed/failed task's
+    user-communication chatroom; flips status back to ACTIVE so the row
+    moves out of COMPLETED TASKS in the sidebar.
+    """
+    pass
 
 
 class BatchCompletePayload(ChatroomPayload):
@@ -137,6 +165,21 @@ class ParticipantAddedPayload(ChatroomPayload):
     """
     participant_id: str
     participant_name: str
+    external: bool = False  # True ⇒ foreign agent; their runner's notifier skips processing this membership
+
+
+class ChatroomClearedPayload(ChatroomPayload):
+    """Payload for CHATROOM_CLEARED entries in unified changelog.
+
+    Carries the metadata each subscriber needs to rewrite its local
+    CHATS.ndjson identically: the same archive filename appears on every
+    runner so a support engineer can diff one server-side backup against
+    its runner-side twin.
+    """
+    cleared_by_participant_id: str   # user id that initiated the clear
+    cleared_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    cleared_through_version: int     # changelog version this clear supersedes
+    archive_filename: str | None = None  # None when room was already empty
 
 
 class ProjectCreatedPayload(BaseModel):
@@ -151,9 +194,13 @@ class ProjectCreatedPayload(BaseModel):
     request: str
     created_by: str  # user_id of creator (required - derived from auth)
     agent_pool: str = "verified"  # "owned", "verified", or "all"
-    agent_teams: list[str] = Field(default_factory=list)  # Only consider agents with any of these user_teams; empty = no team filter
+    agent_teams: list[str] = Field(default_factory=list)  # Hard allowlist by user_team; pairs with agent_names. Empty teams + empty names = no filter.
+    agent_names: list[str] = Field(default_factory=list)  # Hard allowlist by agent display name (id, full name, or owner-relative short name); pairs with agent_teams. OR semantics across both lists.
     git_url: str = ""  # Git repo URL (empty = no git)
     git_ignored_folder: str = ".bus-files"  # Folder for non-git deliverables
+    requester_id: str | None = None  # External user OR agent who initiated a Front Desk project; equal to created_by when internal-user
+    requester_kind: str | None = None  # "user" | "agent" — None for non-FD projects. Discriminator for resolving requester_id polymorphically.
+    surface: str = "regular"  # "regular" | "dm" | "front_desk" — explicit project shape; replaces name-pattern predicates
 
 
 # Union type for changelog payloads
@@ -162,11 +209,28 @@ ChangelogPayload = Union[
     MessagePayload,
     FilePayload,
     RoomCreatedPayload,
+    RoomDeletedPayload,
     ProjectCompletedPayload,
+    ProjectReactivatedPayload,
     BatchCompletePayload,
     BatchTimeoutPayload,
     ParticipantAddedPayload,
+    ChatroomClearedPayload,
 ]
+
+
+class MirroredFromRef(BaseModel):
+    """Pointer to the source entry that a cross-project mirror reflects.
+
+    Written by ``TunnelSubscriber`` when mirroring an entry from one project's
+    room into a bound room in another project. Subscribers (including the
+    TunnelSubscriber itself) use this annotation as a loop-guard: never act on
+    an entry whose ``mirrored_from`` is set.
+    """
+    model_config = {"frozen": True}
+
+    project_id: str
+    version: int
 
 
 # ---------------------------------------------------------------------------
@@ -180,7 +244,7 @@ class ChangelogEntry(BaseModel):
     (messages, file changes, invites, etc.) in a project.
 
     Chatroom-scoped entries have chatroom_name in their payload (via ChatroomPayload).
-    Project-level entries (PROJECT_CREATED, PROJECT_COMPLETED) have no chatroom_name.
+    Project-level entries (PROJECT_CREATED, PROJECT_COMPLETED, PROJECT_REACTIVATED) have no chatroom_name.
     Access chatroom_name via: payload.chatroom_name (for typed payloads) or
     getattr(entry.payload, 'chatroom_name', None) (for mixed entry types).
 
@@ -194,6 +258,7 @@ class ChangelogEntry(BaseModel):
     timestamp: datetime = Field(default_factory=lambda: datetime.now(UTC))
     payload: ChangelogPayload
     source_version: int | None = None  # Version of the entry that triggered this one (reply-to link)
+    mirrored_from: MirroredFromRef | None = None  # Set by TunnelSubscriber when this entry is a cross-project mirror; loop-guard.
 
     @model_validator(mode="before")
     @classmethod
@@ -217,10 +282,13 @@ class ChangelogEntry(BaseModel):
                 "file_created": FilePayload,
                 "file_updated": FilePayload,
                 "room_created": RoomCreatedPayload,
+                "room_deleted": RoomDeletedPayload,
                 "project_completed": ProjectCompletedPayload,
+                "project_reactivated": ProjectReactivatedPayload,
                 "batch_complete": BatchCompletePayload,
                 "batch_timeout": BatchTimeoutPayload,
                 "participant_added": ParticipantAddedPayload,
+                "chatroom_cleared": ChatroomClearedPayload,
             }
 
             payload_cls = payload_types.get(entry_type)
@@ -239,10 +307,13 @@ class ChangelogEntry(BaseModel):
             ChangelogEntryType.FILE_CREATED: FilePayload,
             ChangelogEntryType.FILE_UPDATED: FilePayload,
             ChangelogEntryType.ROOM_CREATED: RoomCreatedPayload,
+            ChangelogEntryType.ROOM_DELETED: RoomDeletedPayload,
             ChangelogEntryType.PROJECT_COMPLETED: ProjectCompletedPayload,
+            ChangelogEntryType.PROJECT_REACTIVATED: ProjectReactivatedPayload,
             ChangelogEntryType.BATCH_COMPLETE: BatchCompletePayload,
             ChangelogEntryType.BATCH_TIMEOUT: BatchTimeoutPayload,
             ChangelogEntryType.PARTICIPANT_ADDED: ParticipantAddedPayload,
+            ChangelogEntryType.CHATROOM_CLEARED: ChatroomClearedPayload,
         }
         expected = expected_types[self.entry_type]
         if not isinstance(self.payload, expected):
