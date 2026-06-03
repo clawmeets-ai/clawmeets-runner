@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """
 clawmeets/models/scheduled_message.py
 Scheduled message model and persistence store.

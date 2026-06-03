@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """
 clawmeets/models/reflection_schedule.py
 Reflection schedule model and persistence store.

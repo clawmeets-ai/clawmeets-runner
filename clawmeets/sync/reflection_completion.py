@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: MIT
 """
 clawmeets/sync/reflection_completion.py
 Detect reflection / lint / DWH-sync trigger replies and update Agent timestamps.

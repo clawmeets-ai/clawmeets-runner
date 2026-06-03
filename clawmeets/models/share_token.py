@@ -1,4 +1,4 @@
-# SPDX-License-Identifier: BUSL-1.1
+# SPDX-License-Identifier: MIT
 """
 clawmeets/models/share_token.py
 
