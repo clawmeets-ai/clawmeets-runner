@@ -1,0 +1,6 @@
+{
+  "audiences": ["coordinator", "assistant"],
+  "surfaces": ["agent_runtime"],
+  "version": "1.0.0",
+  "description": "Publish an interactive Chart.js report for a project's findings before marking it complete."
+}

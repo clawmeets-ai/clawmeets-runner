@@ -50,6 +50,8 @@ import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from clawmeets.utils.knowledge_index import file_preview, render_index_entry
+
 if TYPE_CHECKING:
     from clawmeets.api.client import ClawMeetsClient
     from clawmeets.models.context import ModelContext
@@ -158,6 +160,11 @@ class KnowledgePackManager:
             "name": name,
             "description": description,
             "files": sorted(written),
+            "file_descriptions": {
+                path: str((files.get(path) or {}).get("description") or "")
+                for path in written
+                if str((files.get(path) or {}).get("description") or "").strip()
+            },
         }
         self._write_meta(meta)
         self._rebuild_index(meta)
@@ -217,6 +224,11 @@ class KnowledgePackManager:
                 "name": pack.get("name") or slug,
                 "description": pack.get("description") or "",
                 "files": sorted(written),
+                "file_descriptions": {
+                    path: str((files.get(path) or {}).get("description") or "")
+                    for path in written
+                    if str((files.get(path) or {}).get("description") or "").strip()
+                },
             }
 
         # Drop local pack dirs (and the legacy <slug>.md flat files) the
@@ -310,9 +322,17 @@ class KnowledgePackManager:
             name = (entry.get("name") or slug).strip()
             tail = f" — {description}" if description else ""
             lines.append(f"- **{name}** (`{slug}`){tail}")
+            fdesc = entry.get("file_descriptions") or {}
             for filename in entry.get("files") or []:
-                # Absolute path so the agent's Read tool resolves
-                # regardless of working dir.
-                abs_path = (packs_dir / slug / filename).as_posix()
-                lines.append(f"  - [{filename}]({abs_path})")
+                # Absolute path so the agent's Read tool resolves regardless of
+                # working dir. 'consult when' = the user's curated hint if set,
+                # else a deterministic first-words preview of the file content
+                # (fills bulk uploads that carry no per-file description).
+                file_path = packs_dir / slug / filename
+                when = str(fdesc.get(filename) or "").strip()
+                if not when:
+                    when = file_preview(file_path)
+                lines.append(render_index_entry(
+                    filename, file_path.as_posix(), when=when, indent=1,
+                ))
         index_path.write_text("\n".join(lines) + "\n")

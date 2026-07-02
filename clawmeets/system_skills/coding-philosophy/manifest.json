@@ -1,0 +1,6 @@
+{
+  "audiences": ["worker", "coordinator", "assistant"],
+  "surfaces": ["agent_runtime"],
+  "version": "1.0.0",
+  "description": "Opinionated coding philosophy — optimize for comprehensibility, find the right semantic home for every piece of logic (extend the system rather than hack), keep dependencies layered, expose capabilities through API + web UI + CLI."
+}

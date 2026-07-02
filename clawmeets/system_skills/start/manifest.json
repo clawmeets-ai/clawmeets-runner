@@ -1,0 +1,6 @@
+{
+  "audiences": [],
+  "surfaces": ["user_cli"],
+  "version": "1.0.0",
+  "description": "Start agent runner(s) for the logged-in user (user-side)."
+}

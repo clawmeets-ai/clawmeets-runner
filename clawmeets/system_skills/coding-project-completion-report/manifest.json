@@ -1,0 +1,6 @@
+{
+  "audiences": ["coordinator", "assistant"],
+  "surfaces": ["agent_runtime"],
+  "version": "1.0.0",
+  "description": "Publish a completion report — change summary + annotated diff review — for a git-shaped project."
+}

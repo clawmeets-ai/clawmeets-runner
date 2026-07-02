@@ -1,0 +1,6 @@
+{
+  "audiences": ["worker", "coordinator", "assistant"],
+  "surfaces": ["agent_runtime"],
+  "version": "1.0.0",
+  "description": "Change an agent's runner settings (git repo, model, knowledge/dwh dirs) on a DM request."
+}

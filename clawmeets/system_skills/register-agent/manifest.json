@@ -1,0 +1,6 @@
+{
+  "audiences": ["assistant"],
+  "surfaces": ["agent_runtime", "user_cli"],
+  "version": "1.0.0",
+  "description": "Register a new agent under the logged-in user (or, when invoked by the assistant, under the assistant's owner)."
+}

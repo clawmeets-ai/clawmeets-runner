@@ -1,0 +1,6 @@
+{
+  "audiences": ["assistant"],
+  "surfaces": ["agent_runtime"],
+  "version": "1.0.0",
+  "description": "Post a one-off message into a project chatroom (as the agent, or as the user with --as-user)."
+}

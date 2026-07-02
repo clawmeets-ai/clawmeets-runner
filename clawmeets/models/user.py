@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import secrets
 import uuid
 from dataclasses import dataclass
@@ -24,7 +25,6 @@ import bcrypt
 
 from .participant import Participant, ParticipantRole
 from clawmeets.utils.file_io import FileUtil
-from clawmeets.utils.validation import validate_name
 
 if TYPE_CHECKING:
     from ..api.client import ClawMeetsClient
@@ -60,6 +60,12 @@ class User(Participant):
     All state is read from the passwd file on each property access.
     This ensures the model always reflects the current state on disk.
     """
+
+    # Short names are reserved for admin-created accounts; public
+    # self-registration enforces this minimum.
+    MIN_PUBLIC_USERNAME_LENGTH = 5
+
+    _EMAIL_PATTERN = re.compile(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")
 
     def __init__(
         self,
@@ -106,10 +112,32 @@ class User(Participant):
         Raises:
             ValueError: If username is invalid
         """
-        username = validate_name(username)
+        username = FileUtil.validate_fs_name(username)
         if "-" in username:
             raise ValueError("Username cannot contain hyphens (-). Use underscores (_) instead.")
         return username
+
+    @staticmethod
+    def validate_email(email: str) -> str:
+        """Validate and normalize an email address.
+
+        Args:
+            email: The email to validate
+
+        Returns:
+            Normalized email (lowercase, stripped)
+
+        Raises:
+            ValueError: If email format is invalid
+        """
+        email = email.strip().lower()
+        if not email:
+            raise ValueError("Email cannot be empty")
+        if len(email) > 254:
+            raise ValueError("Email address too long")
+        if not User._EMAIL_PATTERN.match(email):
+            raise ValueError(f"Invalid email format: {email}")
+        return email
 
     @staticmethod
     def _hash_password(password: str) -> str:
@@ -230,29 +258,6 @@ class User(Participant):
         users = data.get("users", {})
         for user_id, user_data in users.items():
             if user_data.get("email", "").lower() == email:
-                return cls(user_id, ctx)
-        return None
-
-    @classmethod
-    def get_by_phone(cls, phone_number: str, ctx: "ModelContext") -> Optional["User"]:
-        """Load user by phone number.
-
-        Args:
-            phone_number: The phone number to find
-            ctx: ModelContext for filesystem operations
-
-        Returns:
-            User instance or None if not found
-        """
-        phone_number = phone_number.strip()
-        passwd_path = cls._passwd_path(ctx)
-        data = FileUtil.read(passwd_path, "json", default=None)
-        if data is None:
-            return None
-
-        users = data.get("users", {})
-        for user_id, user_data in users.items():
-            if user_data.get("phone_number") == phone_number:
                 return cls(user_id, ctx)
         return None
 
@@ -482,34 +487,9 @@ class User(Participant):
         return self._load_passwd_entry().get("verification_token")
 
     @property
-    def phone_number(self) -> Optional[str]:
-        """Get phone number from filesystem."""
-        return self._load_passwd_entry().get("phone_number")
-
-    @property
-    def phone_verified(self) -> bool:
-        """Check if user's phone number is verified."""
-        return self._load_passwd_entry().get("phone_verified", False)
-
-    @property
-    def phone_verification_code(self) -> Optional[str]:
-        """Get phone verification code (None if already verified)."""
-        return self._load_passwd_entry().get("phone_verification_code")
-
-    @property
     def description(self) -> str:
         """Users don't have descriptions."""
         return ""
-
-    @property
-    def assistant_token(self) -> Optional[str]:
-        """Get the plaintext assistant token for this user.
-
-        The token is stored in the passwd entry so the user can retrieve it
-        from the Account Settings page any time. Authentication itself still
-        uses the bcrypt hash persisted in the assistant's credential.json.
-        """
-        return self._load_passwd_entry().get("assistant_token")
 
     @property
     def user_role(self) -> str:
@@ -580,41 +560,6 @@ class User(Participant):
             data["users"] = users
             self._save_passwd(data)
 
-    async def update_phone_number(self, phone_number: str, verification_code: str) -> None:
-        """Update phone number and set verification code.
-
-        Args:
-            phone_number: The new phone number (E.164 format)
-            verification_code: The verification code to send via SMS
-        """
-        async with _passwd_lock:
-            data = self._load_passwd()
-            users = data.get("users", {})
-            if self._id not in users:
-                raise KeyError(f"User {self._id!r} not found")
-            users[self._id]["phone_number"] = phone_number
-            users[self._id]["phone_verified"] = False
-            users[self._id]["phone_verification_code"] = verification_code
-            data["users"] = users
-            self._save_passwd(data)
-
-    async def set_phone_verified(self, verified: bool) -> None:
-        """Set phone verification status.
-
-        Args:
-            verified: Whether phone is verified
-        """
-        async with _passwd_lock:
-            data = self._load_passwd()
-            users = data.get("users", {})
-            if self._id not in users:
-                raise KeyError(f"User {self._id!r} not found")
-            users[self._id]["phone_verified"] = verified
-            if verified:
-                users[self._id]["phone_verification_code"] = None
-            data["users"] = users
-            self._save_passwd(data)
-
     async def delete(self) -> None:
         """Delete this user."""
         async with _passwd_lock:
@@ -638,21 +583,6 @@ class User(Participant):
             if self._id not in users:
                 raise KeyError(f"User {self._id!r} not found")
             users[self._id]["assistant_agent_id"] = assistant_agent_id
-            data["users"] = users
-            self._save_passwd(data)
-
-    async def set_assistant_token(self, token: str) -> None:
-        """Persist the plaintext assistant token on this user's passwd entry.
-
-        Stored so the user can view the token on the Account Settings page.
-        The bcrypt hash in the assistant's credential.json still drives auth.
-        """
-        async with _passwd_lock:
-            data = self._load_passwd()
-            users = data.get("users", {})
-            if self._id not in users:
-                raise KeyError(f"User {self._id!r} not found")
-            users[self._id]["assistant_token"] = token
             data["users"] = users
             self._save_passwd(data)
 
@@ -795,8 +725,6 @@ class User(Participant):
             "username": entry.get("username", ""),
             "email": entry.get("email"),
             "email_verified": entry.get("email_verified", False),
-            "phone_number": entry.get("phone_number"),
-            "phone_verified": entry.get("phone_verified", False),
             "assistant_agent_id": entry.get("assistant_agent_id"),
             "created_at": entry.get("created_at", ""),
             "is_admin": entry.get("role") == "admin",

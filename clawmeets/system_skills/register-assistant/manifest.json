@@ -1,0 +1,6 @@
+{
+  "audiences": [],
+  "surfaces": ["user_cli"],
+  "version": "1.0.0",
+  "description": "Create the user's personal assistant agent and post the personalize-trigger DM (user-side onboarding step 3 — after login, before start)."
+}

@@ -24,15 +24,15 @@ from ..api.actions import ActionBlock, COORDINATOR_ACTION_SCHEMA, WORKER_ACTION_
 from ..api.responses import AgentStatus
 from ..llm.base import LLMInvocationError, LLMRateLimitError, LLMTimeoutError
 from ..llm.prompt_builder import CoordinatorPromptBuilder, create_prompt_builder
+from ..llm.triggers import derive_role
 from ..runner.invocation_registry import invoke_with_registry as _invoke_with_registry
-from ..runner.router_decorator import route_to_foreign_agents
-from ..utils.agent_namespace import short_name
 from ..utils.file_io import FileUtil
 
 if TYPE_CHECKING:
     from ..api.client import ClawMeetsClient
     from .context import ModelContext
     from .chat_message import ChatMessage
+    from .project import Project
 
 logger = logging.getLogger(__name__)
 
@@ -58,8 +58,8 @@ _TRIGGER_MARKER_RE = re.compile(r"<!--\s*clawmeets:[a-z0-9-]+-trigger\s*-->")
 def _resume_marker_for_dm(chatroom, agent_name: str) -> Optional[str]:
     """Return the trigger marker carried by the agent's most recent reply.
 
-    Marker-driven skills (/clawmeets:personalize, /clawmeets:interview)
-    activate on description match against the inbound message. On a
+    Marker-driven skills (e.g. /clawmeets:personalize) activate on
+    description match against the inbound message. On a
     follow-up turn the user's reply carries no marker, so the skill would
     stop firing. The SKILL.md convention asks the agent to echo the marker
     on every interim reply; we surface that signal back into the next
@@ -100,6 +100,45 @@ class Agent(PersistableParticipant):
     _role_subdir: ClassVar[str] = "agents"
 
     @classmethod
+    def resolve_with_namespace(
+        cls,
+        name: str,
+        project: "Project",
+        ctx: "ModelContext",
+    ) -> Optional["Agent"]:
+        """Resolve a name to an Agent in the project owner's namespace.
+
+        Exact match on the full registry name wins. If no exact match, try
+        the project owner's namespace by prefixing ``{owner_username}-``.
+        """
+        from .user import User
+
+        agent = cls.get_by_name(name, ctx)
+        if agent is not None:
+            return agent
+
+        if not project.created_by:
+            return None
+        owner = User.get(project.created_by, ctx)
+        if owner is None:
+            return None
+        return cls.get_by_name(f"{owner.username}-{name}", ctx)
+
+    @staticmethod
+    def short_name(full_name: str, owner_username: Optional[str]) -> str:
+        """Strip ``{owner_username}-`` prefix from a full agent name."""
+        if not owner_username:
+            return full_name
+        prefix = f"{owner_username}-"
+        if full_name.startswith(prefix):
+            return full_name[len(prefix):]
+        return full_name
+
+    def short_name_for(self, owner_username: Optional[str]) -> str:
+        """This agent's short name in the given owner's namespace."""
+        return Agent.short_name(self.name, owner_username)
+
+    @classmethod
     async def sync_from_server(
         cls,
         ctx: "ModelContext",
@@ -134,14 +173,14 @@ class Agent(PersistableParticipant):
         synced_count = 0
         owner_user_id: Optional[str] = None
         for agent_data in agents:
-            agent_id = agent_data["id"]
+            agent_id = agent_data.id
             server_ids.add(agent_id)
             if agent_id in exclude_ids:
                 continue
 
             # Sync card.json for this worker agent
             agent = cls.get_or_create(agent_id, ctx)
-            agent.update_card(**agent_data)
+            agent.update_card(**agent_data.model_dump(mode="json"))
             synced_count += 1
 
             # Locate the owner's user id by matching username against any
@@ -150,10 +189,10 @@ class Agent(PersistableParticipant):
             if (
                 owner_user_id is None
                 and owner_username
-                and agent_data.get("registered_by")
-                and agent_data.get("name", "").startswith(f"{owner_username}-")
+                and agent_data.registered_by
+                and agent_data.name.startswith(f"{owner_username}-")
             ):
-                owner_user_id = agent_data["registered_by"]
+                owner_user_id = agent_data.registered_by
 
         logger.info(f"Synced {synced_count} worker agents from server")
 
@@ -170,16 +209,57 @@ class Agent(PersistableParticipant):
         if pruned_count:
             logger.info(f"Pruned {pruned_count} stale peer card(s) missing from registry")
 
-        # Generate global AGENTS.md file after syncing all agents
-        all_agents = cls.list_all(ctx, discoverable_only=True)
+        # Generate global AGENTS.md file after syncing all agents.
+        cls.regenerate_agents_md(
+            ctx, owner_username=owner_username, owner_user_id=owner_user_id
+        )
+
+        return synced_count
+
+    @classmethod
+    def regenerate_agents_md(
+        cls,
+        ctx: "ModelContext",
+        owner_username: Optional[str] = None,
+        owner_user_id: Optional[str] = None,
+    ) -> None:
+        """Re-render the global AGENTS.md roster from local peer cards.
+
+        Reads the synced peer cards on disk and rewrites AGENTS.md in place.
+        Called by ``sync_from_server`` after a full sync, and by the reactive
+        loop on AGENT_STATUS_CHANGE so the roster's status column stays fresh
+        between full syncs (the status flip is written to each peer card.json,
+        but AGENTS.md must be re-rendered to reflect it).
+
+        Pass the resolved owner id as the viewer so the runner-owner's OWN
+        private (non-discoverable) crew is included — agents are private by
+        default, so without this the coordinator's roster is empty and it has
+        nobody to delegate to. When ``owner_user_id`` is None (unknown owner)
+        this is a no-op for private agents (falls back to discoverable-only),
+        and it only ever adds the owner's own private agents — never another
+        account's.
+
+        When ``owner_user_id`` is not supplied but ``owner_username`` is, the
+        id is resolved from local peer cards (an agent whose name starts with
+        ``{owner_username}-``) — so callers that only know the username (e.g.
+        the reactive loop's status-change handler) still include the private
+        crew without a server round-trip.
+        """
+        if owner_user_id is None and owner_username:
+            prefix = f"{owner_username}-"
+            for peer in cls.list_all(ctx, viewer_is_admin=True):
+                if peer.registered_by and peer.name.startswith(prefix):
+                    owner_user_id = peer.registered_by
+                    break
+        all_agents = cls.list_all(
+            ctx, discoverable_only=True, viewer_user_id=owner_user_id
+        )
         cls._generate_agents_md(
             all_agents,
             ctx.participants_dir / "AGENTS.md",
             owner_username=owner_username,
             owner_user_id=owner_user_id,
         )
-
-        return synced_count
 
     @classmethod
     def prune_peer_card(cls, agent_id: str, ctx: "ModelContext") -> bool:
@@ -237,21 +317,41 @@ class Agent(PersistableParticipant):
             owner_username: Runner owner's username (used to strip prefixes)
             owner_user_id: Runner owner's user id (used to match registered_by)
         """
-        if agents:
-            rows: list[str] = []
-            for a in agents:
-                display = a.name
-                if owner_user_id and a.registered_by == owner_user_id:
-                    display = short_name(a.name, owner_username)
-                if display != a.name:
-                    rows.append(
-                        f"| {display} | {a.description} | {a.status.value} | (full name: `{a.name}`) |"
-                    )
-                else:
-                    rows.append(f"| {display} | {a.description} | {a.status.value} | |")
-            table = "\n".join(rows)
+        header = "| Agent | Role | Status | Notes |\n|-------|------|--------|-------|"
+
+        def _row(a: "Agent") -> str:
+            display = a.name
+            if owner_user_id and a.registered_by == owner_user_id:
+                display = a.short_name_for(owner_username)
+            if display != a.name:
+                return f"| {display} | {a.description} | {a.status.value} | (full name: `{a.name}`) |"
+            return f"| {display} | {a.description} | {a.status.value} | |"
+
+        def _table(group: list["Agent"]) -> str:
+            if not group:
+                return "| (none) | - | - | |"
+            return "\n".join(_row(a) for a in group)
+
+        # Partition by ownership so the user's own crew is never conflated with
+        # other accounts' public (discoverable) agents. Only meaningful when we
+        # know the owner; otherwise fall back to a single flat table.
+        if owner_user_id:
+            owned = [a for a in agents if a.registered_by == owner_user_id]
+            external = [a for a in agents if a.registered_by != owner_user_id]
+            sections = (
+                f"## Your agents\n"
+                f"Your own crew — delegate to these directly.\n\n"
+                f"{header}\n{_table(owned)}\n\n"
+                f"## Other accounts (public — reach via cross-account delegation)\n"
+                f"Public agents owned by **other users**, NOT part of your roster. "
+                f"They appear here only so you can delegate across accounts when the "
+                f"user explicitly asks; never present them as the user's own agents.\n\n"
+                f"{header}\n{_table(external)}"
+            )
+        elif agents:
+            sections = f"{header}\n{_table(agents)}"
         else:
-            table = "| (no agents registered) | - | - | |"
+            sections = f"{header}\n| (no agents registered) | - | - | |"
 
         namespace_note = ""
         if owner_username:
@@ -263,9 +363,7 @@ class Agent(PersistableParticipant):
 
         content = f"""# Available Agents
 
-| Agent | Role | Status | Notes |
-|-------|------|--------|-------|
-{table}
+{sections}
 
 ## Notes
 - Use @mentions to delegate work: "@agent-name please do X"
@@ -312,55 +410,38 @@ class Agent(PersistableParticipant):
     ) -> Optional[list[str]]:
         """Resolve the per-turn invitable-agent list for the coordinator prompt.
 
-        Two surfaces share the same shape ``(allowed_teams, allowed_names)``:
-          - Front Desk projects → ``self.front_desk_invitable_{teams,agents}``,
-            scoped to this coordinator's owner.
-          - Regular projects with a non-empty filter set → ``project.agent_{teams,names}``,
-            scoped to ``project.created_by``.
-          - Regular projects with no filter → returns ``None`` (the prompt
-            falls back to AGENTS.md as the discovery surface).
+        Reads the project-side allowlist (``project.agent_{names,teams}``):
 
-        Resolution is owner-scoped (only agents the owner registered) and
-        uses ``matches_invitable`` so teams expand to live members at every
-        call — adding a new agent to an allowed team makes them invitable
-        on the next coordinator turn without restart.
+          - Non-empty filter → matches every locally-known agent against
+            ``matches_invitable`` (which handles full-name, id,
+            owner-relative short-name, and team match uniformly).
+          - Empty filter → returns ``None`` (the prompt falls back to
+            AGENTS.md as the discovery surface).
 
-        Skips entries whose agent record isn't synced locally yet (the
-        chatroom-create gate enforces strictly; the prompt surface is
-        best-effort discovery).
+        The candidate pool is NOT owner-scoped: cross-owner agents the user
+        explicitly listed in ``agent_names`` (e.g. ``clawmeets-nyc_dining``
+        on a chengtao-owned project) must reach ``matches_invitable`` to be
+        accepted — matching what the server's create_room enforcement does.
         """
-        from clawmeets.utils.agent_filter import resolve_invitable_agents
-
-        if project.is_front_desk_project:
-            allowed_teams = self.front_desk_invitable_teams
-            allowed_names = self.front_desk_invitable_agents
-            viewer_owner_id = self.registered_by
-        elif project.agent_teams or project.agent_names:
-            allowed_teams = project.agent_teams
-            allowed_names = project.agent_names
-            viewer_owner_id = project.created_by
-        else:
+        if not project.enforces_invitable_allowlist:
             return None
+        viewer_owner_id = project._invitable_viewer_owner_id(self._model_ctx)
 
-        # Pool: owner's full agent set (admin viewer skips the discoverable
-        # filter so non-discoverable owned agents are visible).
+        # Pool: every known agent (admin viewer skips the discoverable
+        # filter so non-discoverable owned agents are visible). matches_invitable
+        # drops anything the project hasn't allowed.
         candidates = [
             a
             for a in Agent.list_all(self._model_ctx, viewer_is_admin=True)
-            if a.registered_by == viewer_owner_id and a.id != self.id
+            if a.id != self.id
         ]
-        matched = resolve_invitable_agents(
-            candidates,
-            list(allowed_teams),
-            list(allowed_names),
-            viewer_owner_id,
-        )
+        matched = project.resolve_invitable_agents(candidates, self._model_ctx)
 
         names: list[str] = []
         for other in matched:
             # Strip ``{owner}-`` prefix when the agent is owned by the same
             # user (display name); cross-owner agents keep the full registry
-            # name. Mirrors the historic Front Desk display rule.
+            # name.
             if (
                 viewer_owner_id
                 and other.registered_by == viewer_owner_id
@@ -368,7 +449,7 @@ class Agent(PersistableParticipant):
             ):
                 names.append(other.name.split("-", 1)[1])
             else:
-                names.append(short_name(other.name, None))
+                names.append(Agent.short_name(other.name, None))
         return names
 
     @property
@@ -381,6 +462,35 @@ class Agent(PersistableParticipant):
         their owner's coordinator via AGENTS.md.
         """
         return self.registered_by
+
+    def _coordinator_dm_action_schema(
+        self, project: "Project"
+    ) -> tuple[dict, bool]:
+        """Pick the action schema + ``dm_is_owned`` flag for a coordinator turn.
+
+        Owned DM (the user's own 1:1 with their assistant) is restricted to
+        ``reply`` + ``update_file`` — cross-domain work moves into a scoped
+        project via the proposal flow, not orphan workrooms. FD-tunneled
+        DM-shaped projects (foreign coordinator) keep the full coordinator
+        schema since ``create_room`` is how the FD's actual workspace
+        materializes. Non-DM regular projects always use the full schema.
+
+        ``created_by == registered_by`` alone can't tell an owned DM from an
+        FD channel the agent hosts for a foreign requester: FD channels are
+        stamped to the host (the agent's own owner), so that equality is true
+        for *every* FD channel this agent hosts. Gate on
+        ``fd_requester_name is None`` as well — set for ``-fd-`` tunnel names
+        and None for genuine ``-dm-`` owned DMs — so FD channels fall through
+        to the full coordinator schema (``create_room`` + roster restored).
+        """
+        if (
+            project.is_dm_project
+            and project.fd_requester_name is None
+            and project.created_by is not None
+            and project.created_by == self.registered_by
+        ):
+            return WORKER_ACTION_SCHEMA, True
+        return COORDINATOR_ACTION_SCHEMA, False
 
     async def on_message(
         self,
@@ -429,17 +539,32 @@ class Agent(PersistableParticipant):
         self,
         project_id: str,
         chatroom_name: str,
+        trigger_version: int,
     ) -> None:
-        """Emit an acknowledgment message before processing."""
+        """Emit an acknowledgment message before processing.
+
+        Best-effort: the ack is non-essential UI sugar (it feeds
+        ``clawmeets user listen``). A transient server error here must NOT abort
+        the substantive turn that follows — otherwise a single 503 on this POST
+        propagates up through ``on_batch_complete`` → ``runloop.sync`` and wedges
+        the project (the runloop cursor only advances on full success).
+        """
         if not self._model_ctx.client:
             return
 
-        await self._model_ctx.client.post_message(
-            project_id=project_id,
-            chatroom_name=chatroom_name,
-            content="Message received, processing...",
-            is_ack=True,
-        )
+        try:
+            await self._model_ctx.client.post_message(
+                project_id=project_id,
+                chatroom_name=chatroom_name,
+                content="Message received, processing...",
+                source_version=trigger_version,
+                is_ack=True,
+            )
+        except Exception:
+            logger.warning(
+                f"Agent {self.name}: acknowledgment post failed (non-fatal); continuing",
+                exc_info=True,
+            )
 
     async def _execute_task(
         self,
@@ -467,7 +592,7 @@ class Agent(PersistableParticipant):
             return
 
         # Emit acknowledgment before processing
-        await self._emit_acknowledgment(project_id, chatroom_name)
+        await self._emit_acknowledgment(project_id, chatroom_name, trigger_version)
 
         # Get project for context
         from .project import Project
@@ -490,18 +615,24 @@ class Agent(PersistableParticipant):
             OperationalMode.WORKER,
             coordinator_name=project.coordinator_name,
             capabilities=self.capabilities,
-            git_ignored_folder=project.git_ignored_folder if project.git_url else None,
+            git_url=self._model_ctx.git_url,
         )
 
-        is_dm = chatroom_name.startswith("dm-")
+        is_dm = project.is_dm_project
         inbound_content = message.content
-        if is_dm:
-            from .chatroom import Chatroom
-            chatroom = Chatroom.get(project_id, chatroom_name, self._model_ctx)
-            if chatroom is not None:
-                resume_marker = _resume_marker_for_dm(chatroom, self.name)
-                if resume_marker and resume_marker not in inbound_content:
-                    inbound_content = f"{resume_marker}\n{inbound_content}"
+
+        from .chatroom import Chatroom
+        chatroom = Chatroom.get(project_id, chatroom_name, self._model_ctx)
+        if is_dm and chatroom is not None:
+            resume_marker = _resume_marker_for_dm(chatroom, self.name)
+            if resume_marker and resume_marker not in inbound_content:
+                inbound_content = f"{resume_marker}\n{inbound_content}"
+
+        chat_history = (
+            chatroom.recent_history_for_prompt(exclude_message_id=message.id)
+            if chatroom is not None
+            else None
+        )
 
         # Build prompt - extract message fields for Layer 0 compatibility
         prompt = prompt_builder.build_prompt(
@@ -517,8 +648,7 @@ class Agent(PersistableParticipant):
             knowledge_dirs=self._model_ctx.knowledge_dirs,
             dwh_dir=self._model_ctx.dwh_dir,
             is_dm=is_dm,
-            mcp_config_files=self._model_ctx.installed_mcp_config_files(),
-            skill_config_files=self._model_ctx.installed_skill_config_files(),
+            chat_history=chat_history,
         )
 
         # Execute using ClaudeCLI with retry for transient failures
@@ -534,6 +664,8 @@ class Agent(PersistableParticipant):
                     log_dir,
                     additional_dirs,
                     action_schema=WORKER_ACTION_SCHEMA,
+                    trigger_version=trigger_version,
+                    role=derive_role(self.name, is_coordinator=False),
                 )
                 break  # Success
             except LLMRateLimitError as e:
@@ -542,7 +674,7 @@ class Agent(PersistableParticipant):
                     f"(type={e.rate_limit_type}, resets={e.resets_at_human})"
                 )
                 await self._post_error_notification(
-                    project_id, chatroom_name, agent_name, e
+                    project_id, chatroom_name, agent_name, e, trigger_version
                 )
                 raise
             except LLMInvocationError as e:
@@ -555,7 +687,7 @@ class Agent(PersistableParticipant):
                     retry_delay *= 2
                 else:
                     await self._post_error_notification(
-                        project_id, chatroom_name, agent_name, e
+                        project_id, chatroom_name, agent_name, e, trigger_version
                     )
                     raise
 
@@ -565,7 +697,6 @@ class Agent(PersistableParticipant):
         )
 
         # Process using ActionBlockExecutor - executes actions via HTTP
-        action_block.source_version = trigger_version
         replied_chatrooms = await action_executor.process(
             action_block=action_block,
             project_id=project_id,
@@ -576,11 +707,8 @@ class Agent(PersistableParticipant):
         # so the server marks this worker as responded and clears PendingWork.
         # Without this, the typing indicator would persist until batch timeout.
         if chatroom_name not in replied_chatrooms:
-            await self._model_ctx.client.post_message(
-                project_id=project_id,
-                chatroom_name=chatroom_name,
-                content="Message processed, no further action needed at the moment!",
-                source_version=trigger_version,
+            await self._emit_no_action_message(
+                project_id, chatroom_name, trigger_version, replied_chatrooms
             )
 
     async def _post_error_notification(
@@ -589,6 +717,7 @@ class Agent(PersistableParticipant):
         chatroom_name: str,
         agent_name: str,
         error: Exception,
+        trigger_version: int,
     ) -> None:
         """Post an error notification to the chatroom when a task fails.
 
@@ -616,6 +745,7 @@ class Agent(PersistableParticipant):
                 project_id=project_id,
                 chatroom_name=chatroom_name,
                 content=content,
+                source_version=trigger_version,
                 is_ack=False,
             )
         except Exception:
@@ -763,41 +893,41 @@ class Agent(PersistableParticipant):
             additional_dirs.append(data_dir)
         additional_dirs.extend(self._model_ctx.knowledge_dirs)
 
-        # Get recent messages for context
-        messages = chatroom.get_messages()[-10:]
-        context_str = "\n".join([
-            f"{m.from_participant_name or m.from_participant_id}: {m.content}" for m in messages
-        ])
-
-        # Build batch status
+        # Build batch status — the incoming "message" the coordinator sees is
+        # synthetic: "batch complete in <room>; responded X, timed out Y".
+        # Recent conversation rides through the prompt's RECENT CHAT block;
+        # deliverable files ride through the SYNCED PROJECT FILE MANIFEST.
         status_parts = [f"Batch complete in '{chatroom_name}'"]
         if responded_participants:
             status_parts.append(f"Responded: {', '.join(responded_participants)}")
         if timed_out:
             status_parts.append(f"Timed out: {', '.join(timed_out)}")
         batch_status = ". ".join(status_parts)
+        batch_content = (
+            batch_status
+            + ".\n\nIMPORTANT: Update PLAN.md with your assessment "
+            "(PASS/FAIL per acceptance criterion) BEFORE deciding next steps."
+        )
 
-        # Include deliverable file listing from the chatroom
-        files = chatroom.list_files() if chatroom else []
-        files_section = ""
-        if files:
-            files_section = "\n\nDeliverable files in chatroom:\n"
-            files_section += "\n".join(f"  - {f}" for f in files)
-            files_section += "\nReview these files to assess whether acceptance criteria are met."
+        chat_history = (
+            chatroom.recent_history_for_prompt()
+            if chatroom is not None
+            else None
+        )
 
         # Create coordinator prompt builder for this task
         coordinator_builder = create_prompt_builder(
             OperationalMode.COORDINATOR,
-            git_ignored_folder=project.git_ignored_folder if project.git_url else None,
+            git_url=self._model_ctx.git_url,
         )
         assert isinstance(coordinator_builder, CoordinatorPromptBuilder)
 
-        # Build synthetic message content with batch context
-        batch_content = f"{batch_status}\n\nRecent conversation:\n{context_str}{files_section}"
-        batch_content += "\n\nIMPORTANT: Update PLAN.md with your assessment (PASS/FAIL per acceptance criterion) BEFORE deciding next steps."
-
-        # Build prompt - agents are referenced via AGENTS.md file
-        is_front_desk = project.is_front_desk_project
+        # Build prompt - agents are referenced via AGENTS.md file.
+        # flow_context="batch" injects the BATCH COMPLETION WORKFLOW and
+        # HANDLING WORKER QUESTIONS AND BLOCKERS blocks into the role
+        # contract; otherwise they sit dormant on every user-comm turn
+        # for no benefit.
+        action_schema, dm_is_owned = self._coordinator_dm_action_schema(project)
         prompt = coordinator_builder.build_prompt(
             name=self.name,
             description=self.description,
@@ -810,13 +940,14 @@ class Agent(PersistableParticipant):
             agent_dir=self._model_ctx.base_dir,
             knowledge_dirs=self._model_ctx.knowledge_dirs,
             dwh_dir=self._model_ctx.dwh_dir,
-            is_front_desk=is_front_desk,
+            is_dm=project.is_dm_project,
+            dm_is_owned=dm_is_owned,
             invitable_agents=self._resolve_invitable_agents_for_prompt(project),
-            mcp_config_files=self._model_ctx.installed_mcp_config_files(),
-            skill_config_files=self._model_ctx.installed_skill_config_files(),
+            chat_history=chat_history,
+            flow_context="batch",
         )
 
-        await self._emit_acknowledgment(project_id, chatroom_name)
+        await self._emit_acknowledgment(project_id, chatroom_name, trigger_version)
 
         retry_delay = _INITIAL_RETRY_DELAY
         for attempt in range(_MAX_RETRIES + 1):
@@ -829,7 +960,9 @@ class Agent(PersistableParticipant):
                     sandbox_dir,
                     log_dir,
                     additional_dirs,
-                    action_schema=COORDINATOR_ACTION_SCHEMA,
+                    action_schema=action_schema,
+                    trigger_version=trigger_version,
+                    role=derive_role(self.name, is_coordinator=True),
                 )
                 break
             except LLMRateLimitError as e:
@@ -838,7 +971,7 @@ class Agent(PersistableParticipant):
                     f"(type={e.rate_limit_type}, resets={e.resets_at_human})"
                 )
                 await self._post_error_notification(
-                    project_id, chatroom_name, self.name, e
+                    project_id, chatroom_name, self.name, e, trigger_version
                 )
                 raise
             except LLMInvocationError as e:
@@ -851,7 +984,7 @@ class Agent(PersistableParticipant):
                     retry_delay *= 2
                 else:
                     await self._post_error_notification(
-                        project_id, chatroom_name, self.name, e
+                        project_id, chatroom_name, self.name, e, trigger_version
                     )
                     raise
 
@@ -860,14 +993,6 @@ class Agent(PersistableParticipant):
             f"(cost=${usage.cost_usd:.4f})"
         )
 
-        action_block.source_version = trigger_version
-        await route_to_foreign_agents(
-            action_block=action_block,
-            model_ctx=self._model_ctx,
-            project_id=project_id,
-            requester_agent_id=self.id,
-            requester_agent_owner_id=self.registered_by or "",
-        )
         replied_chatrooms = await action_executor.process(
             action_block=action_block,
             project_id=project_id,
@@ -914,16 +1039,25 @@ class Agent(PersistableParticipant):
         # Create coordinator prompt builder for this task
         coordinator_builder = create_prompt_builder(
             OperationalMode.COORDINATOR,
-            git_ignored_folder=project.git_ignored_folder if project.git_url else None,
+            git_url=self._model_ctx.git_url,
         )
         assert isinstance(coordinator_builder, CoordinatorPromptBuilder)
 
-        await self._emit_acknowledgment(project_id, chatroom_name)
+        await self._emit_acknowledgment(project_id, chatroom_name, trigger_version)
 
-        # Front Desk projects skip the PLAN.md / milestones setup prompt — wrong
-        # shape for a casual DM-style channel. Use the soft live coordinator
-        # prompt instead so the first message is treated like any other.
-        if project.is_front_desk_project:
+        # DM-shaped projects (solo DM + cross-user tunneled FD) skip the PLAN.md /
+        # milestones setup prompt — wrong shape for a casual conversational
+        # channel. Use the soft live coordinator prompt instead so the first
+        # message is treated like any other.
+        action_schema, dm_is_owned = self._coordinator_dm_action_schema(project)
+        if project.is_dm_project:
+            from .chatroom import Chatroom
+            chatroom = Chatroom.get(project_id, chatroom_name, self._model_ctx)
+            chat_history = (
+                chatroom.recent_history_for_prompt(exclude_message_id=message.id)
+                if chatroom is not None
+                else None
+            )
             prompt = coordinator_builder.build_prompt(
                 name=self.name,
                 description=self.description,
@@ -936,10 +1070,10 @@ class Agent(PersistableParticipant):
                 agent_dir=self._model_ctx.base_dir,
                 knowledge_dirs=self._model_ctx.knowledge_dirs,
                 dwh_dir=self._model_ctx.dwh_dir,
-                is_front_desk=True,
+                is_dm=True,
+                dm_is_owned=dm_is_owned,
                 invitable_agents=self._resolve_invitable_agents_for_prompt(project),
-                mcp_config_files=self._model_ctx.installed_mcp_config_files(),
-                skill_config_files=self._model_ctx.installed_skill_config_files(),
+                chat_history=chat_history,
             )
         else:
             # Build setup prompt - agents are referenced via AGENTS.md file.
@@ -960,8 +1094,6 @@ class Agent(PersistableParticipant):
                 knowledge_dirs=self._model_ctx.knowledge_dirs,
                 dwh_dir=self._model_ctx.dwh_dir,
                 invitable_agents=self._resolve_invitable_agents_for_prompt(project),
-                mcp_config_files=self._model_ctx.installed_mcp_config_files(),
-                skill_config_files=self._model_ctx.installed_skill_config_files(),
             )
 
         retry_delay = _INITIAL_RETRY_DELAY
@@ -975,7 +1107,9 @@ class Agent(PersistableParticipant):
                     sandbox_dir,
                     log_dir,
                     additional_dirs,
-                    action_schema=COORDINATOR_ACTION_SCHEMA,
+                    action_schema=action_schema,
+                    trigger_version=trigger_version,
+                    role=derive_role(self.name, is_coordinator=True),
                 )
                 break
             except LLMRateLimitError as e:
@@ -984,7 +1118,7 @@ class Agent(PersistableParticipant):
                     f"(type={e.rate_limit_type}, resets={e.resets_at_human})"
                 )
                 await self._post_error_notification(
-                    project_id, chatroom_name, self.name, e
+                    project_id, chatroom_name, self.name, e, trigger_version
                 )
                 raise
             except LLMInvocationError as e:
@@ -997,7 +1131,7 @@ class Agent(PersistableParticipant):
                     retry_delay *= 2
                 else:
                     await self._post_error_notification(
-                        project_id, chatroom_name, self.name, e
+                        project_id, chatroom_name, self.name, e, trigger_version
                     )
                     raise
 
@@ -1006,14 +1140,6 @@ class Agent(PersistableParticipant):
             f"(cost=${usage.cost_usd:.4f})"
         )
 
-        action_block.source_version = trigger_version
-        await route_to_foreign_agents(
-            action_block=action_block,
-            model_ctx=self._model_ctx,
-            project_id=project_id,
-            requester_agent_id=self.id,
-            requester_agent_owner_id=self.registered_by or "",
-        )
         replied_chatrooms = await action_executor.process(
             action_block=action_block,
             project_id=project_id,
@@ -1072,7 +1198,7 @@ class Agent(PersistableParticipant):
         if not action_executor:
             raise RuntimeError(f"Agent {name} (coordinator): Action executor not configured")
 
-        await self._emit_acknowledgment(project_id, chatroom_name)
+        await self._emit_acknowledgment(project_id, chatroom_name, trigger_version)
 
         from .project import Project
         project = Project.get(project_id, self._model_ctx)
@@ -1088,11 +1214,19 @@ class Agent(PersistableParticipant):
 
         prompt_builder = create_prompt_builder(
             OperationalMode.COORDINATOR,
-            git_ignored_folder=project.git_ignored_folder if project.git_url else None,
+            git_url=self._model_ctx.git_url,
         )
         assert isinstance(prompt_builder, CoordinatorPromptBuilder)
 
-        is_front_desk = project.is_front_desk_project
+        from .chatroom import Chatroom
+        chatroom = Chatroom.get(project_id, chatroom_name, self._model_ctx)
+        chat_history = (
+            chatroom.recent_history_for_prompt(exclude_message_id=message.id)
+            if chatroom is not None
+            else None
+        )
+
+        action_schema, dm_is_owned = self._coordinator_dm_action_schema(project)
         prompt = prompt_builder.build_prompt(
             name=self.name,
             description=self.description,
@@ -1105,10 +1239,10 @@ class Agent(PersistableParticipant):
             agent_dir=self._model_ctx.base_dir,
             knowledge_dirs=self._model_ctx.knowledge_dirs,
             dwh_dir=self._model_ctx.dwh_dir,
-            is_front_desk=is_front_desk,
+            is_dm=project.is_dm_project,
+            dm_is_owned=dm_is_owned,
             invitable_agents=self._resolve_invitable_agents_for_prompt(project),
-            mcp_config_files=self._model_ctx.installed_mcp_config_files(),
-            skill_config_files=self._model_ctx.installed_skill_config_files(),
+            chat_history=chat_history,
         )
 
         retry_delay = _INITIAL_RETRY_DELAY
@@ -1122,7 +1256,9 @@ class Agent(PersistableParticipant):
                     sandbox_dir,
                     log_dir,
                     additional_dirs,
-                    action_schema=COORDINATOR_ACTION_SCHEMA,
+                    action_schema=action_schema,
+                    trigger_version=trigger_version,
+                    role=derive_role(self.name, is_coordinator=True),
                 )
                 break
             except LLMRateLimitError as e:
@@ -1130,7 +1266,7 @@ class Agent(PersistableParticipant):
                     f"Agent {name} (coordinator): rate limited "
                     f"(type={e.rate_limit_type}, resets={e.resets_at_human})"
                 )
-                await self._post_error_notification(project_id, chatroom_name, name, e)
+                await self._post_error_notification(project_id, chatroom_name, name, e, trigger_version)
                 raise
             except LLMInvocationError as e:
                 if attempt < _MAX_RETRIES and _is_transient_error(e):
@@ -1141,7 +1277,7 @@ class Agent(PersistableParticipant):
                     await asyncio.sleep(retry_delay)
                     retry_delay *= 2
                 else:
-                    await self._post_error_notification(project_id, chatroom_name, name, e)
+                    await self._post_error_notification(project_id, chatroom_name, name, e, trigger_version)
                     raise
 
         logger.info(
@@ -1149,14 +1285,6 @@ class Agent(PersistableParticipant):
             f"(cost=${usage.cost_usd:.4f}, tokens in={usage.input_tokens} out={usage.output_tokens})"
         )
 
-        action_block.source_version = trigger_version
-        await route_to_foreign_agents(
-            action_block=action_block,
-            model_ctx=self._model_ctx,
-            project_id=project_id,
-            requester_agent_id=self.id,
-            requester_agent_owner_id=self.registered_by or "",
-        )
         replied_chatrooms = await action_executor.process(
             action_block=action_block,
             project_id=project_id,
@@ -1164,25 +1292,36 @@ class Agent(PersistableParticipant):
         )
 
         if chatroom_name not in replied_chatrooms:
-            await self._emit_no_action_message(project_id, chatroom_name, trigger_version)
+            await self._emit_no_action_message(
+                project_id, chatroom_name, trigger_version, replied_chatrooms
+            )
 
     async def _emit_no_action_message(
         self,
         project_id: str,
         chatroom_name: str,
         source_version: int,
+        replied_chatrooms: set[str] | None = None,
     ) -> None:
         """Post a closure reply when the LLM produced no reply action for this room.
 
         Posted non-ack so the server's record_response marks this participant
-        as responded, clears PendingWork, and fires BATCH_COMPLETE.
+        as responded, clears PendingWork, and fires BATCH_COMPLETE. When the
+        LLM did reply but misrouted to a different chatroom, surface that
+        instead of the upbeat zero-action filler so the user has a pointer
+        to the stranded reply.
         """
         if not self._model_ctx.client:
             raise RuntimeError(f"Agent {self.name}: Client not configured, cannot emit no-action message")
 
+        if replied_chatrooms:
+            rooms = ", ".join(sorted(replied_chatrooms))
+            content = f"(My reply landed in: {rooms}. See there for the actual answer.)"
+        else:
+            content = "Message processed, no further action needed at the moment!"
         await self._model_ctx.client.post_message(
             project_id=project_id,
             chatroom_name=chatroom_name,
-            content="Message processed, no further action needed at the moment!",
+            content=content,
             source_version=source_version,
         )

@@ -1,0 +1,6 @@
+{
+  "audiences": ["assistant"],
+  "surfaces": ["agent_runtime"],
+  "version": "1.0.0",
+  "description": "Create, list, or cancel recurring (cron) messages — DM threads or project user-communication rooms."
+}

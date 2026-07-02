@@ -1,0 +1,6 @@
+{
+  "audiences": ["assistant"],
+  "surfaces": ["agent_runtime"],
+  "version": "1.0.0",
+  "description": "Actively start/stop the user's other agents on a DM request, with PID-verified status (assistant-only). Replaces the passive start-agent/stop-agent skills."
+}

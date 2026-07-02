@@ -12,8 +12,15 @@ from typing import Optional
 
 import typer
 
-from clawmeets.cli_runner import agent_app, user_app, dm_app, mcp_app, reflection_app
-from clawmeets.cli_init import init_command
+from clawmeets.cli_runner import (
+    agent_app,
+    user_app,
+    dm_app,
+    mcp_app,
+    reflection_app,
+    assistant_app,
+    agent_team_app,
+)
 from clawmeets.cli_lifecycle import start_command, stop_command, status_command
 
 app = typer.Typer(
@@ -46,11 +53,12 @@ def _root(
     pass
 
 # Top-level commands (setup + lifecycle)
-app.command("init")(init_command)
 app.command("start")(start_command)
 app.command("stop")(stop_command)
 app.command("status")(status_command)
 
+app.add_typer(assistant_app, name="assistant")
+app.add_typer(agent_team_app, name="agent-team")
 app.add_typer(agent_app, name="agent")
 app.add_typer(user_app,  name="user")
 app.add_typer(dm_app,    name="dm")

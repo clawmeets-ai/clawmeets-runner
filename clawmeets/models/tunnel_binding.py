@@ -7,7 +7,7 @@ agent's project room and the responder's Front Desk project's
 ``user-communication`` room.
 
 A binding is server-side state. It is consulted by ``TunnelSubscriber``
-(``sync/tunnel.py``) on every changelog append to decide whether the entry
+(``server/tunnel_subscriber.py``) on every changelog append to decide whether the entry
 needs to be mirrored to the other side of the tunnel.
 
 Storage layout::

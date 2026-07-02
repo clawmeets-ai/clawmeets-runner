@@ -11,34 +11,75 @@ Raises the generic LLM* exceptions from clawmeets.llm.base.
 """
 from __future__ import annotations
 
-import asyncio
 import copy
 import json
 import logging
-import os
 import subprocess
-import time
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Optional
 
-from ..api.actions import ActionBlock
-from ..utils.notification_center import LLM_COMPLETE, LLM_ERROR, NotificationCenter
 from .base import (
     LLMInvocationError,
     LLMNotFoundError,
-    LLMProvider,
     LLMRateLimitError,
     LLMTimeoutError,
     LLMUsage,
+    ParsedResult,
+    PreparedInvocation,
+    SubprocessLLMProvider,
+    link_mcp_config_into,
+    materialize_skill_tree,
 )
+from .pricing import price_usd
 
 logger = logging.getLogger(__name__)
+
+# Codex CLI's default model family, used to price token usage when codex reports
+# neither a cost nor a model name and no --llm-model is set (best-effort; exact
+# when codex names the model or --llm-model is pinned).
+_DEFAULT_CODEX_MODEL = "gpt-5"
 
 
 # Markers for detecting rate limits in error events. Codex surfaces provider
 # errors as JSONL events with free-form messages, so we pattern-match.
 _RATE_LIMIT_MARKERS = ("rate_limit", "rate limit", "429", "too many requests")
+
+
+def _ensure_codex_project_trust(working_dir: Path) -> None:
+    """Auto-trust ``working_dir`` in ``~/.codex/config.toml`` so codex loads
+    its project-level ``.codex/config.toml`` (including our symlinked
+    ``[mcp_servers.*]`` blocks).
+
+    Codex's discovery rules ignore project config unless the project path
+    appears as ``[projects."<abs-path>"] trust_level = "trusted"`` in the
+    user's user-config — normally established interactively on first run.
+    We elide the prompt by appending the block when absent.
+
+    Skipped if ``~/.codex/config.toml`` doesn't exist yet (fresh codex
+    install — the user's first interactive run will create it and the trust
+    prompt mechanism will work as designed).
+    """
+    user_config = Path.home() / ".codex" / "config.toml"
+    if not user_config.exists():
+        return
+    abs_path = str(working_dir.resolve())
+    header = f'[projects."{abs_path}"]'
+    try:
+        existing = user_config.read_text(encoding="utf-8")
+    except OSError as e:
+        logger.warning(f"[codex-invoke] could not read {user_config}: {e}")
+        return
+    if header in existing:
+        return
+    suffix = "" if existing.endswith("\n") else "\n"
+    suffix += f'\n{header}\ntrust_level = "trusted"\n'
+    try:
+        with open(user_config, "a", encoding="utf-8") as f:
+            f.write(suffix)
+    except OSError as e:
+        logger.warning(f"[codex-invoke] could not append trust entry to {user_config}: {e}")
+        return
+    logger.info(f"[codex-invoke] auto-trusted codex project: {abs_path}")
 
 
 def _adapt_schema_for_codex(schema: dict) -> dict:
@@ -78,32 +119,38 @@ def _adapt_schema_for_codex(schema: dict) -> dict:
     return result
 
 
-class CodexCLI(LLMProvider):
+class CodexCLI(SubprocessLLMProvider):
     """Invokes the `codex` CLI (OpenAI Codex) as a subprocess.
 
     Expects `codex` to be available on PATH and authenticated
     (via `codex login` or OPENAI_API_KEY env var).
     """
 
+    _provider_name = "Codex"
+    _log_tag = "codex-invoke"
+    _install_hint = "Install Codex: https://github.com/openai/codex"
+
     def __init__(
         self,
+        *,
+        agent_env: dict[str, str],
         codex_bin: str = "codex",
         model: Optional[str] = None,
         sandbox_mode: str = "workspace-write",
-        agent_env: Optional[dict[str, str]] = None,
     ) -> None:
         """Initialize CodexCLI.
 
         Args:
+            agent_env: Environment variables exposed to every Codex
+                subprocess (CLAWMEETS_AGENT_ID / CLAWMEETS_AGENT_TOKEN /
+                CLAWMEETS_SERVER_URL / CLAWMEETS_AGENT_DIR). See ClaudeCLI
+                for rationale. Required — pass ``{}`` explicitly to opt out.
             codex_bin: Path to codex CLI binary
             model: Optional model override (e.g. "o3"); None uses Codex default.
             sandbox_mode: Codex sandbox policy. Default "workspace-write" lets
                 the agent modify its own sandbox (clawmeets already isolates
                 sandboxes per agent). Other options: "read-only",
                 "danger-full-access".
-            agent_env: Extra environment variables exposed to every Codex
-                subprocess (CLAWMEETS_AGENT_ID / CLAWMEETS_AGENT_TOKEN /
-                CLAWMEETS_SERVER_URL). See ClaudeCLI for rationale.
 
         The JSON action schema is selected per invocation and passed to
         ``invoke(action_schema=...)``.
@@ -111,7 +158,7 @@ class CodexCLI(LLMProvider):
         self._bin = codex_bin
         self._model = model
         self._sandbox_mode = sandbox_mode
-        self._agent_env = dict(agent_env or {})
+        self._agent_env = dict(agent_env)
 
     @classmethod
     def verify_cli(cls, codex_bin: str = "codex") -> None:
@@ -148,14 +195,32 @@ class CodexCLI(LLMProvider):
         working_dir: Path,
         additional_dirs: list[Path],
         action_schema: dict,
-    ) -> tuple[str, str, str, str, list[str]]:
-        """Set up directories, write prompt + schema files, build command.
-
-        Returns:
-            Tuple of (prompt_file_abs, schema_file_abs, last_message_abs,
-                      codex_cwd, cmd)
-        """
+        mcp_config_dir: Optional[Path] = None,
+        skill_source_dirs: Optional[list[Path]] = None,
+    ) -> PreparedInvocation:
+        """Set up directories, write prompt + schema files, build command."""
         working_dir.mkdir(parents=True, exist_ok=True)
+
+        # Codex loads project-level .codex/config.toml from cwd (or any
+        # ancestor) when the project is "trusted" in ~/.codex/config.toml.
+        # Symlink the rendered config from the agent's pre-rendered dist,
+        # then idempotently auto-trust the sandbox path so the prompt is
+        # elided for fresh sandboxes.
+        if mcp_config_dir is not None:
+            link_mcp_config_into(
+                mcp_config_dir / ".codex" / "config.toml",
+                working_dir / ".codex" / "config.toml",
+            )
+            _ensure_codex_project_trust(working_dir)
+
+        # Codex auto-discovers `.agents/skills/<name>/SKILL.md` from cwd
+        # (Agent Skills open-standard path). Materialize the flat tree so
+        # codex's native skill-loader picks up installed + personal skills.
+        if skill_source_dirs is not None:
+            materialize_skill_tree(
+                working_dir / ".agents" / "skills",
+                skill_source_dirs,
+            )
 
         prompt_file = working_dir / ".agent-prompt.txt"
         prompt_file.write_text(prompt, encoding="utf-8")
@@ -204,25 +269,13 @@ class CodexCLI(LLMProvider):
             logger.info(f"[codex-invoke] additional-dirs={[str(d.expanduser().resolve()) for d in additional_dirs]}")
         logger.debug(f"[codex-invoke] prompt content:\n{prompt[:500]}...")
 
-        return prompt_file_abs, schema_file_abs, last_message_abs, codex_cwd, cmd
-
-    def _write_invocation_logs(
-        self, log_dir: Path, stdout: str, stderr: str
-    ) -> None:
-        """Append stdout/stderr to log files with timestamps."""
-        log_dir.mkdir(parents=True, exist_ok=True)
-        stdout_file = log_dir / "cli-stdout.log"
-        stderr_file = log_dir / "cli-stderr.log"
-
-        timestamp = datetime.now(UTC).isoformat()
-        separator = f"\n{'='*60}\n[{timestamp}]\n{'='*60}\n"
-
-        with open(stdout_file, "a", encoding="utf-8") as f:
-            f.write(separator)
-            f.write(stdout)
-        with open(stderr_file, "a", encoding="utf-8") as f:
-            f.write(separator)
-            f.write(stderr or "(empty)")
+        return PreparedInvocation(
+            cmd=cmd,
+            cwd=codex_cwd,
+            prompt_file_abs=prompt_file_abs,
+            stdin_bytes=prompt.encode("utf-8"),
+            extras={"last_message_abs": last_message_abs},
+        )
 
     def _parse_events(self, raw_output: str) -> tuple[LLMUsage, list[dict]]:
         """Parse Codex JSONL event stream for usage + error events.
@@ -233,6 +286,14 @@ class CodexCLI(LLMProvider):
         """
         usage = LLMUsage()
         errors: list[dict] = []
+        # Best-effort tool telemetry: count Responses-style tool/command items
+        # (`item.completed` events). Stays empty if the schema differs, in which
+        # case the eval harness falls back to output-inference.
+        tool_counts: dict[str, int] = {}
+        _tool_item_types = {
+            "function_call", "local_shell_call", "web_search_call",
+            "mcp_tool_call", "command_execution", "tool_call",
+        }
 
         for line in raw_output.splitlines():
             line = line.strip()
@@ -250,50 +311,53 @@ class CodexCLI(LLMProvider):
                 # {"type":"turn.completed","usage":{"input_tokens":N,
                 #  "output_tokens":M,"cached_input_tokens":K,...}}
                 u = event.get("usage") or {}
+                in_tok = u.get("input_tokens", 0)
+                out_tok = u.get("output_tokens", 0)
+                cached = u.get("cached_input_tokens", 0)
+                # Prefer codex's reported cost; it usually omits it, so fall back
+                # to pricing the captured tokens. Model: what codex reports, else
+                # the configured --llm-model, else the CLI default (best-effort).
+                model = (event.get("model", "") or u.get("model", "")
+                         or self._model or _DEFAULT_CODEX_MODEL)
+                reported = u.get("total_cost_usd", 0.0) or 0.0
+                cost = reported if reported > 0 else price_usd(
+                    model, "openai", in_tok, out_tok, cached, 0)
                 usage = LLMUsage(
-                    input_tokens=u.get("input_tokens", 0),
-                    output_tokens=u.get("output_tokens", 0),
-                    cache_read_tokens=u.get("cached_input_tokens", 0),
+                    input_tokens=in_tok,
+                    output_tokens=out_tok,
+                    cache_read_tokens=cached,
                     cache_creation_tokens=0,  # Codex doesn't surface this
-                    cost_usd=u.get("total_cost_usd", 0.0),
+                    cost_usd=cost,
                     duration_ms=event.get("duration_ms", 0),
-                    model=event.get("model", "") or u.get("model", ""),
+                    model=model,
                 )
             elif etype in ("error", "turn.failed"):
                 errors.append(event)
+            elif etype in ("item.completed", "item.done"):
+                item = event.get("item")
+                if isinstance(item, dict) and item.get("type") in _tool_item_types:
+                    nm = item.get("name") or item.get("type")
+                    tool_counts[nm] = tool_counts.get(nm, 0) + 1
 
+        usage.tool_calls = tool_counts
         return usage, errors
 
-    def _read_last_message(self, last_message_abs: str) -> Optional[dict]:
-        """Read the schema-conformant final message from Codex's -o file."""
-        path = Path(last_message_abs)
-        if not path.exists():
-            return None
-        try:
-            content = path.read_text(encoding="utf-8").strip()
-            if not content:
-                return None
-            return json.loads(content)
-        except json.JSONDecodeError as e:
-            logger.warning(f"[codex-invoke] last message is not valid JSON: {e}")
-            return None
+    def _check_rate_limit(
+        self,
+        prepared: PreparedInvocation,
+        stdout: str,
+        stderr: str,
+        returncode: int,
+    ) -> Optional[LLMRateLimitError]:
+        """Codex surfaces provider errors as JSONL events with free-form
+        messages — pattern-match against `_RATE_LIMIT_MARKERS`."""
+        _, error_events = self._parse_events(stdout)
 
-    def _extract_actions(self, final_message: Optional[dict]) -> list[dict]:
-        """Extract the actions array from the schema-validated final message."""
-        if not isinstance(final_message, dict):
-            return []
-        actions = final_message.get("actions")
-        if isinstance(actions, list):
-            return actions
-        return []
-
-    def _detect_rate_limit(self, errors: list[dict], stderr: str) -> Optional[LLMRateLimitError]:
-        """Check whether any error event signals a rate limit."""
         def _matches(text: str) -> bool:
             lower = text.lower()
             return any(marker in lower for marker in _RATE_LIMIT_MARKERS)
 
-        for event in errors:
+        for event in error_events:
             msg = event.get("message", "") or ""
             err = event.get("error") or {}
             err_msg = err.get("message", "") if isinstance(err, dict) else ""
@@ -312,127 +376,49 @@ class CodexCLI(LLMProvider):
 
         return None
 
-    async def invoke(
+    def _build_error_detail(
         self,
-        prompt: str,
-        working_dir: Path,
-        log_dir: Path,
-        additional_dirs: list[Path],
-        notification_center: NotificationCenter,
-        action_schema: dict,
-    ) -> tuple[ActionBlock, LLMUsage]:
-        """Invoke Codex CLI with the given prompt."""
-        (
-            prompt_file_abs,
-            _schema_file_abs,
-            last_message_abs,
-            codex_cwd,
-            cmd,
-        ) = self._prepare_invocation(prompt, working_dir, additional_dirs, action_schema)
+        prepared: PreparedInvocation,
+        stdout: str,
+        stderr: str,
+        returncode: int,
+    ) -> Optional[str]:
+        _, error_events = self._parse_events(stdout)
+        if returncode == 0 and not error_events:
+            return None
+        logger.error(f"[codex-invoke] stdout tail: {stdout[-2000:]}")
+        parts: list[str] = []
+        for ev in error_events[:3]:
+            parts.append(json.dumps(ev)[:500])
+        if stderr:
+            parts.append(stderr[:500])
+        return "\n".join(parts) or "(no error detail)"
 
-        env = os.environ.copy()
-        env.update(self._agent_env)
+    def _parse_result(
+        self,
+        prepared: PreparedInvocation,
+        stdout: str,
+        stderr: str,
+    ) -> ParsedResult:
+        usage, _ = self._parse_events(stdout)
 
-        invoke_timeout = 1800
-
-        start_time = time.time()
-        proc: Optional[asyncio.subprocess.Process] = None
-        try:
+        # Read the schema-conformant final message from Codex's -o file.
+        final_message: Optional[dict] = None
+        last_message_path = Path(prepared.extras["last_message_abs"])
+        if last_message_path.exists():
             try:
-                proc = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    cwd=codex_cwd,
-                    env=env,
-                )
-            except FileNotFoundError:
-                raise LLMNotFoundError(
-                    self._bin,
-                    install_hint="Install Codex: https://github.com/openai/codex",
-                )
+                content = last_message_path.read_text(encoding="utf-8").strip()
+                if content:
+                    final_message = json.loads(content)
+            except json.JSONDecodeError as e:
+                logger.warning(f"[codex-invoke] last message is not valid JSON: {e}")
 
-            try:
-                stdout_b, stderr_b = await asyncio.wait_for(
-                    proc.communicate(input=prompt.encode("utf-8")),
-                    timeout=invoke_timeout,
-                )
-            except asyncio.CancelledError:
-                proc.kill()
-                try:
-                    await proc.wait()
-                except Exception:
-                    pass
-                elapsed = time.time() - start_time
-                logger.info(f"[codex-invoke] CANCELLED after {elapsed:.1f}s")
-                raise
-            except asyncio.TimeoutError:
-                proc.kill()
-                try:
-                    await proc.wait()
-                except Exception:
-                    pass
-                elapsed = time.time() - start_time
-                logger.error(f"[codex-invoke] TIMEOUT after {elapsed:.1f}s")
-                error = LLMTimeoutError(
-                    timeout_seconds=invoke_timeout,
-                    prompt_file=prompt_file_abs,
-                    working_dir=codex_cwd,
-                    provider="Codex",
-                )
-                await notification_center.publish(LLM_ERROR, sandbox_dir=working_dir, error=error)
-                raise error
+        actions: list[dict] = []
+        if isinstance(final_message, dict):
+            raw_actions = final_message.get("actions")
+            if isinstance(raw_actions, list):
+                actions = raw_actions
 
-            stdout = stdout_b.decode("utf-8", errors="replace")
-            stderr = stderr_b.decode("utf-8", errors="replace")
-            returncode = proc.returncode if proc.returncode is not None else -1
-
-            elapsed = time.time() - start_time
-            logger.info(f"[codex-invoke] FINISHED in {elapsed:.1f}s, returncode={returncode}")
-            logger.info(f"[codex-invoke] stdout length={len(stdout)} chars")
-            if stderr:
-                logger.warning(f"[codex-invoke] stderr ({len(stderr)} chars): {stderr[:1000]}")
-
-            self._write_invocation_logs(log_dir, stdout, stderr)
-        finally:
-            if proc is not None and proc.returncode is None:
-                try:
-                    proc.kill()
-                    await proc.wait()
-                except Exception:
-                    pass
-
-        usage, error_events = self._parse_events(stdout)
-
-        # Rate limit detection takes precedence — they look like invocation errors
-        # otherwise, and should not be retried with short backoff.
-        rate_limit_error = self._detect_rate_limit(error_events, stderr)
-        if rate_limit_error is not None:
-            rate_limit_error.prompt_file = prompt_file_abs
-            rate_limit_error.working_dir = codex_cwd
-            await notification_center.publish(LLM_ERROR, sandbox_dir=working_dir, error=rate_limit_error)
-            raise rate_limit_error
-
-        if returncode != 0 or error_events:
-            logger.error(f"[codex-invoke] stdout tail: {stdout[-2000:]}")
-            detail_parts = []
-            if error_events:
-                for ev in error_events[:3]:
-                    detail_parts.append(json.dumps(ev)[:500])
-            if stderr:
-                detail_parts.append(stderr[:500])
-            detail = "\n".join(detail_parts) or "(no error detail)"
-            error = LLMInvocationError(
-                f"Codex exited with code {returncode}:\n{detail}",
-                prompt_file=prompt_file_abs,
-                working_dir=codex_cwd,
-            )
-            await notification_center.publish(LLM_ERROR, sandbox_dir=working_dir, error=error)
-            raise error
-
-        final_message = self._read_last_message(last_message_abs)
-        actions = self._extract_actions(final_message)
         if actions:
             logger.info(f"[codex-invoke] final message actions: {len(actions)} action(s)")
         else:
@@ -444,7 +430,5 @@ class CodexCLI(LLMProvider):
             f"cache_read={usage.cache_read_tokens}"
         )
 
-        await notification_center.publish(LLM_COMPLETE, sandbox_dir=working_dir, usage=usage)
-
         raw_output = json.dumps(final_message) if final_message is not None else ""
-        return ActionBlock(raw=raw_output, actions=actions), usage
+        return ParsedResult(usage=usage, actions=actions, raw_text=raw_output)

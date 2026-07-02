@@ -29,49 +29,30 @@ from __future__ import annotations
 import re
 from datetime import UTC, datetime
 from pathlib import Path
+from collections.abc import Iterable
 from typing import TYPE_CHECKING, Literal, Optional
 
-from pydantic import BaseModel, Field, PrivateAttr, computed_field, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, computed_field
 
 from ..sync.changelog import ProjectStatus
 from ..utils.file_io import FileUtil
-from ..utils.validation import validate_name
 from .participant import Participant
 
 
-# Front Desk project name format: {requester_username}-fd-{agent_short_name}
-# Both username and agent short name use the existing validate_name() character
-# set (alphanumerics, dashes, underscores). The literal `-fd-` token is the
-# separator. Match is anchored.
-FRONT_DESK_NAME_RE = re.compile(r"^([a-z0-9][a-z0-9_-]*)-fd-([a-z0-9][a-z0-9_-]*)$")
+# Project surface — the explicit project shape. DM-shaped projects (both solo
+# personal DM and the responder side of a cross-user tunnel) use "dm";
+# task-shaped projects use "regular".
+ProjectSurface = Literal["regular", "dm"]
 
+# Front Desk / DM-shaped project name shape: ``{requester}-fd-{agent_short}``.
+# Mirrors the frontend FRONT_DESK_NAME_RE (web/frontend/src/types/index.ts).
+# Group 1 is the requester prefix (a username for user-requester channels, or a
+# requester agent's full name for cross-agent delegation).
+_FRONT_DESK_NAME_RE = re.compile(r"^([a-z0-9][a-z0-9_-]*)-fd-([a-z0-9][a-z0-9_-]*)$")
 
-# Project surface — the explicit project shape that replaces name-pattern predicates.
-# Adding a new DM-shaped use case is one new value here, consulted uniformly by
-# server auth / prompt-builder / frontend / action-schema selection.
-ProjectSurface = Literal["regular", "dm", "front_desk"]
-
-
-def parse_front_desk_name(name: str) -> tuple[str, str] | None:
-    """Parse a Front Desk project name into (requester_username, agent_short_name).
-
-    Returns None if the name does not match the Front Desk pattern.
-    """
-    m = FRONT_DESK_NAME_RE.match(name)
-    if not m:
-        return None
-    return m.group(1), m.group(2)
-
-
-def _derive_surface_from_name(name: str) -> ProjectSurface:
-    """Back-fill `surface` for legacy on-disk projects that predate the field."""
-    if name.startswith("DM-"):
-        return "dm"
-    if FRONT_DESK_NAME_RE.match(name):
-        return "front_desk"
-    return "regular"
 
 if TYPE_CHECKING:
+    from .agent import Agent
     from .context import ModelContext
     from .chatroom import Chatroom
 
@@ -92,29 +73,13 @@ class Project(BaseModel):
     participating_agents: list[str] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     created_by: str               # user_id of creator (derived from auth)
-    agent_pool: str = Field(default="verified")  # "owned", "verified", or "all"
+    agent_pool: str = Field(default="verified")  # "self", "owned", "verified", or "all". "self" = coordinator only (used by own-DM); the resolver returns an empty invitable list.
     agent_teams: list[str] = Field(default_factory=list)  # Hard allowlist by user_team; pairs with agent_names. Empty teams + empty names = no filter (everyone in pool is invitable).
     agent_names: list[str] = Field(default_factory=list)  # Hard allowlist by agent display name (id, full name, or owner-relative short name); pairs with agent_teams. OR semantics across both lists.
-    git_url: str = Field(default="")  # Git repo URL (empty = no git)
-    git_ignored_folder: str = Field(default=".bus-files")  # Folder for non-git deliverables
-    requester_id: str | None = None   # External user OR agent who initiated a Front Desk project; equal to created_by when internal-user
-    requester_kind: Literal["user", "agent"] | None = None  # Discriminator for resolving requester_id. None for non-FD projects.
-    surface: ProjectSurface = "regular"  # Explicit project shape; "regular" | "dm" | "front_desk"
+    surface: ProjectSurface = "regular"  # Explicit project shape; "regular" | "dm"
 
     # Private runtime state (not serialized)
     _ctx: Optional["ModelContext"] = PrivateAttr(default=None)
-
-    @model_validator(mode="before")
-    @classmethod
-    def _backfill_surface_from_name(cls, data):
-        """Derive `surface` from the project name for legacy on-disk projects.
-
-        New projects always set `surface` explicitly via their creation route;
-        this only fires for meta.json files written before the field existed.
-        """
-        if isinstance(data, dict) and "name" in data and not data.get("surface"):
-            data["surface"] = _derive_surface_from_name(data["name"])
-        return data
 
     @property
     def ctx(self) -> "ModelContext":
@@ -181,36 +146,91 @@ class Project(BaseModel):
 
     @property
     def is_dm_project(self) -> bool:
-        """Check if this is a DM (direct message) project."""
+        """Check if this is a DM-shaped project (solo personal DM or cross-user tunnel endpoint)."""
         return self.surface == "dm"
 
     @property
-    def is_front_desk_project(self) -> bool:
-        """Check if this is a Front Desk project.
+    def fd_requester_name(self) -> Optional[str]:
+        """Requester prefix of a DM-shaped Front Desk project name
+        (``{requester}-fd-{agent_short}``), else None.
 
-        The long-lived coordinator channel that backs the DM-shaped UI for both
-        internal (requester == owner) and external (requester != owner) flows.
+        For user-requester channels this equals the requester's username; for
+        agent-requester (cross-agent delegation) channels it's the requester
+        agent's full name, which never matches a username — so it's inert in
+        user-JWT authorization. ``created_by`` stays the host (foreign agent's
+        owner); this lets the requester be authorized on their own channel
+        without flipping ownership.
         """
-        return self.surface == "front_desk"
+        if not self.is_dm_project:
+            return None
+        m = _FRONT_DESK_NAME_RE.match(self.name)
+        return m.group(1) if m else None
+
+    # -------------------------------------------------------------------------
+    # Invitable allowlist (the unified (teams, names) policy for who can be
+    # invited to a chatroom in this project).
+    # -------------------------------------------------------------------------
 
     @property
-    def front_desk_parts(self) -> tuple[str, str] | None:
-        """Return ``(requester_username, agent_short_name)`` for Front Desk projects.
+    def enforces_invitable_allowlist(self) -> bool:
+        """Whether the chatroom-create gate should run the allowlist check.
 
-        Returns ``None`` for projects that don't match the Front Desk name pattern.
+        Allowlist is only enforced when explicitly populated; an empty
+        allowlist means "no filter" (every agent in the pool is invitable).
+        ``agent_pool="self"`` also forces enforcement so the resolver's
+        empty-list short-circuit is honored at the prompt callsite.
         """
-        return parse_front_desk_name(self.name)
+        return bool(self.agent_names or self.agent_teams) or self.agent_pool == "self"
 
-    def is_user_requester(self, user_id: str) -> bool:
-        """True when ``user_id`` is the authorized human requester.
+    def _invitable_viewer_owner_id(self, ctx: "ModelContext") -> Optional[str]:
+        """Owner whose namespace short names resolve in for the allowlist check.
 
-        Treats projects without an explicit ``requester_kind`` as user-shaped
-        (legacy default). Agent-as-requester FD projects return False here —
-        the agent-bearer auth path handles them separately.
+        Always scopes to the project creator. Returns ``None`` when no owner is
+        recorded (legacy projects).
         """
-        if self.requester_id is None or self.requester_id != user_id:
-            return False
-        return self.requester_kind in (None, "user")
+        return self.created_by
+
+    def matches_invitable(self, invitee: "Agent", ctx: "ModelContext") -> bool:
+        """Does ``invitee`` pass this project's invitable allowlist?
+
+        Empty allowlist = nothing matches (callers that want "empty = pass"
+        should gate on ``enforces_invitable_allowlist`` first).
+        """
+        allowed_names = set(self.agent_names)
+        allowed_teams = set(self.agent_teams)
+        if invitee.id in allowed_names:
+            return True
+        if invitee.name in allowed_names:
+            return True
+        viewer_owner_id = self._invitable_viewer_owner_id(ctx)
+        if (
+            viewer_owner_id
+            and invitee.registered_by == viewer_owner_id
+            and "-" in invitee.name
+        ):
+            short = invitee.name.split("-", 1)[1]
+            if short in allowed_names:
+                return True
+        if allowed_teams and (allowed_teams & set(invitee.user_teams)):
+            return True
+        return False
+
+    def resolve_invitable_agents(
+        self,
+        candidates: "Iterable[Agent]",
+        ctx: "ModelContext",
+    ) -> "list[Agent]":
+        """Filter ``candidates`` down to those that pass this project's allowlist.
+
+        ``agent_pool="self"`` short-circuits to an empty list — the
+        coordinator is the only allowed speaker (own-DM).
+        Empty allowlist = pass-through (returns the full list as-is).
+        """
+        if self.agent_pool == "self":
+            return []
+        if not self.agent_teams and not self.agent_names:
+            return list(candidates)
+        return [c for c in candidates if self.matches_invitable(c, ctx)]
 
     # -------------------------------------------------------------------------
     # Association Methods (lookup-based, no caching)
@@ -226,7 +246,8 @@ class Project(BaseModel):
         result = []
         for chatroom_name in self.chatrooms:
             room = Chatroom.get(self.id, chatroom_name, self.ctx)
-            result.append(room)
+            if room is not None:
+                result.append(room)
         return result
 
     def get_chatroom(self, chatroom_name: str):
@@ -236,7 +257,7 @@ class Project(BaseModel):
             chatroom_name: The chatroom name
 
         Returns:
-            Chatroom
+            Chatroom, or None when the room doesn't exist (Chatroom.get contract)
         """
         from .chatroom import Chatroom
         return Chatroom.get(self.id, chatroom_name, self.ctx)
@@ -325,8 +346,20 @@ class Project(BaseModel):
         Returns:
             Project
         """
-        # Find project directory by ID (glob for {name}-{id} pattern)
-        matches = list(ctx.metadata_dir.glob(f"*-{project_id}"))
+        # Find project directory by ID (glob for {name}-{id} pattern). Sort for
+        # determinism: glob order is filesystem-dependent, so an unsorted matches[0]
+        # could resolve to a different {name}-{id} dir across processes if a stale
+        # duplicate ever exists — yielding a different project.name and thus a
+        # different sandbox_dir between the writer and the action executor.
+        matches = sorted(ctx.metadata_dir.glob(f"*-{project_id}"))
+        if not matches:
+            # Callers may pass the bare id or the full "{name}-{id}" slug (what
+            # an agent sees as its synced project dir). The glob above only
+            # matches the bare id; fall back to an exact dir match so the slug
+            # form resolves too.
+            exact = ctx.metadata_dir / project_id
+            if exact.is_dir():
+                matches = [exact]
         if not matches:
             raise ValueError(f"Project {project_id} not found")
         meta_path = matches[0] / "meta.json"
@@ -384,7 +417,7 @@ class Project(BaseModel):
                 continue
             for chatroom_name in proj.chatrooms:
                 room = Chatroom.get(proj.id, chatroom_name, ctx)
-                if agent_id in room.participants:
+                if room is not None and agent_id in room.participants:
                     result.append(room)
         return result
 
@@ -464,10 +497,6 @@ class ProjectState:
         agent_pool: str = "verified",
         agent_teams: list[str] | None = None,
         agent_names: list[str] | None = None,
-        git_url: str = "",
-        git_ignored_folder: str = ".bus-files",
-        requester_id: str | None = None,
-        requester_kind: Literal["user", "agent"] | None = None,
         surface: ProjectSurface = "regular",
     ) -> Project:
         """Create a new project with directories and meta.json.
@@ -497,7 +526,7 @@ class ProjectState:
             ValueError: If project_name is invalid
         """
         # Validate project name
-        project_name = validate_name(project_name)
+        project_name = FileUtil.validate_fs_name(project_name)
 
         # Build paths (directories created by FileUtil.write with ensure_dir=True)
         meta_dir = ctx.metadata_dir / f"{project_name}-{project_id}"
@@ -516,10 +545,6 @@ class ProjectState:
             "agent_pool": agent_pool,
             "agent_teams": list(agent_teams) if agent_teams else [],
             "agent_names": list(agent_names) if agent_names else [],
-            "git_url": git_url,
-            "git_ignored_folder": git_ignored_folder,
-            "requester_id": requester_id,
-            "requester_kind": requester_kind,
             "surface": surface,
         }
         FileUtil.write(meta_dir / "meta.json", project_data, "json", atomic=True)
@@ -545,6 +570,23 @@ class ProjectState:
         meta_path = self._project.meta_path
         project_dict = FileUtil.read(meta_path, "json")
         project_dict["status"] = "active"
+        FileUtil.write(meta_path, project_dict, "json", atomic=True)
+
+    def apply_allowlist_update(
+        self,
+        agent_names: list[str],
+        agent_teams: list[str],
+    ) -> None:
+        """Overwrite the project's allowlist snapshot in meta.json.
+
+        Idempotent: re-writes the two list fields with the supplied values.
+        Fired by ``PROJECT_ALLOWLIST_UPDATED`` replay; emitted server-side
+        when the coordinator's Front Desk Settings change.
+        """
+        meta_path = self._project.meta_path
+        project_dict = FileUtil.read(meta_path, "json")
+        project_dict["agent_names"] = list(agent_names)
+        project_dict["agent_teams"] = list(agent_teams)
         FileUtil.write(meta_path, project_dict, "json", atomic=True)
 
     def add_participant(self, participant_id: str) -> None:

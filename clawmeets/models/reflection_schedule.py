@@ -17,10 +17,9 @@ import logging
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Optional
 
-from croniter import croniter
 from pydantic import BaseModel
 
-from clawmeets.models.scheduled_message import compute_next_fire, validate_cron_expression
+from .scheduled_message import compute_next_fire, validate_cron_expression
 from clawmeets.utils.file_io import FileUtil
 
 if TYPE_CHECKING:
@@ -32,18 +31,20 @@ logger = logging.getLogger("clawmeets.models.reflection_schedule")
 class ReflectionSchedule(BaseModel):
     """A user-scoped recurring reflection schedule.
 
-    Carries two independent cadences:
-    - ``cron_expression`` / ``next_fire_at`` / ``last_fired_at`` for the *reflect*
-      pass (distill new lessons; fans out to agents with new activity).
-    - ``lint_cron_expression`` / ``next_lint_fire_at`` / ``last_lint_fired_at``
-      for the *lint* pass (audit existing memory; fans out to agents that have
-      a memory to lint, i.e. ``last_reflected_at is not None``).
+    Single cadence:
+    - ``cron_expression`` / ``next_fire_at`` / ``last_fired_at`` for the
+      reflect pass (distill new lessons AND audit the existing wiki in one
+      turn; fans out to agents with new activity).
 
-    Lint cadence is opt-in: ``lint_cron_expression == None`` disables the lint
-    fan-out even when the reflect cron is active. Setting ``is_active = False``
-    disables both. Both crons are interpreted in ``timezone`` (IANA name,
-    default ``"UTC"`` for backward compat).
+    Setting ``is_active = False`` disables the fan-out. The cron is
+    interpreted in ``timezone`` (IANA name, default ``"UTC"`` for backward
+    compat).
     """
+
+    # Persisted with extra="ignore" so older rows carrying lint_cron_expression /
+    # last_lint_fired_at / next_lint_fire_at (removed in the audit-fold-in
+    # change) deserialize cleanly without a migration.
+    model_config = {"extra": "ignore"}
 
     user_id: str
     username: str
@@ -54,10 +55,6 @@ class ReflectionSchedule(BaseModel):
     last_fired_at: Optional[datetime] = None
     next_fire_at: datetime
     end_at: Optional[datetime] = None
-    # Lint cadence (v2). Independent cursors so reflect and lint advance separately.
-    lint_cron_expression: Optional[str] = None
-    last_lint_fired_at: Optional[datetime] = None
-    next_lint_fire_at: Optional[datetime] = None
 
 
 class ReflectionScheduleStore:
@@ -115,22 +112,15 @@ class ReflectionScheduleStore:
         cron_expression: str,
         is_active: bool = True,
         end_at: Optional[datetime] = None,
-        lint_cron_expression: Optional[str] = None,
         timezone: str = "UTC",
     ) -> ReflectionSchedule:
         """Create or update the user's reflection schedule.
 
-        Validates both crons. Recomputes ``next_fire_at`` from now. Recomputes
-        ``next_lint_fire_at`` only when ``lint_cron_expression`` *or*
-        ``timezone`` differs from the stored value (so toggling reflect doesn't
-        reset lint progress, but a TZ edit does shift both cursors).
-        Pass ``lint_cron_expression=None`` to clear lint cadence.
-        Preserves ``last_fired_at`` / ``last_lint_fired_at`` on update.
+        Validates the cron. Recomputes ``next_fire_at`` from now. Preserves
+        ``last_fired_at`` on update.
         """
         if not validate_cron_expression(cron_expression):
             raise ValueError(f"Invalid cron expression: {cron_expression!r}")
-        if lint_cron_expression is not None and not validate_cron_expression(lint_cron_expression):
-            raise ValueError(f"Invalid lint cron expression: {lint_cron_expression!r}")
 
         now = datetime.now(UTC)
         next_fire = compute_next_fire(cron_expression, now, timezone)
@@ -143,22 +133,12 @@ class ReflectionScheduleStore:
                     existing = s
                     break
             if existing is not None:
-                tz_changed = existing.timezone != timezone
                 existing.username = username
                 existing.cron_expression = cron_expression
                 existing.timezone = timezone
                 existing.is_active = is_active
                 existing.next_fire_at = next_fire
                 existing.end_at = end_at
-                if lint_cron_expression != existing.lint_cron_expression or tz_changed:
-                    existing.lint_cron_expression = lint_cron_expression
-                    existing.next_lint_fire_at = (
-                        compute_next_fire(lint_cron_expression, now, timezone)
-                        if lint_cron_expression
-                        else None
-                    )
-                    if lint_cron_expression is None:
-                        existing.last_lint_fired_at = None
                 result = existing
             else:
                 result = ReflectionSchedule(
@@ -170,12 +150,6 @@ class ReflectionScheduleStore:
                     created_at=now,
                     next_fire_at=next_fire,
                     end_at=end_at,
-                    lint_cron_expression=lint_cron_expression,
-                    next_lint_fire_at=(
-                        compute_next_fire(lint_cron_expression, now, timezone)
-                        if lint_cron_expression
-                        else None
-                    ),
                 )
                 schedules.append(result)
             self._save_all_sync(schedules)
@@ -195,7 +169,7 @@ class ReflectionScheduleStore:
         return False
 
     async def update_after_fire(self, user_id: str, now: datetime) -> None:
-        """Advance the *reflect* cursor after a reflect fan-out fires."""
+        """Advance the reflect cursor after a fan-out fires."""
         async with self._lock:
             schedules = self._load_all_sync()
             for s in schedules:
@@ -213,37 +187,5 @@ class ReflectionScheduleStore:
                         break
                     if s.end_at and s.next_fire_at > s.end_at:
                         s.is_active = False
-                    break
-            self._save_all_sync(schedules)
-
-    async def update_after_lint_fire(self, user_id: str, now: datetime) -> None:
-        """Advance the *lint* cursor after a lint fan-out fires.
-
-        Independent of the reflect cursor — they tick at their own cadences.
-        If the lint cron is no longer present (cleared via upsert), this is a
-        no-op so a stale loop iteration can't resurrect the cursor.
-        """
-        async with self._lock:
-            schedules = self._load_all_sync()
-            for s in schedules:
-                if s.user_id == user_id:
-                    if s.lint_cron_expression is None:
-                        break
-                    s.last_lint_fired_at = now
-                    try:
-                        s.next_lint_fire_at = compute_next_fire(
-                            s.lint_cron_expression, now, s.timezone
-                        )
-                    except ValueError:
-                        logger.error(
-                            f"Invalid lint cron for reflection schedule user={user_id}, "
-                            "clearing lint cadence"
-                        )
-                        s.lint_cron_expression = None
-                        s.next_lint_fire_at = None
-                        break
-                    if s.end_at and s.next_lint_fire_at and s.next_lint_fire_at > s.end_at:
-                        s.lint_cron_expression = None
-                        s.next_lint_fire_at = None
                     break
             self._save_all_sync(schedules)

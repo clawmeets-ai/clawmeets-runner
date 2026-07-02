@@ -1,0 +1,6 @@
+{
+  "audiences": ["assistant"],
+  "surfaces": ["agent_runtime"],
+  "version": "1.0.0",
+  "description": "Add/remove agents or teams on an existing project's invitable allowlist (who the coordinator may invite as workers)."
+}

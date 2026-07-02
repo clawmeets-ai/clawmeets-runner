@@ -66,11 +66,18 @@ async def invoke_with_registry(
     log_dir: Path,
     additional_dirs: list[Path],
     action_schema: dict,
+    trigger_version: int,
+    role: "str | None" = None,
 ) -> "tuple[ActionBlock, LLMUsage]":
     """Run cli.invoke and register the task so it can be cancelled.
 
     If no InvocationRegistry is attached (e.g. unit tests), the call still
     runs — it just isn't cancellable from outside.
+
+    ``role`` ("worker" | "coordinator" | "assistant") selects which
+    system-skill-hub subset is prepended to skill_source_dirs. None
+    means no system layer (back-compat for callsites that haven't been
+    threaded yet); production callsites always pass it.
     """
     coro = model_ctx.cli.invoke(
         prompt,
@@ -79,6 +86,9 @@ async def invoke_with_registry(
         additional_dirs=additional_dirs,
         notification_center=model_ctx.notification_center,
         action_schema=action_schema,
+        trigger_version=trigger_version,
+        mcp_config_dir=model_ctx.mcp_dist_dir,
+        skill_source_dirs=model_ctx.skill_source_dirs(role=role),
     )
     registry = model_ctx.invocation_registry
     if registry is None:

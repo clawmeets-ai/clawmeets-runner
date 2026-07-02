@@ -101,11 +101,16 @@ class ActionBlockExecutor:
                 elif action_type == "update_file":
                     file_path = action["file_path"]
                     room_name = action["room"]
-                    full_path = sandbox_dir / file_path
+                    # Resolve the sandbox root so this read side matches the write
+                    # side, which resolves write_root (api_provider `_build_file_tools`).
+                    # On macOS the temp dir is a /var → /private/var symlink; without
+                    # resolving here the two sides can name the same file differently.
+                    sandbox_root = sandbox_dir.resolve()
+                    full_path = sandbox_root / file_path
                     if not full_path.exists():
                         # Fallback: Claude sometimes writes into the chatroom directory
                         # structure (synced from project_dir) instead of sandbox root
-                        fallback_path = sandbox_dir / "chatrooms" / room_name / "files" / file_path
+                        fallback_path = sandbox_root / "chatrooms" / room_name / "files" / file_path
                         if fallback_path.exists():
                             full_path = fallback_path
                             logger.info(f"File found at fallback chatroom path: {fallback_path}")
@@ -119,7 +124,10 @@ class ActionBlockExecutor:
                         )
                         logger.debug(f"Updated file {file_path} in {room_name}")
                     else:
-                        logger.warning(f"File not found in sandbox: {sandbox_dir / file_path}")
+                        logger.warning(
+                            "File not found in sandbox: %s (sandbox_root=%s, exists=%s)",
+                            full_path, sandbox_root, sandbox_root.exists(),
+                        )
 
                 elif action_type == "project_completed":
                     await self._client.complete_project(
@@ -143,7 +151,7 @@ class ActionBlockExecutor:
         self,
         project_id: str,
         summary: str,
-        source_version: int | None,
+        source_version: int,
     ) -> None:
         """Post a coordinator-authored failure note to user-communication.
 

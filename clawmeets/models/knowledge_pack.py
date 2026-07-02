@@ -23,7 +23,7 @@ as ``USER.md`` and ``REFERENCES.md``.
 Storage layout::
 
     {data_dir}/knowledge-packs/
-      <username>/                # username; validated by validate_name
+      <username>/                # username; validated by FileUtil.validate_fs_name
         <slug>/                  # slug; validated by validate_slug
           _meta.json             # {"name", "description", "created_at", "updated_at"}
           <path/to/file>         # one real file per pack-file (validate_filepath)
@@ -53,7 +53,6 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 
 from clawmeets.utils.file_io import FileUtil
-from clawmeets.utils.validation import validate_name
 
 _lock = asyncio.Lock()
 
@@ -70,9 +69,16 @@ class PackFile(BaseModel):
     """A single file inside a knowledge pack. Content is raw bytes,
     base64-encoded for transport. The server treats every pack file as opaque
     bytes; the frontend decides per-file (by extension) whether to UTF-8
-    decode for display."""
+    decode for display.
+
+    ``description`` is the optional one-line "consult when" hint the user
+    attaches so the installed-pack index (``memory/KNOWLEDGE_PACKS.md``) can
+    point the agent at the right file inside a multi-file pack instead of only
+    naming the pack. Stored in the pack's ``_meta.json`` (the file on disk is
+    opaque bytes), so it rides ``model_dump`` over the install wire for free."""
 
     content_b64: str
+    description: str = ""
 
 
 class KnowledgePack(BaseModel):
@@ -154,13 +160,13 @@ def validate_filepath(filepath: str) -> str:
 
 def _validate_username(username: str) -> str:
     """Defensive re-check at the model boundary. Usernames are already
-    validated at registration via ``validate_name``; this guards against
-    a caller passing something else (an id, a path, an empty string).
+    validated at registration via ``FileUtil.validate_fs_name``; this guards
+    against a caller passing something else (an id, a path, an empty string).
     """
     cleaned = (username or "").strip()
     if not cleaned:
         raise ValueError("Username cannot be empty")
-    return validate_name(cleaned)
+    return FileUtil.validate_fs_name(cleaned)
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +212,9 @@ def _load_pack(pack_dir: Path, slug: str) -> KnowledgePack | None:
     meta = FileUtil.read(_meta_path(pack_dir), "json")
     if not isinstance(meta, dict):
         return None
+    file_descriptions = meta.get("file_descriptions")
+    if not isinstance(file_descriptions, dict):
+        file_descriptions = {}
 
     files: dict[str, PackFile] = {}
     for entry in pack_dir.rglob("*"):
@@ -221,6 +230,7 @@ def _load_pack(pack_dir: Path, slug: str) -> KnowledgePack | None:
         try:
             files[rel] = PackFile(
                 content_b64=base64.b64encode(entry.read_bytes()).decode("ascii"),
+                description=str(file_descriptions.get(rel) or ""),
             )
         except OSError:
             continue
@@ -242,8 +252,21 @@ def _write_meta(
     description: str,
     created_at: str,
     updated_at: str,
+    file_descriptions: dict | None = None,
 ) -> None:
     pack_dir.mkdir(parents=True, exist_ok=True)
+    # Prune stale entries for files that no longer exist, keeping _meta.json
+    # tight. Empty descriptions are dropped too — absence == "".
+    existing = {
+        entry.relative_to(pack_dir).as_posix()
+        for entry in pack_dir.rglob("*")
+        if entry.is_file() and not (entry.name == META_FILENAME and entry.parent == pack_dir)
+    }
+    fdesc = {
+        path: desc
+        for path, desc in (file_descriptions or {}).items()
+        if path in existing and str(desc or "").strip()
+    }
     FileUtil.write(
         _meta_path(pack_dir),
         {
@@ -251,6 +274,7 @@ def _write_meta(
             "description": description,
             "created_at": created_at,
             "updated_at": updated_at,
+            "file_descriptions": fdesc,
         },
         "json",
     )
@@ -300,8 +324,10 @@ async def create_pack(
     name: str,
     description: str = "",
     files: dict[str, str] | None = None,
+    file_descriptions: dict[str, str] | None = None,
 ) -> KnowledgePack:
-    """Create a new pack. ``files`` is ``{relative_path: base64_content}``.
+    """Create a new pack. ``files`` is ``{relative_path: base64_content}``;
+    optional ``file_descriptions`` is ``{relative_path: "consult when ..."}``.
 
     Raises ValueError if the slug already exists or any path is invalid.
     """
@@ -313,6 +339,10 @@ async def create_pack(
             validated_files[path] = base64.b64decode(body or "", validate=True)
         except (ValueError, TypeError) as e:
             raise ValueError(f"Invalid base64 content for {raw_path!r}: {e}")
+    validated_descs = {
+        validate_filepath(p): str(d or "")
+        for p, d in (file_descriptions or {}).items()
+    }
 
     async with _lock:
         pack_dir = _pack_dir(data_dir, username, slug)
@@ -320,17 +350,18 @@ async def create_pack(
             raise ValueError(f"Knowledge pack {slug!r} already exists")
 
         now = _now()
+        for rel_path, body_bytes in validated_files.items():
+            target = pack_dir.joinpath(*rel_path.split("/"))
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(body_bytes)
         _write_meta(
             pack_dir,
             name=name,
             description=description,
             created_at=now,
             updated_at=now,
+            file_descriptions=validated_descs,
         )
-        for rel_path, body_bytes in validated_files.items():
-            target = pack_dir.joinpath(*rel_path.split("/"))
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(body_bytes)
 
         pack = _load_pack(pack_dir, slug)
         assert pack is not None  # just wrote it
@@ -367,6 +398,7 @@ async def update_pack(
             description=meta.get("description") or "",
             created_at=meta["created_at"],
             updated_at=meta["updated_at"],
+            file_descriptions=meta.get("file_descriptions") or {},
         )
         return _load_pack(pack_dir, slug)
 
@@ -377,10 +409,12 @@ async def upsert_file(
     slug: str,
     filepath: str,
     content_b64: str,
+    description: str | None = None,
 ) -> KnowledgePack | None:
     """Add or replace a single file inside a pack. ``content_b64`` is the
-    base64-encoded raw bytes. Returns the updated pack, or None if the pack
-    does not exist. Path validation enforced.
+    base64-encoded raw bytes; optional ``description`` sets the file's
+    "consult when" hint (None leaves an existing hint untouched). Returns the
+    updated pack, or None if the pack does not exist. Path validation enforced.
     """
     slug = validate_slug(slug)
     clean = validate_filepath(filepath)
@@ -398,6 +432,9 @@ async def upsert_file(
         target.write_bytes(body_bytes)
 
         meta = _read_meta(pack_dir)
+        fdesc = dict(meta.get("file_descriptions") or {})
+        if description is not None:
+            fdesc[clean] = description
         meta.setdefault("created_at", _now())
         meta["updated_at"] = _now()
         _write_meta(
@@ -406,6 +443,7 @@ async def upsert_file(
             description=meta.get("description") or "",
             created_at=meta["created_at"],
             updated_at=meta["updated_at"],
+            file_descriptions=fdesc,
         )
         return _load_pack(pack_dir, slug)
 
@@ -443,12 +481,15 @@ async def delete_file(
         meta = _read_meta(pack_dir)
         meta.setdefault("created_at", _now())
         meta["updated_at"] = _now()
+        # _write_meta prunes file_descriptions to files that still exist, so the
+        # just-deleted file's hint drops out automatically.
         _write_meta(
             pack_dir,
             name=meta.get("name") or slug,
             description=meta.get("description") or "",
             created_at=meta["created_at"],
             updated_at=meta["updated_at"],
+            file_descriptions=meta.get("file_descriptions") or {},
         )
         return _load_pack(pack_dir, slug)
 

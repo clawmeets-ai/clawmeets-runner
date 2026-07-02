@@ -26,6 +26,8 @@ they flow through the distributed changelog system.
 """
 from __future__ import annotations
 
+import re
+import shutil
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
@@ -33,7 +35,6 @@ from typing import TYPE_CHECKING, Optional
 from pydantic import BaseModel, Field, PrivateAttr, computed_field
 
 from ..utils.file_io import FileUtil
-from ..utils.validation import validate_name
 from .chat_message import (
     ChatBatchTimeoutEvent,
     ChatFileEvent,
@@ -44,7 +45,11 @@ from .chat_message import (
 from .participant import Participant
 
 if TYPE_CHECKING:
+    from .agent import Agent
     from .context import ModelContext
+
+
+_MENTION_RE = re.compile(r'(?:^|(?<=[^a-zA-Z0-9_]))@([a-zA-Z][a-zA-Z0-9_-]*)')
 
 
 class Chatroom(BaseModel):
@@ -167,26 +172,6 @@ class Chatroom(BaseModel):
         return self.name.startswith("user-communication")
 
     @property
-    def is_dm_chatroom(self) -> bool:
-        """Check if this is a DM (direct message) chatroom.
-
-        DM chatrooms are named "dm-{agent-name}" and are used for direct
-        messaging between users and specific agents.
-        """
-        return self.name.startswith("dm-")
-
-    @property
-    def dm_agent_name(self) -> Optional[str]:
-        """Extract the agent name from a DM chatroom name.
-
-        Returns:
-            The agent name if this is a DM chatroom, None otherwise.
-        """
-        if not self.is_dm_chatroom:
-            return None
-        return self.name[3:]  # Remove "dm-" prefix
-
-    @property
     def last_cleared_at(self) -> Optional[datetime]:
         """When the chatroom history was last cleared, if ever.
 
@@ -221,6 +206,34 @@ class Chatroom(BaseModel):
         """
         from .project import Project
         return Project.get(self.project_id, self.ctx)
+
+    def parse_mentions(self, content: Optional[str]) -> list[str]:
+        """Extract @agent-name mentions from a message in this room.
+
+        Returns names without the ``@`` prefix, deduplicated, preserving
+        order of first occurrence. Matches ``@`` only at word boundaries
+        (so ``user@x.com`` is rejected, ``**@agent**`` is accepted).
+        """
+        if not content:
+            return []
+        seen: set[str] = set()
+        result: list[str] = []
+        for m in _MENTION_RE.findall(content):
+            if m not in seen:
+                seen.add(m)
+                result.append(m)
+        return result
+
+    def resolve_mention(self, name: str) -> Optional["Agent"]:
+        """Resolve an @mention name to an Agent in this room's namespace.
+
+        Delegates to ``Agent.resolve_with_namespace`` using this chatroom's
+        parent project. Does NOT filter by participant membership — callers
+        that need that distinction (e.g. to log "not a participant" warnings
+        separately from "not found") apply it themselves.
+        """
+        from .agent import Agent
+        return Agent.resolve_with_namespace(name, self.project(), self.ctx)
 
     def list_participants(self) -> list:
         """Load participants for all chatroom participants.
@@ -264,6 +277,31 @@ class Chatroom(BaseModel):
         """
         messages = [e for e in self.get_log_entries() if isinstance(e, ChatMessage)]
         return messages[-limit:]
+
+    def recent_history_for_prompt(
+        self,
+        limit: int = 10,
+        exclude_message_id: Optional[str] = None,
+    ) -> list[tuple[str, str]]:
+        """Return the last ``limit`` non-ack messages as (sender, content) pairs.
+
+        Used by the prompt builder's `RECENT CHAT IN THIS ROOM` section so the
+        LLM sees recent context on every turn (not only batch mode).
+
+        Args:
+            limit: max number of messages to include (most recent last).
+            exclude_message_id: drop this message id from the result — used
+                when the trigger message will already appear in the prompt's
+                `INCOMING MESSAGE` block, to avoid duplication.
+        """
+        messages = [m for m in self.get_messages() if not m.is_ack]
+        if exclude_message_id is not None:
+            messages = [m for m in messages if m.id != exclude_message_id]
+        messages = messages[-limit:]
+        return [
+            (m.from_participant_name or m.from_participant_id, m.content)
+            for m in messages
+        ]
 
     def get_messages_since(self, since_message_id: str) -> list[ChatMessage]:
         """Get messages after a given message ID.
@@ -333,7 +371,7 @@ class Chatroom(BaseModel):
         project_id: str,
         chatroom_name: str,
         ctx: "ModelContext",
-    ) -> "Chatroom":
+    ) -> Optional["Chatroom"]:
         """Load chatroom by name.
 
         Args:
@@ -342,12 +380,20 @@ class Chatroom(BaseModel):
             ctx: ModelContext for filesystem operations
 
         Returns:
-            Chatroom
+            Chatroom, or None when the room doesn't exist — same Active Record
+            contract as ``Project.get`` / ``Agent.get``, so route handlers'
+            ``if room is None: raise HTTPException(404)`` checks work. (This
+            used to raise ValueError, which surfaced as a 500 on e.g. a file
+            upload to a room name an agent got slightly wrong.)
         """
         from .project import Project
 
-        # Load project first to get project_name
-        project = Project.get(project_id, ctx)
+        # Load project first to get project_name. Project.get raises ValueError
+        # for an unknown project — fold that into the None contract here.
+        try:
+            project = Project.get(project_id, ctx)
+        except ValueError:
+            return None
 
         # Build path directly using project name
         meta_path = (
@@ -360,7 +406,7 @@ class Chatroom(BaseModel):
 
         data = FileUtil.read(meta_path, "json")
         if not data:
-            raise ValueError(f"Chatroom {chatroom_name} not found in project {project_id}")
+            return None
         instance = cls.model_validate(data)
         object.__setattr__(instance, "_ctx", ctx)
         return instance
@@ -439,7 +485,7 @@ class ChatroomState:
             ValueError: If chatroom_name is invalid
         """
         # Validate chatroom name
-        chatroom_name = validate_name(chatroom_name)
+        chatroom_name = FileUtil.validate_fs_name(chatroom_name)
 
         # Build paths (directories created by FileUtil.write with ensure_dir=True)
         data_dir = (
@@ -605,8 +651,6 @@ class ChatroomState:
             cleared_through_version: Changelog version this clear supersedes;
                 stamped into meta.json so consumers can show "cleared at vN".
         """
-        import shutil
-
         chats_path = self._chatroom.chats_path
         if archive_filename and chats_path.exists() and chats_path.stat().st_size > 0:
             archive_path = chats_path.parent / archive_filename

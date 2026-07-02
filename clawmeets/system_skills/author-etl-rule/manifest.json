@@ -1,0 +1,6 @@
+{
+  "audiences": ["assistant"],
+  "surfaces": ["agent_runtime"],
+  "version": "1.0.0",
+  "description": "Assistant-only: turn a DM description of a recurring data-derivation pipeline into an etl.json rule on the owning data agent — draft, confirm with the user, apply via skill set-config, optionally schedule the trigger DM."
+}

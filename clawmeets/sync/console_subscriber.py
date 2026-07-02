@@ -34,6 +34,7 @@ class Colors:
     BLUE = '\033[0;34m'
     YELLOW = '\033[1;33m'
     CYAN = '\033[0;36m'
+    RED = '\033[0;31m'
     GRAY = '\033[0;90m'
     BOLD = '\033[1m'
     NC = '\033[0m'  # No Color / Reset
@@ -75,6 +76,7 @@ class ConsoleOutputSubscriber(ChangelogSubscriber):
             config: Console output configuration
         """
         self._config = config
+        self._entry_counts: dict[str, int] = {}
 
     # ─────────────────────────────────────────────────────────
     # Color Helpers
@@ -120,90 +122,6 @@ class ConsoleOutputSubscriber(ChangelogSubscriber):
         print(message, file=self._config.output_stream, flush=True)
 
     # ─────────────────────────────────────────────────────────
-    # Entry Handlers
-    # ─────────────────────────────────────────────────────────
-
-    def _handle_message(
-        self,
-        entry: "ChangelogEntry",
-        project_id: str,
-        project_name: str,
-    ) -> None:
-        """Handle MESSAGE entry."""
-        payload = entry.payload
-
-        # Get display info
-        from_name = payload.from_participant_name or payload.from_participant_id[:8] if payload.from_participant_id else "unknown"
-
-        timestamp = self._timestamp(payload.ts)
-        room = self._room_name(payload.chatroom_name)
-        agent = self._agent_name(from_name)
-        preview = self._truncate(payload.content)
-
-        self._print(f"{timestamp} {room} {agent}: {preview}")
-
-    def _handle_file_created(
-        self,
-        entry: "ChangelogEntry",
-        project_id: str,
-        project_name: str,
-    ) -> None:
-        """Handle FILE_CREATED entry."""
-        payload = entry.payload
-        filename = payload.filename or "unknown"
-
-        sync_label = self._c(Colors.CYAN, "[Sync]")
-        room = self._room_name(payload.chatroom_name)
-        file_text = self._c(Colors.BOLD, filename)
-
-        self._print(f"{sync_label} {room} File created: {file_text}")
-
-    def _handle_file_updated(
-        self,
-        entry: "ChangelogEntry",
-        project_id: str,
-        project_name: str,
-    ) -> None:
-        """Handle FILE_UPDATED entry."""
-        payload = entry.payload
-        filename = payload.filename or "unknown"
-
-        sync_label = self._c(Colors.CYAN, "[Sync]")
-        room = self._room_name(payload.chatroom_name)
-        file_text = self._c(Colors.BOLD, filename)
-
-        self._print(f"{sync_label} {room} File synced: {file_text}")
-
-    def _handle_room_created(
-        self,
-        entry: "ChangelogEntry",
-        project_id: str,
-        project_name: str,
-    ) -> None:
-        """Handle ROOM_CREATED entry."""
-        # Print participants joining when room is created
-        payload = entry.payload
-        plus_label = self._c(Colors.BLUE, "[+]")
-        room = self._room_name(payload.chatroom_name)
-
-        for participant in payload.participants:
-            agent_name = participant.name or participant.id[:8]
-            agent = self._agent_name(agent_name)
-            self._print(f"{plus_label} {room} {agent} joined")
-
-    def _handle_project_completed(
-        self,
-        entry: "ChangelogEntry",
-        project_id: str,
-        project_name: str,
-    ) -> None:
-        """Handle PROJECT_COMPLETED entry."""
-        self._print("")
-        green_bold = Colors.GREEN + Colors.BOLD if self._config.colors else ""
-        nc = Colors.NC if self._config.colors else ""
-        self._print(f"{green_bold}=== Project '{project_name}' Completed! ==={nc}")
-
-    # ─────────────────────────────────────────────────────────
     # ChangelogSubscriber Interface
     # ─────────────────────────────────────────────────────────
 
@@ -214,22 +132,85 @@ class ConsoleOutputSubscriber(ChangelogSubscriber):
         project_name: str,
     ) -> None:
         """Process a changelog entry and print formatted output."""
+        self._entry_counts[project_id] = self._entry_counts.get(project_id, 0) + 1
+        payload = entry.payload
+        ts = self._timestamp(entry.timestamp)
         try:
             match entry.entry_type:
                 case ChangelogEntryType.MESSAGE:
-                    self._handle_message(entry, project_id, project_name)
+                    from_name = payload.from_participant_name or (payload.from_participant_id[:8] if payload.from_participant_id else "unknown")
+                    self._print(
+                        f"{self._timestamp(payload.ts)} {self._room_name(payload.chatroom_name)} "
+                        f"{self._agent_name(from_name)}: {self._truncate(payload.content)}"
+                    )
                 case ChangelogEntryType.FILE_CREATED:
-                    self._handle_file_created(entry, project_id, project_name)
+                    self._print(
+                        f"{self._c(Colors.CYAN, '[Sync]')} {self._room_name(payload.chatroom_name)} "
+                        f"File created: {self._c(Colors.BOLD, payload.filename or 'unknown')}"
+                    )
                 case ChangelogEntryType.FILE_UPDATED:
-                    self._handle_file_updated(entry, project_id, project_name)
+                    self._print(
+                        f"{self._c(Colors.CYAN, '[Sync]')} {self._room_name(payload.chatroom_name)} "
+                        f"File synced: {self._c(Colors.BOLD, payload.filename or 'unknown')}"
+                    )
                 case ChangelogEntryType.ROOM_CREATED:
-                    self._handle_room_created(entry, project_id, project_name)
+                    plus = self._c(Colors.BLUE, "[+]")
+                    room = self._room_name(payload.chatroom_name)
+                    for p in payload.participants:
+                        self._print(f"{plus} {room} {self._agent_name(p.name or p.id[:8])} joined")
                 case ChangelogEntryType.PROJECT_COMPLETED:
-                    self._handle_project_completed(entry, project_id, project_name)
+                    self._print("")
+                    green_bold = Colors.GREEN + Colors.BOLD if self._config.colors else ""
+                    nc = Colors.NC if self._config.colors else ""
+                    self._print(f"{green_bold}=== Project '{project_name}' Completed! ==={nc}")
+                case ChangelogEntryType.PROJECT_CREATED:
+                    self._print(
+                        f"{ts} {self._c(Colors.BLUE, '[+]')} Project created: "
+                        f"{self._c(Colors.BOLD, payload.project_name)} "
+                        f"(coordinator: {self._agent_name(payload.coordinator_name)})"
+                    )
+                case ChangelogEntryType.ROOM_DELETED:
+                    self._print(f"{ts} {self._c(Colors.RED, '[-]')} {self._room_name(payload.chatroom_name)} deleted")
+                case ChangelogEntryType.PROJECT_REACTIVATED:
+                    self._print(f"{ts} Project '{self._c(Colors.BOLD, project_name)}' reactivated")
+                case ChangelogEntryType.BATCH_COMPLETE:
+                    self._print(
+                        f"{ts} {self._c(Colors.CYAN, '[Batch]')} {self._room_name(payload.chatroom_name)} "
+                        f"complete (responded: {len(payload.responded_participants)})"
+                    )
+                case ChangelogEntryType.BATCH_TIMEOUT:
+                    self._print(
+                        f"{ts} {self._c(Colors.RED, '[Batch]')} {self._room_name(payload.chatroom_name)} "
+                        f"timeout (responded: {len(payload.responded_participants)}, "
+                        f"timed out: {len(payload.timed_out_participants)})"
+                    )
+                case ChangelogEntryType.PARTICIPANT_ADDED:
+                    name = payload.participant_name or payload.participant_id[:8]
+                    self._print(
+                        f"{ts} {self._c(Colors.BLUE, '[+]')} {self._room_name(payload.chatroom_name)} "
+                        f"{self._agent_name(name)} joined"
+                    )
+                case ChangelogEntryType.CHATROOM_CLEARED:
+                    self._print(
+                        f"{ts} {self._room_name(payload.chatroom_name)} "
+                        f"cleared by {payload.cleared_by_participant_id[:8]} "
+                        f"(archive: {payload.archive_filename or 'empty'})"
+                    )
                 case _:
-                    pass  # Ignore other entry types
+                    logger.debug(f"Unhandled changelog entry type: {entry.entry_type}")
         except Exception as e:
             logger.warning(f"Failed to format changelog entry: {e}")
+
+    async def on_sync_complete(
+        self,
+        project_id: str,
+        project_name: str,
+    ) -> None:
+        """Emit a one-line summary at the end of each sync batch."""
+        count = self._entry_counts.pop(project_id, 0)
+        sync_label = self._c(Colors.CYAN, "[Sync]")
+        name = self._c(Colors.BOLD, project_name)
+        self._print(f"{sync_label} {name} sync complete ({count} entries)")
 
     async def on_first_message(
         self,

@@ -2,13 +2,18 @@
 """
 clawmeets/runner/skill_manager.py
 
-Manages the skill-hub plugin directory for an agent.
+Manages the skill-hub directory for an agent.
+
 Downloads and caches SKILL.md files installed via the ClawMeets Skill Hub.
+Each LLM provider's ``_prepare_invocation`` runs ``materialize_skill_tree``
+to flatten ``skill-hub/skills/`` + ``personal-skill-hub/skills/`` into the
+CLI's native cwd skill-discovery path (Claude: ``.claude/skills/``;
+Codex + Gemini: ``.agents/skills/``), so each CLI's own auto-loader
+surfaces the skills — no prompt-side INDEX needed.
 """
 from __future__ import annotations
 
 import base64
-import json
 import logging
 import shutil
 from pathlib import Path
@@ -21,21 +26,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("clawmeets.runner")
 
-PLUGIN_JSON = {
-    "name": "skill-hub",
-    "version": "1.0.0",
-    "description": "Skills installed via ClawMeets Skill Hub",
-}
-
 
 class SkillManager:
     """
-    Manages a local skill-hub plugin directory for an agent.
+    Manages a local skill-hub directory for an agent.
 
-    Directory layout:
+    Directory layout::
+
         {agent_dir}/skill-hub/
-        ├── .claude-plugin/
-        │   └── plugin.json
         └── skills/
             ├── pdf/
             │   └── SKILL.md
@@ -45,18 +43,7 @@ class SkillManager:
 
     def __init__(self, agent_dir: Path) -> None:
         self.skill_hub_dir = agent_dir / "skill-hub"
-        self._ensure_plugin_structure()
-
-    def _ensure_plugin_structure(self) -> None:
-        """Create the skill-hub plugin directory structure if it doesn't exist."""
-        plugin_dir = self.skill_hub_dir / ".claude-plugin"
-        plugin_dir.mkdir(parents=True, exist_ok=True)
-        skills_dir = self.skill_hub_dir / "skills"
-        skills_dir.mkdir(parents=True, exist_ok=True)
-
-        plugin_json = plugin_dir / "plugin.json"
-        if not plugin_json.exists():
-            plugin_json.write_text(json.dumps(PLUGIN_JSON, indent=2))
+        (self.skill_hub_dir / "skills").mkdir(parents=True, exist_ok=True)
 
     async def sync_from_server(self, client: "ClawMeetsClient", agent_id: str) -> None:
         """Catch-up: fetch installed skills from server, download missing ones, remove extras."""
@@ -118,7 +105,7 @@ class SkillManager:
         )
 
     def uninstall_skill(self, skill_name: str) -> None:
-        """Remove a skill directory from the skill-hub plugin."""
+        """Remove a skill directory."""
         skill_dir = self.skill_hub_dir / "skills" / skill_name
         if skill_dir.exists():
             shutil.rmtree(skill_dir)
@@ -133,11 +120,6 @@ class SkillManager:
             d.name for d in skills_dir.iterdir()
             if d.is_dir() and (d / "SKILL.md").exists()
         )
-
-    @property
-    def plugin_dir(self) -> Path:
-        """Return the skill-hub plugin directory path for --plugin-dir."""
-        return self.skill_hub_dir
 
 
 def _decode_skill_files(files: dict[str, dict]) -> dict[str, bytes]:

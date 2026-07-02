@@ -1,0 +1,6 @@
+{
+  "audiences": ["assistant", "worker", "coordinator"],
+  "surfaces": ["agent_runtime"],
+  "version": "1.0.0",
+  "description": "Update an MCP server's per-agent runtime config (assistant on any owned peer; worker/coordinator on self)."
+}

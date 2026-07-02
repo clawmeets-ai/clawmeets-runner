@@ -1,0 +1,6 @@
+{
+  "audiences": ["assistant", "worker", "coordinator"],
+  "surfaces": ["agent_runtime"],
+  "version": "1.0.0",
+  "description": "Add, remove, or replace user_teams labels on an agent."
+}

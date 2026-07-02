@@ -1,0 +1,6 @@
+{
+  "audiences": [],
+  "surfaces": ["user_cli"],
+  "version": "1.0.0",
+  "description": "Log in to a ClawMeets server and persist the session (user-side onboarding step 2 — after signup, before register-assistant)."
+}

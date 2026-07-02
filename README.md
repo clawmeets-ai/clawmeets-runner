@@ -30,6 +30,10 @@ clawmeets agent run --agent-dir ~/.clawmeets/agents/researcher-<id>/
 
 Default server is `https://clawmeets.ai`. Override with `--server <url>` or `CLAWMEETS_SERVER_URL` env var.
 
+## Set up your `/today` page
+
+Once your agents are running, build a personal `/today` dashboard one tab at a time by asking your assistant in plain English. See [SAMPLE_TODAY.md](SAMPLE_TODAY.md) for nine copy-paste example asks.
+
 ## Commands
 
 | Command | Description |

@@ -6,8 +6,10 @@ Manages the MCP-hub directory for an agent.
 
 Mirrors SkillManager: caches manifests installed via the ClawMeets MCP Hub,
 owns the per-server runtime state directory (including OAuth tokens), and
-renders Claude Code's `.mcp.json` into a sandbox directory just before each
-LLM invocation.
+renders provider-specific MCP configs into a persistent `mcp-hub/dist/`
+directory whenever the installed set changes. Each LLM provider then
+symlinks its own format file into the per-invocation working dir — no
+per-invocation file I/O happens here.
 """
 from __future__ import annotations
 
@@ -33,28 +35,36 @@ class McpManager:
     Directory layout:
         {agent_dir}/mcp-hub/
         ├── manifests/
-        │   ├── gmail.json
-        │   └── google-calendar.json
-        └── servers/
-            ├── gmail/
-            │   └── token.json
-            └── google-calendar/
-                └── token.json
+        │   └── chess.json
+        ├── servers/
+        │   └── chess/
+        │       └── token.json        (if the MCP needs OAuth)
+        └── dist/                     (rendered configs, one per provider)
+            ├── .mcp.json                  (Claude format)
+            ├── .gemini/settings.json      (Gemini project-scope format)
+            └── .codex/config.toml         (Codex project-level format)
 
     The manifest (`launch` + `auth` spec) is cached per installed server. The
     `servers/{name}/` directory is where each server keeps its runtime state —
     OAuth tokens, caches, etc. Tokens never leave this directory.
+
+    The `dist/` directory is rewritten by ``render_dist()`` whenever
+    ``install_mcp`` / ``uninstall_mcp`` / ``sync_from_server`` mutate the
+    installed set, mirroring how ``SkillManager`` keeps ``skill-hub/skills/``
+    in sync with the server registry.
     """
 
     def __init__(self, agent_dir: Path) -> None:
         self.mcp_hub_dir = agent_dir / "mcp-hub"
         self.manifests_dir = self.mcp_hub_dir / "manifests"
         self.servers_dir = self.mcp_hub_dir / "servers"
+        self.dist_dir = self.mcp_hub_dir / "dist"
         self._ensure_structure()
 
     def _ensure_structure(self) -> None:
         self.manifests_dir.mkdir(parents=True, exist_ok=True)
         self.servers_dir.mkdir(parents=True, exist_ok=True)
+        self.dist_dir.mkdir(parents=True, exist_ok=True)
 
     # ---------- Sync / install / uninstall ----------
 
@@ -87,21 +97,30 @@ class McpManager:
             self.uninstall_mcp(mcp_name)
             logger.info(f"Removed uninstalled MCP: {mcp_name}")
 
+        # Re-render once after the full catch-up so a sync that touched
+        # nothing still produces an up-to-date dist (covers the case where
+        # placeholders depend on agent_dir and the dist was wiped).
+        self.render_dist()
+
     def install_mcp(self, mcp_name: str, manifest: dict) -> None:
-        """Cache an MCP manifest locally and ensure its server state directory exists."""
+        """Cache an MCP manifest locally, ensure its server state directory exists,
+        and refresh the per-provider rendered configs under ``dist/``."""
         manifest_path = self.manifests_dir / f"{mcp_name}.json"
         manifest_path.write_text(json.dumps(manifest, indent=2))
         (self.servers_dir / mcp_name).mkdir(parents=True, exist_ok=True)
+        self.render_dist()
         logger.info(f"Installed MCP: {mcp_name}")
 
     def uninstall_mcp(self, mcp_name: str) -> None:
-        """Remove both the cached manifest and the server state directory."""
+        """Remove both the cached manifest and the server state directory,
+        then refresh the rendered configs under ``dist/``."""
         manifest_path = self.manifests_dir / f"{mcp_name}.json"
         if manifest_path.exists():
             manifest_path.unlink()
         server_dir = self.servers_dir / mcp_name
         if server_dir.exists():
             shutil.rmtree(server_dir)
+        self.render_dist()
         logger.info(f"Uninstalled MCP: {mcp_name}")
 
     # ---------- Query ----------
@@ -142,22 +161,13 @@ class McpManager:
             return False
         return not self.has_token(mcp_name)
 
-    # ---------- .mcp.json rendering ----------
+    # ---------- Provider-config rendering ----------
 
-    def render_mcp_json(self, sandbox_dir: Path) -> None:
-        """Write {sandbox_dir}/.mcp.json from installed manifests.
-
-        Claude Code reads `.mcp.json` from its working directory on startup,
-        so each per-project sandbox gets its own copy. Servers that need
-        authentication but don't have a token yet are skipped with a warning
-        — listing them in .mcp.json would make Claude fail on launch.
-
-        If no MCP servers are usable, no file is written (and any stale file
-        is removed so Claude doesn't pick up outdated config).
-        """
-        sandbox_dir.mkdir(parents=True, exist_ok=True)
-        target = sandbox_dir / ".mcp.json"
-
+    def _resolved_servers(self) -> dict[str, dict]:
+        """Build the canonical ``{name: {command, args, env}}`` map after
+        placeholder substitution, with the same skip rules every provider
+        agrees on: skip when authentication is required but no token exists,
+        skip when the manifest carries no launch command."""
         servers: dict[str, dict] = {}
         for mcp_name in self.installed_mcps():
             manifest = self.get_manifest(mcp_name)
@@ -165,7 +175,7 @@ class McpManager:
                 continue
             if self.needs_auth(mcp_name):
                 logger.warning(
-                    f"Skipping MCP {mcp_name} in .mcp.json — token missing. "
+                    f"Skipping MCP {mcp_name} in rendered configs — token missing. "
                     f"Run: clawmeets mcp auth {mcp_name}"
                 )
                 continue
@@ -193,10 +203,64 @@ class McpManager:
                 "args": args,
                 "env": env,
             }
+        return servers
 
+    def render_dist(self) -> None:
+        """Re-render the three provider-format configs into ``dist/``.
+
+        Called by ``install_mcp`` / ``uninstall_mcp`` / ``sync_from_server``
+        so the dist stays in sync with the installed manifests. Each LLM
+        provider symlinks the relevant file into its per-invocation working
+        dir at spawn time.
+
+        When no MCP servers are usable, all three files are removed so a
+        stale config never survives an uninstall.
+        """
+        self.dist_dir.mkdir(parents=True, exist_ok=True)
+        gemini_dir = self.dist_dir / ".gemini"
+        codex_dir = self.dist_dir / ".codex"
+        gemini_dir.mkdir(parents=True, exist_ok=True)
+        codex_dir.mkdir(parents=True, exist_ok=True)
+
+        claude_target = self.dist_dir / ".mcp.json"
+        gemini_target = gemini_dir / "settings.json"
+        codex_target = codex_dir / "config.toml"
+
+        servers = self._resolved_servers()
         if not servers:
-            if target.exists():
-                target.unlink()
+            for target in (claude_target, gemini_target, codex_target):
+                if target.exists():
+                    target.unlink()
             return
 
-        target.write_text(json.dumps({"mcpServers": servers}, indent=2))
+        payload = {"mcpServers": servers}
+        claude_target.write_text(json.dumps(payload, indent=2))
+        gemini_target.write_text(json.dumps(payload, indent=2))
+        codex_target.write_text(_emit_codex_toml(servers))
+
+
+def _emit_codex_toml(servers: dict[str, dict]) -> str:
+    """Emit `[mcp_servers.<name>] command/args/env` TOML blocks for codex.
+
+    Strings are encoded via ``json.dumps`` — TOML basic-string escape rules
+    are a subset of JSON-string rules, so a JSON-encoded string is always a
+    valid TOML basic string. Arrays become bracketed comma-separated basic
+    strings. Env is an inline table of basic-string-to-basic-string entries.
+    """
+    lines: list[str] = []
+    for name in sorted(servers):
+        spec = servers[name]
+        lines.append(f"[mcp_servers.{json.dumps(name)}]")
+        lines.append(f"command = {json.dumps(spec['command'])}")
+        args_inner = ", ".join(json.dumps(a) for a in spec.get("args") or [])
+        lines.append(f"args = [{args_inner}]")
+        env = spec.get("env") or {}
+        if env:
+            env_inner = ", ".join(
+                f"{json.dumps(k)} = {json.dumps(v)}" for k, v in env.items()
+            )
+            lines.append("env = { " + env_inner + " }")
+        else:
+            lines.append("env = {}")
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"

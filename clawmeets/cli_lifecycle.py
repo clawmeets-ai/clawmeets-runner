@@ -82,30 +82,6 @@ def clear_user_token(data_dir: Path, username: str) -> Path:
     return path
 
 
-def add_agent_to_settings(data_dir: Path, username: str, agent_entry: dict) -> Path:
-    """Append (or update) an agent entry in the user's settings.json agents[].
-
-    Matches existing entries by name. Raises FileNotFoundError if the user
-    has no settings.json yet — callers should ensure the user is logged in.
-    """
-    path = get_user_config_path(data_dir, username)
-    if not path.exists():
-        raise FileNotFoundError(
-            f"No settings found for user '{username}'. Log in first with `clawmeets user login --save`."
-        )
-    config = json.loads(path.read_text())
-    agents = config.setdefault("agents", [])
-    name = agent_entry.get("name")
-    for i, existing in enumerate(agents):
-        if existing.get("name") == name:
-            agents[i] = agent_entry
-            break
-    else:
-        agents.append(agent_entry)
-    path.write_text(json.dumps(config, indent=2))
-    return path
-
-
 def load_user_config(data_dir: Path, username: str | None = None) -> tuple[dict, Path]:
     """Load a user's settings.json. Uses current_user if username not specified."""
     if username is None:
@@ -115,9 +91,17 @@ def load_user_config(data_dir: Path, username: str | None = None) -> tuple[dict,
         if path.exists():
             return json.loads(path.read_text()), path
     if username:
-        typer.echo(f"Error: No config for user '{username}'. Run `clawmeets init` first.", err=True)
+        typer.echo(
+            f"Error: No config for user '{username}'. "
+            f"Run `clawmeets user login {username} <password> --save` first.",
+            err=True,
+        )
     else:
-        typer.echo("Error: No user configured. Run `clawmeets init` first.", err=True)
+        typer.echo(
+            "Error: No user configured. "
+            "Run `clawmeets user login <username> <password> --save` first.",
+            err=True,
+        )
     raise typer.Exit(1)
 
 
@@ -239,9 +223,8 @@ def _stop_pid(pid_file: Path, label: str) -> bool:
     return True
 
 
-def _get_agents_dir(config: dict) -> Path:
-    data_dir = config.get("data_dir", DEFAULT_DATA_DIR)
-    return Path(data_dir).expanduser() / "agents"
+def _get_agents_dir() -> Path:
+    return Path(DEFAULT_DATA_DIR).expanduser() / "agents"
 
 
 def _prefixed_name(username: str, agent_name: str) -> str:
@@ -260,20 +243,86 @@ def _find_agent_dir(agents_dir: Path, prefixed_name: str) -> Path | None:
     return None
 
 
-def _build_agent_list(config: dict) -> list[str]:
-    """Build the list of agent names (prefixed) from config."""
-    username = config.get("user", {}).get("username") or config.get("name", "")
-    agents = []
-    for agent_def in config.get("agents", []):
-        name = agent_def.get("name", "")
-        if name and username:
-            agents.append(_prefixed_name(username, name))
-        elif name:
-            agents.append(name)
-    # Add assistant
-    if username:
-        agents.append(f"{username}-assistant")
-    return agents
+def _list_owned_agent_short_names(agents_dir: Path, username: str) -> list[str]:
+    """Return owned agents' short names by globbing the filesystem.
+
+    Pattern: ``{agents_dir}/{username}-{short}-{id}/`` with ``credential.json``
+    present. Skips ``DELETED-*`` (renamed by self-destruct) and any dir
+    without a ``credential.json`` (half-registered). The trailing ``-{id}``
+    is stripped off the right.
+    """
+    if not agents_dir.exists():
+        return []
+    prefix = f"{username}-"
+    names: list[str] = []
+    for entry in sorted(agents_dir.iterdir()):
+        if not entry.is_dir() or entry.name.startswith("DELETED-"):
+            continue
+        if not entry.name.startswith(prefix):
+            continue
+        if not (entry / "credential.json").exists():
+            continue
+        rest = entry.name[len(prefix):]
+        short = rest.rsplit("-", 1)[0] if "-" in rest else rest
+        if short:
+            names.append(short)
+    return names
+
+
+def _build_agent_list(agents_dir: Path, username: str) -> list[str]:
+    """Build the list of agent prefixed-names by globbing ``agents_dir``.
+
+    The assistant short-name ``assistant`` is included in the filesystem
+    enumeration if its dir is present; no separate auto-append needed.
+    """
+    if not username:
+        return []
+    return [_prefixed_name(username, n) for n in _list_owned_agent_short_names(agents_dir, username)]
+
+
+def _filter_requested(
+    agent_names: list[str], requested: list[str] | None, username: str
+) -> list[str]:
+    """Keep only the owned ``agent_names`` that match the ``--agent`` filter.
+
+    Shared by ``start`` / ``stop`` / ``status`` so the three commands target a
+    name identically: each ``requested`` entry may be the short name
+    ('researcher') or the prefixed form ('chengtao-researcher'); both match.
+    An empty or ``None`` filter returns ``agent_names`` unchanged (the legacy
+    all-agents behavior). A non-empty filter that matches nothing is a clean
+    error (echo + ``Exit(1)``), never a partial action. Pure — no FS/process I/O.
+    """
+    cleaned = {a.strip() for a in (requested or []) if a and a.strip()}
+    if not cleaned:
+        return agent_names
+    prefixed = {_prefixed_name(username, a) if username else a for a in cleaned}
+    matched = [n for n in agent_names if n in prefixed or n in cleaned]
+    if not matched:
+        typer.echo(
+            f"Error: --agent filter matched no agents. Requested: {sorted(cleaned)}",
+            err=True,
+        )
+        raise typer.Exit(1)
+    return matched
+
+
+def _is_self(agent_dir: Path) -> bool:
+    """True iff ``agent_dir`` is THIS runner's own agent dir.
+
+    Compares against ``$CLAWMEETS_AGENT_DIR``, which is injected only inside a
+    runner's LLM subprocess. Returns False when the env var is unset — a plain
+    user-terminal ``clawmeets stop`` is never self-guarded and keeps its
+    all-agents behavior. This is the hard CLI backstop behind the soft skill
+    refusal: even if the skill's wording is bypassed, an in-runner stop will
+    not kill the controlling runner.
+    """
+    self_dir = os.environ.get("CLAWMEETS_AGENT_DIR")
+    if not self_dir:
+        return False
+    try:
+        return agent_dir.resolve() == Path(self_dir).resolve()
+    except OSError:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -285,15 +334,24 @@ def start_command(
     server: Optional[str] = typer.Option(None, "--server", "-s", help="Server URL (overrides config)"),
     config_file: Optional[Path] = typer.Option(None, "--config", "-c", help="Path to settings.json"),
     user: Optional[str] = typer.Option(None, "--user", "-u", help="Username (overrides current_user)"),
+    agent: list[str] = typer.Option(
+        None, "--agent", "-a",
+        help="Start only the given agent(s); repeatable. Accepts either the short "
+             "name as it appears in settings.json (e.g. 'sf-real-estate-analyst') "
+             "or the prefixed form ('chengtao-sf-real-estate-analyst'). When "
+             "omitted, starts every agent in settings.json plus the assistant.",
+    ),
 ) -> None:
-    """Start all agents in the background.
+    """Start agents in the background.
 
     Reads agent configuration from the current user's settings.json and starts
-    each agent as a background process.
+    each agent as a background process. Pass ``--agent`` (repeatable) to start
+    a specific subset; otherwise starts everything.
 
     Example:
         clawmeets start
         clawmeets start --user alice
+        clawmeets start --agent sf-real-estate-analyst --agent cpa-tax
         clawmeets start --server https://my-server.com
     """
     if config_file:
@@ -306,34 +364,19 @@ def start_command(
         config, config_path = load_user_config(Path(DEFAULT_DATA_DIR), user)
 
     server_url = server or config.get("server_url", DEFAULT_SERVER)
-    agents_dir = _get_agents_dir(config)
+    agents_dir = _get_agents_dir()
+    username = config.get("user", {}).get("username") or config.get("name", "")
 
-    agent_names = _build_agent_list(config)
+    agent_names = _build_agent_list(agents_dir, username)
 
     if not agent_names:
-        typer.echo("No agents found in config.")
+        typer.echo(f"No agents found under {agents_dir}.")
         return
 
-    # Read plugin config
-    claude_plugin_dir = config.get("claude_plugin_dir", "")
-
-    # Resolve relative paths from config directory
-    if claude_plugin_dir and not claude_plugin_dir.startswith("/"):
-        resolved = (config_path.parent / claude_plugin_dir).resolve()
-        if resolved.exists():
-            claude_plugin_dir = str(resolved)
+    # Same matching rule as `stop`/`status` (short or prefixed name).
+    agent_names = _filter_requested(agent_names, agent, username)
 
     typer.echo("=== Start Agents ===\n")
-
-    # Map prefixed name -> short name for settings.json self-destruct cleanup.
-    # Assistants are not in settings.json agents[], so they won't appear here.
-    username = config.get("user", {}).get("username") or config.get("name", "")
-    short_name_by_prefixed: dict[str, str] = {}
-    if username:
-        for agent_def in config.get("agents", []):
-            short = agent_def.get("name")
-            if short:
-                short_name_by_prefixed[_prefixed_name(username, short)] = short
 
     started = 0
     for name in agent_names:
@@ -365,20 +408,11 @@ def start_command(
 
         if knowledge_dir:
             cmd.extend(["--knowledge-dir", knowledge_dir])
-        if claude_plugin_dir:
-            cmd.extend(["--claude-plugin-dir", claude_plugin_dir])
 
         # Always pass --user-config so the runner can resolve relative
         # knowledge_dir strings against ~/.clawmeets/config/<username>/ —
         # the same base cli_init.py used when it wrote CLAUDE.md.
         cmd.extend(["--user-config", str(config_path)])
-
-        # --settings-name is only set for agents that appear in
-        # settings.json[agents]; it scopes self-destruct cleanup to that
-        # entry. Assistants aren't in agents[] so this stays unset for them.
-        settings_short_name = short_name_by_prefixed.get(name)
-        if settings_short_name:
-            cmd.extend(["--settings-name", settings_short_name])
 
         stdout_log = agent_dir / "stdout.log"
         stderr_log = agent_dir / "stderr.log"
@@ -411,34 +445,58 @@ def start_command(
 def stop_command(
     config_file: Optional[Path] = typer.Option(None, "--config", "-c", help="Path to settings.json"),
     user: Optional[str] = typer.Option(None, "--user", "-u", help="Username (overrides current_user)"),
+    agent: list[str] = typer.Option(
+        None, "--agent", "-a",
+        help="Stop only the given agent(s); repeatable. Accepts the short name "
+             "or the prefixed form, exactly like `start --agent`. When omitted, "
+             "stops every agent for the user (legacy behavior).",
+    ),
 ) -> None:
-    """Stop all running agents.
+    """Stop running agents.
+
+    With ``--agent`` (repeatable) stops only the named subset, reusing the same
+    graceful SIGTERM -> 5s -> SIGKILL escalation and stale-pidfile cleanup as
+    the all-agents path (``_stop_pid``). Without it, preserves the legacy
+    stop-everything behavior.
 
     Example:
         clawmeets stop
         clawmeets stop --user alice
+        clawmeets stop --agent budget-analyst
     """
     if config_file:
         config = json.loads(config_file.read_text())
     else:
         config, _ = load_user_config(Path(DEFAULT_DATA_DIR), user)
 
-    agents_dir = _get_agents_dir(config)
-    agent_names = _build_agent_list(config)
+    agents_dir = _get_agents_dir()
+    username = config.get("user", {}).get("username") or config.get("name", "")
+    agent_names = _build_agent_list(agents_dir, username)
+    agent_names = _filter_requested(agent_names, agent, username)
 
     typer.echo("=== Stop Agents ===\n")
 
     stopped = 0
+    skipped_self = False
     for name in agent_names:
         agent_dir = _find_agent_dir(agents_dir, name)
         if not agent_dir:
+            continue
+        # Hard self-stop backstop: never let an in-runner stop kill the
+        # controlling runner (only fires when $CLAWMEETS_AGENT_DIR is set).
+        if _is_self(agent_dir):
+            typer.echo(
+                f"  Refusing to stop '{name}' — it is the controlling runner; "
+                f"an agent cannot stop itself."
+            )
+            skipped_self = True
             continue
         pid_file = agent_dir / "agent.pid"
         if _stop_pid(pid_file, f"agent '{name}'"):
             stopped += 1
 
     if stopped == 0:
-        typer.echo("  No agents were running.")
+        typer.echo("  No agents stopped." if skipped_self else "  No agents were running.")
     else:
         typer.echo(f"\n{stopped} agent(s) stopped.")
 
@@ -451,12 +509,22 @@ def stop_command(
 def status_command(
     config_file: Optional[Path] = typer.Option(None, "--config", "-c", help="Path to settings.json"),
     user: Optional[str] = typer.Option(None, "--user", "-u", help="Username (overrides current_user)"),
+    agent: list[str] = typer.Option(
+        None, "--agent", "-a",
+        help="Show status for only the given agent(s); repeatable. Same name "
+             "matching as `start`/`stop --agent`.",
+    ),
 ) -> None:
-    """Show status of all agents.
+    """Show status of agents.
+
+    Each row is PID-verified via ``_read_pid`` (``_pid_is_alive``), so a crash
+    that left a stale pidfile reads as ``dead (stale PID)`` rather than running.
+    With ``--agent`` (repeatable) restricts the rows to the named subset.
 
     Example:
         clawmeets status
         clawmeets status --user alice
+        clawmeets status --agent budget-analyst
     """
     if config_file:
         config = json.loads(config_file.read_text())
@@ -464,8 +532,10 @@ def status_command(
     else:
         config, config_path = load_user_config(Path(DEFAULT_DATA_DIR), user)
 
-    agents_dir = _get_agents_dir(config)
-    agent_names = _build_agent_list(config)
+    agents_dir = _get_agents_dir()
+    username = config.get("user", {}).get("username") or config.get("name", "")
+    agent_names = _build_agent_list(agents_dir, username)
+    agent_names = _filter_requested(agent_names, agent, username)
     server_url = config.get("server_url", DEFAULT_SERVER)
 
     typer.echo("=== Agent Status ===\n")

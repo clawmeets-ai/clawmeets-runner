@@ -1,0 +1,6 @@
+{
+  "audiences": ["assistant"],
+  "surfaces": ["agent_runtime"],
+  "version": "1.0.0",
+  "description": "Assistant-only: judge whether a DM ask warrants a multi-agent project, propose one (reuse + register-new + bootstrap), and on approval shell agent register + project create."
+}

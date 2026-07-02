@@ -39,6 +39,7 @@ from clawmeets.sync.changelog import (
     ChangelogEntry,
     ChangelogEntryType,
     ChatroomClearedPayload,
+    ProjectAllowlistUpdatedPayload,
     ProjectCreatedPayload,
     MessagePayload,
     FilePayload,
@@ -48,9 +49,9 @@ from clawmeets.sync.changelog import (
 )
 from clawmeets.sync.subscriber import ChangelogSubscriber
 from clawmeets.utils.file_io import FileUtil
-from clawmeets.models.project import Project, ProjectState
-from clawmeets.models.chatroom import Chatroom, ChatroomState
-from clawmeets.models.chat_message import ChatBatchTimeoutEvent, ChatFileEvent, ChatMessage
+from .project import Project, ProjectState
+from .chatroom import Chatroom, ChatroomState
+from .chat_message import ChatBatchTimeoutEvent, ChatFileEvent, ChatMessage
 
 from clawmeets.api.action_executor import ActionBlockExecutor
 from clawmeets.api.client import ClawMeetsClient
@@ -92,6 +93,7 @@ class ModelContext:
         client: Optional["ClawMeetsClient"] = None,
         claude_plugin_dirs: Optional[list[Path]] = None,
         dwh_dir: Optional[Path] = None,
+        git_url: Optional[str] = None,
     ) -> None:
         """Initialize context with a single base directory.
 
@@ -107,9 +109,10 @@ class ModelContext:
         - claude_plugin_dirs: Claude plugin directories for skill access.
             Used only by ClaudeCLI; other providers ignore this field.
 
-        Git configuration (git_url, git_ignored_folder) is now per-project,
-        stored in the PROJECT_CREATED changelog payload and read by
-        GitSandboxSubscriber at runtime.
+        Git configuration (git_url) is per-AGENT, set in card.json
+        local_settings and surfaced to the LLM via $CLAWMEETS_AGENT_GIT_URL.
+        The git-workflow skill — not the runner — drives clone/branch/commit/push.
+        This field is rendered as a one-line binding nudge in the agent prompt.
 
         Args:
             base_dir: Base directory for all data
@@ -128,6 +131,7 @@ class ModelContext:
         self._notification_center = notification_center
         self._invocation_registry: Optional["InvocationRegistry"] = None
         self._dwh_dir = dwh_dir
+        self._git_url = git_url or None
 
     @property
     def cli(self) -> Optional["LLMProvider"]:
@@ -156,6 +160,17 @@ class ModelContext:
     def update_dwh_dir(self, dwh_dir: Optional[Path]) -> None:
         """Replace the dwh_dir. Takes effect on the next LLM invocation."""
         self._dwh_dir = dwh_dir
+
+    @property
+    def git_url(self) -> Optional[str]:
+        """Git repo this agent is bound to (None if not configured). Surfaced
+        in the prompt; the actual clone/branch/commit/push is run by the
+        git-workflow skill via $CLAWMEETS_AGENT_GIT_URL."""
+        return self._git_url
+
+    def update_git_url(self, git_url: Optional[str]) -> None:
+        """Replace the bound git_url. Takes effect on the next LLM invocation."""
+        self._git_url = git_url or None
 
     @property
     def claude_plugin_dirs(self) -> list[Path]:
@@ -251,6 +266,37 @@ class ModelContext:
         return self._base_dir / "mcp-hub" / "configs"
 
     @property
+    def mcp_dist_dir(self) -> Path:
+        """Per-provider MCP configs rendered by `McpManager.render_dist` on
+        MCP_SYNC. The runner passes this to `cli.invoke(mcp_config_dir=...)`
+        so each provider symlinks the relevant per-format file
+        (`.mcp.json` / `.gemini/settings.json` / `.codex/config.toml`) into
+        the per-invocation working dir. Runner-only path."""
+        return self._base_dir / "mcp-hub" / "dist"
+
+    def skill_source_dirs(self, role: Optional[str] = None) -> list[Path]:
+        """Skill source-of-truth dirs in scan order, passed to
+        `cli.invoke(skill_source_dirs=...)`. Each provider's
+        `_prepare_invocation` flattens these into the CLI's native
+        cwd skill-discovery path (`.claude/skills` for Claude,
+        `.agents/skills` for Codex + Gemini).
+
+        Order matters: `materialize_skill_tree` lets later sources win
+        on name collisions. With `role` set, the per-audience
+        ``system-skill-hub/skills-<role>/`` tree is prepended as the
+        BASE layer so a user-installed (skill-hub) or agent-authored
+        (personal-skill-hub) skill of the same name overrides it.
+        Runner-only path."""
+        dirs: list[Path] = []
+        if role is not None:
+            dirs.append(self._base_dir / "system-skill-hub" / f"skills-{role}")
+        dirs.extend([
+            self._base_dir / "skill-hub" / "skills",
+            self._base_dir / "personal-skill-hub" / "skills",
+        ])
+        return dirs
+
+    @property
     def skill_configs_dir(self) -> Path:
         """Per-skill runtime config files at `skill-hub/configs/<name>.json`,
         sibling of the synced `skill-hub/skills/`. Runner-only path. The
@@ -291,7 +337,7 @@ class ModelContext:
         skill's per-agent config file explicitly. The LLM is instructed
         to Read these files before invoking a skill so operator-set
         per-skill policy (e.g. `invoke_when`, `providers.<n>.use_for`
-        for clawmeets-consult) actually influences routing decisions.
+        for the consult skill) actually influences routing decisions.
 
         Skills without a sibling config file are still included — the
         path is emitted so the LLM knows where to look, and the
@@ -426,6 +472,7 @@ class ModelContextChangelogSubscriber(ChangelogSubscriber):
     - BATCH_TIMEOUT → ChatroomState.append_batch_timeout()
     - PROJECT_COMPLETED → ProjectState.complete()
     - PROJECT_REACTIVATED → ProjectState.reactivate()
+    - PROJECT_ALLOWLIST_UPDATED → ProjectState.apply_allowlist_update()
 
     ## Priority
 
@@ -506,6 +553,9 @@ class ModelContextChangelogSubscriber(ChangelogSubscriber):
             case ChangelogEntryType.CHATROOM_CLEARED:
                 await self._handle_chatroom_cleared(entry)
 
+            case ChangelogEntryType.PROJECT_ALLOWLIST_UPDATED:
+                await self._handle_project_allowlist_updated(entry)
+
             case ChangelogEntryType.BATCH_COMPLETE:
                 pass  # Existing reply-window logic in the chip already covers it
 
@@ -530,10 +580,6 @@ class ModelContextChangelogSubscriber(ChangelogSubscriber):
             agent_pool=getattr(payload, "agent_pool", "verified"),
             agent_teams=getattr(payload, "agent_teams", []) or [],
             agent_names=getattr(payload, "agent_names", []) or [],
-            git_url=getattr(payload, "git_url", ""),
-            git_ignored_folder=getattr(payload, "git_ignored_folder", ".bus-files"),
-            requester_id=getattr(payload, "requester_id", None),
-            requester_kind=getattr(payload, "requester_kind", None),
             surface=getattr(payload, "surface", "regular"),
         )
 
@@ -631,8 +677,14 @@ class ModelContextChangelogSubscriber(ChangelogSubscriber):
         payload: MessagePayload = entry.payload  # type: ignore[assignment]
         chatroom_name = payload.chatroom_name
 
-        # Load chatroom and append message via internal model
+        # Load chatroom and append message via internal model. The changelog is
+        # the source of truth — a MESSAGE for a room with no prior ROOM_CREATED
+        # is a corruption signal, so fail loudly.
         chatroom = Chatroom.get(self._project_id, chatroom_name, self._model_ctx)
+        if chatroom is None:
+            raise ValueError(
+                f"Chatroom {chatroom_name} not found in project {self._project_id}"
+            )
         chat_message = ChatMessage.from_message_payload(
             payload,
             version=entry.version,
@@ -649,8 +701,13 @@ class ModelContextChangelogSubscriber(ChangelogSubscriber):
         payload: FilePayload = entry.payload  # type: ignore[assignment]
         chatroom_name = payload.chatroom_name
 
-        # Load chatroom and write file via internal model
+        # Load chatroom and write file via internal model. Same corruption
+        # signal as _handle_message: FILE_* without prior ROOM_CREATED.
         chatroom = Chatroom.get(self._project_id, chatroom_name, self._model_ctx)
+        if chatroom is None:
+            raise ValueError(
+                f"Chatroom {chatroom_name} not found in project {self._project_id}"
+            )
         content = FileUtil.from_base64(payload.content_b64)
         chatroom.state().write_file(payload.filename, content)
 
@@ -721,6 +778,21 @@ class ModelContextChangelogSubscriber(ChangelogSubscriber):
         project = Project.get(self._project_id, self._model_ctx)
         project.state().reactivate()
 
+    async def _handle_project_allowlist_updated(self, entry: ChangelogEntry) -> None:
+        """Replay an allowlist snapshot refresh into project meta.json."""
+        payload: ProjectAllowlistUpdatedPayload = entry.payload  # type: ignore[assignment]
+        project = Project.get(self._project_id, self._model_ctx)
+        if project is None:
+            logger.warning(
+                f"PROJECT_ALLOWLIST_UPDATED: project {self._project_id[:8]} not found; "
+                "skipping (likely a stale entry replayed before the project meta is on disk)"
+            )
+            return
+        project.state().apply_allowlist_update(
+            agent_names=payload.agent_names,
+            agent_teams=payload.agent_teams,
+        )
+
     async def _handle_chatroom_cleared(self, entry: ChangelogEntry) -> None:
         """Wipe CHATS.ndjson and archive prior contents to .bak sibling.
 
@@ -733,9 +805,8 @@ class ModelContextChangelogSubscriber(ChangelogSubscriber):
             entry: The CHATROOM_CLEARED changelog entry
         """
         payload: ChatroomClearedPayload = entry.payload  # type: ignore[assignment]
-        try:
-            chatroom = Chatroom.get(self._project_id, payload.chatroom_name, self._model_ctx)
-        except (FileNotFoundError, ValueError):
+        chatroom = Chatroom.get(self._project_id, payload.chatroom_name, self._model_ctx)
+        if chatroom is None:
             logger.warning(
                 f"CHATROOM_CLEARED: chatroom {payload.chatroom_name!r} not found "
                 f"in project {self._project_id[:8]}; skipping"

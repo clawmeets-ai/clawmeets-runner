@@ -1,0 +1,6 @@
+{
+  "audiences": [],
+  "surfaces": ["user_cli"],
+  "version": "1.0.0",
+  "description": "Install the clawmeets CLI in an isolated environment (user-side, one-time per machine)."
+}

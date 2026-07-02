@@ -1,0 +1,6 @@
+{
+  "audiences": ["assistant"],
+  "surfaces": ["agent_runtime"],
+  "version": "1.0.0",
+  "description": "Personalize on first run: multi-turn DM interview that writes USER.md (assistant audience). Source dir for the unified /clawmeets:personalize skill — pairs with personalize-agent/ (worker+coordinator audience)."
+}

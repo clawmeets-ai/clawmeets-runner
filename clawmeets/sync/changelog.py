@@ -36,6 +36,7 @@ class ChangelogEntryType(str, Enum):
     BATCH_TIMEOUT = "batch_timeout"    # Some agents didn't respond in time
     PARTICIPANT_ADDED = "participant_added"  # Participant added to existing room
     CHATROOM_CLEARED = "chatroom_cleared"    # All messages in a chatroom wiped by user
+    PROJECT_ALLOWLIST_UPDATED = "project_allowlist_updated"  # Snapshot of agent_names/agent_teams refreshed
 
 
 class ProjectStatus(str, Enum):
@@ -182,6 +183,17 @@ class ChatroomClearedPayload(ChatroomPayload):
     archive_filename: str | None = None  # None when room was already empty
 
 
+class ProjectAllowlistUpdatedPayload(BaseModel):
+    """Payload for PROJECT_ALLOWLIST_UPDATED entries.
+
+    Project-level entry — refreshes ``Project.agent_names`` / ``Project.agent_teams``.
+    Fanned out by ``PUT /agents/{id}`` when the coordinator's Front Desk
+    invitable list changes so existing FD projects pick up the edit.
+    """
+    agent_names: list[str] = Field(default_factory=list)
+    agent_teams: list[str] = Field(default_factory=list)
+
+
 class ProjectCreatedPayload(BaseModel):
     """Payload for PROJECT_CREATED entries in unified changelog.
 
@@ -193,14 +205,10 @@ class ProjectCreatedPayload(BaseModel):
     coordinator_name: str  # Name of coordinator (required - avoids lookup on workers)
     request: str
     created_by: str  # user_id of creator (required - derived from auth)
-    agent_pool: str = "verified"  # "owned", "verified", or "all"
+    agent_pool: str = "verified"  # "self", "owned", "verified", or "all". "self" = coordinator only (used by own-DM).
     agent_teams: list[str] = Field(default_factory=list)  # Hard allowlist by user_team; pairs with agent_names. Empty teams + empty names = no filter.
     agent_names: list[str] = Field(default_factory=list)  # Hard allowlist by agent display name (id, full name, or owner-relative short name); pairs with agent_teams. OR semantics across both lists.
-    git_url: str = ""  # Git repo URL (empty = no git)
-    git_ignored_folder: str = ".bus-files"  # Folder for non-git deliverables
-    requester_id: str | None = None  # External user OR agent who initiated a Front Desk project; equal to created_by when internal-user
-    requester_kind: str | None = None  # "user" | "agent" — None for non-FD projects. Discriminator for resolving requester_id polymorphically.
-    surface: str = "regular"  # "regular" | "dm" | "front_desk" — explicit project shape; replaces name-pattern predicates
+    surface: str = "regular"  # "regular" | "dm" — explicit project shape
 
 
 # Union type for changelog payloads
@@ -216,6 +224,7 @@ ChangelogPayload = Union[
     BatchTimeoutPayload,
     ParticipantAddedPayload,
     ChatroomClearedPayload,
+    ProjectAllowlistUpdatedPayload,
 ]
 
 
@@ -289,6 +298,7 @@ class ChangelogEntry(BaseModel):
                 "batch_timeout": BatchTimeoutPayload,
                 "participant_added": ParticipantAddedPayload,
                 "chatroom_cleared": ChatroomClearedPayload,
+                "project_allowlist_updated": ProjectAllowlistUpdatedPayload,
             }
 
             payload_cls = payload_types.get(entry_type)
@@ -314,6 +324,7 @@ class ChangelogEntry(BaseModel):
             ChangelogEntryType.BATCH_TIMEOUT: BatchTimeoutPayload,
             ChangelogEntryType.PARTICIPANT_ADDED: ParticipantAddedPayload,
             ChangelogEntryType.CHATROOM_CLEARED: ChatroomClearedPayload,
+            ChangelogEntryType.PROJECT_ALLOWLIST_UPDATED: ProjectAllowlistUpdatedPayload,
         }
         expected = expected_types[self.entry_type]
         if not isinstance(self.payload, expected):

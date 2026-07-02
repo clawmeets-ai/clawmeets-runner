@@ -14,19 +14,28 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 import httpx
 
-from clawmeets.api.control import AgentRegistryChangePayload, AgentSettingsChangePayload, AgentStatusChangePayload, CancelLLMPayload, ChangelogUpdatePayload, ControlMessageType, KnowledgePackSyncPayload, McpAuthCodePayload, McpSyncPayload, ProjectDeletedPayload, SkillSyncPayload
+from clawmeets.api.control import AgentRegistryChangePayload, AgentSettingsChangePayload, AgentStatusChangePayload, CancelLLMPayload, ChangelogUpdatePayload, ControlMessageType, KnowledgePackSyncPayload, McpAuthCodePayload, McpSyncPayload, ProjectDeletedPayload, SkillAuthCodePayload, SkillSyncPayload
 from clawmeets.models.agent import Agent
 from clawmeets.models.context import ModelContext
+from clawmeets.runner.references_index import build_references_index
 from clawmeets.sync.changelog import ChangelogEntry
-from clawmeets.sync.git_sandbox import GitSandboxSubscriber
 from clawmeets.sync.runloop_manager import ChangelogRunloopManager
 from clawmeets.sync.subscriber import ChangelogSubscriber
 from clawmeets.utils.file_io import FileUtil
-from clawmeets.utils.knowledge_dir import resolve_local_knowledge_dir, resolve_local_dwh_dir
-from clawmeets.utils.notification_center import LLM_COMPLETE
+from clawmeets.utils.notification_center import LLM_COMPLETE, LLM_ERROR
 
 from .invocation_registry import InvocationRegistry
 from .participant_notifier import ParticipantNotifier
+
+# Skills with auth blocks shell different top-level Typer apps than their
+# skill name. Used only for the fallback hint surfaced when relay OAuth
+# fails — the actual token write lands at the per-skill state dir regardless.
+_SKILL_TO_CLI_NAME = {
+    "google-calendar": "gcal",
+    "google-drive": "gdrive",
+    "google-drive-write": "gdrive-write",
+    "gmail": "gmail",
+}
 
 if TYPE_CHECKING:
     from clawmeets.api.client import ClawMeetsClient
@@ -65,7 +74,9 @@ class ReactiveControlLoop:
         mcp_manager: "McpManager | None" = None,
         knowledge_pack_manager: "KnowledgePackManager | None" = None,
         user_config_dir: Optional[Path] = None,
-        cli_factory: Optional[Callable[[str, Optional[str]], "LLMProvider"]] = None,
+        cli_factory: Optional[Callable[[dict], "LLMProvider"]] = None,
+        owner_username: Optional[str] = None,
+        agent_env: Optional[dict] = None,
     ) -> None:
         """
         Initialize the reactive control loop.
@@ -80,8 +91,16 @@ class ReactiveControlLoop:
             user_config_dir: Base for resolving relative knowledge_dir values from
                              local_settings (usually ~/.clawmeets/config/<username>/).
                              Hot-update applies this base on AGENT_SETTINGS_CHANGE.
+            owner_username: This runner's owner username, known at startup from
+                            credential.json. Used to derive the AGENTS.md roster
+                            namespace WITHOUT depending on ``participant.name`` —
+                            which resolves from a synced peer-card that doesn't
+                            exist on the first cold-start sync (so it would be
+                            empty, silently dropping the owner's private crew from
+                            the roster). See ``_owner_username``.
         """
         self._participant = participant
+        self._owner_username_hint = owner_username
         self._client = client
         self._model_ctx = model_ctx
         self._extra_subscribers = extra_subscribers
@@ -90,6 +109,10 @@ class ReactiveControlLoop:
         self._knowledge_pack_manager = knowledge_pack_manager
         self._user_config_dir = user_config_dir
         self._cli_factory = cli_factory
+        # Shared with cli_factory's closure: mutating the git keys here updates
+        # the env the next-built CLI captures (CLI providers copy agent_env at
+        # construction, so a git_url change must rebuild the CLI to take effect).
+        self._agent_env = agent_env if agent_env is not None else {}
 
         # Background auto-OAuth tasks for MCP installs. Tracked in a set so
         # asyncio doesn't GC them mid-run; the by-name dict lets uninstall
@@ -110,6 +133,15 @@ class ReactiveControlLoop:
         # the auto-auth task is awaiting it. The Future is keyed by the
         # one-shot state token the runner minted in build_authorization_url.
         self._mcp_auth_waiters: dict[str, asyncio.Future[str]] = {}
+        # Skill-rail sibling of ``_mcp_auth_waiters``. Same shape; same
+        # one-shot state-token keys. SKILL_SYNC install with an ``auth`` block
+        # spawns into the skill rail; the two are independent so a MCP +
+        # skill consent can overlap without colliding.
+        self._skill_auth_waiters: dict[str, asyncio.Future[str]] = {}
+        # Dedup state for skill auto-auth tasks (mirrors MCP rail).
+        self._auto_auth_skill_tasks: set[asyncio.Task] = set()
+        self._auto_auth_skill_in_flight: set[str] = set()
+        self._auto_auth_skill_tasks_by_name: dict[str, asyncio.Task] = {}
 
         # Per-runner registry of in-flight LLM tasks, keyed by (project_id, room).
         # Surfaced through ModelContext so participants can register their own
@@ -120,23 +152,30 @@ class ReactiveControlLoop:
         # Create shared notifier (one per participant, shared across projects)
         self._notifier = ParticipantNotifier(participant=self._participant)
 
-        # Build runloop factory that assembles per-project subscribers
+        # Persist every successful invocation's usage to the owning project's
+        # metadata/projects/{name}-{id}/cost.ndjson (one runner-level subscriber;
+        # self-routes by sandbox_dir). Closes the documented cost.json gap and
+        # enables project-level cost/token aggregation across all agents.
+        from clawmeets.runner.cost_recorder import CostRecorder
+
+        self._cost_recorder = CostRecorder(self._model_ctx.metadata_dir)
+        self._model_ctx.notification_center.subscribe(
+            LLM_COMPLETE, self._cost_recorder.on_llm_complete,
+        )
+        # Also record the partial cost a FAILED invocation burned (LLM_ERROR
+        # carries optional usage from the in-process provider) — otherwise a turn
+        # that errors after many steps shows $0 and hides real spend.
+        self._model_ctx.notification_center.subscribe(
+            LLM_ERROR, self._cost_recorder.on_llm_error,
+        )
+
+        # Build runloop factory that assembles per-project subscribers.
+        # Git is no longer driven from the runloop — repo-bound agents run the
+        # git-workflow skill themselves (see CLAWMEETS_AGENT_GIT_URL injection).
         def _make_runloop(pid: str, pname: str, coordinator_id: str):
             subs: list[ChangelogSubscriber] = [
                 model_ctx.changelog_subscriber(pid, pname),
             ]
-            # Always register GitSandboxSubscriber — it reads git_url
-            # from the PROJECT_CREATED payload and no-ops if empty.
-            git_sub = GitSandboxSubscriber(
-                sandbox_dir=model_ctx.sandbox_dir(pid, pname),
-                coordinator_id=coordinator_id,
-                participant_id=participant.id,
-                project_dir=model_ctx.project_dir(pid, pname),
-            )
-            model_ctx.notification_center.subscribe(
-                LLM_COMPLETE, git_sub._on_llm_complete,
-            )
-            subs.append(git_sub)
             subs.extend(extra_subscribers)
             subs.append(self._notifier)
             return model_ctx.changelog_dir(pid, pname), subs
@@ -149,6 +188,20 @@ class ReactiveControlLoop:
     # ─────────────────────────────────────────────────────────
     # Lifecycle
     # ─────────────────────────────────────────────────────────
+
+    def _owner_username(self) -> str:
+        """Resolve this runner's owner username for the AGENTS.md roster.
+
+        Prefers the startup hint from credential.json (always available, even on
+        a cold start before any peer-card sync). Falls back to deriving it from
+        ``participant.name`` — which is empty until the self peer-card has been
+        synced, so it must NOT be the only source. Usernames cannot contain
+        ``-``, so the first ``-`` separates owner from the agent-name suffix.
+        """
+        if self._owner_username_hint:
+            return self._owner_username_hint
+        name = self._participant.name
+        return name.split("-", 1)[0] if "-" in name else name
 
     async def start(self) -> None:
         """Start the control loop."""
@@ -187,6 +240,21 @@ class ReactiveControlLoop:
                 if agent is not None:
                     agent.update_card(status=payload.new_status)
                     logger.debug(f"Updated local card for {payload.agent_name}: status={payload.new_status}")
+                    # Re-render AGENTS.md so the roster's status column reflects
+                    # the flip. update_card only touches the peer card.json;
+                    # without this the global roster stays stale until the next
+                    # full sync_from_server (startup / AGENT_REGISTRY_CHANGE /
+                    # reconnect catch-up).
+                    try:
+                        Agent.regenerate_agents_md(
+                            self._model_ctx, owner_username=self._owner_username()
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to regenerate AGENTS.md after status change "
+                            f"for {payload.agent_name}: {e}",
+                            exc_info=True,
+                        )
 
             case ControlMessageType.PROJECT_DELETED:
                 payload: ProjectDeletedPayload = envelope.payload
@@ -196,23 +264,44 @@ class ReactiveControlLoop:
             case ControlMessageType.SKILL_SYNC:
                 payload: SkillSyncPayload = envelope.payload
                 if self._skill_manager:
-                    if payload.action == "install" and payload.skill_content:
+                    if payload.action == "install":
                         from clawmeets.runner.skill_manager import _decode_skill_files
-                        sibling_files = _decode_skill_files(payload.skill_files or {})
+                        sibling_files = _decode_skill_files(payload.skill_files)
                         self._skill_manager.install_skill(
                             payload.skill_name,
                             payload.skill_content,
                             files=sibling_files,
                         )
+                        # If the skill declares OAuth and the token isn't on
+                        # disk yet, fire auto-auth so the user doesn't have to
+                        # hop to a terminal after clicking Install in the web UI.
+                        if payload.auth and not self._skill_token_exists(
+                            payload.skill_name, payload.auth,
+                        ):
+                            self._spawn_auto_auth_skill(
+                                payload.skill_name, payload.auth,
+                            )
                     elif payload.action == "uninstall":
+                        self._cancel_auto_auth_skill(payload.skill_name)
                         self._skill_manager.uninstall_skill(payload.skill_name)
+                    elif payload.action == "reauth":
+                        # User clicked Re-authenticate in the web UI for an
+                        # already-installed OAuth skill. Cancel any in-flight
+                        # auto-auth and start a fresh relay flow regardless of
+                        # whether token.json exists — this is the whole point
+                        # of reauth (overwrite the stale/revoked token).
+                        self._cancel_auto_auth_skill(payload.skill_name)
+                        if payload.auth:
+                            self._spawn_auto_auth_skill(
+                                payload.skill_name, payload.auth,
+                            )
                 else:
                     logger.warning("Received SKILL_SYNC but no SkillManager configured")
 
             case ControlMessageType.KNOWLEDGE_PACK_SYNC:
                 payload: KnowledgePackSyncPayload = envelope.payload
                 if self._knowledge_pack_manager:
-                    if payload.action == "install" and payload.pack_files is not None:
+                    if payload.action == "install":
                         self._knowledge_pack_manager.install_pack(
                             slug=payload.pack_slug,
                             name=payload.pack_name or payload.pack_slug,
@@ -227,7 +316,7 @@ class ReactiveControlLoop:
             case ControlMessageType.MCP_SYNC:
                 payload: McpSyncPayload = envelope.payload
                 if self._mcp_manager:
-                    if payload.action == "install" and payload.manifest:
+                    if payload.action == "install":
                         self._mcp_manager.install_mcp(payload.mcp_name, payload.manifest)
                         # If the manifest needs auth and there's no token yet,
                         # pop the browser now so the user doesn't have to hop
@@ -248,14 +337,6 @@ class ReactiveControlLoop:
                 if payload.agent_id == self._participant.id:
                     if payload.local_settings is not None:
                         await self._apply_local_settings(payload.local_settings)
-                    if payload.front_desk_invitable_agents is not None:
-                        self._apply_front_desk_invitable_agents(
-                            payload.front_desk_invitable_agents
-                        )
-                    if payload.front_desk_invitable_teams is not None:
-                        self._apply_front_desk_invitable_teams(
-                            payload.front_desk_invitable_teams
-                        )
 
             case ControlMessageType.AGENT_REGISTRY_CHANGE:
                 # A peer agent (owned by this runner's owner) was registered,
@@ -282,15 +363,11 @@ class ReactiveControlLoop:
                             exc_info=True,
                         )
                 else:
-                    runner_name = self._participant.name
-                    owner_username = (
-                        runner_name.split("-", 1)[0] if "-" in runner_name else runner_name
-                    )
                     try:
                         await Agent.sync_from_server(
                             ctx=self._model_ctx,
                             exclude_ids={self._participant.id},
-                            owner_username=owner_username,
+                            owner_username=self._owner_username(),
                         )
                         logger.debug(
                             f"AGENT_REGISTRY_CHANGE ({payload.action}) "
@@ -351,6 +428,28 @@ class ReactiveControlLoop:
                 # to a runner. Log and ignore to avoid raising.
                 logger.warning(
                     "MCP_AUTH_URL_FOR_USER unexpectedly delivered to runner; ignoring"
+                )
+
+            case ControlMessageType.SKILL_AUTH_CODE:
+                payload: SkillAuthCodePayload = envelope.payload
+                if payload.agent_id != self._participant.id:
+                    logger.warning(
+                        f"SKILL_AUTH_CODE routed to wrong participant: "
+                        f"target={payload.agent_id[:8]} self={self._participant.id[:8]} — ignoring"
+                    )
+                else:
+                    waiter = self._skill_auth_waiters.pop(payload.state, None)
+                    if waiter is None:
+                        logger.warning(
+                            f"SKILL_AUTH_CODE: no in-flight waiter for state "
+                            f"{payload.state[:8]}… (skill={payload.skill_name}) — ignoring"
+                        )
+                    elif not waiter.done():
+                        waiter.set_result(payload.code)
+
+            case ControlMessageType.SKILL_AUTH_URL_FOR_USER:
+                logger.warning(
+                    "SKILL_AUTH_URL_FOR_USER unexpectedly delivered to runner; ignoring"
                 )
 
             case _:
@@ -432,7 +531,7 @@ class ReactiveControlLoop:
         reactive loop.
         """
         import os
-        from clawmeets.mcp.auth.google_oauth import (
+        from clawmeets.integrations.auth.google_oauth import (
             build_authorization_url,
             exchange_code,
             run_installed_flow,
@@ -507,7 +606,7 @@ class ReactiveControlLoop:
         sees the access/refresh tokens.
         """
         import secrets
-        from clawmeets.mcp.auth.google_oauth import (
+        from clawmeets.integrations.auth.google_oauth import (
             build_authorization_url,
             exchange_code,
         )
@@ -582,6 +681,176 @@ class ReactiveControlLoop:
             )
 
     # ─────────────────────────────────────────────────────────
+    # Skill auto-OAuth (sibling of MCP auto-OAuth above)
+    # ─────────────────────────────────────────────────────────
+
+    def _skill_token_path(self, skill_name: str, auth: dict) -> Path:
+        """Where the runner-side CLI keeps the skill's OAuth token."""
+        token_file = (auth.get("token_file") or "token.json") if isinstance(auth, dict) else "token.json"
+        return (
+            self._model_ctx.base_dir
+            / "skill-hub" / "state" / skill_name / token_file
+        )
+
+    def _skill_token_exists(self, skill_name: str, auth: dict) -> bool:
+        try:
+            return self._skill_token_path(skill_name, auth).exists()
+        except Exception:
+            return False
+
+    def _spawn_auto_auth_skill(self, skill_name: str, auth: dict) -> None:
+        """Fire a background OAuth task for one skill, with dedup."""
+        if skill_name in self._auto_auth_skill_in_flight:
+            return
+        self._auto_auth_skill_in_flight.add(skill_name)
+        task = asyncio.create_task(self._auto_auth_skill(skill_name, auth))
+        self._auto_auth_skill_tasks.add(task)
+        self._auto_auth_skill_tasks_by_name[skill_name] = task
+
+        def _done(t: asyncio.Task) -> None:
+            self._auto_auth_skill_tasks.discard(t)
+            self._auto_auth_skill_in_flight.discard(skill_name)
+            if self._auto_auth_skill_tasks_by_name.get(skill_name) is t:
+                self._auto_auth_skill_tasks_by_name.pop(skill_name, None)
+
+        task.add_done_callback(_done)
+
+    def _cancel_auto_auth_skill(self, skill_name: str) -> None:
+        task = self._auto_auth_skill_tasks_by_name.pop(skill_name, None)
+        self._auto_auth_skill_in_flight.discard(skill_name)
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _auto_auth_skill(self, skill_name: str, auth: dict) -> None:
+        """Skill-rail sibling of ``_auto_auth_mcp``."""
+        import os
+        from clawmeets.integrations.auth.google_oauth import run_installed_flow
+
+        method = auth.get("method")
+        if method != "google_oauth_installed":
+            logger.info(
+                f"Skill {skill_name}: auth method {method!r} is not auto-runnable; "
+                f"run `clawmeets <skill> auth` manually when ready."
+            )
+            return
+        scopes = auth.get("scopes") or []
+        if not scopes:
+            logger.warning(f"Skill {skill_name}: auth block has no scopes; skipping")
+            return
+
+        token_path = self._skill_token_path(skill_name, auth)
+        # SKILL.md convention: every OAuth-bearing skill exposes a single
+        # ``clawmeets <skill_name> auth`` subcommand whose top-level Typer
+        # name matches the skill (gmail/gcal/gdrive/gdrive-write share this).
+        # Some integration CLIs use different short names than the skill —
+        # use the integration-CLI alias here.
+        cli_name = _SKILL_TO_CLI_NAME.get(skill_name, skill_name)
+        fallback = f"clawmeets {cli_name} auth"
+        mode = os.environ.get("CLAWMEETS_OAUTH_MODE", "relay").lower()
+
+        if mode == "relay":
+            await self._auto_auth_skill_relay(
+                skill_name=skill_name, scopes=scopes,
+                token_path=token_path, fallback=fallback,
+            )
+            return
+
+        logger.info(
+            f"Skill {skill_name}: starting automatic OAuth "
+            f"(browser should open on this machine; token → {token_path})"
+        )
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(run_installed_flow, scopes, token_path),
+                timeout=300,
+            )
+            logger.info(f"Skill {skill_name}: auto OAuth complete")
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"Skill {skill_name}: OAuth timed out after 5 min. "
+                f"Re-run `{fallback}` when ready."
+            )
+        except Exception as e:
+            logger.warning(
+                f"Skill {skill_name}: auto OAuth failed: {e}. Fallback: `{fallback}`."
+            )
+
+    async def _auto_auth_skill_relay(
+        self,
+        skill_name: str,
+        scopes: list[str],
+        token_path: Path,
+        fallback: str,
+    ) -> None:
+        """Skill-rail sibling of ``_auto_auth_mcp_relay``."""
+        import secrets
+        from clawmeets.integrations.auth.google_oauth import (
+            build_authorization_url, exchange_code,
+        )
+
+        server_url = self._client._base_url
+        redirect_uri = f"{server_url}/oauth/skill/callback"
+        state = secrets.token_urlsafe(32)
+
+        try:
+            auth_url, code_verifier = build_authorization_url(
+                scopes=scopes, redirect_uri=redirect_uri, state=state,
+            )
+        except Exception as e:
+            logger.warning(
+                f"Skill {skill_name}: failed to build authorization URL: {e}. "
+                f"Fallback: `{fallback}`."
+            )
+            return
+
+        loop = asyncio.get_running_loop()
+        waiter: asyncio.Future[str] = loop.create_future()
+        self._skill_auth_waiters[state] = waiter
+
+        try:
+            await self._client.post_skill_auth_init(
+                agent_id=self._participant.id,
+                skill_name=skill_name,
+                state=state,
+                auth_url=auth_url,
+            )
+        except Exception as e:
+            self._skill_auth_waiters.pop(state, None)
+            logger.warning(
+                f"Skill {skill_name}: failed to register auth-init with server: {e}. "
+                f"Fallback: `{fallback}`."
+            )
+            return
+
+        logger.info(
+            f"Skill {skill_name}: awaiting user consent via server relay "
+            f"(state={state[:8]}…; token → {token_path})"
+        )
+
+        try:
+            code = await asyncio.wait_for(waiter, timeout=600)
+        except asyncio.TimeoutError:
+            self._skill_auth_waiters.pop(state, None)
+            logger.warning(
+                f"Skill {skill_name}: relay OAuth timed out after 10 min. "
+                f"Re-run `{fallback}` when ready."
+            )
+            return
+        finally:
+            self._skill_auth_waiters.pop(state, None)
+
+        try:
+            await asyncio.to_thread(
+                exchange_code, code, scopes, redirect_uri,
+                token_path, code_verifier,
+            )
+            logger.info(f"Skill {skill_name}: relay OAuth complete")
+        except Exception as e:
+            logger.warning(
+                f"Skill {skill_name}: code exchange failed: {e}. Fallback: `{fallback}`."
+            )
+
+    # ─────────────────────────────────────────────────────────
     # Local Settings
     # ─────────────────────────────────────────────────────────
 
@@ -616,18 +885,43 @@ class ReactiveControlLoop:
         current_card = FileUtil.read(self_card_path, "json") or {}
         prior_settings = current_card.get("local_settings") or {}
 
-        # Hot-swap the LLM CLI if provider or model changed. The factory is
-        # passed in by cli_runner.py and closes over plugin_dirs / mcp_manager
-        # / agent_env so we don't need to know construction details here.
-        new_provider = local_settings.get("llm_provider") or "claude"
-        new_model = local_settings.get("llm_model") or None
-        prior_provider = prior_settings.get("llm_provider") or "claude"
-        prior_model = prior_settings.get("llm_model") or None
-        if self._cli_factory is not None and (
-            new_provider != prior_provider or new_model != prior_model
-        ):
+        # Git binding — update the shared agent_env so the next-built CLI
+        # exposes the new CLAWMEETS_AGENT_GIT_URL / _GIT_BASE_BRANCH. The
+        # git-workflow skill reads these; the runner itself runs no git. Because
+        # CLI providers copy agent_env at construction, a git change is folded
+        # into the CLI-rebuild below so the next invocation picks it up.
+        git_changed = (
+            local_settings.get("git_url") != prior_settings.get("git_url")
+            or local_settings.get("git_base_branch") != prior_settings.get("git_base_branch")
+        )
+        if git_changed:
+            for env_key, settings_key in (
+                ("CLAWMEETS_AGENT_GIT_URL", "git_url"),
+                ("CLAWMEETS_AGENT_GIT_BASE_BRANCH", "git_base_branch"),
+            ):
+                val = local_settings.get(settings_key) or ""
+                if val:
+                    self._agent_env[env_key] = val
+                else:
+                    self._agent_env.pop(env_key, None)
+            self._model_ctx.update_git_url(local_settings.get("git_url") or None)
+
+        # Hot-swap the LLM CLI if any provider-affecting setting changed (or the
+        # git env changed — the rebuilt CLI re-captures the updated agent_env).
+        # The factory is passed in by cli_runner.py and closes over plugin_dirs /
+        # skill_dirs / agent_env; it takes the live local_settings so provider
+        # (incl. the ``-api`` variant) / model / BYO-key all resolve there.
+        # Switching e.g. claude → claude-api is a llm_provider change, so it
+        # still triggers the swap.
+        llm_keys = ("llm_provider", "llm_model", "llm_api_key", "llm_base_url")
+        llm_changed = any(
+            local_settings.get(k) != prior_settings.get(k) for k in llm_keys
+        )
+        if self._cli_factory is not None and (llm_changed or git_changed):
+            new_provider = local_settings.get("llm_provider") or "claude"
+            new_model = local_settings.get("llm_model") or None
             try:
-                new_cli = self._cli_factory(new_provider, new_model)
+                new_cli = self._cli_factory(local_settings)
                 self._model_ctx.update_cli(new_cli)
                 logger.info(
                     f"{self._participant.name}: hot-swapped LLM to "
@@ -636,7 +930,8 @@ class ReactiveControlLoop:
             except Exception as e:
                 logger.error(
                     f"{self._participant.name}: hot-swap to "
-                    f"provider={new_provider!r} model={new_model!r} failed: {e}. "
+                    f"provider={new_provider!r} model={new_model!r} "
+                    f"failed: {e}. "
                     f"Keeping previous CLI in service.",
                     exc_info=True,
                 )
@@ -645,14 +940,20 @@ class ReactiveControlLoop:
         # startup so a hot update of `./owner` lands on the same folder as
         # the initial load.
         knowledge_dir = local_settings.get("knowledge_dir", "")
-        resolved = resolve_local_knowledge_dir(knowledge_dir, self._user_config_dir)
+        resolved = FileUtil.resolve_local_dir(knowledge_dir, self._user_config_dir)
         new_dirs = [resolved] if resolved is not None else []
         self._model_ctx.update_knowledge_dirs(new_dirs)
+
+        # Rebuild the deterministic proprietary-knowledge index when the
+        # knowledge_dir setting changed, so memory/REFERENCES.md stays fresh
+        # without restart (same builder cli_runner uses at startup).
+        if local_settings.get("knowledge_dir") != prior_settings.get("knowledge_dir"):
+            build_references_index(self._model_ctx.memory_dir, new_dirs)
 
         # Update dwh_dir (personal data warehouse root). Same resolution as
         # the initial load. None clears the prompt block.
         raw_dwh_dir = local_settings.get("dwh_dir", "")
-        resolved_dwh = resolve_local_dwh_dir(raw_dwh_dir, self._user_config_dir) if raw_dwh_dir else None
+        resolved_dwh = FileUtil.resolve_local_dir(raw_dwh_dir, self._user_config_dir) if raw_dwh_dir else None
         self._model_ctx.update_dwh_dir(resolved_dwh)
 
         # Per-MCP config write-through. Diff against prior to avoid rewriting
@@ -752,47 +1053,6 @@ class ReactiveControlLoop:
             f"{sorted(written)} -> {configs_dir}"
         )
 
-    def _apply_front_desk_invitable_agents(self, invitable: list[str]) -> None:
-        """Persist a Front-Desk invitable-agents update to the synced agent card.
-
-        The coordinator-prompt builder reads ``self.front_desk_invitable_agents``
-        via ``_load_card()`` which resolves to
-        ``participants_dir/agents/{name}-{id}/card.json`` — the same location
-        ``Agent.sync_from_server`` writes to. Updating the runner's *top-level*
-        self-card (where ``_apply_local_settings`` writes its mirror) wouldn't
-        reach the property at all. So we go through ``Participant.update_card``
-        which routes via ``_save_card`` → the correct synced-card path.
-
-        Safe to call from the live AGENT_SETTINGS_CHANGE handler because
-        ``Agent.sync_from_server`` already populated the ``agents/{name}-{id}``
-        directory at startup (catch_up runs sync_from_server before any live
-        envelope can arrive).
-        """
-        prior = list(self._participant.front_desk_invitable_agents)
-        if prior == list(invitable):
-            return
-        self._participant.update_card(front_desk_invitable_agents=list(invitable))
-        logger.info(
-            f"Applied front_desk_invitable_agents for {self._participant.name}: "
-            f"prior={prior} new={invitable}"
-        )
-
-    def _apply_front_desk_invitable_teams(self, invitable: list[str]) -> None:
-        """Persist a Front-Desk invitable-teams update to the synced agent card.
-
-        Sibling of ``_apply_front_desk_invitable_agents`` — both fields live on
-        the synced-peer card and compose via OR in the allowlist. Same routing
-        through ``update_card`` so subsequent prompt builds see the fresh value.
-        """
-        prior = list(self._participant.front_desk_invitable_teams)
-        if prior == list(invitable):
-            return
-        self._participant.update_card(front_desk_invitable_teams=list(invitable))
-        logger.info(
-            f"Applied front_desk_invitable_teams for {self._participant.name}: "
-            f"prior={prior} new={invitable}"
-        )
-
     # ─────────────────────────────────────────────────────────
     # Changelog Sync
     # ─────────────────────────────────────────────────────────
@@ -815,20 +1075,12 @@ class ReactiveControlLoop:
 
         # Create fetch callback that queries server with participant filtering
         async def fetch_entries(last_version: int, target_version: int) -> list[ChangelogEntry]:
-            data = await self._client.get_changelog(
+            batch = await self._client.get_changelog(
                 project_id=project_id,
                 since=last_version,
                 participant_id=self._participant.id,
             )
-            raw_entries = data.get("entries", [])
-
-            # Parse entries individually to avoid one bad entry breaking the batch
-            parsed_entries = []
-            for i, e in enumerate(raw_entries):
-                entry = ChangelogEntry.model_validate(e)
-                parsed_entries.append(entry)
-
-            return parsed_entries
+            return list(batch.entries)
 
         # Sync using the runloop
         processed = await runloop.sync(
@@ -856,20 +1108,73 @@ class ReactiveControlLoop:
         # the user edited settings in the web UI would otherwise keep using
         # stale values until the next live edit. Run before other catch-ups
         # so subsequent steps see the fresh knowledge_dir.
-        await self._sync_self_settings_from_server()
+        #
+        # The two steps below (self-settings + peer-roster) are ADVISORY — they
+        # refresh local_settings drift and the AGENTS.md roster. They must never
+        # abort the load-bearing changelog catch-up further down (the part that
+        # actually picks up a message @mentioning this agent). A transient tunnel
+        # error here (ngrok 404/503/ReadTimeout) is logged and skipped; the data
+        # re-syncs on the next live event or reconnect.
+        try:
+            await self._sync_self_settings_from_server()
+        except Exception:  # noqa: BLE001 — advisory; never block changelog catch-up
+            logger.warning(
+                f"{self._participant.name}: self-settings catch-up failed; "
+                "continuing to changelog catch-up",
+                exc_info=True,
+            )
 
         # Sync worker agents (in case we missed AGENT_STATUS_CHANGE while disconnected)
-        # Owner username lets AGENTS.md render owned agents by short name.
-        # Usernames cannot contain hyphens, so the first ``-`` unambiguously
-        # separates owner from suffix for agent names; a user participant has
-        # no hyphen in its name at all.
-        runner_name = self._participant.name
-        owner_username = runner_name.split("-", 1)[0] if "-" in runner_name else runner_name
-        await Agent.sync_from_server(
-            ctx=self._model_ctx,
-            exclude_ids=set(),
-            owner_username=owner_username,
-        )
+        # Owner username lets AGENTS.md render owned agents by short name AND
+        # include the owner's private (non-discoverable) crew. It comes from the
+        # startup credential hint, NOT participant.name — on this first cold-start
+        # sync the self peer-card doesn't exist yet, so participant.name would be
+        # empty and the roster would silently drop every private team agent.
+        try:
+            await Agent.sync_from_server(
+                ctx=self._model_ctx,
+                exclude_ids=set(),
+                owner_username=self._owner_username(),
+            )
+        except Exception:  # noqa: BLE001 — advisory; never block changelog catch-up
+            logger.warning(
+                f"{self._participant.name}: peer-roster catch-up failed; "
+                "continuing to changelog catch-up",
+                exc_info=True,
+            )
+
+        # Catch up project changelogs for entries appended while this runner was
+        # offline. The server only pushes go-forward CHANGELOG_UPDATE envelopes
+        # (and replays nothing on connect), so reconnect MUST reconcile the gap
+        # itself — otherwise a message @mentioning this agent that arrived while
+        # it was down would sit AWAITING until its batch timeout. Runs
+        # unconditionally (independent of any local_settings drift).
+        #
+        # Isolate per project: an agent in many projects makes a long sequence of
+        # changelog fetches, and a single slow/failing one (e.g. a ReadTimeout on
+        # a huge changelog through a rate-limited tunnel) must NOT abort the
+        # others — especially the project carrying a pending @mention. A project
+        # that fails here keeps its prior runloop_state and is retried on the next
+        # reconnect/CHANGELOG_UPDATE.
+        server_projects = await self._fetch_server_projects()
+        for project_id, info in server_projects.items():
+            try:
+                await self._sync_changelog(
+                    project_id,
+                    info["name"],
+                    info["current_version"],
+                    coordinator_id=info.get("coordinator_id"),
+                )
+            except Exception:  # noqa: BLE001 — one project must not abort the rest
+                logger.warning(
+                    f"{self._participant.name}: changelog catch-up failed for "
+                    f"project {info.get('name', project_id)}; other projects "
+                    "continue (will retry on next reconnect)",
+                    exc_info=True,
+                )
+
+        # Reconcile: clean up local projects that no longer exist on the server.
+        await self._reconcile_deleted_projects(set(server_projects.keys()))
 
     async def _sync_self_settings_from_server(self) -> None:
         """Re-fetch this runner's own card.json from the server and apply
@@ -897,10 +1202,6 @@ class ReactiveControlLoop:
         # synced-peer cards under `agents/{name}-{id}/`, which doesn't include
         # the runner's own runtime config. So we have to reconcile this field
         # explicitly here.
-        # `front_desk_invitable_agents`, in contrast, lives on the synced-peer
-        # card (where `_load_card()` reads from), and `Agent.sync_from_server`
-        # in catch_up's next step writes the up-to-date server value there
-        # automatically. No extra catch-up call needed for that field.
         server_settings = (resp.json() or {}).get("local_settings") or {}
         if not server_settings:
             return
@@ -918,20 +1219,6 @@ class ReactiveControlLoop:
         )
         await self._apply_local_settings(server_settings)
 
-        # Sync project changelogs
-        server_projects = await self._fetch_server_projects()
-
-        for project_id, info in server_projects.items():
-            await self._sync_changelog(
-                project_id,
-                info["name"],
-                info["current_version"],
-                coordinator_id=info.get("coordinator_id"),
-            )
-
-        # Reconcile: clean up local projects that no longer exist on the server
-        await self._reconcile_deleted_projects(set(server_projects.keys()))
-
     async def _fetch_server_projects(self) -> dict[str, dict]:
         """Fetch project info from server.
 
@@ -942,11 +1229,11 @@ class ReactiveControlLoop:
         """
         projects_data = await self._client.list_projects(self._participant.id)
         return {
-            p["id"]: {
-                "name": p["name"],
-                "status": p.get("status", "active"),
-                "current_version": p.get("current_version", 0),
-                "coordinator_id": p.get("coordinator_id", ""),
+            p.id: {
+                "name": p.name,
+                "status": p.status,
+                "current_version": p.current_version,
+                "coordinator_id": p.coordinator_id,
             }
             for p in projects_data
         }

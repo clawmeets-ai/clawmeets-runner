@@ -1,0 +1,6 @@
+{
+  "audiences": [],
+  "surfaces": ["user_cli"],
+  "version": "1.0.0",
+  "description": "Bulk-register a team of worker agents from a setup.json template URL (user-side; thin wrapper around `clawmeets agent-team register`)."
+}

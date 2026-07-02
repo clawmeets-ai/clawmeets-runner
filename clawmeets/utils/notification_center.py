@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 LLM_COMPLETE = "llm_complete"  # kwargs: sandbox_dir: Path, usage: LLMUsage
-LLM_ERROR = "llm_error"        # kwargs: sandbox_dir: Path, error: Exception
+LLM_ERROR = "llm_error"        # kwargs: sandbox_dir: Path, error: Exception, usage: LLMUsage | None
 
 
 # ---------------------------------------------------------------------------

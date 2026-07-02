@@ -1,0 +1,6 @@
+{
+  "audiences": ["worker", "coordinator"],
+  "surfaces": ["agent_runtime"],
+  "version": "1.0.0",
+  "description": "Render high-quality canvas designs with bundled fonts."
+}

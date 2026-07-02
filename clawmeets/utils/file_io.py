@@ -13,9 +13,10 @@ import base64
 import hashlib
 import json
 import logging
+import re
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,76 @@ class FileUtil:
         # Compute hash
         sha = FileUtil.sha256(content)
     """
+
+    MAX_FS_NAME_LENGTH = 64
+
+    # Alphanumeric start, optional [-_]+alnum runs — no leading/trailing
+    # separators, no consecutive separators. Matches: a, my-project,
+    # My_Project, project-123. Rejects: -x, x-, x--y, "my project".
+    _NAME_PATTERN = re.compile(r"^[a-zA-Z0-9]([_-]?[a-zA-Z0-9])*$")
+
+    # Windows reserved device names (checked case-insensitively)
+    _RESERVED_NAMES = frozenset([
+        "con", "prn", "aux", "nul",
+        "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9",
+        "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+    ])
+
+    @staticmethod
+    def validate_fs_name(name: str) -> str:
+        """Validate a name for filesystem compatibility (case-sensitive).
+
+        A valid name must:
+        1. Be non-empty
+        2. Be ASCII-only (a-z, A-Z, 0-9, and allowed separators)
+        3. Start with a letter or number (not a separator)
+        4. Not end with a separator
+        5. Use only allowed separators: - (hyphen), _ (underscore)
+        6. No consecutive separators
+        7. No reserved names or characters problematic for filesystems
+        8. No leading or trailing whitespace
+
+        Args:
+            name: The name to validate
+
+        Returns:
+            The original name (unmodified) if valid
+
+        Raises:
+            ValueError: If name is invalid
+        """
+        if not name:
+            raise ValueError("name cannot be empty")
+
+        if name != name.strip():
+            raise ValueError("name cannot have leading or trailing whitespace")
+
+        if len(name) > FileUtil.MAX_FS_NAME_LENGTH:
+            raise ValueError(f"name cannot exceed {FileUtil.MAX_FS_NAME_LENGTH} characters")
+
+        if not name.isascii():
+            raise ValueError("name must contain only ASCII characters")
+
+        if " " in name:
+            raise ValueError("name cannot contain spaces")
+
+        if not FileUtil._NAME_PATTERN.match(name):
+            if name.startswith(("-", "_")):
+                raise ValueError("name cannot start with a separator (- or _)")
+            if name.endswith(("-", "_")):
+                raise ValueError("name cannot end with a separator (- or _)")
+            if "--" in name or "__" in name or "-_" in name or "_-" in name:
+                raise ValueError("name cannot contain consecutive separators")
+            if name.startswith("."):
+                raise ValueError("name cannot start with a dot")
+            raise ValueError(
+                "name must contain only letters, numbers, hyphens, and underscores"
+            )
+
+        if name.lower() in FileUtil._RESERVED_NAMES:
+            raise ValueError(f"name cannot be a reserved name: {name}")
+
+        return name
 
     @staticmethod
     def read(
@@ -349,3 +420,30 @@ class FileUtil:
             if raise_on_error:
                 raise
             return False
+
+    @staticmethod
+    def resolve_local_dir(raw: str, user_config_dir: Optional[Path]) -> Optional[Path]:
+        """Resolve a path string from card.json local_settings.
+
+        - Absolute paths (`/foo/bar`) and `~`-prefixed paths are honored
+          verbatim (the latter is expanded against the user's home).
+        - Relative paths (`./foo`, `foo`, `../foo`) are joined to
+          ``user_config_dir`` — the same base ``cli_init`` used when
+          writing CLAUDE.md. When ``user_config_dir`` is None, relative
+          paths fall through to ``Path(raw)`` (legacy behavior, relative
+          to CWD).
+        - Empty strings return None.
+
+        Callers that want a per-resource subfolder (e.g. dwh, knowledge,
+        scratch) append it themselves:
+        ``FileUtil.resolve_local_dir(raw, base) / "sub"``.
+        """
+        if not raw:
+            return None
+        if raw.startswith("~"):
+            return Path(raw).expanduser()
+        if raw.startswith("/"):
+            return Path(raw)
+        if user_config_dir is None:
+            return Path(raw)
+        return user_config_dir / raw

@@ -35,7 +35,6 @@ from typing import TYPE_CHECKING, ClassVar, Optional
 
 from ..api.responses import AgentResponse, AgentStatus
 from ..utils.file_io import FileUtil
-from ..utils.validation import validate_name
 from .participant import Participant, ParticipantRole
 
 if TYPE_CHECKING:
@@ -47,6 +46,23 @@ if TYPE_CHECKING:
 logger = logging.getLogger("clawmeets.models.persistable")
 
 DELETED_DIR_PREFIX = "DELETED-"
+
+
+def _clean_str_list(raw: object) -> list[str]:
+    """Strip / dedupe a card field whose value should be a list of non-empty strings."""
+    if not isinstance(raw, list):
+        return []
+    seen: set[str] = set()
+    out: list[str] = []
+    for value in raw:
+        if not isinstance(value, str):
+            continue
+        stripped = value.strip()
+        if not stripped or stripped in seen:
+            continue
+        seen.add(stripped)
+        out.append(stripped)
+    return out
 
 
 class PersistableParticipant(Participant, ABC):
@@ -252,23 +268,6 @@ class PersistableParticipant(Participant, ABC):
         self._save_card(card)
 
     @property
-    def last_linted_at(self) -> Optional[datetime]:
-        """Timestamp of the last completed lint pass (None if never)."""
-        ts = self._load_card().get("last_linted_at")
-        if ts:
-            try:
-                return datetime.fromisoformat(ts)
-            except ValueError:
-                pass
-        return None
-
-    def update_last_linted_at(self, when: datetime) -> None:
-        """Persist a new last-lint timestamp."""
-        card = self._load_card()
-        card["last_linted_at"] = when.isoformat()
-        self._save_card(card)
-
-    @property
     def last_synced_at(self) -> Optional[datetime]:
         """Timestamp of the last completed DWH sync cycle (None if never).
 
@@ -297,49 +296,6 @@ class PersistableParticipant(Participant, ABC):
         return self._load_card().get("discoverable_through_registry", True)
 
     @property
-    def front_desk_invitable_agents(self) -> list[str]:
-        """Agent IDs this agent may invite as workers in a Front Desk project.
-
-        Composed via OR with ``front_desk_invitable_teams``: an agent passes
-        the allowlist if its id is here OR if any of its ``user_teams`` is
-        listed there. Empty on both = no delegation; the coordinator must
-        reply directly. Defaults to empty for newly created agents.
-        """
-        raw = self._load_card().get("front_desk_invitable_agents", []) or []
-        seen: set[str] = set()
-        out: list[str] = []
-        for value in raw:
-            if not isinstance(value, str):
-                continue
-            stripped = value.strip()
-            if not stripped or stripped in seen:
-                continue
-            seen.add(stripped)
-            out.append(stripped)
-        return out
-
-    @property
-    def front_desk_invitable_teams(self) -> list[str]:
-        """User-team labels this agent may invite as workers in a Front Desk project.
-
-        Composed via OR with ``front_desk_invitable_agents``: any owned agent
-        carrying one of these team labels passes the allowlist. Empty on both
-        = no delegation. Defaults to empty for newly created agents.
-        """
-        raw = self._load_card().get("front_desk_invitable_teams", []) or []
-        seen: set[str] = set()
-        out: list[str] = []
-        for value in raw:
-            if not isinstance(value, str):
-                continue
-            stripped = value.strip()
-            if not stripped or stripped in seen:
-                continue
-            seen.add(stripped)
-            out.append(stripped)
-        return out
-
-    @property
     def user_teams(self) -> list[str]:
         """Owner-defined teams used to group agents in the UI sidebar.
 
@@ -347,19 +303,22 @@ class PersistableParticipant(Participant, ABC):
         Empty list means the agent only appears in MY AGENTS, not under
         any TEAMS sub-section.
         """
-        raw = self._load_card().get("user_teams", []) or []
-        # Defensive cleanup: drop empties, dedupe (preserve order).
-        seen: set[str] = set()
-        out: list[str] = []
-        for value in raw:
-            if not isinstance(value, str):
-                continue
-            stripped = value.strip()
-            if not stripped or stripped in seen:
-                continue
-            seen.add(stripped)
-            out.append(stripped)
-        return out
+        return _clean_str_list(self._load_card().get("user_teams"))
+
+    @property
+    def default_invitable_agents(self) -> list[str]:
+        """Defaults seeded into the ``agent_names`` allowlist of new
+        FD-tunnel DM projects coordinated by this agent. Empty = no
+        per-name filter on the resulting project (it falls back to the
+        team filter, or solo if both are empty)."""
+        return _clean_str_list(self._load_card().get("default_invitable_agents"))
+
+    @property
+    def default_invitable_teams(self) -> list[str]:
+        """Defaults seeded into the ``agent_teams`` allowlist of new
+        FD-tunnel DM projects coordinated by this agent. Empty = no
+        per-team filter on the resulting project."""
+        return _clean_str_list(self._load_card().get("default_invitable_teams"))
 
     def get_project(self, project_id: str):
         """Load a project by ID.
@@ -613,7 +572,7 @@ class PersistableParticipant(Participant, ABC):
         Raises:
             ValueError: If name is invalid
         """
-        return validate_name(name)
+        return FileUtil.validate_fs_name(name)
 
     @classmethod
     def register(
@@ -622,7 +581,7 @@ class PersistableParticipant(Participant, ABC):
         description: str,
         ctx: "ModelContext",
         registered_by: str,
-        discoverable: bool = True,
+        discoverable: bool = False,
         capabilities: Optional[list[str]] = None,
     ) -> tuple["Self", str]:
         """Register a new participant. Returns (instance, token).
@@ -634,7 +593,8 @@ class PersistableParticipant(Participant, ABC):
             registered_by: User ID of the owning user. Required — every
                 agent must be owned by exactly one user. The same field
                 drives AGENTS.md filtering (public + owner-visible).
-            discoverable: Whether participant appears in public registry
+            discoverable: Whether participant appears in the public registry.
+                Defaults to False (private) — publishing is an explicit opt-in.
             capabilities: List of capabilities
 
         Returns:
@@ -810,12 +770,11 @@ class PersistableParticipant(Participant, ABC):
             registered_by=self.registered_by,
             is_verified=self.is_verified,
             user_teams=self.user_teams,
+            default_invitable_agents=self.default_invitable_agents,
+            default_invitable_teams=self.default_invitable_teams,
             local_settings=card.get("local_settings", {}),
             last_reflected_at=self.last_reflected_at,
-            last_linted_at=self.last_linted_at,
             last_synced_at=self.last_synced_at,
-            front_desk_invitable_agents=self.front_desk_invitable_agents,
-            front_desk_invitable_teams=self.front_desk_invitable_teams,
         )
 
     def to_dict(self) -> dict:
@@ -833,11 +792,10 @@ class PersistableParticipant(Participant, ABC):
             "registered_by": card.get("registered_by"),
             "is_verified": card.get("is_verified", False),
             "user_teams": self.user_teams,
+            "default_invitable_agents": self.default_invitable_agents,
+            "default_invitable_teams": self.default_invitable_teams,
             "last_reflected_at": card.get("last_reflected_at"),
-            "last_linted_at": card.get("last_linted_at"),
             "last_synced_at": card.get("last_synced_at"),
-            "front_desk_invitable_agents": self.front_desk_invitable_agents,
-            "front_desk_invitable_teams": self.front_desk_invitable_teams,
             "role": self.role.value,
         }
 

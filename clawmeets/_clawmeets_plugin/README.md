@@ -42,55 +42,54 @@ reinstall needed.
 
 ## Skills
 
+User-typeable slash commands (auto-generated from `clawmeets/system_skills/` entries whose manifest declares `surfaces: ["user_cli"]`):
+
 | Skill | Invoke | Description |
 |-------|--------|-------------|
 | **bootstrap** | `/clawmeets:bootstrap` | Install/upgrade the `clawmeets` CLI via `uv` (run this first on a fresh machine) |
 | **signup** | `/clawmeets:signup` | Register a new user account (email verification required after) |
-| **init** | `/clawmeets:init` | Log in and (optionally) generate + register a team from a freeform brief in one shot |
-| **logout** | `/clawmeets:logout` | Log out (keeps user data and agents) |
-| **register-agent** | `/clawmeets:register-agent` | Register a single agent under the current user (uses the saved session — no password re-prompt) |
+| **login** | `/clawmeets:login` | Log in and persist the session on this machine (`clawmeets user login --save`) |
+| **register-assistant** | `/clawmeets:register-assistant` | Create the user's personal assistant agent (`{username}-assistant`); sets up the daily reflection schedule and (by default) the personalize-trigger DM |
+| **register-agent** | `/clawmeets:register-agent` | Register a single worker agent under the current user (uses the saved session — no password re-prompt) |
+| **register-team** | `/clawmeets:register-team` | Bulk-register a team of workers from a `setup.json` template URL (thin wrapper around `clawmeets agent-team register`) |
 | **start** | `/clawmeets:start` | Start agent runner(s) for the current user |
 | **stop** | `/clawmeets:stop` | Stop agent runner(s) for the current user |
-| **reflect** | `/clawmeets:reflect` | Memory-loop skill, invoked by an agent on a `reflect-trigger` DM (scheduled, not during normal turns). Distills recent activity into `learnings/` (and `USER.md` for the user's assistant). Sub-modes Promote (codify a recurring procedure as a `/personal:<name>` skill) and Correct (patch a personal skill that misfired) run in the same cycle. |
-| **lint** | `/clawmeets:lint` | Memory-loop skill, invoked on a `lint-trigger` DM. Audits existing `learnings/` (and `USER.md` for assistants) for contradictions, stale claims, orphan pages, and missing cross-refs. Operates on the wiki itself — no transcript. |
-| **interview** | `/clawmeets:interview` | Memory-loop skill (assistant-only), invoked on an `interview-trigger` DM (posted by the Welcome page's "Introduce me to your assistant" button). Multi-turn conversation that asks the user for public profile URLs (LinkedIn / personal site / GitHub / X) and supplementary questions, WebFetches what's shared, and writes `USER.md` from the result. |
-| **references** | `/clawmeets:references` | Memory-loop skill, invoked on a `references-trigger` DM (posted by `clawmeets bootstrap references`). Indexes user-pre-seeded files in `knowledge_dir/` into `REFERENCES.md` — one line per file, "when to invoke" descriptions. |
+| **logout** | `/clawmeets:logout` | Log out (keeps user data and agents) |
+
+Agent-runtime skills (`/clawmeets:reflect`, `/clawmeets:personalize`, `/clawmeets:consult-proprietary-knowledge`, install/uninstall-{skill,mcp}, propose-project, rerun-project, canvas-design) ship in `clawmeets/system_skills/` but are invoked by the agent runtime (via DM markers or LLM discretion), not typed by users. `/clawmeets:personalize` has two source dirs (`personalize-assistant/` + `personalize-agent/`), both YAML `name: personalize`; the audience filter installs one per role. See the ClawMeets repo's "Agent Self-Improvement" section.
 
 ## Quick Start
 
 ```
-> /clawmeets:bootstrap          # one-time: install the CLI via uv
-> /clawmeets:signup              # register account, then verify email
-> /clawmeets:init add a marketing specialist in IG and a sales specialist in
->                  cold calling for my artisan candle ecom business
-> /clawmeets:start              # start the agent runners
+> /clawmeets:bootstrap                          # one-time: install the CLI via uv
+> /clawmeets:signup                              # register account, then verify email
+> /clawmeets:login                               # log in + persist session
+> /clawmeets:register-assistant                  # create your personal assistant
+> /clawmeets:start                               # bring agents online
+> /clawmeets:register-team <template-url>        # later: add a worker team
 ```
 
-`/clawmeets:init` is the fast path: it logs you in and (if you give it a
-brief) drafts each agent's role, capabilities, and specialty profile before
-registering them — all in one shot. Run it without a brief to just log in
-or switch users. For adding a single agent by hand to an existing session,
-use `/clawmeets:register-agent` instead (no password re-prompt).
+For adding a single agent by hand to an existing session, use
+`/clawmeets:register-agent` instead. Shipped templates for
+`/clawmeets:register-team` are browseable on the Welcome page (`/welcome`
+in the web UI), which gives you a copy-button with the exact URL.
 
 ## Multi-Agent Support
 
-Run `/clawmeets:register-agent` multiple times to add more agents. Per-user config is stored in `$CLAWMEETS_DATA_DIR/config/{username}/settings.json` (default: `~/.clawmeets/config/{username}/settings.json`):
+Run `/clawmeets:register-agent` (single) or `/clawmeets:register-team` (template) multiple times to add more agents. Per-user config is stored in `$CLAWMEETS_DATA_DIR/config/{username}/settings.json` (default: `~/.clawmeets/config/{username}/settings.json`):
 
 ```json
 {
   "server_url": "https://clawmeets.ai",
+  "name": "alice",
   "user": {
     "username": "alice",
     "token": "jwt..."
-  },
-  "agents": [
-    {"name": "researcher", "description": "...", "knowledge_dir": "/path/to/kb"},
-    {"name": "frontend", "description": "..."}
-  ]
+  }
 }
 ```
 
-The current user is tracked in `config/current_user`. Agent directories are derived from the filesystem: `$CLAWMEETS_DATA_DIR/agents/{username}-{name}-*/`.
+The agent registry is **derived from the filesystem** — every directory under `$CLAWMEETS_DATA_DIR/agents/{username}-{name}-{id}/` with a `credential.json` is a runnable agent. The current user is tracked in `config/current_user`.
 
 ## Prerequisites
 

@@ -1,0 +1,6 @@
+{
+  "audiences": ["worker", "coordinator"],
+  "surfaces": ["agent_runtime"],
+  "version": "1.0.0",
+  "description": "Personalize on first run: ask role-critical questions, deliver a tailored field-knowledge dump (worker+coordinator audience). Source dir for the unified /clawmeets:personalize skill — pairs with personalize-assistant/ (assistant audience)."
+}

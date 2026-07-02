@@ -18,28 +18,34 @@ Raises the generic LLM* exceptions from clawmeets.llm.base.
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
-import os
 import subprocess
-import time
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Optional
 
-from ..api.actions import ActionBlock
-from ..utils.notification_center import LLM_COMPLETE, LLM_ERROR, NotificationCenter
+from ._structured_text import JSON_ONLY_SUFFIX as _JSON_ONLY_SUFFIX
+from ._structured_text import normalize_actions, parse_json_object
 from .base import (
     LLMInvocationError,
     LLMNotFoundError,
-    LLMProvider,
     LLMRateLimitError,
     LLMTimeoutError,
     LLMUsage,
+    ParsedResult,
+    PreparedInvocation,
+    SubprocessLLMProvider,
+    link_mcp_config_into,
+    materialize_skill_tree,
 )
+from .pricing import price_usd
 
 logger = logging.getLogger(__name__)
+
+# The `gemini` CLI's default model, used to price token usage when no explicit
+# --llm-model is set (the CLI reports tokens but not cost, and its usage stats
+# key models by ROLE, not model ID). Exact pricing requires --llm-model.
+_DEFAULT_GEMINI_MODEL = "gemini-2.5-pro"
 
 
 # Markers for detecting rate limits in stderr or error envelopes.
@@ -52,57 +58,53 @@ _RATE_LIMIT_MARKERS = (
     "resource_exhausted",
 )
 
-
-_JSON_ONLY_SUFFIX = (
-    "\n\n=== OUTPUT FORMAT (STRICT) ===\n"
-    "Respond with ONLY the raw JSON object matching the action schema above. "
-    "Do not wrap it in markdown fences (no ```json, no ```). "
-    "Do not include any prose, explanation, or trailing text. "
-    "Your entire response must be a single parseable JSON object."
+# Auth / ineligible-tier failures (e.g. deprecated "Gemini Code Assist for
+# individuals"). Checked first so a retry-backoff line in the auth stack trace
+# isn't misclassified as a rate limit.
+_AUTH_MARKERS = (
+    "ineligibletier",
+    "unsupported_client",
+    "no longer supported",
+    "error authenticating",
+    "gemini code assist",
 )
 
 
-def _strip_markdown_fences(text: str) -> str:
-    """Strip ```json ... ``` or ``` ... ``` fences if the text is wrapped in them.
-
-    Returns the inner content unchanged if no fence is detected.
-    """
-    stripped = text.strip()
-    if not stripped.startswith("```"):
-        return stripped
-
-    first_newline = stripped.find("\n")
-    if first_newline == -1:
-        return stripped  # No newline after fence — not a valid block, leave it.
-
-    inner = stripped[first_newline + 1 :].rstrip()
-    if inner.endswith("```"):
-        inner = inner[:-3].rstrip()
-    return inner
-
-
-class GeminiCLI(LLMProvider):
+class GeminiCLI(SubprocessLLMProvider):
     """Invokes the `gemini` CLI (Google Gemini) as a subprocess.
 
     Expects `gemini` to be available on PATH and authenticated
     (via `gemini auth` or GEMINI_API_KEY env var).
     """
 
+    _provider_name = "Gemini"
+    _log_tag = "gemini-invoke"
+    _install_hint = "Install Gemini CLI: https://github.com/google-gemini/gemini-cli"
+
     def __init__(
         self,
+        *,
+        agent_env: dict[str, str],
         gemini_bin: str = "gemini",
         model: Optional[str] = None,
-        agent_env: Optional[dict[str, str]] = None,
+        skill_dirs: Optional[list[Path]] = None,
     ) -> None:
         """Initialize GeminiCLI.
 
         Args:
+            agent_env: Environment variables exposed to every Gemini
+                subprocess (CLAWMEETS_AGENT_ID / CLAWMEETS_AGENT_TOKEN /
+                CLAWMEETS_SERVER_URL / CLAWMEETS_AGENT_DIR). See ClaudeCLI
+                for rationale. Required — pass ``{}`` explicitly to opt out.
             gemini_bin: Path to gemini CLI binary
             model: Optional model override (e.g. "gemini-2.5-pro"); None uses
                 Gemini's default.
-            agent_env: Extra environment variables exposed to every Gemini
-                subprocess (CLAWMEETS_AGENT_ID / CLAWMEETS_AGENT_TOKEN /
-                CLAWMEETS_SERVER_URL). See ClaudeCLI for rationale.
+            skill_dirs: Static directories merged into ``--include-directories``
+                on every invocation, so the prompt's absolute SKILL.md paths
+                (under skill-hub / personal-skill-hub) resolve through
+                Gemini's sandboxed file access. The plumbing is uniform
+                across all skill kinds — Gemini has no equivalent to
+                Claude's plugin auto-discovery.
 
         Gemini cannot enforce a JSON schema at the CLI level; the schema is
         embedded in the prompt (via the existing prompt builder) and parsed
@@ -111,7 +113,8 @@ class GeminiCLI(LLMProvider):
         """
         self._bin = gemini_bin
         self._model = model
-        self._agent_env = dict(agent_env or {})
+        self._agent_env = dict(agent_env)
+        self._skill_dirs = list(skill_dirs or [])
 
     @classmethod
     def verify_cli(cls, gemini_bin: str = "gemini") -> None:
@@ -147,13 +150,39 @@ class GeminiCLI(LLMProvider):
         prompt: str,
         working_dir: Path,
         additional_dirs: list[Path],
-    ) -> tuple[str, str, str, list[str]]:
+        action_schema: dict,
+        mcp_config_dir: Optional[Path] = None,
+        skill_source_dirs: Optional[list[Path]] = None,
+    ) -> PreparedInvocation:
         """Set up directories, write prompt file, build command.
 
-        Returns:
-            Tuple of (prompt_file_abs, gemini_cwd, full_prompt, cmd)
+        ``action_schema`` is accepted for interface symmetry but not used —
+        Gemini has no CLI-level schema enforcement; the schema is embedded
+        in the prompt by the caller's prompt builder.
         """
         working_dir.mkdir(parents=True, exist_ok=True)
+
+        # Gemini auto-discovers .gemini/settings.json from cwd (project scope).
+        # Symlink it from the agent's pre-rendered dist so installed MCP
+        # servers appear under `mcpServers`.
+        if mcp_config_dir is not None:
+            link_mcp_config_into(
+                mcp_config_dir / ".gemini" / "settings.json",
+                working_dir / ".gemini" / "settings.json",
+            )
+
+        # Gemini auto-discovers `.agents/skills/<name>/SKILL.md` from cwd
+        # (workspace tier, Agent Skills open-standard alias). Materialize
+        # the flat tree so gemini's native skill-loader picks up installed
+        # + personal skills. --include-directories below keeps the symlink
+        # *targets* (the two hub dirs) Read-accessible inside Gemini's
+        # sandbox so following a symlink to its absolute target doesn't
+        # trip the allow-list.
+        if skill_source_dirs is not None:
+            materialize_skill_tree(
+                working_dir / ".agents" / "skills",
+                skill_source_dirs,
+            )
 
         full_prompt = prompt + _JSON_ONLY_SUFFIX
 
@@ -173,8 +202,17 @@ class GeminiCLI(LLMProvider):
 
         # --include-directories accepts either comma-separated or repeated args.
         # Use repeated args so paths with commas (unlikely but possible) work.
-        for d in additional_dirs:
-            cmd.extend(["--include-directories", str(d.expanduser().resolve())])
+        # Static skill_dirs (skill-hub / personal-skill-hub) merge with the
+        # per-invocation additional_dirs (project / knowledge bases). Dedupe
+        # by resolved absolute path so a project that happens to share a
+        # prefix with a skill dir doesn't appear twice.
+        seen: set[str] = set()
+        for d in list(self._skill_dirs) + list(additional_dirs):
+            abs_d = str(d.expanduser().resolve())
+            if abs_d in seen:
+                continue
+            seen.add(abs_d)
+            cmd.extend(["--include-directories", abs_d])
 
         cmd.extend(["-p", full_prompt])
 
@@ -183,32 +221,17 @@ class GeminiCLI(LLMProvider):
         logger.info(f"[gemini-invoke] START")
         logger.info(f"[gemini-invoke] command: {' '.join(log_cmd)}")
         logger.info(f"[gemini-invoke] cwd={gemini_cwd}")
-        if additional_dirs:
-            logger.info(
-                f"[gemini-invoke] include-dirs="
-                f"{[str(d.expanduser().resolve()) for d in additional_dirs]}"
-            )
+        if seen:
+            logger.info(f"[gemini-invoke] include-dirs={sorted(seen)}")
         logger.debug(f"[gemini-invoke] prompt content:\n{full_prompt[:500]}...")
 
-        return prompt_file_abs, gemini_cwd, full_prompt, cmd
-
-    def _write_invocation_logs(
-        self, log_dir: Path, stdout: str, stderr: str
-    ) -> None:
-        """Append stdout/stderr to log files with timestamps."""
-        log_dir.mkdir(parents=True, exist_ok=True)
-        stdout_file = log_dir / "cli-stdout.log"
-        stderr_file = log_dir / "cli-stderr.log"
-
-        timestamp = datetime.now(UTC).isoformat()
-        separator = f"\n{'='*60}\n[{timestamp}]\n{'='*60}\n"
-
-        with open(stdout_file, "a", encoding="utf-8") as f:
-            f.write(separator)
-            f.write(stdout)
-        with open(stderr_file, "a", encoding="utf-8") as f:
-            f.write(separator)
-            f.write(stderr or "(empty)")
+        # stdin_bytes=None → base wires stdin to DEVNULL (prompt rides in -p).
+        return PreparedInvocation(
+            cmd=cmd,
+            cwd=gemini_cwd,
+            prompt_file_abs=prompt_file_abs,
+            stdin_bytes=None,
+        )
 
     def _parse_envelope(self, raw_output: str) -> Optional[dict]:
         """Parse Gemini's outer JSON envelope from stdout."""
@@ -232,23 +255,7 @@ class GeminiCLI(LLMProvider):
 
         Tries raw first, then markdown-fence-stripped before giving up.
         """
-        if not response_text:
-            return None
-
-        try:
-            return json.loads(response_text.strip())
-        except json.JSONDecodeError:
-            pass
-
-        stripped = _strip_markdown_fences(response_text)
-        try:
-            return json.loads(stripped)
-        except json.JSONDecodeError as e:
-            logger.warning(
-                f"[gemini-invoke] response field is not valid JSON after fence "
-                f"strip: {e}; head={response_text[:200]!r}"
-            )
-            return None
+        return parse_json_object(response_text, log_tag="gemini-invoke")
 
     def _extract_usage(self, envelope: dict) -> LLMUsage:
         """Aggregate token usage across all models in stats.models.*"""
@@ -273,201 +280,134 @@ class GeminiCLI(LLMProvider):
             output_tokens += tokens.get("candidates", 0) or 0
             cached += tokens.get("cached", 0) or 0
 
-        # Gemini returns multiple models (routing utility + main). Report the
-        # "main" one if present, else any; falls back to empty string.
-        model_name = ""
-        if "main" in model_names:
-            model_name = "main"
-        elif model_names:
-            model_name = model_names[-1]
+        # stats.models keys are ROLES ("main"/"routing utility"), not model IDs,
+        # so they can't price. Use the configured model (--llm-model) when set,
+        # else the CLI's default model — a best-effort price (exact when pinned).
+        del model_names  # (role keys, unused for pricing/reporting)
+        priced_model = self._model or _DEFAULT_GEMINI_MODEL
+
+        # Best-effort tool telemetry from stats.tools (shape varies by version);
+        # stays empty if absent — the eval harness falls back to output-inference.
+        tool_counts: dict[str, int] = {}
+        tools = stats.get("tools")
+        if isinstance(tools, dict):
+            for tname, info in tools.items():
+                if isinstance(info, dict):
+                    n = info.get("count") or info.get("calls") or info.get("totalCalls")
+                    if isinstance(n, int) and n > 0:
+                        tool_counts[str(tname)] = n
+                elif isinstance(info, int) and info > 0:
+                    tool_counts[str(tname)] = info
 
         return LLMUsage(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             cache_read_tokens=cached,
             cache_creation_tokens=0,
-            cost_usd=0.0,  # Gemini does not report cost
+            # Gemini CLI reports no cost — compute it from the captured tokens.
+            # The CLI's `tokens.input` is the FRESH (uncached) count with `cached`
+            # SEPARATE (cache_read routinely exceeds input via context caching), but
+            # genai-prices wants the TOTAL input — so add `cached` here, else the
+            # "uncached = input − cache_read" goes negative and prices to $0.0.
+            cost_usd=price_usd(
+                priced_model, "google", input_tokens + cached, output_tokens, cached, 0
+            ),
             duration_ms=0,  # Latency is in stats but not summed here
-            model=model_name,
+            model=priced_model,
+            tool_calls=tool_counts,
         )
 
-    def _extract_actions(self, parsed: Optional[Any]) -> list[dict]:
-        """Extract the actions array from the parsed response."""
-        if not isinstance(parsed, dict):
-            return []
-        actions = parsed.get("actions")
-        if isinstance(actions, list):
-            return actions
-        return []
+    def _envelope_error_text(self, envelope: Optional[dict]) -> str:
+        """Extract the envelope-level error message (str or dict.message)."""
+        if envelope is None:
+            return ""
+        err = envelope.get("error")
+        if isinstance(err, str):
+            return err
+        if isinstance(err, dict):
+            return err.get("message", "") or json.dumps(err)
+        return ""
 
-    def _detect_rate_limit(self, *haystacks: str) -> Optional[LLMRateLimitError]:
-        """Check each text blob for rate-limit markers."""
-        def _matches(text: str) -> bool:
-            lower = text.lower()
-            return any(marker in lower for marker in _RATE_LIMIT_MARKERS)
+    def _check_rate_limit(
+        self,
+        prepared: PreparedInvocation,
+        stdout: str,
+        stderr: str,
+        returncode: int,
+    ) -> Optional[LLMRateLimitError]:
+        """Pattern-match `_RATE_LIMIT_MARKERS` against stderr and the envelope
+        error message (Gemini's `gemini-cli` surfaces rate limits in either
+        channel depending on whether the upstream HTTP status propagates)."""
+        envelope = self._parse_envelope(stdout)
+        envelope_error_text = self._envelope_error_text(envelope)
 
-        for hay in haystacks:
-            if hay and _matches(hay):
+        # Auth/ineligible-tier failures are NOT rate limits — let them fall
+        # through to a generic LLMInvocationError instead of being retried.
+        for hay in (stderr, envelope_error_text):
+            if hay and any(m in hay.lower() for m in _AUTH_MARKERS):
+                return None
+
+        for hay in (stderr, envelope_error_text):
+            if not hay:
+                continue
+            lower = hay.lower()
+            if any(marker in lower for marker in _RATE_LIMIT_MARKERS):
                 return LLMRateLimitError(
                     message=f"Rate limited: {hay.strip()[:500]}",
                     rate_limit_type=None,
                 )
         return None
 
-    async def invoke(
+    def _build_error_detail(
         self,
-        prompt: str,
-        working_dir: Path,
-        log_dir: Path,
-        additional_dirs: list[Path],
-        notification_center: NotificationCenter,
-        action_schema: dict,
-    ) -> tuple[ActionBlock, LLMUsage]:
-        """Invoke Gemini CLI with the given prompt.
-
-        ``action_schema`` is accepted for interface symmetry but not used —
-        Gemini has no CLI-level schema enforcement; the schema is embedded
-        in the prompt by the caller's prompt builder.
-        """
-        (
-            prompt_file_abs,
-            gemini_cwd,
-            _full_prompt,
-            cmd,
-        ) = self._prepare_invocation(prompt, working_dir, additional_dirs)
-
-        env = os.environ.copy()
-        env.update(self._agent_env)
-
-        invoke_timeout = 1800
-
-        start_time = time.time()
-        proc: Optional[asyncio.subprocess.Process] = None
-        try:
-            try:
-                proc = await asyncio.create_subprocess_exec(
-                    *cmd,
-                    stdin=asyncio.subprocess.DEVNULL,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    cwd=gemini_cwd,
-                    env=env,
-                )
-            except FileNotFoundError:
-                raise LLMNotFoundError(
-                    self._bin,
-                    install_hint="Install Gemini CLI: https://github.com/google-gemini/gemini-cli",
-                )
-
-            try:
-                stdout_b, stderr_b = await asyncio.wait_for(
-                    proc.communicate(),
-                    timeout=invoke_timeout,
-                )
-            except asyncio.CancelledError:
-                proc.kill()
-                try:
-                    await proc.wait()
-                except Exception:
-                    pass
-                elapsed = time.time() - start_time
-                logger.info(f"[gemini-invoke] CANCELLED after {elapsed:.1f}s")
-                raise
-            except asyncio.TimeoutError:
-                proc.kill()
-                try:
-                    await proc.wait()
-                except Exception:
-                    pass
-                elapsed = time.time() - start_time
-                logger.error(f"[gemini-invoke] TIMEOUT after {elapsed:.1f}s")
-                error = LLMTimeoutError(
-                    timeout_seconds=invoke_timeout,
-                    prompt_file=prompt_file_abs,
-                    working_dir=gemini_cwd,
-                    provider="Gemini",
-                )
-                await notification_center.publish(LLM_ERROR, sandbox_dir=working_dir, error=error)
-                raise error
-
-            stdout = stdout_b.decode("utf-8", errors="replace")
-            stderr = stderr_b.decode("utf-8", errors="replace")
-            returncode = proc.returncode if proc.returncode is not None else -1
-
-            elapsed = time.time() - start_time
-            logger.info(
-                f"[gemini-invoke] FINISHED in {elapsed:.1f}s, "
-                f"returncode={returncode}"
+        prepared: PreparedInvocation,
+        stdout: str,
+        stderr: str,
+        returncode: int,
+    ) -> Optional[str]:
+        # Auth / ineligible-tier failure → a concise, actionable message instead
+        # of the raw ~1.6 KB CLI stack trace.
+        if stderr and any(m in stderr.lower() for m in _AUTH_MARKERS):
+            return (
+                "gemini CLI auth failed: it is using the deprecated 'Gemini Code "
+                "Assist for individuals' OAuth tier and ignoring GEMINI_API_KEY. "
+                "Reconfigure the gemini CLI to API-key auth (or clear its cached "
+                "OAuth login). gemini-api (the in-process tier) is unaffected."
             )
-            logger.info(f"[gemini-invoke] stdout length={len(stdout)} chars")
-            if stderr:
-                logger.warning(
-                    f"[gemini-invoke] stderr ({len(stderr)} chars): "
-                    f"{stderr[:1000]}"
-                )
 
-            self._write_invocation_logs(log_dir, stdout, stderr)
-        finally:
-            if proc is not None and proc.returncode is None:
-                try:
-                    proc.kill()
-                    await proc.wait()
-                except Exception:
-                    pass
-
-        # Rate limit check — look at stderr first (most likely location).
         envelope = self._parse_envelope(stdout)
-        envelope_error_text = ""
-        if envelope is not None:
-            err = envelope.get("error")
-            if isinstance(err, str):
-                envelope_error_text = err
-            elif isinstance(err, dict):
-                envelope_error_text = err.get("message", "") or json.dumps(err)
+        envelope_error_text = self._envelope_error_text(envelope)
 
-        rate_limit_error = self._detect_rate_limit(stderr, envelope_error_text)
-        if rate_limit_error is not None:
-            rate_limit_error.prompt_file = prompt_file_abs
-            rate_limit_error.working_dir = gemini_cwd
-            await notification_center.publish(LLM_ERROR, sandbox_dir=working_dir, error=rate_limit_error)
-            raise rate_limit_error
-
-        # Non-zero exit with no rate-limit signature is a generic invocation error.
-        if returncode != 0:
-            logger.error(f"[gemini-invoke] stdout tail: {stdout[-2000:]}")
-            detail_parts = []
-            if envelope_error_text:
-                detail_parts.append(envelope_error_text[:500])
-            if stderr:
-                detail_parts.append(stderr[:500])
-            detail = "\n".join(detail_parts) or "(no error detail)"
-            error = LLMInvocationError(
-                f"Gemini exited with code {returncode}:\n{detail}",
-                prompt_file=prompt_file_abs,
-                working_dir=gemini_cwd,
-            )
-            await notification_center.publish(LLM_ERROR, sandbox_dir=working_dir, error=error)
-            raise error
-
-        # Returncode 0 but no envelope → treat as invocation error (malformed output).
+        # Malformed envelope (no parseable JSON object) — treat as invocation
+        # error so the runner doesn't ingest a half-formed result.
         if envelope is None:
-            error = LLMInvocationError(
-                f"Gemini returned non-JSON stdout:\n{stdout[:500]}",
-                prompt_file=prompt_file_abs,
-                working_dir=gemini_cwd,
-            )
-            await notification_center.publish(LLM_ERROR, sandbox_dir=working_dir, error=error)
-            raise error
+            if returncode != 0:
+                return (stderr[:500] if stderr else "(no error detail)")
+            return f"Gemini returned non-JSON stdout:\n{stdout[:500]}"
 
-        # Envelope reports an error even with exit code 0 (shouldn't normally happen).
+        if returncode == 0 and not envelope_error_text:
+            return None
+
+        logger.error(f"[gemini-invoke] stdout tail: {stdout[-2000:]}")
+        parts: list[str] = []
         if envelope_error_text:
-            error = LLMInvocationError(
-                f"Gemini envelope error: {envelope_error_text[:500]}",
-                prompt_file=prompt_file_abs,
-                working_dir=gemini_cwd,
-            )
-            await notification_center.publish(LLM_ERROR, sandbox_dir=working_dir, error=error)
-            raise error
+            parts.append(envelope_error_text[:500])
+        if stderr:
+            parts.append(stderr[:500])
+        return "\n".join(parts) or "(no error detail)"
+
+    def _parse_result(
+        self,
+        prepared: PreparedInvocation,
+        stdout: str,
+        stderr: str,
+    ) -> ParsedResult:
+        # Reachable only when _build_error_detail returned None, which already
+        # rules out envelope is None and envelope.error. Belt-and-braces guard
+        # in case the envelope vanishes between calls.
+        envelope = self._parse_envelope(stdout)
+        if envelope is None:
+            return ParsedResult(usage=LLMUsage(), actions=[], raw_text="")
 
         usage = self._extract_usage(envelope)
 
@@ -475,7 +415,10 @@ class GeminiCLI(LLMProvider):
         if not isinstance(response_text, str):
             response_text = ""
         parsed = self._parse_response_field(response_text)
-        actions = self._extract_actions(parsed)
+
+        actions: list[dict] = []
+        if isinstance(parsed, dict):
+            actions = normalize_actions(parsed.get("actions"))
 
         if actions:
             logger.info(f"[gemini-invoke] parsed {len(actions)} action(s)")
@@ -490,9 +433,7 @@ class GeminiCLI(LLMProvider):
             f"out={usage.output_tokens} cache_read={usage.cache_read_tokens}"
         )
 
-        await notification_center.publish(LLM_COMPLETE, sandbox_dir=working_dir, usage=usage)
-
         raw_output = (
             json.dumps(parsed) if parsed is not None else (response_text or "")
         )
-        return ActionBlock(raw=raw_output, actions=actions), usage
+        return ParsedResult(usage=usage, actions=actions, raw_text=raw_output)

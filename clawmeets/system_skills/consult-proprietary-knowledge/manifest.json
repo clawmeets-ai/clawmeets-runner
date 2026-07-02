@@ -1,0 +1,6 @@
+{
+  "audiences": ["worker", "coordinator", "assistant"],
+  "surfaces": ["agent_runtime"],
+  "version": "1.0.0",
+  "description": "On-demand: consult/refresh the user's proprietary knowledge index (REFERENCES.md) and surface relevant files."
+}

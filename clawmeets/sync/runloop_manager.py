@@ -13,8 +13,8 @@ import logging
 from pathlib import Path
 from typing import Callable
 
-from clawmeets.sync.runloop import ChangelogRunloop
-from clawmeets.sync.subscriber import ChangelogSubscriber
+from .runloop import ChangelogRunloop
+from .subscriber import ChangelogSubscriber
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +61,15 @@ class ChangelogRunloopManager:
         """
         self._runloop_factory = runloop_factory
         self._runloops: dict[str, ChangelogRunloop] = {}
+        # Guards ONLY the _runloops/_create_locks dicts. Never held across an
+        # awaited runloop operation (load_state/save_state/processing) — doing
+        # so deadlocks against any runloop whose subscriber re-enters
+        # get_or_create from inside on_entry (TunnelSubscriber mirroring).
         self._lock = asyncio.Lock()
+        # Per-project creation locks: serialize concurrent first-creates of the
+        # SAME project without serializing different projects (and without
+        # holding the global lock across load_state()).
+        self._create_locks: dict[str, asyncio.Lock] = {}
 
     async def get_or_create(
         self,
@@ -74,14 +82,32 @@ class ChangelogRunloopManager:
         Args:
             project_id: The project ID
             project_name: The project name
-            coordinator_id: The project coordinator's ID (used by git sandbox)
+            coordinator_id: The project coordinator's ID (passed to the runloop
+                factory; retained for the factory contract)
 
         Returns:
             ChangelogRunloop instance for the project
         """
+        # Fast path: return the cached runloop. The global lock is held only
+        # for the dict lookup — never across load_state() below.
         async with self._lock:
-            if project_id in self._runloops:
-                return self._runloops[project_id]
+            existing = self._runloops.get(project_id)
+            if existing is not None:
+                return existing
+            create_lock = self._create_locks.get(project_id)
+            if create_lock is None:
+                create_lock = asyncio.Lock()
+                self._create_locks[project_id] = create_lock
+
+        # Serialize first-creation of THIS project only. load_state() runs
+        # OUTSIDE the global lock, so a slow/stuck runloop can never block
+        # lookups for other projects, and remove()'s teardown can proceed even
+        # while this awaits — breaking the manager-lock ↔ runloop-lock cycle.
+        async with create_lock:
+            async with self._lock:
+                existing = self._runloops.get(project_id)
+                if existing is not None:
+                    return existing
 
             # Ask the factory for changelog dir and subscribers
             changelog_dir, subscribers = self._runloop_factory(
@@ -98,7 +124,14 @@ class ChangelogRunloopManager:
                 runloop.add_subscriber(subscriber)
 
             await runloop.load_state()
-            self._runloops[project_id] = runloop
+
+            async with self._lock:
+                # A concurrent caller may have published one while we loaded;
+                # keep a single instance per project.
+                existing = self._runloops.get(project_id)
+                if existing is not None:
+                    return existing
+                self._runloops[project_id] = runloop
 
             logger.debug(
                 f"Created runloop for project {project_name}-{project_id[:8]}, "
@@ -110,16 +143,18 @@ class ChangelogRunloopManager:
     async def remove(self, project_id: str) -> None:
         """Remove a project's runloop from the registry.
 
-        Saves state before removal. Use when a project is being deleted.
+        Use when a project is being deleted. Does NOT persist runloop state:
+        the project's on-disk data is destroyed immediately after (rmtree), so
+        the save is pointless — and the old in-lock save_state() held the
+        global manager lock across the runloop's own lock, which deadlocked
+        against TunnelSubscriber re-entering get_or_create from inside a
+        runloop's processing. Dict mutation only, no awaited runloop I/O.
         """
         async with self._lock:
-            runloop = self._runloops.pop(project_id, None)
-            if runloop:
-                try:
-                    await runloop.save_state()
-                except Exception as e:
-                    logger.warning(f"Failed to save state for deleted project {project_id}: {e}")
-                logger.info(f"Removed runloop for project {project_id[:8]}")
+            existed = self._runloops.pop(project_id, None) is not None
+            self._create_locks.pop(project_id, None)
+        if existed:
+            logger.info(f"Removed runloop for project {project_id[:8]}")
 
     async def shutdown(self) -> None:
         """Save state for all runloops and clear registry.
@@ -127,19 +162,25 @@ class ChangelogRunloopManager:
         Call this on graceful shutdown.
         """
         async with self._lock:
-            for project_id, runloop in self._runloops.items():
-                try:
-                    await runloop.save_state()
-                    logger.debug(f"Saved state for project {project_id[:8]}")
-                except Exception as e:
-                    logger.error(f"Failed to save state for project {project_id}: {e}")
-
+            runloops = list(self._runloops.items())
             self._runloops.clear()
-            logger.info("ChangelogRunloopManager shutdown complete")
+            self._create_locks.clear()
+
+        # Persist OUTSIDE the global lock (same deadlock-avoidance rationale as
+        # get_or_create/remove). Shutdown is terminal, but a runloop may still
+        # be mid-processing and re-enter the manager.
+        for project_id, runloop in runloops:
+            try:
+                await runloop.save_state()
+                logger.debug(f"Saved state for project {project_id[:8]}")
+            except Exception as e:
+                logger.error(f"Failed to save state for project {project_id}: {e}")
+
+        logger.info("ChangelogRunloopManager shutdown complete")
 
     def __len__(self) -> int:
         """Return number of active runloops."""
         return len(self._runloops)
 
     def __repr__(self) -> str:
-        return f"ChangelogRunloopManager(model_ctx={self._model_ctx!r}, projects={len(self)})"
+        return f"ChangelogRunloopManager(projects={len(self)})"

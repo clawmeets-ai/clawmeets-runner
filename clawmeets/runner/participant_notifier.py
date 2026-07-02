@@ -24,8 +24,9 @@ from ..sync.changelog import (
     FilePayload,
     RoomCreatedPayload,
 )
-from ..sync.subscriber import ChangelogSubscriber
 from ..models.chat_message import ChatMessage
+from ..models.chatroom import Chatroom
+from ..sync.subscriber import ChangelogSubscriber
 
 if TYPE_CHECKING:
     from ..models.participant import Participant
@@ -130,13 +131,9 @@ class ParticipantNotifier(ChangelogSubscriber):
         # So count == 1 means this is the first message
         project = self._participant.get_project(project_id)
 
-        # In DM projects the coordinator (assistant) is a member of every
-        # agent's dm-{name} sub-room, but it should only reply when it's the
-        # actual addressee — i.e. for its own dm-{assistant-name} room. We
-        # key on `expects_response_from` (authoritative) rather than matching
-        # room names against `self.name`, because for the runner's own
-        # participant `self.name` reads from a card path that doesn't apply
-        # to the self-card and returns "".
+        # In DM projects the coordinator IS the partner agent, so it should
+        # only reply when actually addressed (server populates
+        # expects_response_from via the user-comm auto-coordinator fallback).
         if project.is_dm_project and self._participant.is_coordinator_for(project):
             if self._participant.id not in payload.expects_response_from:
                 return
@@ -166,18 +163,6 @@ class ParticipantNotifier(ChangelogSubscriber):
             )
         else:
             addressed = self._participant.id in payload.expects_response_from
-            # In a DM chatroom `dm-{name}` the chatroom name itself binds the
-            # addressee to the agent named `{name}` — `expects_response_from`
-            # is redundant. This matters when the previous same-name agent
-            # was deleted and re-registered: any pending message frozen with
-            # the deleted id in `expects_response_from` still belongs to the
-            # currently-live successor. Symmetric to the coordinator-side DM
-            # gate above (lines 140-142).
-            if (
-                not addressed
-                and payload.chatroom_name == f"dm-{self._participant.name}"
-            ):
-                addressed = True
             message = ChatMessage.from_message_payload(payload)
             await self._participant.on_message(
                 project_id=project_id,
@@ -233,8 +218,6 @@ class ParticipantNotifier(ChangelogSubscriber):
         delivering the same message to their FD project where they handle it.
         Returns False for missing chatrooms / legacy rows (safe default).
         """
-        from clawmeets.models.chatroom import Chatroom
-
         try:
             chatroom = Chatroom.get(project_id, chatroom_name, self._participant._model_ctx)
         except (ValueError, AttributeError):
