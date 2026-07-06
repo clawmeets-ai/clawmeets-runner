@@ -1,19 +1,19 @@
 # SPDX-License-Identifier: MIT
 """
-clawmeets/models/today_tab.py
+clawmeets/models/brief_tab.py
 
-Today-tab registry — owner-scoped, per-tab JSON artifacts that the
-``/today`` frontend composes into a tab strip.
+Brief-tab registry — owner-scoped, per-tab JSON artifacts that the
+My Desk "Scheduled briefings" section composes into a tab strip.
 
-A today tab is the output of one agent's run of the ``today`` skill:
+A brief tab is the output of one agent's run of the ``brief`` skill:
 the agent gathers data, writes a short render JS body, and shells
-``clawmeets today upsert-tab <slug>`` to upload both. The server stores
+``clawmeets brief upsert-tab <slug>`` to upload both. The server stores
 the bundle keyed by ``(owner_user_id, slug)`` and pushes a
-``TODAY_TAB_SYNC`` envelope so the owner's browser refetches.
+``BRIEF_TAB_SYNC`` envelope so the owner's browser refetches.
 
 Storage::
 
-    {data_dir}/today-tabs/
+    {data_dir}/brief-tabs/
       <owner_user_id>/
         <slug>.json          # one tab artifact
         ...
@@ -34,13 +34,13 @@ from clawmeets.utils.file_io import FileUtil
 
 _lock = asyncio.Lock()
 
-TABS_DIR = "today-tabs"
+TABS_DIR = "brief-tabs"
 
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 
 
-class TodayTab(BaseModel):
-    """A single today tab.
+class BriefTab(BaseModel):
+    """A single brief tab.
 
     ``data`` is opaque JSON the render body consumes. ``render_code_js``
     is the body of ``function(mount, data, lib)`` — no signature, no
@@ -85,27 +85,27 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def _load_tab(path: Path) -> TodayTab | None:
+def _load_tab(path: Path) -> BriefTab | None:
     data = FileUtil.read(path, "json")
     if not isinstance(data, dict):
         return None
     try:
-        return TodayTab.model_validate(data)
+        return BriefTab.model_validate(data)
     except Exception:
         return None
 
 
-def get_tab(data_dir: Path, owner_user_id: str, slug: str) -> TodayTab | None:
+def get_tab(data_dir: Path, owner_user_id: str, slug: str) -> BriefTab | None:
     return _load_tab(_tab_path(data_dir, owner_user_id, slug))
 
 
-def list_tabs(data_dir: Path, owner_user_id: str) -> list[TodayTab]:
+def list_tabs(data_dir: Path, owner_user_id: str) -> list[BriefTab]:
     """Return every persisted tab for the given user. Newest first
     (sorted by ``generated_at`` descending)."""
     user_dir = _user_dir(data_dir, owner_user_id)
     if not user_dir.is_dir():
         return []
-    tabs: list[TodayTab] = []
+    tabs: list[BriefTab] = []
     for entry in user_dir.iterdir():
         if not entry.is_file() or entry.suffix != ".json":
             continue
@@ -125,13 +125,13 @@ async def upsert_tab(
     title: str,
     data: dict | list,
     render_code_js: str,
-) -> TodayTab:
+) -> BriefTab:
     """Create or replace a tab. Always succeeds (overwrite is the
     contract — the publishing agent owns the slug and re-runs on
     every refresh)."""
     slug = validate_slug(slug)
     async with _lock:
-        tab = TodayTab(
+        tab = BriefTab(
             slug=slug,
             title=(title or "").strip() or slug,
             owner_user_id=owner_user_id,

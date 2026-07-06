@@ -39,6 +39,7 @@ from clawmeets.sync.changelog import (
     ChangelogEntry,
     ChangelogEntryType,
     ChatroomClearedPayload,
+    DisplayNameChangedPayload,
     ProjectAllowlistUpdatedPayload,
     ProjectCreatedPayload,
     MessagePayload,
@@ -50,6 +51,7 @@ from clawmeets.sync.changelog import (
 from clawmeets.sync.subscriber import ChangelogSubscriber
 from clawmeets.utils.file_io import FileUtil
 from .project import Project, ProjectState
+from .participant import Participant, ParticipantRole
 from .chatroom import Chatroom, ChatroomState
 from .chat_message import ChatBatchTimeoutEvent, ChatFileEvent, ChatMessage
 
@@ -473,6 +475,7 @@ class ModelContextChangelogSubscriber(ChangelogSubscriber):
     - PROJECT_COMPLETED → ProjectState.complete()
     - PROJECT_REACTIVATED → ProjectState.reactivate()
     - PROJECT_ALLOWLIST_UPDATED → ProjectState.apply_allowlist_update()
+    - DISPLAY_NAME_CHANGED → ProjectState.set_thread_title() (writes display_name)
 
     ## Priority
 
@@ -556,8 +559,29 @@ class ModelContextChangelogSubscriber(ChangelogSubscriber):
             case ChangelogEntryType.PROJECT_ALLOWLIST_UPDATED:
                 await self._handle_project_allowlist_updated(entry)
 
+            case ChangelogEntryType.DISPLAY_NAME_CHANGED:
+                # MF1 site 4 (load-bearing): without this case a changelog
+                # rebuild silently does NOT reproduce the auto-title.
+                await self._handle_display_name_changed(entry)
+
             case ChangelogEntryType.BATCH_COMPLETE:
                 pass  # Existing reply-window logic in the chip already covers it
+
+            case _:
+                # MF1 loud default: this subscriber materializes state for EVERY
+                # known entry type above (BATCH_COMPLETE is an explicit no-op).
+                # A fall-through here means a new ChangelogEntryType was added
+                # without an apply handler — surface it loudly instead of a silent
+                # no-op (which would make a changelog rebuild drop the state that
+                # entry encodes). Non-fatal by design: raising would wedge the
+                # per-project runloop cursor for a type another subscriber may own.
+                logger.error(
+                    "ModelContextChangelogSubscriber: no apply handler for entry_type "
+                    "%s in project %s — state for this entry will NOT be materialized "
+                    "on replay. Add a case in on_entry.",
+                    entry.entry_type,
+                    self._project_id[:8],
+                )
 
     async def _handle_project_created(self, entry: ChangelogEntry) -> None:
         """Create project directories and write project meta.json.
@@ -581,6 +605,7 @@ class ModelContextChangelogSubscriber(ChangelogSubscriber):
             agent_teams=getattr(payload, "agent_teams", []) or [],
             agent_names=getattr(payload, "agent_names", []) or [],
             surface=getattr(payload, "surface", "regular"),
+            display_name=getattr(payload, "display_name", None),
         )
 
     async def _handle_room_created(self, entry: ChangelogEntry) -> None:
@@ -692,6 +717,35 @@ class ModelContextChangelogSubscriber(ChangelogSubscriber):
         )
         chatroom.state().append_message(chat_message)
 
+        # Advance the project's activity timestamps so the sidebar can sort by
+        # recency (last_modified = max(last_request_ts, last_response_ts)).
+        # Skip is_ack placeholder bubbles (they must not bump ordering) and
+        # cross-project mirrors: a mirrored entry is classified by the local
+        # mirroring participant, which would mislabel the counterpart's message
+        # as this side (fix S3). A native message on either end already advances
+        # the correct timestamp, so skipping mirrors loses nothing. Monotonic
+        # set-if-greater in touch_activity keeps this idempotent under replay.
+        if not payload.is_ack and entry.mirrored_from is None:
+            project = Project.get(self._project_id, self._model_ctx)
+            project.state().touch_activity(
+                ts=payload.ts,
+                is_request=self._author_is_user(entry),
+            )
+
+    def _author_is_user(self, entry: ChangelogEntry) -> bool:
+        """Classify a MESSAGE entry's author as USER (request) vs AGENT (response).
+
+        Looks up the sending participant's role. An unknown participant is
+        treated as a response (agent-side) so a stray message never mislabels a
+        user request. Callers must already have excluded ``mirrored_from``
+        entries (see ``_handle_message``) — this resolves the *native* author.
+        """
+        payload: MessagePayload = entry.payload  # type: ignore[assignment]
+        participant = Participant.get(payload.from_participant_id, self._model_ctx)
+        if participant is None:
+            return False
+        return participant.role == ParticipantRole.USER
+
     async def _handle_file_update(self, entry: ChangelogEntry) -> None:
         """Create or update a data file, and log the touch to CHATS.ndjson.
 
@@ -792,6 +846,27 @@ class ModelContextChangelogSubscriber(ChangelogSubscriber):
             agent_names=payload.agent_names,
             agent_teams=payload.agent_teams,
         )
+
+    async def _handle_display_name_changed(self, entry: ChangelogEntry) -> None:
+        """Apply a DM-thread auto-title into project meta.json.
+
+        SF1: applies the title UNCONDITIONALLY (last-write-wins overwrite). Does
+        NOT re-check ``== "New chat"`` and does NOT re-run any compare-and-set —
+        the append-time guard on the rename endpoint is the only gate, and a
+        changelog rebuild must deterministically reproduce the last
+        DISPLAY_NAME_CHANGED. Reuses the already-shipped
+        ``ProjectState.set_thread_title`` (writes ``display_name`` into
+        meta.json; slug/dir untouched — R6).
+        """
+        payload: DisplayNameChangedPayload = entry.payload  # type: ignore[assignment]
+        project = Project.get(self._project_id, self._model_ctx)
+        if project is None:
+            logger.warning(
+                f"DISPLAY_NAME_CHANGED: project {self._project_id[:8]} not found; "
+                "skipping (likely a stale entry replayed before the project meta is on disk)"
+            )
+            return
+        project.state().set_thread_title(display_name=payload.display_name)
 
     async def _handle_chatroom_cleared(self, entry: ChangelogEntry) -> None:
         """Wipe CHATS.ndjson and archive prior contents to .bak sibling.

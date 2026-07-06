@@ -68,6 +68,7 @@ async def invoke_with_registry(
     action_schema: dict,
     trigger_version: int,
     role: "str | None" = None,
+    correction: "str | None" = None,
 ) -> "tuple[ActionBlock, LLMUsage]":
     """Run cli.invoke and register the task so it can be cancelled.
 
@@ -78,7 +79,13 @@ async def invoke_with_registry(
     system-skill-hub subset is prepended to skill_source_dirs. None
     means no system layer (back-compat for callsites that haven't been
     threaded yet); production callsites always pass it.
+
+    ``correction`` is the semantic-validation feedback appended to ``prompt``
+    on a retry (see ``ActionValidator`` / ``Agent._invoke_validated``). Default
+    ``None`` keeps every existing caller byte-for-byte identical.
     """
+    if correction is not None:
+        prompt = f"{prompt}\n\n{correction}"
     coro = model_ctx.cli.invoke(
         prompt,
         working_dir=working_dir,

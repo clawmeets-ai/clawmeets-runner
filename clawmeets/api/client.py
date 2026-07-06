@@ -14,7 +14,7 @@ Centralizes all HTTP endpoint interactions in one place:
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Optional
 
 import httpx
 
@@ -195,6 +195,34 @@ class ClawMeetsClient:
         resp = await self._http.post(url, params=params)
         resp.raise_for_status()
         logger.debug(f"Marked project {project_id} as completed")
+
+    async def set_project_display_name(
+        self,
+        project_id: str,
+        display_name: str,
+        expected_current: Optional[str] = None,
+    ) -> None:
+        """Rename a DM thread's ``display_name`` (the auto-title mutation).
+
+        Called by the DM'd agent's runloop from the auto-title trigger, awaited
+        within the turn (SF3). Authenticated as the agent (the http_client
+        carries the agent bearer token) — the server binds authority to the
+        project's coordinator, so only the thread's own agent may rename it.
+
+        Args:
+            project_id: The DM thread project ID.
+            display_name: The model-generated title replacing "New chat".
+            expected_current: Optional defensive sentinel; the auto path passes
+                the literal ``"New chat"`` so a title that already flipped is a
+                server-side no-op (best-effort, not an atomic CAS).
+        """
+        url = f"{self._base_url}/projects/{project_id}/display-name"
+        payload: dict[str, Any] = {"display_name": display_name}
+        if expected_current is not None:
+            payload["expected_current"] = expected_current
+        resp = await self._http.post(url, json=payload)
+        resp.raise_for_status()
+        logger.debug(f"Renamed project {project_id} display_name -> {display_name!r}")
 
     # ─────────────────────────────────────────────────────────────────────────
     # Sync Operations

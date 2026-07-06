@@ -15,14 +15,39 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
-from .changelog import ChangelogEntry, ChangelogPayload, MirroredFromRef
+from .changelog import (
+    ChangelogEntry,
+    ChangelogEntryType,
+    ChangelogPayload,
+    MirroredFromRef,
+)
 from .subscriber import ChangelogSubscriber
 from clawmeets.utils.file_io import FileUtil
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class BatchEntrySpec:
+    """One entry in an :meth:`ChangelogRunloop.append_batch` call.
+
+    ``source_version`` is an absolute reply-to link (same as ``append``).
+    ``link_to_index`` instead links to the assigned version of another spec in
+    the SAME batch (by its position in the list) — used to point attached FILE
+    entries at the sibling MESSAGE entry whose version is only known once the
+    batch assigns versions under the lock. Exactly one of the two should be set
+    (``link_to_index`` wins if both are).
+    """
+
+    entry_type: ChangelogEntryType
+    payload: ChangelogPayload
+    source_version: int | None = None
+    link_to_index: int | None = None
+    mirrored_from: MirroredFromRef | None = None
 
 
 class ChangelogRunloop:
@@ -236,6 +261,59 @@ class ChangelogRunloop:
 
             return entry
 
+    async def append_batch(
+        self,
+        specs: list["BatchEntrySpec"],
+    ) -> list[ChangelogEntry]:
+        """Append several entries atomically under a single lock hold.
+
+        All entries are assigned sequential versions and persisted BEFORE any
+        subscriber runs, then processed in version order. This is what makes a
+        "message with attachments" wake-safe: the FILE_* entries (which wake no
+        agent) are given lower versions and process first, so the sibling
+        MESSAGE entry — appended last — fires ``ParticipantNotifier`` only once
+        the files are already on disk.
+
+        ``link_to_index`` on a spec is resolved to the assigned version of the
+        spec at that index, so callers can point attachments at the message
+        without knowing the version in advance (it is assigned here, under the
+        lock — never guessed).
+
+        Returns the created entries in the same order as ``specs``.
+        """
+        if not specs:
+            return []
+
+        async with self._lock:
+            base_version = self.get_current_version()
+
+            # First pass: assign versions so link_to_index can resolve to a
+            # sibling's final version.
+            assigned_versions = [base_version + 1 + i for i in range(len(specs))]
+
+            entries: list[ChangelogEntry] = []
+            for i, spec in enumerate(specs):
+                if spec.link_to_index is not None:
+                    source_version = assigned_versions[spec.link_to_index]
+                else:
+                    source_version = spec.source_version
+                entries.append(
+                    ChangelogEntry(
+                        version=assigned_versions[i],
+                        entry_type=spec.entry_type,
+                        payload=spec.payload,
+                        source_version=source_version,
+                        mirrored_from=spec.mirrored_from,
+                    )
+                )
+
+            # Persist all, then process the whole batch in version order.
+            await self._persist_entries(entries)
+            self._pending_entries.extend(entries)
+            await self._process_queue_internal()
+
+            return entries
+
     # ─────────────────────────────────────────────────────────
     # Query Methods
     # ─────────────────────────────────────────────────────────
@@ -259,6 +337,28 @@ class ChangelogRunloop:
             if entry.version <= since_version:
                 continue
             entries.append(entry)
+        return entries
+
+    def get_entries_by_source_version(
+        self,
+        source_version: int,
+    ) -> list[ChangelogEntry]:
+        """Return all entries whose ``source_version`` matches (single pass).
+
+        Used by the tunnel to gather a message's sibling attachments (the FILE_*
+        entries appended in the same atomic batch, which carry
+        ``source_version == message.version``).
+        """
+        changelog_path = self._changelog_dir / "changelog.ndjson"
+        if not changelog_path.exists():
+            return []
+        entries: list[ChangelogEntry] = []
+        for line in changelog_path.read_text(encoding="utf-8").splitlines():
+            if not line:
+                continue
+            entry = ChangelogEntry.model_validate_json(line)
+            if entry.source_version == source_version:
+                entries.append(entry)
         return entries
 
     def get_current_version(self) -> int:

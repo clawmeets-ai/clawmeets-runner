@@ -39,10 +39,25 @@ from ..utils.file_io import FileUtil
 from .participant import Participant
 
 
-# Project surface — the explicit project shape. DM-shaped projects (both solo
-# personal DM and the responder side of a cross-user tunnel) use "dm";
-# task-shaped projects use "regular".
-ProjectSurface = Literal["regular", "dm"]
+# Project surface — the explicit project shape.
+#   "regular"   — task-shaped project (PLAN.md / milestones / multi-party).
+#   "dm"        — owned 1:1 DM (a user with their OWN agent), single
+#                 user-communication room, DM prompt variant, auto-title.
+#   "frontdesk" — ONE END of a cross-account thread (Front Desk). Each end is a
+#                 distinct project OWNED (created_by) by that side and bound
+#                 1-to-1 to the other end by a TunnelBinding. The requester end's
+#                 coordinator is a foreign agent (an `external` ghost that never
+#                 runs locally); the host end's coordinator is that same foreign
+#                 agent running for real. "dm" and "frontdesk" are both
+#                 "dm-shaped" (see Project.is_dm_shaped).
+ProjectSurface = Literal["regular", "dm", "frontdesk"]
+
+# Seeded label a fresh DM thread carries until its first exchange auto-titles it.
+# Doubles as the fire-once latch for the auto-title trigger (agent.py) and the
+# defensive ``expected_current`` sentinel on the rename endpoint — the trigger
+# runs only while ``display_name == NEW_CHAT_PLACEHOLDER`` and the mutation flips
+# it, so every later message reads a non-placeholder value and skips.
+NEW_CHAT_PLACEHOLDER = "New chat"
 
 # Front Desk / DM-shaped project name shape: ``{requester}-fd-{agent_short}``.
 # Mirrors the frontend FRONT_DESK_NAME_RE (web/frontend/src/types/index.ts).
@@ -55,6 +70,17 @@ if TYPE_CHECKING:
     from .agent import Agent
     from .context import ModelContext
     from .chatroom import Chatroom
+
+
+def _as_aware_utc(dt: datetime) -> datetime:
+    """Coerce a datetime to timezone-aware UTC.
+
+    Timestamps in this system are written as UTC-aware isoformat strings, but a
+    legacy/hand-edited ``meta.json`` could carry a naive value. Normalizing
+    before any ``max()``/comparison avoids a ``TypeError`` from mixing aware and
+    naive datetimes.
+    """
+    return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt
 
 
 class Project(BaseModel):
@@ -77,9 +103,31 @@ class Project(BaseModel):
     agent_teams: list[str] = Field(default_factory=list)  # Hard allowlist by user_team; pairs with agent_names. Empty teams + empty names = no filter (everyone in pool is invitable).
     agent_names: list[str] = Field(default_factory=list)  # Hard allowlist by agent display name (id, full name, or owner-relative short name); pairs with agent_teams. OR semantics across both lists.
     surface: ProjectSurface = "regular"  # Explicit project shape; "regular" | "dm"
+    display_name: Optional[str] = None    # Model-set human label (regular projects AND dm threads).
+                                          # None only on legacy/pre-migration rows -> callers render `name` (the slug).
+    last_request_ts: Optional[datetime] = None   # ts of the most recent non-ack USER message across the project.
+    last_response_ts: Optional[datetime] = None  # ts of the most recent non-ack AGENT/ASSISTANT message.
 
     # Private runtime state (not serialized)
     _ctx: Optional["ModelContext"] = PrivateAttr(default=None)
+
+    @computed_field
+    @property
+    def last_modified(self) -> datetime:
+        """Recency key the sidebar sorts on (desc).
+
+        ``max(last_request_ts, last_response_ts)`` with ``created_at`` as the
+        floor, so a brand-new / message-less project still has a deterministic,
+        non-null sort key. Decorated with ``@computed_field`` so it rides
+        ``model_dump()`` into ``GET /projects`` and ``GET /projects/{id}``
+        without extra plumbing.
+        """
+        candidates = [_as_aware_utc(self.created_at)]
+        if self.last_request_ts is not None:
+            candidates.append(_as_aware_utc(self.last_request_ts))
+        if self.last_response_ts is not None:
+            candidates.append(_as_aware_utc(self.last_response_ts))
+        return max(candidates)
 
     @property
     def ctx(self) -> "ModelContext":
@@ -146,8 +194,57 @@ class Project(BaseModel):
 
     @property
     def is_dm_project(self) -> bool:
-        """Check if this is a DM-shaped project (solo personal DM or cross-user tunnel endpoint)."""
+        """Owned 1:1 DM ONLY (``surface == "dm"``).
+
+        Does NOT include Front Desk ends (``surface == "frontdesk"``). Use
+        :meth:`is_dm_shaped` wherever the old code meant "dm-shaped" rather than
+        "owned DM specifically" — see the §5 surface audit in the Front Desk plan.
+        """
         return self.surface == "dm"
+
+    @property
+    def is_frontdesk_project(self) -> bool:
+        """One END of a cross-account Front Desk thread (``surface == "frontdesk"``)."""
+        return self.surface == "frontdesk"
+
+    @property
+    def is_dm_shaped(self) -> bool:
+        """True for BOTH owned DMs and Front Desk ends.
+
+        Both carry a single ``user-communication`` room, use the DM prompt
+        variant (``is_dm=True``), and are auto-title eligible. This is the
+        predicate the auto-title trigger, prompt-variant selection, and the
+        DM-vs-milestone-setup branch key on — the widened successor to
+        ``is_dm_project`` at those callsites.
+        """
+        return self.surface in ("dm", "frontdesk")
+
+    def frontdesk_is_host_side(self, ctx: "ModelContext") -> bool:
+        """True when the coordinator is owned by ``created_by`` (the terminal/host end).
+
+        Semantics: the project's coordinator agent is ``registered_by`` the same
+        user who created the project — i.e. someone reached IN to MY agent. This
+        is the **host / terminal** side of a cross-account thread (renders in the
+        owner's Front Desk section; tunnel detection treats it as terminal so it
+        never spawns an FD-of-an-FD). The **requester** side is the negation —
+        the coordinator is a foreign agent I do NOT own (I reached OUT).
+
+        Requires an Agent lookup because ``Project`` stores ``coordinator_id``,
+        not the coordinator's owner. Returns ``False`` when the coordinator or
+        ``created_by`` cannot be resolved (fail-open to non-terminal).
+
+        NOTE: for an owned DM (``surface == "dm"``) this is also True (the agent
+        is my own) — which is correct for the terminal-gate usage in
+        ``tunnel_subscriber`` (own DMs and legacy shared ``-fd-`` rows are both
+        terminal: cross-account delegation must not bleed a tunnel out of them).
+        """
+        from .agent import Agent
+        if not self.created_by:
+            return False
+        coordinator = Agent.get(self.coordinator_id, ctx)
+        if coordinator is None:
+            return False
+        return coordinator.registered_by == self.created_by
 
     @property
     def fd_requester_name(self) -> Optional[str]:
@@ -498,6 +595,7 @@ class ProjectState:
         agent_teams: list[str] | None = None,
         agent_names: list[str] | None = None,
         surface: ProjectSurface = "regular",
+        display_name: Optional[str] = None,
     ) -> Project:
         """Create a new project with directories and meta.json.
 
@@ -546,6 +644,7 @@ class ProjectState:
             "agent_teams": list(agent_teams) if agent_teams else [],
             "agent_names": list(agent_names) if agent_names else [],
             "surface": surface,
+            "display_name": display_name,
         }
         FileUtil.write(meta_dir / "meta.json", project_data, "json", atomic=True)
 
@@ -602,3 +701,51 @@ class ProjectState:
             current_agents.append(participant_id)
             project_dict["participating_agents"] = current_agents
             FileUtil.write(meta_path, project_dict, "json", atomic=True)
+
+    def touch_activity(self, *, ts: datetime, is_request: bool) -> None:
+        """Advance ``last_request_ts`` (user message) or ``last_response_ts``
+        (agent message) so the project sorts by recency in the sidebar.
+
+        Monotonic set-if-greater / set-if-null: a timestamp is only ever moved
+        forward, never backward. This makes the write idempotent under changelog
+        replay and safe against an out-of-order replay or a re-run migration
+        backfill regressing a value the live server already advanced.
+
+        Args:
+            ts: The message timestamp.
+            is_request: True for a USER message (``last_request_ts``), False for
+                an AGENT/ASSISTANT message (``last_response_ts``).
+        """
+        field = "last_request_ts" if is_request else "last_response_ts"
+        meta_path = self._project.meta_path
+        project_dict = FileUtil.read(meta_path, "json")
+        new_dt = _as_aware_utc(ts)
+        existing_raw = project_dict.get(field)
+        existing_dt = (
+            _as_aware_utc(datetime.fromisoformat(existing_raw)) if existing_raw else None
+        )
+        if existing_dt is not None and existing_dt >= new_dt:
+            return  # never regress; no write needed
+        project_dict[field] = new_dt.isoformat()
+        FileUtil.write(meta_path, project_dict, "json", atomic=True)
+
+    def set_thread_title(self, *, display_name: str, slug: Optional[str] = None) -> None:
+        """Apply a model-generated title to a DM thread after its first exchange.
+
+        Sets ``display_name`` (replacing the ``"New chat"`` placeholder). The
+        stable thread identity is the project ``id`` (UUID) — see the plan's
+        OPEN Q2. The ``slug`` parameter is accepted for interface stability but
+        deliberately NOT applied: the on-disk layout keys the project directory
+        on ``{name}-{id}``, so renaming the slug would require moving directories
+        and is unsafe until Q2 is resolved. Only ``display_name`` is model-set.
+
+        Idempotent: a second call simply overwrites ``display_name`` again.
+
+        Args:
+            display_name: The model-generated human title.
+            slug: Reserved (see above); currently a no-op.
+        """
+        meta_path = self._project.meta_path
+        project_dict = FileUtil.read(meta_path, "json")
+        project_dict["display_name"] = display_name
+        FileUtil.write(meta_path, project_dict, "json", atomic=True)

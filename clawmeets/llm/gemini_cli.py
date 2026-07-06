@@ -116,6 +116,16 @@ class GeminiCLI(SubprocessLLMProvider):
         self._agent_env = dict(agent_env)
         self._skill_dirs = list(skill_dirs or [])
 
+    def _build_env(self) -> dict[str, str]:
+        env = super()._build_env()
+        # Gemini CLI's trusted-folders feature refuses headless runs in an
+        # untrusted cwd (exit 55: "not running in a trusted directory") —
+        # and the agent's sandbox dir is never interactively trusted.
+        # Trusting the workspace is the same decision --approval-mode yolo
+        # already encodes.
+        env.setdefault("GEMINI_CLI_TRUST_WORKSPACE", "true")
+        return env
+
     @classmethod
     def verify_cli(cls, gemini_bin: str = "gemini") -> None:
         """Verify Gemini CLI is available.

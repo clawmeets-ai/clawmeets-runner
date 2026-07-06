@@ -125,3 +125,5 @@ class ParticipantProjectResponse(BaseModel):
     is_viewer: bool = False
     created_by: str
     surface: Optional[str] = None  # "regular" | "dm"
+    display_name: Optional[str] = None  # raw model-set label; frontend renders `display_name ?? name`
+    last_modified: datetime  # ISO-8601, non-null; sidebar sorts the PROJECTS list by this desc

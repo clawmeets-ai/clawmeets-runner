@@ -52,6 +52,13 @@ dependencies = [
     # WebFetch local fallbacks; genai-prices computes per-request cost_usd.
     "pydantic-ai-slim[anthropic,openai,google,mcp,duckduckgo,web-fetch,openrouter]>=1.0",
     "genai-prices>=0.0.60",
+    # OpenMontage pipeline manifests (pipeline_defs/*.yaml) parsed by the
+    # `clawmeets om` stage-handoff CLI.
+    "PyYAML>=6.0",
+    # Interactive Brokers read-only integration (clawmeets/integrations/ib/).
+    # `ib_async` is the maintained, API-compatible fork of the unmaintained
+    # `ib_insync`; it talks to a human-operated TWS / IB Gateway socket API.
+    "ib_async>=1.0",
 ]
 
 [project.scripts]

@@ -632,6 +632,7 @@ class User(Participant):
             "event": "message",
             "project_id": project_id,
             "project_name": project.name,
+            "display_name": project.display_name,
             "chatroom_name": chatroom_name,
             "user_id": self._id,
             "username": self.username,

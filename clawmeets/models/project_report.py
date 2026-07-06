@@ -8,7 +8,7 @@ by the coordinator at wrap-up and rendered in the project detail view.
 Reuses the self-serve tab publishing protocol (``data`` JSON +
 ``render_code_js`` body executed in the browser via
 ``new Function('mount', 'data', 'lib', ...)`` with the same ``lib``
-namespace as today-tabs). What differs is the scope: a report is keyed
+namespace as brief-tabs). What differs is the scope: a report is keyed
 by the project, not the user, and surfaces inside the project's own UI.
 
 Storage::

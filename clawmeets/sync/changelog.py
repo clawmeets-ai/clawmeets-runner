@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from enum import Enum
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Optional, Union
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -37,6 +37,7 @@ class ChangelogEntryType(str, Enum):
     PARTICIPANT_ADDED = "participant_added"  # Participant added to existing room
     CHATROOM_CLEARED = "chatroom_cleared"    # All messages in a chatroom wiped by user
     PROJECT_ALLOWLIST_UPDATED = "project_allowlist_updated"  # Snapshot of agent_names/agent_teams refreshed
+    DISPLAY_NAME_CHANGED = "display_name_changed"  # Project-scoped rename (dm thread auto-title)
 
 
 class ProjectStatus(str, Enum):
@@ -194,6 +195,19 @@ class ProjectAllowlistUpdatedPayload(BaseModel):
     agent_teams: list[str] = Field(default_factory=list)
 
 
+class DisplayNameChangedPayload(BaseModel):
+    """Payload for DISPLAY_NAME_CHANGED entries in unified changelog.
+
+    Project-level entry (no chatroom_name) — mirrors ``ProjectCompletedPayload``
+    in scope. Carries the new model-generated title that replaces the seeded
+    ``"New chat"`` placeholder on a DM thread after its first exchange. Applied
+    by ``ModelContextChangelogSubscriber._handle_display_name_changed`` via the
+    already-shipped ``ProjectState.set_thread_title`` (slug/dir untouched).
+    """
+    project_id: str
+    display_name: str  # the new model-generated title (replaces "New chat")
+
+
 class ProjectCreatedPayload(BaseModel):
     """Payload for PROJECT_CREATED entries in unified changelog.
 
@@ -209,6 +223,7 @@ class ProjectCreatedPayload(BaseModel):
     agent_teams: list[str] = Field(default_factory=list)  # Hard allowlist by user_team; pairs with agent_names. Empty teams + empty names = no filter.
     agent_names: list[str] = Field(default_factory=list)  # Hard allowlist by agent display name (id, full name, or owner-relative short name); pairs with agent_teams. OR semantics across both lists.
     surface: str = "regular"  # "regular" | "dm" — explicit project shape
+    display_name: Optional[str] = None  # model-set label; "New chat" placeholder for a fresh dm thread. Optional/default for wire compat.
 
 
 # Union type for changelog payloads
@@ -225,6 +240,7 @@ ChangelogPayload = Union[
     ParticipantAddedPayload,
     ChatroomClearedPayload,
     ProjectAllowlistUpdatedPayload,
+    DisplayNameChangedPayload,
 ]
 
 
@@ -299,6 +315,7 @@ class ChangelogEntry(BaseModel):
                 "participant_added": ParticipantAddedPayload,
                 "chatroom_cleared": ChatroomClearedPayload,
                 "project_allowlist_updated": ProjectAllowlistUpdatedPayload,
+                "display_name_changed": DisplayNameChangedPayload,
             }
 
             payload_cls = payload_types.get(entry_type)
@@ -325,6 +342,7 @@ class ChangelogEntry(BaseModel):
             ChangelogEntryType.PARTICIPANT_ADDED: ParticipantAddedPayload,
             ChangelogEntryType.CHATROOM_CLEARED: ChatroomClearedPayload,
             ChangelogEntryType.PROJECT_ALLOWLIST_UPDATED: ProjectAllowlistUpdatedPayload,
+            ChangelogEntryType.DISPLAY_NAME_CHANGED: DisplayNameChangedPayload,
         }
         expected = expected_types[self.entry_type]
         if not isinstance(self.payload, expected):

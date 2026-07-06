@@ -187,6 +187,44 @@ class ScheduledMessageStore:
                     return True
             return False
 
+    async def update(
+        self,
+        msg_id: str,
+        user_id: str,
+        *,
+        project_id: str,
+        chatroom_name: str,
+        content: str,
+        cron_expression: str,
+        timezone: str,
+        end_at: Optional[datetime],
+    ) -> Optional[ScheduledMessage]:
+        """Update an existing scheduled message in place (user-scoped).
+
+        Rewrites the editable fields and recomputes ``next_fire_at`` from the new
+        cron/timezone. Returns the updated message, or ``None`` if not found or
+        not owned by ``user_id``. Callers must validate cron/timezone/target
+        first (see the PUT route).
+        """
+        async with self._lock:
+            messages = self._load_all_sync()
+            for msg in messages:
+                if msg.id == msg_id and msg.user_id == user_id:
+                    msg.project_id = project_id
+                    msg.chatroom_name = chatroom_name
+                    msg.content = content
+                    msg.cron_expression = cron_expression
+                    msg.timezone = timezone
+                    msg.end_at = end_at
+                    msg.next_fire_at = compute_next_fire(
+                        cron_expression, datetime.now(UTC), timezone
+                    )
+                    if msg.end_at and msg.next_fire_at > msg.end_at:
+                        msg.is_active = False
+                    self._save_all_ndjson_sync(messages)
+                    return msg
+            return None
+
     async def update_after_fire(self, msg_id: str, now: datetime) -> None:
         """Update a message after it has been fired.
 

@@ -6,8 +6,9 @@ description: >
   change PLUS the coordinator's overall review of the change PLUS an
   annotated diff review — what was done, why, the holistic verdict, key
   files, risk areas, and the diff with inline reviewer comments. Invoke
-  BEFORE `project_completed` when wrapping a coding project. For
-  non-coding projects, use `project-completion-report` instead.
+  BEFORE `project_completed` when wrapping a coding project — a report is
+  required for every git-shaped project, not optional. For non-coding
+  projects, use `project-completion-report` instead.
 ---
 
 # Coding project completion report
@@ -25,19 +26,21 @@ self-serve protocol as `/today` tabs: a `data` JSON + a small
 
 ## § When to use
 
-Author this iff ALL of:
+Author this for **every git-shaped project** — a report is required
+before `project_completed`, not optional. Use it when:
 
 - The project's FILES & STATE block shows a `Git repo` line (it's
-  git-tracked).
-- The diff is non-trivial: more than one file, or a single file with
-  a non-obvious change.
+  git-tracked), AND
 - Acceptance criteria have passed.
 
-Skip when:
+Scale the depth to the diff (a one-file change gets a short review; a
+large diff gets the full annotated walk-through) — but always publish.
 
-- The diff is one tiny edit a chat reply already explained.
-- The project never produced code (use `project-completion-report`).
-- The project failed and you're recording why (use a plain chat note).
+Route elsewhere only when:
+
+- The project never produced code — use `project-completion-report`.
+- The project failed and you're recording why — use a plain chat note
+  (there's no successful change to review).
 
 ## § When in the project lifecycle
 

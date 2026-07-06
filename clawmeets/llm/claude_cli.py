@@ -190,6 +190,32 @@ class ClaudeCLI(SubprocessLLMProvider):
             stdin_bytes=prompt.encode("utf-8"),
         )
 
+    def _prepare_text_invocation(
+        self, prompt: str, working_dir: Path, max_tokens: int
+    ) -> PreparedInvocation:
+        """One-shot plain-text completion via ``claude --print``.
+
+        No ``--json-schema`` (so ``--print`` streams the assistant text straight
+        to stdout in its default text format), no MCP/skills/add-dir, no session
+        persistence — the cheapest way to turn a one-line titling prompt into a
+        title. Reads the prompt from stdin like the main invoke path.
+        """
+        working_dir.mkdir(parents=True, exist_ok=True)
+        cmd = [
+            self._bin,
+            "--print",
+            "--permission-mode", "bypassPermissions",
+            "--no-session-persistence",
+        ]
+        if self._model:
+            cmd.extend(["--model", self._model])
+        return PreparedInvocation(
+            cmd=cmd,
+            cwd=str(working_dir),
+            prompt_file_abs="",
+            stdin_bytes=prompt.encode("utf-8"),
+        )
+
     def _check_rate_limit(
         self,
         prepared: PreparedInvocation,

@@ -3,14 +3,15 @@ name: project-completion-report
 description: >
   Publish an interactive, chart-rich report for the project you are
   coordinating, so the user absorbs the findings + supporting rationale
-  in one polished surface instead of scrolling chat history. INVOKE when
-  the project is about to wrap up AND produced findings worth presenting
-  (numbers, comparisons, recommendations, ranked options). Skip for
-  trivial DM-style projects where a one-line summary is enough. The
-  report renders inside the project's own UI ("Report" tab) — not in
-  chat, not on /today. For git-shaped projects (FILES & STATE block
-  shows a `Git repo` line), prefer `coding-project-completion-report`
-  instead — it pairs the summary with an annotated diff review.
+  in one polished surface instead of scrolling chat history. INVOKE
+  before wrapping up EVERY regular project — a completion report is
+  required, not optional. The report renders inside the project's own UI
+  ("Report" tab) — not in chat, not on /today. Two exceptions only: for
+  git-shaped projects (FILES & STATE block shows a `Git repo` line) use
+  `coding-project-completion-report` instead (it pairs the summary with
+  an annotated diff review); and DM-shaped projects (a one-to-one direct
+  message, no PLAN.md / milestones) don't get a report — a chat reply is
+  the deliverable there.
 ---
 
 # Project completion report
@@ -22,27 +23,28 @@ user opens when they want to know what the project found and why.
 
 ## § When to use
 
-Author a report iff the project produced:
+A completion report is **required for every regular project** you
+coordinate — publish one before `project_completed`, every time. It is
+the user's polished take-away; the chat is not. Shape the report to what
+the project produced (numerical findings, ranked options, a
+recommendation with rationale, or structured data to scan) — but always
+publish one.
 
-- numerical findings (metrics, growth rates, comparisons), OR
-- multiple options the user must choose between (ranked, scored), OR
-- a recommendation with non-obvious rationale (steps in a chain, sources
-  the user might want to verify), OR
-- structured data the user will want to scan / filter (rows, dates,
-  prices, contacts).
+Only two cases are exempt:
 
-Skip the report for:
+- **git-shaped projects** (FILES & STATE block shows a `Git repo` line) —
+  use `coding-project-completion-report` instead; its diff-aware review
+  is what users want for code changes. (You still publish a report — just
+  the coding variant.)
+- **DM-shaped projects** — a one-to-one direct message (no PLAN.md,
+  milestones, or setup). There the chat reply IS the deliverable; don't
+  publish a report.
 
-- git-shaped projects (FILES & STATE block shows a `Git repo` line) — use
-  `coding-project-completion-report` instead; its diff-aware review is
-  what users want for code changes,
-- single-question DMs answered with a sentence,
-- projects whose deliverable IS a file (the user opens the file directly),
-- trivial confirmations / acknowledgments.
-
-When in doubt: if you would otherwise write a 200+ word markdown summary
-in `user-communication`, write the report instead. The report replaces
-that summary; do not write both.
+Everything else — including projects whose deliverable is a file — gets a
+report. When a file is the deliverable, keep the report short and link to
+the file in **Sources**; the report still gives the user the verdict and
+where to look. If you would otherwise write a 200+ word markdown summary
+in `user-communication`, write the report instead — do not write both.
 
 ## § When in the project lifecycle
 

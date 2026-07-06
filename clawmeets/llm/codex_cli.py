@@ -277,6 +277,50 @@ class CodexCLI(SubprocessLLMProvider):
             extras={"last_message_abs": last_message_abs},
         )
 
+    def _prepare_text_invocation(
+        self, prompt: str, working_dir: Path, max_tokens: int
+    ) -> PreparedInvocation:
+        """One-shot plain-text completion via ``codex exec`` (no schema).
+
+        Drops ``--json`` / ``--output-schema`` (so the run is a plain text turn)
+        and captures the final agent message with ``-o <file>`` — the clean way
+        to read the completion back without parsing the JSONL event stream.
+        Read-only sandbox: titling never needs to touch the filesystem.
+        """
+        working_dir.mkdir(parents=True, exist_ok=True)
+        last_message_file = working_dir / ".gentext-last-message.txt"
+        if last_message_file.exists():
+            last_message_file.unlink()
+        last_message_abs = str(last_message_file.resolve())
+        codex_cwd = str(working_dir)
+        cmd = [
+            self._bin,
+            "exec",
+            "--skip-git-repo-check",
+            "--sandbox", "read-only",
+            "-o", last_message_abs,
+            "-C", codex_cwd,
+        ]
+        if self._model:
+            cmd.extend(["-m", self._model])
+        return PreparedInvocation(
+            cmd=cmd,
+            cwd=codex_cwd,
+            prompt_file_abs="",
+            stdin_bytes=prompt.encode("utf-8"),
+            extras={"last_message_abs": last_message_abs},
+        )
+
+    def _parse_text_result(self, prepared: PreparedInvocation, stdout: str) -> str:
+        """Read codex's ``-o`` final-message file; fall back to raw stdout."""
+        path = prepared.extras.get("last_message_abs")
+        if path:
+            try:
+                return Path(path).read_text(encoding="utf-8")
+            except OSError:
+                return ""
+        return stdout
+
     def _parse_events(self, raw_output: str) -> tuple[LLMUsage, list[dict]]:
         """Parse Codex JSONL event stream for usage + error events.
 

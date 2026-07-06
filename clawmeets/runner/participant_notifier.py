@@ -131,10 +131,12 @@ class ParticipantNotifier(ChangelogSubscriber):
         # So count == 1 means this is the first message
         project = self._participant.get_project(project_id)
 
-        # In DM projects the coordinator IS the partner agent, so it should
-        # only reply when actually addressed (server populates
-        # expects_response_from via the user-comm auto-coordinator fallback).
-        if project.is_dm_project and self._participant.is_coordinator_for(project):
+        # In DM-shaped projects (owned DM OR Front Desk host end) the coordinator
+        # IS the partner agent, so it should only reply when actually addressed
+        # (server populates expects_response_from via the user-comm
+        # auto-coordinator fallback, or the tunnel mirror forwards it on the FD
+        # host end).
+        if project.is_dm_shaped and self._participant.is_coordinator_for(project):
             if self._participant.id not in payload.expects_response_from:
                 return
 
@@ -142,7 +144,7 @@ class ParticipantNotifier(ChangelogSubscriber):
             self._participant.is_coordinator_for(project) and
             payload.chatroom_name == "user-communication" and
             project.get_chatroom(payload.chatroom_name).count_messages() == 1 and
-            not project.is_dm_project  # Skip for DM projects
+            not project.is_dm_shaped  # Skip for DM AND Front Desk ends
         )
 
         if is_first_user_message:

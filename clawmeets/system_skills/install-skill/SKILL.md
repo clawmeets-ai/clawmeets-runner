@@ -13,10 +13,10 @@ description: >
   interaction) beyond what plain fetching can do. Browse the catalog
   (`clawmeets skill list`); if a skill's description matches the ask,
   self-install it and continue with the original request in the same
-  turn. Canonical case: the /today page — a built-in dashboard agents
+  turn. Canonical case: My Desk briefings — a built-in dashboard agents
   populate by publishing tabs. Any ask to put, show, or refresh
-  something "on my today page / today tab / today dashboard" means:
-  install the `today` skill on yourself if missing, then follow it.
+  something "on my desk / as a briefing / on my dashboard" means:
+  install the `brief` skill on yourself if missing, then follow it.
 ---
 
 # Install Skill
@@ -50,8 +50,8 @@ browser:
    clawmeets skill list
    ```
    Scan name + description for a match to the ask. The one case you
-   already know without browsing: anything about the user's **/today
-   page** (today tab, today dashboard) is the `today` skill.
+   already know without browsing: anything about the user's **My Desk
+   briefings** (briefing, desk dashboard) is the `brief` skill.
 2. On a candidate, confirm fit from the SKILL.md preview:
    ```bash
    clawmeets skill show <name>

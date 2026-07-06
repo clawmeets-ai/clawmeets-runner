@@ -364,7 +364,18 @@ Notes:
   out of that pool.
 - `--post-initial-message` wakes you (as coordinator) inside the new
   project on the same turn, so Phase 0 kicks off immediately rather than
-  sitting idle until the user types something.
+  sitting idle until the user types something. It is **on by default**
+  (pass `--no-post-initial-message` only if you deliberately want a quiet
+  create).
+
+**This create call IS the kickoff.** It posts your `<request_body>` into
+the new project's `user-communication` as an `@`-mention to you, which is
+the single event that wakes the coordinator and starts Phase 0. Do **not**
+follow it with a `clawmeets message send … user-communication "Kickoff…"`
+or any second kickoff into that room — a second coordinator-directed
+message triggers an independent second planning pass, and the coordinator
+will mint a duplicate set of Phase-0 workrooms (often under a slightly
+different slug, so they don't dedupe). One create = one kickoff.
 
 ### 6e. Confirm in the DM
 

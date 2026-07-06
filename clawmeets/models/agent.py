@@ -21,11 +21,13 @@ from typing import TYPE_CHECKING, ClassVar, Optional
 from .participant import ParticipantRole, OperationalMode
 from .persistable import PersistableParticipant
 from ..api.actions import ActionBlock, COORDINATOR_ACTION_SCHEMA, WORKER_ACTION_SCHEMA
+from ..api.action_validator import ActionValidator, StateSnapshot
 from ..api.responses import AgentStatus
 from ..llm.base import LLMInvocationError, LLMRateLimitError, LLMTimeoutError
 from ..llm.prompt_builder import CoordinatorPromptBuilder, create_prompt_builder
 from ..llm.triggers import derive_role
 from ..runner.invocation_registry import invoke_with_registry as _invoke_with_registry
+from ..sync.changelog import ProjectStatus
 from ..utils.file_io import FileUtil
 
 if TYPE_CHECKING:
@@ -40,6 +42,13 @@ logger = logging.getLogger(__name__)
 _MAX_RETRIES = 2  # Total attempts: 3 (1 original + 2 retries)
 _INITIAL_RETRY_DELAY = 30  # seconds
 _TRANSIENT_INDICATORS = ("overloaded", "rate_limit", "529", "503", "too many requests")
+
+# Semantic-validation retry budget (see action_validator + _invoke_validated).
+# Hard integer cap -> at most 1 + _MAX_VALIDATION_RETRIES = 3 model invocations
+# per triggered turn, 0 extra on the common valid path. This is distinct from
+# _MAX_RETRIES above (transient CLI failures); the two never compound because a
+# validation retry re-enters the transient loop only after a *successful* invoke.
+_MAX_VALIDATION_RETRIES = 2
 
 
 def _is_transient_error(error: LLMInvocationError) -> bool:
@@ -71,6 +80,153 @@ def _resume_marker_for_dm(chatroom, agent_name: str) -> Optional[str]:
             m = _TRIGGER_MARKER_RE.search(msg.content)
             return m.group(0) if m else None
     return None
+
+
+def _schema_allows_create_room(action_schema: dict) -> bool:
+    """True iff ``action_schema`` permits a ``create_room`` action.
+
+    Precise discriminator for "does this turn need the agent scans" — only a
+    turn that can emit ``create_room`` needs ``invitable_agents`` /
+    ``resolvable_agents``. Reads the ``oneOf`` variants by structure (not by
+    identity), so it stays correct for the full COORDINATOR schema, the
+    restricted coordinator-DM schema, and WORKER_ACTION_SCHEMA alike — an
+    assistant acting as coordinator is covered, a coordinator on an owned DM
+    (worker schema) correctly skips the scan.
+    """
+    variants = (
+        action_schema.get("properties", {})
+        .get("actions", {})
+        .get("items", {})
+        .get("oneOf", [])
+    )
+    return any(
+        v.get("properties", {}).get("type", {}).get("const") == "create_room"
+        for v in variants
+    )
+
+
+def _agent_name_variants(full_name: str) -> set[str]:
+    """Full registry name plus its short (post-``{owner}-`` prefix) form.
+
+    Used only to build ``resolvable_agents`` for the feedback-message branch
+    (§1a-B), so a known-but-not-invitable agent is recognized whether the model
+    referenced it by full name (cross-owner, e.g. ``clawmeets-nyc_dining``) or
+    by short name. Never affects the PASS/REJECT decision.
+    """
+    variants = {full_name}
+    if "-" in full_name:
+        variants.add(full_name.split("-", 1)[1])
+    return variants
+
+
+def build_state_snapshot(
+    model_ctx: "ModelContext",
+    project_id: str,
+    *,
+    include_agents: bool,
+) -> StateSnapshot:
+    """Read local (no-HTTP) server state ONCE per turn for validation.
+
+    Sources every referent set from the SAME ``Project.get(project_id, ctx)``
+    the turn already loaded (its rooms, status), so the validator's valid-set is
+    built from the identical local synced snapshot the prompt is built from
+    (the stale-local-snapshot invariant: the model can only reference rooms it
+    can see, and the validator sees exactly those, so a valid reference cannot
+    false-reject; the executor's 4xx handler backstops any TOCTOU race).
+
+    Keyed on the single ``project_id`` in scope, it automatically reads the
+    correct side of a two-sided Front-Desk tunnel (§1b) — the side whose turn is
+    running — with no cross-tunnel read and no extra project fetch.
+
+    Agent scans (``invitable_agents`` + ``resolvable_agents``) run ONLY when
+    ``include_agents`` (a turn that can emit ``create_room``). Worker turns and
+    owned-DM turns skip both scans entirely (reviewer M1 refinement).
+    """
+    from .project import Project
+
+    project = Project.get(project_id, model_ctx)
+    existing_rooms = frozenset(project.chatrooms)
+    project_active = project.status == ProjectStatus.ACTIVE
+
+    if include_agents:
+        invitable_agents = frozenset(
+            Agent.invitable_short_names_for_project(project, model_ctx)
+        )
+        resolvable_agents = frozenset(
+            variant
+            for other in Agent.list_all(model_ctx, viewer_is_admin=True)
+            for variant in _agent_name_variants(other.name)
+        )
+    else:
+        invitable_agents = frozenset()
+        resolvable_agents = frozenset()
+
+    return StateSnapshot(
+        existing_rooms=existing_rooms,
+        invitable_agents=invitable_agents,
+        resolvable_agents=resolvable_agents,
+        project_active=project_active,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DM-thread auto-title (M4c) — generator constants + pure helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Instruction handed to LLMProvider.generate_text. Ends with a blank line then
+# the message so the provider-agnostic deterministic default
+# (llm.base.deterministic_text_snippet) isolates the message as its payload.
+_DM_TITLE_INSTRUCTION = (
+    "Generate a concise, specific 3-6 word title (no surrounding quotes, no "
+    "trailing period) that captures the topic of a conversation that opens with "
+    "the message below. Reply with the title text only.\n\n{message}"
+)
+
+# Low-signal defer (R5/MF3): a triggering message at/under this length OR matching
+# the greeting-only pattern carries no topic, so titling is deferred to a later
+# substantive message — up to the defer budget, after which a terse thread is
+# force-titled deterministically so it still converges off "New chat".
+_DM_TITLE_MIN_SIGNAL_CHARS = 12
+_DM_TITLE_DEFER_BUDGET = 3
+_DM_GREETING_RE = re.compile(
+    r"^(hi|hii+|hey|hello|yo|sup|hiya|howdy|gm|gn|good\s+(morning|evening|afternoon)|"
+    r"hey\s+there|hi\s+there|hello\s+there|you\s+there|yt|test+|ping|ok|okay|k|"
+    r"thanks|thank\s+you|ty|cool|nice)[\s!.?,\-]*$",
+    re.IGNORECASE,
+)
+
+
+def _dm_title_is_too_terse(content: str) -> bool:
+    """True when a triggering message is too low-signal to title from (R5/MF3)."""
+    stripped = content.strip()
+    return len(stripped) <= _DM_TITLE_MIN_SIGNAL_CHARS or bool(_DM_GREETING_RE.match(stripped))
+
+
+def _clean_dm_title(text: str, *, max_words: int = 6, max_chars: int = 60) -> str:
+    """Normalize raw generator output into a short, punctuation-clean title.
+
+    Every DM-thread title flows through here — model-composed output, the live
+    trigger's deterministic-truncation fallback, and the offline backfill — so
+    this is the single choke point that capitalizes the leading character. That
+    keeps a deterministic-truncation title (which arrives fully lowercase from
+    the model-free fallback, e.g. ``react state bug``) from rendering lowercase
+    in the sidebar, while a first-char-only bump leaves the casing of every
+    NON-leading word intact (``debug reactDOM`` → ``Debug reactDOM``) and is a
+    no-op on an already-capitalized model title.
+    """
+    if not text:
+        return ""
+    cleaned = " ".join(text.split())  # collapse all whitespace/newlines
+    cleaned = cleaned.strip().strip("\"'`").strip()  # drop wrapping quotes
+    cleaned = re.sub(r"^(chat\s+)?title\s*[:\-]\s*", "", cleaned, flags=re.IGNORECASE).strip()
+    words = cleaned.split(" ")
+    if len(words) > max_words:
+        cleaned = " ".join(words[:max_words])
+    cleaned = cleaned[:max_chars]
+    cleaned = cleaned.rstrip(" .,;:!?-—–").strip()  # drop trailing punctuation
+    if cleaned:
+        cleaned = cleaned[0].upper() + cleaned[1:]  # capitalize leading char only
+    return cleaned
 
 
 class Agent(PersistableParticipant):
@@ -425,17 +581,46 @@ class Agent(PersistableParticipant):
         """
         if not project.enforces_invitable_allowlist:
             return None
-        viewer_owner_id = project._invitable_viewer_owner_id(self._model_ctx)
+        return Agent.invitable_short_names_for_project(
+            project, self._model_ctx, exclude_ids=frozenset({self.id})
+        )
 
-        # Pool: every known agent (admin viewer skips the discoverable
-        # filter so non-discoverable owned agents are visible). matches_invitable
-        # drops anything the project hasn't allowed.
+    @classmethod
+    def invitable_short_names_for_project(
+        cls,
+        project: "Project",
+        model_ctx: "ModelContext",
+        *,
+        exclude_ids: frozenset[str] = frozenset(),
+    ) -> list[str]:
+        """Short-names of the agents a coordinator may invite into ``project``.
+
+        With an explicit allowlist set (``project.agent_{names,teams}``) →
+        the resolved allowlist; with no allowlist → the owner's own crew
+        (matching what AGENTS.md lists under "Your agents"). Used both to
+        surface the invitable list in the coordinator prompt and to tell a
+        coordinator which names are valid when a ``create_room`` invite 404s.
+
+        The candidate pool is admin-scoped (skips the discoverable filter so
+        non-discoverable owned agents are visible); ``resolve_invitable_agents``
+        drops anything the project hasn't allowed.
+        """
+        viewer_owner_id = project._invitable_viewer_owner_id(model_ctx)
         candidates = [
             a
-            for a in Agent.list_all(self._model_ctx, viewer_is_admin=True)
-            if a.id != self.id
+            for a in cls.list_all(model_ctx, viewer_is_admin=True)
+            if a.id not in exclude_ids
         ]
-        matched = project.resolve_invitable_agents(candidates, self._model_ctx)
+        if project.enforces_invitable_allowlist:
+            matched = project.resolve_invitable_agents(candidates, model_ctx)
+        else:
+            # No allowlist: the invitable set is the owner's own crew, the
+            # same "Your agents" AGENTS.md shows.
+            matched = [
+                a
+                for a in candidates
+                if viewer_owner_id and a.registered_by == viewer_owner_id
+            ]
 
         names: list[str] = []
         for other in matched:
@@ -449,7 +634,7 @@ class Agent(PersistableParticipant):
             ):
                 names.append(other.name.split("-", 1)[1])
             else:
-                names.append(Agent.short_name(other.name, None))
+                names.append(cls.short_name(other.name, None))
         return names
 
     @property
@@ -525,6 +710,10 @@ class Agent(PersistableParticipant):
                 )
                 return
             if chatroom.is_user_communication_room:
+                # Fire-once DM auto-title (M4c), AWAITED within the turn (SF3) so
+                # msg-2 already sees the flipped "New chat" latch. Best-effort: it
+                # never blocks or aborts the substantive reply below.
+                await self._maybe_autotitle_dm_thread(project, chatroom, message)
                 await self._handle_user_request(project_id, chatroom_name, message, trigger_version)
             elif addressed_to_me:
                 await self._coordinate(project_id, chatroom_name, message, trigger_version)
@@ -534,6 +723,192 @@ class Agent(PersistableParticipant):
         if not addressed_to_me:
             return
         await self._execute_task(project_id, chatroom_name, message, trigger_version)
+
+    async def _maybe_autotitle_dm_thread(
+        self,
+        project: "Project",
+        chatroom: "Chatroom",
+        message: "ChatMessage",
+    ) -> None:
+        """Fire-once DM-thread auto-title, driven from ``on_message`` (R1).
+
+        Overwrites the seeded ``"New chat"`` placeholder from the FIRST
+        principal message alone (ChatGPT-style). Fire-once holds via three
+        independent guards (R2): the in-process ``"New chat"`` latch (this method
+        no-ops the moment the placeholder is gone), runner per-project
+        serialization (this is awaited within the turn — SF3), and the
+        replay-idempotent overwrite applied server-side. Runs on the side that
+        has a running coordinator:
+
+        - **owned DM** — principal = ``created_by`` (the human owner), same as
+          before.
+        - **host Front Desk end** — the foreign agent's runloop composes the
+          title from the REQUESTER's mirrored first message (principal = that
+          requesting human). The requester (local) end has no running
+          coordinator, so its row re-titles via the reverse tunnel mirror of the
+          resulting ``DISPLAY_NAME_CHANGED`` (see ``TunnelSubscriber``).
+
+        Best-effort throughout: any failure is swallowed/logged so a transient
+        error never blocks or aborts the agent's reply.
+        """
+        from .project import NEW_CHAT_PLACEHOLDER
+
+        # guard 1 — dm-shaped only: owned DM OR Front Desk host end (R3).
+        if not project.is_dm_shaped:
+            return
+        # guard 2 — placeholder latch (R2-i): only title while still "New chat"
+        if (project.display_name or "") != NEW_CHAT_PLACEHOLDER:
+            return
+        # guard 3 — TITLING-PRINCIPAL-authored, non-ack, real content only.
+        #   owned DM  -> principal = created_by (the human owner).
+        #   host FD   -> principal = the human REQUESTER who authored the
+        #               mirrored first message (from_participant_id is the author
+        #               unless it's an agent — see _dm_title_principal_id's
+        #               agent-negative resolution). None-safe: if the author is
+        #               an agent/unknown we skip (never mis-attribute or crash).
+        principal_id = self._dm_title_principal_id(project, message)
+        if (
+            message.is_ack
+            or principal_id is None
+            or message.from_participant_id != principal_id
+        ):
+            return
+        content = (message.content or "").strip()
+        if not content:
+            return
+        if self._model_ctx.client is None:
+            return
+
+        # guard 4 — low-signal defer with budget + terminal fallback (R5/MF3).
+        # Filter on the titling principal (not created_by) so the host FD end
+        # accumulates the REQUESTER's messages, not the host owner's.
+        user_msgs = [
+            m for m in chatroom.get_messages()
+            if not m.is_ack and m.from_participant_id == principal_id
+        ]
+        if _dm_title_is_too_terse(content):
+            if len(user_msgs) < _DM_TITLE_DEFER_BUDGET:
+                return  # DEFER: latch stays "New chat"; a later message titles it
+            # Budget exhausted on a persistently terse thread: converge off
+            # "New chat" using the accumulated user content (terminal fallback).
+            source_text = " ".join(m.content for m in user_msgs).strip() or content
+        else:
+            # Substantive message: title from the later triggering message (MF3),
+            # i.e. THIS message's content alone.
+            source_text = content
+
+        try:
+            title = await self._generate_dm_thread_title(source_text)
+            if not title or title == NEW_CHAT_PLACEHOLDER:
+                return
+            # expected_current = literal "New chat" sentinel (MF2), never the
+            # agent's last-observed title — awaited within the turn (SF3).
+            await self._model_ctx.client.set_project_display_name(
+                project.id, title, expected_current=NEW_CHAT_PLACEHOLDER,
+            )
+        except Exception:
+            logger.warning(
+                f"Agent {self.name}: DM auto-title failed for project "
+                f"{project.id[:8]} (non-fatal); leaving 'New chat'",
+                exc_info=True,
+            )
+
+    async def _maybe_autotitle_project(self, project: "Project") -> None:
+        """Fire-once auto-title for a REGULAR project, driven from
+        ``on_first_user_request`` (the coordinator's first turn).
+
+        Regular projects are created with a caller-chosen kebab slug (``name``)
+        and no ``display_name``, so every label falls back to the raw slug. This
+        gives them the same human-readable title DM threads get — generated from
+        the project's ``request`` (its canonical goal statement) via the shared
+        one-shot title path, then persisted through ``DISPLAY_NAME_CHANGED``.
+
+        Fire-once holds on the ``display_name is None`` latch (a titled project
+        has a non-null ``display_name``, so re-runs/replays no-op). Best-effort:
+        the caller swallows/logs any failure so titling never blocks or aborts
+        coordinator setup. On failure the meaningful slug simply remains — no
+        placeholder is seeded, unlike the DM path's ``"New chat"``.
+        """
+        # dm/frontdesk are handled by _maybe_autotitle_dm_thread — never double-title.
+        if project.is_dm_shaped:
+            return
+        # Fire-once latch: only title while display_name is still unset.
+        if project.display_name is not None:
+            return
+        if self._model_ctx.client is None:
+            return
+        source_text = (project.request or "").strip()
+        if not source_text:
+            return
+        title = await self._generate_dm_thread_title(source_text)
+        if not title:
+            return
+        # Regular projects carry no "New chat" sentinel; the None latch above is
+        # the guard, so expected_current is None (skips the server's defensive
+        # compare).
+        await self._model_ctx.client.set_project_display_name(
+            project.id, title, expected_current=None,
+        )
+
+    def _dm_title_principal_id(
+        self, project: "Project", message: "ChatMessage"
+    ) -> Optional[str]:
+        """Who must have authored the message for it to seed the auto-title.
+
+        - **owned DM** (``surface == "dm"``): the project owner ``created_by``.
+        - **host Front Desk end** (``surface == "frontdesk"``): the human
+          REQUESTER who authored the mirrored first message —
+          ``message.from_participant_id`` UNLESS that id is an agent.
+
+        Resolution is **agent-NEGATIVE**, and deliberately so. This method runs
+        on the host coordinator's OWN runner, whose ``participants_dir`` carries
+        neither the server's ``passwd`` nor the coordinator's own card. A
+        positive ``User.get(from_participant_id)`` could therefore NEVER resolve
+        the requester off-server — it silently returned ``None`` and the host
+        never emitted ``DISPLAY_NAME_CHANGED`` (the DD-title path stayed dead in
+        production). So we invert the test: the author IS the human requester
+        unless it is an agent — the coordinator itself (``self._id``, which the
+        runner never syncs into its own ``agents/``) or any synced peer ``Agent``
+        card. None-safe: a blank/unknown author -> ``None`` (SF2 — skip titling,
+        never mis-attribute to the host owner or crash).
+        """
+        if project.is_frontdesk_project:
+            sender = message.from_participant_id
+            if (
+                not sender
+                or sender == self._id
+                or Agent.get(sender, self._model_ctx) is not None
+            ):
+                return None
+            return sender
+        return project.created_by
+
+    async def _generate_dm_thread_title(self, source_text: str) -> str:
+        """Generate a short thread title from user content alone (first-message
+        design). Uses the provider's one-shot ``generate_text`` — which carries a
+        deterministic-truncation default on every provider (MF5), so this never
+        strands a thread even if the provider hasn't implemented real generation
+        or a live call errors — then normalizes the result. Falls back to a
+        deterministic clean of ``source_text`` if the generation is empty.
+        """
+        cli = self._model_ctx.cli
+        raw = ""
+        if cli is not None:
+            try:
+                raw = await cli.generate_text(
+                    _DM_TITLE_INSTRUCTION.format(message=source_text)
+                )
+            except Exception:
+                logger.warning(
+                    f"Agent {self.name}: generate_text raised during DM auto-title; "
+                    "using deterministic fallback",
+                    exc_info=True,
+                )
+                raw = ""
+        title = _clean_dm_title(raw)
+        if not title:
+            title = _clean_dm_title(source_text)
+        return title
 
     async def _emit_acknowledgment(
         self,
@@ -618,7 +993,7 @@ class Agent(PersistableParticipant):
             git_url=self._model_ctx.git_url,
         )
 
-        is_dm = project.is_dm_project
+        is_dm = project.is_dm_shaped  # owned DM OR Front Desk end -> DM prompt variant
         inbound_content = message.content
 
         from .chatroom import Chatroom
@@ -652,44 +1027,17 @@ class Agent(PersistableParticipant):
         )
 
         # Execute using ClaudeCLI with retry for transient failures
-        retry_delay = _INITIAL_RETRY_DELAY
-        for attempt in range(_MAX_RETRIES + 1):
-            try:
-                action_block, usage = await _invoke_with_registry(
-                    self._model_ctx,
-                    project_id,
-                    chatroom_name,
-                    prompt,
-                    sandbox_dir,
-                    log_dir,
-                    additional_dirs,
-                    action_schema=WORKER_ACTION_SCHEMA,
-                    trigger_version=trigger_version,
-                    role=derive_role(self.name, is_coordinator=False),
-                )
-                break  # Success
-            except LLMRateLimitError as e:
-                logger.warning(
-                    f"Agent {agent_name}: rate limited "
-                    f"(type={e.rate_limit_type}, resets={e.resets_at_human})"
-                )
-                await self._post_error_notification(
-                    project_id, chatroom_name, agent_name, e, trigger_version
-                )
-                raise
-            except LLMInvocationError as e:
-                if attempt < _MAX_RETRIES and _is_transient_error(e):
-                    logger.warning(
-                        f"Agent {agent_name}: transient failure (attempt {attempt + 1}/{_MAX_RETRIES + 1}), "
-                        f"retrying in {retry_delay}s: {e}"
-                    )
-                    await asyncio.sleep(retry_delay)
-                    retry_delay *= 2
-                else:
-                    await self._post_error_notification(
-                        project_id, chatroom_name, agent_name, e, trigger_version
-                    )
-                    raise
+        action_block, usage, validation_notes = await self._invoke_validated(
+            project_id=project_id,
+            chatroom_name=chatroom_name,
+            prompt=prompt,
+            sandbox_dir=sandbox_dir,
+            log_dir=log_dir,
+            additional_dirs=additional_dirs,
+            action_schema=WORKER_ACTION_SCHEMA,
+            trigger_version=trigger_version,
+            role=derive_role(self.name, is_coordinator=False),
+        )
 
         logger.info(
             f"Agent {agent_name}: Claude invocation complete "
@@ -702,6 +1050,7 @@ class Agent(PersistableParticipant):
             project_id=project_id,
             sandbox_dir=sandbox_dir,
         )
+        await self._post_validation_notes(project_id, validation_notes, trigger_version)
 
         # If the LLM didn't reply in the triggering chatroom, post a closure
         # so the server marks this worker as responded and clears PendingWork.
@@ -710,6 +1059,162 @@ class Agent(PersistableParticipant):
             await self._emit_no_action_message(
                 project_id, chatroom_name, trigger_version, replied_chatrooms
             )
+
+    async def _invoke_with_transient_retry(
+        self,
+        *,
+        project_id: str,
+        chatroom_name: str,
+        prompt: str,
+        sandbox_dir: Path,
+        log_dir: Path,
+        additional_dirs: list[Path],
+        action_schema: dict,
+        trigger_version: int,
+        role: str,
+        correction: "str | None" = None,
+    ) -> "tuple[ActionBlock, LLMUsage]":
+        """One model invocation, with the existing transient-failure retry.
+
+        Extracts the per-call-site transient-retry loop (rate-limit → surface &
+        raise; transient CLI failure → bounded exponential backoff) so all four
+        turn methods share one copy. ``correction`` (the validation feedback) is
+        threaded to ``invoke_with_registry`` and appended to the prompt on a
+        semantic-validation retry.
+        """
+        retry_delay = _INITIAL_RETRY_DELAY
+        for attempt in range(_MAX_RETRIES + 1):
+            try:
+                return await _invoke_with_registry(
+                    self._model_ctx,
+                    project_id,
+                    chatroom_name,
+                    prompt,
+                    sandbox_dir,
+                    log_dir,
+                    additional_dirs,
+                    action_schema=action_schema,
+                    trigger_version=trigger_version,
+                    role=role,
+                    correction=correction,
+                )
+            except LLMRateLimitError as e:
+                logger.warning(
+                    f"Agent {self.name}: rate limited "
+                    f"(type={e.rate_limit_type}, resets={e.resets_at_human})"
+                )
+                await self._post_error_notification(
+                    project_id, chatroom_name, self.name, e, trigger_version
+                )
+                raise
+            except LLMInvocationError as e:
+                if attempt < _MAX_RETRIES and _is_transient_error(e):
+                    logger.warning(
+                        f"Agent {self.name}: transient failure "
+                        f"(attempt {attempt + 1}/{_MAX_RETRIES + 1}), "
+                        f"retrying in {retry_delay}s: {e}"
+                    )
+                    await asyncio.sleep(retry_delay)
+                    retry_delay *= 2
+                else:
+                    await self._post_error_notification(
+                        project_id, chatroom_name, self.name, e, trigger_version
+                    )
+                    raise
+        # Unreachable: the loop either returns or raises on every path.
+        raise AssertionError("transient-retry loop exited without a result")
+
+    async def _invoke_validated(
+        self,
+        *,
+        project_id: str,
+        chatroom_name: str,
+        prompt: str,
+        sandbox_dir: Path,
+        log_dir: Path,
+        additional_dirs: list[Path],
+        action_schema: dict,
+        trigger_version: int,
+        role: str,
+    ) -> "tuple[ActionBlock, LLMUsage, list[str]]":
+        """Invoke → validate → maybe retry, up to ``_MAX_VALIDATION_RETRIES``.
+
+        Provably terminating (plan §4): the state snapshot is taken ONCE before
+        the loop (a closed, fixed target), the budget is a hard integer counter,
+        and only a REJECT_RETRY classification re-invokes — NO_OP / PASS never
+        do, so idempotent actions (create-existing-room, re-complete) cannot
+        spin. Never keys on free-form content, so valid-but-non-deterministic
+        prose triggers zero retries.
+
+        At budget exhaustion the terminal fallback drops the still-offending
+        actions, keeps the valid ones, and surfaces a note (identical to today's
+        4xx behavior — no regression). Returns the (possibly filtered) block,
+        its usage, and the notes to post to user-communication.
+        """
+        include_agents = _schema_allows_create_room(action_schema)
+        snapshot = build_state_snapshot(
+            self._model_ctx, project_id, include_agents=include_agents
+        )
+
+        correction: "str | None" = None
+        block: "ActionBlock"
+        usage: "LLMUsage"
+        result = None
+        for _attempt in range(_MAX_VALIDATION_RETRIES + 1):
+            block, usage = await self._invoke_with_transient_retry(
+                project_id=project_id,
+                chatroom_name=chatroom_name,
+                prompt=prompt,
+                sandbox_dir=sandbox_dir,
+                log_dir=log_dir,
+                additional_dirs=additional_dirs,
+                action_schema=action_schema,
+                trigger_version=trigger_version,
+                role=role,
+                correction=correction,
+            )
+            result = ActionValidator().validate(block, snapshot)
+            if not result.retryable:
+                break
+            correction = result.feedback()
+
+        # ``result.retryable`` is True here only if the budget was exhausted with
+        # a hard-invalid referent still present -> terminal fallback (drop them).
+        drop = result.retryable
+        block.actions = result.surviving_actions(drop_retryable=drop)
+        notes = result.notes()
+        if drop:
+            notes = notes + result.dropped_notes()
+        return block, usage, notes
+
+    async def _post_validation_notes(
+        self,
+        project_id: str,
+        notes: list[str],
+        trigger_version: int,
+    ) -> None:
+        """Post no-op / dropped-action notes to user-communication.
+
+        Same surfacing channel as the executor's 4xx failure note, so a skipped
+        or dropped action is visible to the coordinator/user on the next
+        dispatch. Silent-fails per note so a missing user-communication room
+        can't mask the turn's real work.
+        """
+        if not notes:
+            return
+        client = self._model_ctx.client
+        if client is None:
+            return
+        for note in notes:
+            try:
+                await client.post_message(
+                    project_id=project_id,
+                    chatroom_name="user-communication",
+                    content=note,
+                    source_version=trigger_version,
+                )
+            except Exception:
+                logger.exception("Failed to post validation note to user-communication")
 
     async def _post_error_notification(
         self,
@@ -843,6 +1348,16 @@ class Agent(PersistableParticipant):
             f"Agent {self.name} (as coordinator): Handling first user request "
             f"in project {project_id[:8]}"
         )
+        # Fire-once auto-title from the request. Best-effort: never blocks or
+        # aborts setup (mirrors the DM auto-title contract).
+        try:
+            await self._maybe_autotitle_project(project)
+        except Exception:
+            logger.warning(
+                f"Agent {self.name}: project auto-title failed for "
+                f"{project_id[:8]} (non-fatal); leaving slug label",
+                exc_info=True,
+            )
         await self._invoke_coordinator_setup(
             project_id=project_id,
             chatroom_name=chatroom_name,
@@ -940,7 +1455,7 @@ class Agent(PersistableParticipant):
             agent_dir=self._model_ctx.base_dir,
             knowledge_dirs=self._model_ctx.knowledge_dirs,
             dwh_dir=self._model_ctx.dwh_dir,
-            is_dm=project.is_dm_project,
+            is_dm=project.is_dm_shaped,
             dm_is_owned=dm_is_owned,
             invitable_agents=self._resolve_invitable_agents_for_prompt(project),
             chat_history=chat_history,
@@ -949,44 +1464,17 @@ class Agent(PersistableParticipant):
 
         await self._emit_acknowledgment(project_id, chatroom_name, trigger_version)
 
-        retry_delay = _INITIAL_RETRY_DELAY
-        for attempt in range(_MAX_RETRIES + 1):
-            try:
-                action_block, usage = await _invoke_with_registry(
-                    self._model_ctx,
-                    project_id,
-                    chatroom_name,
-                    prompt,
-                    sandbox_dir,
-                    log_dir,
-                    additional_dirs,
-                    action_schema=action_schema,
-                    trigger_version=trigger_version,
-                    role=derive_role(self.name, is_coordinator=True),
-                )
-                break
-            except LLMRateLimitError as e:
-                logger.warning(
-                    f"Agent {self.name} (coordinator): rate limited "
-                    f"(type={e.rate_limit_type}, resets={e.resets_at_human})"
-                )
-                await self._post_error_notification(
-                    project_id, chatroom_name, self.name, e, trigger_version
-                )
-                raise
-            except LLMInvocationError as e:
-                if attempt < _MAX_RETRIES and _is_transient_error(e):
-                    logger.warning(
-                        f"Agent {self.name} (coordinator): transient failure "
-                        f"(attempt {attempt + 1}/{_MAX_RETRIES + 1}), retrying in {retry_delay}s: {e}"
-                    )
-                    await asyncio.sleep(retry_delay)
-                    retry_delay *= 2
-                else:
-                    await self._post_error_notification(
-                        project_id, chatroom_name, self.name, e, trigger_version
-                    )
-                    raise
+        action_block, usage, validation_notes = await self._invoke_validated(
+            project_id=project_id,
+            chatroom_name=chatroom_name,
+            prompt=prompt,
+            sandbox_dir=sandbox_dir,
+            log_dir=log_dir,
+            additional_dirs=additional_dirs,
+            action_schema=action_schema,
+            trigger_version=trigger_version,
+            role=derive_role(self.name, is_coordinator=True),
+        )
 
         logger.info(
             f"Agent {self.name} (coordinator): Batch processing complete "
@@ -998,6 +1486,7 @@ class Agent(PersistableParticipant):
             project_id=project_id,
             sandbox_dir=sandbox_dir,
         )
+        await self._post_validation_notes(project_id, validation_notes, trigger_version)
 
         # If the coordinator moved on (created next milestone room, updated
         # PLAN.md, etc.) without replying in this room, post a closure so
@@ -1045,12 +1534,12 @@ class Agent(PersistableParticipant):
 
         await self._emit_acknowledgment(project_id, chatroom_name, trigger_version)
 
-        # DM-shaped projects (solo DM + cross-user tunneled FD) skip the PLAN.md /
+        # DM-shaped projects (owned DM + Front Desk host end) skip the PLAN.md /
         # milestones setup prompt — wrong shape for a casual conversational
         # channel. Use the soft live coordinator prompt instead so the first
         # message is treated like any other.
         action_schema, dm_is_owned = self._coordinator_dm_action_schema(project)
-        if project.is_dm_project:
+        if project.is_dm_shaped:
             from .chatroom import Chatroom
             chatroom = Chatroom.get(project_id, chatroom_name, self._model_ctx)
             chat_history = (
@@ -1096,44 +1585,17 @@ class Agent(PersistableParticipant):
                 invitable_agents=self._resolve_invitable_agents_for_prompt(project),
             )
 
-        retry_delay = _INITIAL_RETRY_DELAY
-        for attempt in range(_MAX_RETRIES + 1):
-            try:
-                action_block, usage = await _invoke_with_registry(
-                    self._model_ctx,
-                    project_id,
-                    chatroom_name,
-                    prompt,
-                    sandbox_dir,
-                    log_dir,
-                    additional_dirs,
-                    action_schema=action_schema,
-                    trigger_version=trigger_version,
-                    role=derive_role(self.name, is_coordinator=True),
-                )
-                break
-            except LLMRateLimitError as e:
-                logger.warning(
-                    f"Agent {self.name} (coordinator): rate limited "
-                    f"(type={e.rate_limit_type}, resets={e.resets_at_human})"
-                )
-                await self._post_error_notification(
-                    project_id, chatroom_name, self.name, e, trigger_version
-                )
-                raise
-            except LLMInvocationError as e:
-                if attempt < _MAX_RETRIES and _is_transient_error(e):
-                    logger.warning(
-                        f"Agent {self.name} (coordinator): transient failure "
-                        f"(attempt {attempt + 1}/{_MAX_RETRIES + 1}), retrying in {retry_delay}s: {e}"
-                    )
-                    await asyncio.sleep(retry_delay)
-                    retry_delay *= 2
-                else:
-                    await self._post_error_notification(
-                        project_id, chatroom_name, self.name, e, trigger_version
-                    )
-                    raise
+        action_block, usage, validation_notes = await self._invoke_validated(
+            project_id=project_id,
+            chatroom_name=chatroom_name,
+            prompt=prompt,
+            sandbox_dir=sandbox_dir,
+            log_dir=log_dir,
+            additional_dirs=additional_dirs,
+            action_schema=action_schema,
+            trigger_version=trigger_version,
+            role=derive_role(self.name, is_coordinator=True),
+        )
 
         logger.info(
             f"Agent {self.name} (coordinator): Setup invocation complete "
@@ -1145,6 +1607,7 @@ class Agent(PersistableParticipant):
             project_id=project_id,
             sandbox_dir=sandbox_dir,
         )
+        await self._post_validation_notes(project_id, validation_notes, trigger_version)
 
         # Close out the triggering room if the LLM didn't reply there —
         # keeps the self-batch pending work from getting stuck and the
@@ -1239,46 +1702,23 @@ class Agent(PersistableParticipant):
             agent_dir=self._model_ctx.base_dir,
             knowledge_dirs=self._model_ctx.knowledge_dirs,
             dwh_dir=self._model_ctx.dwh_dir,
-            is_dm=project.is_dm_project,
+            is_dm=project.is_dm_shaped,
             dm_is_owned=dm_is_owned,
             invitable_agents=self._resolve_invitable_agents_for_prompt(project),
             chat_history=chat_history,
         )
 
-        retry_delay = _INITIAL_RETRY_DELAY
-        for attempt in range(_MAX_RETRIES + 1):
-            try:
-                action_block, usage = await _invoke_with_registry(
-                    self._model_ctx,
-                    project_id,
-                    chatroom_name,
-                    prompt,
-                    sandbox_dir,
-                    log_dir,
-                    additional_dirs,
-                    action_schema=action_schema,
-                    trigger_version=trigger_version,
-                    role=derive_role(self.name, is_coordinator=True),
-                )
-                break
-            except LLMRateLimitError as e:
-                logger.warning(
-                    f"Agent {name} (coordinator): rate limited "
-                    f"(type={e.rate_limit_type}, resets={e.resets_at_human})"
-                )
-                await self._post_error_notification(project_id, chatroom_name, name, e, trigger_version)
-                raise
-            except LLMInvocationError as e:
-                if attempt < _MAX_RETRIES and _is_transient_error(e):
-                    logger.warning(
-                        f"Agent {name} (coordinator): transient failure "
-                        f"(attempt {attempt + 1}/{_MAX_RETRIES + 1}), retrying in {retry_delay}s: {e}"
-                    )
-                    await asyncio.sleep(retry_delay)
-                    retry_delay *= 2
-                else:
-                    await self._post_error_notification(project_id, chatroom_name, name, e, trigger_version)
-                    raise
+        action_block, usage, validation_notes = await self._invoke_validated(
+            project_id=project_id,
+            chatroom_name=chatroom_name,
+            prompt=prompt,
+            sandbox_dir=sandbox_dir,
+            log_dir=log_dir,
+            additional_dirs=additional_dirs,
+            action_schema=action_schema,
+            trigger_version=trigger_version,
+            role=derive_role(self.name, is_coordinator=True),
+        )
 
         logger.info(
             f"Agent {name} (coordinator): Claude invocation complete "
@@ -1290,6 +1730,7 @@ class Agent(PersistableParticipant):
             project_id=project_id,
             sandbox_dir=sandbox_dir,
         )
+        await self._post_validation_notes(project_id, validation_notes, trigger_version)
 
         if chatroom_name not in replied_chatrooms:
             await self._emit_no_action_message(

@@ -1,0 +1,6 @@
+{
+  "audiences": ["assistant"],
+  "surfaces": ["agent_runtime"],
+  "version": "1.0.0",
+  "description": "Assistant-only: turn a DM ask for a recurring briefing on My Desk into a running pipeline — route to a capable executor agent, draft the trigger-marker + SOP refresh message, confirm with the user, schedule it, and handle later cadence changes or removal."
+}

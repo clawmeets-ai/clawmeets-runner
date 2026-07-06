@@ -502,6 +502,7 @@ class ApiLLMProvider(LLMProvider):
         web_fetch_max_uses: int = 12,
         max_requests: int = 50,
         max_total_tokens: Optional[int] = None,
+        reasoning_effort: Optional[str] = None,
     ) -> None:
         provider = (provider or "anthropic").lower()
         if provider not in _PROVIDERS:
@@ -538,6 +539,16 @@ class ApiLLMProvider(LLMProvider):
         # web_max_uses (graceful "stop fetching" instead of a fatal abort).
         self._web_fetch_max_uses = web_fetch_max_uses
         self._max_requests = max_requests
+        # Reasoning-effort override for the LOCAL OpenAI-compatible path only.
+        # A local reasoning model (qwen3 via ollama /v1) surfaces its <think> in a
+        # separate `reasoning` channel; on some tool/structured-output turns the
+        # response comes back reasoning-only (empty content + no tool call), which
+        # Pydantic AI treats as a failed output and — after 2 such — aborts the
+        # turn with "Exceeded maximum output retries". Setting this to "none" makes
+        # ollama suppress thinking (it maps `reasoning_effort:"none"` → think:false,
+        # honored ONLY on /v1), forcing a content/tool-call every turn. None ⇒
+        # provider/model default (thinking on). See _model_settings.
+        self._reasoning_effort = reasoning_effort
         # Cumulative per-turn token ceiling (None ⇒ unbounded). A runaway loop
         # (e.g. an agent re-reading its own deliverable each step) grows the
         # re-sent transcript until it trips this — aborting as a recoverable
@@ -722,7 +733,89 @@ class ApiLLMProvider(LLMProvider):
             if len(models) > 1:
                 settings["extra_body"] = {"models": models}
             return settings
-        return {"max_tokens": self._max_tokens}
+        settings = {"max_tokens": self._max_tokens}
+        # Local OpenAI-compatible endpoints (ollama /v1) only: forward a
+        # reasoning-effort override as a top-level request field via extra_body.
+        # `reasoning_effort:"none"` is ollama's /v1 spelling of think:false — the
+        # one knob this build honors (plain `think:false` / `enable_thinking` are
+        # ignored on /v1). Gated on _base_url so hosted OpenAI (Responses API,
+        # where "none" isn't a valid effort) is never touched. See __init__.
+        if self._base_url and self._reasoning_effort:
+            settings["extra_body"] = {"reasoning_effort": self._reasoning_effort}
+        return settings
+
+    # --- one-shot text generation (lightweight sibling of invoke) -----------
+
+    # Short kill window for the one-shot titling call (see the subprocess
+    # providers' _text_gen_timeout): titling is cheap and the DM auto-title
+    # awaits it inline, so a slow model drops to the deterministic default
+    # rather than stalling the agent's real reply.
+    _text_gen_timeout: int = 60
+
+    def _one_shot_settings(self, max_tokens: int) -> Any:
+        """Minimal per-provider ModelSettings for the one-shot titling call —
+        just a tight ``max_tokens``. No prompt caching (a single short turn
+        doesn't benefit); OpenRouter keeps its multi-model fallback chain."""
+        if self._provider == "anthropic":
+            from pydantic_ai.models.anthropic import AnthropicModelSettings
+
+            return AnthropicModelSettings(max_tokens=max_tokens)
+        if self._provider == "openrouter":
+            models = self._openrouter_models()
+            settings: dict = {"max_tokens": max_tokens}
+            if len(models) > 1:
+                settings["extra_body"] = {"models": models}
+            return settings
+        return {"max_tokens": max_tokens}
+
+    async def generate_text(self, prompt: str, *, max_tokens: int = 32) -> str:
+        """Real one-shot generation via the BYO-key model, in-process.
+
+        Overrides the deterministic base default (MF5): drives a bare Pydantic
+        AI agent (``output_type=str``, no tools/MCP/skills, tight ``max_tokens``)
+        so the DM auto-title gets a MODEL-composed title, not a truncation. Any
+        failure — model can't build (no key), the call errors/times out, or the
+        output is empty — falls back to the base deterministic-truncation
+        default so a thread is never stranded. Cancellation propagates.
+        """
+        from pydantic_ai import Agent
+        from pydantic_ai.usage import UsageLimits
+
+        try:
+            model = self._build_model()
+        except Exception:
+            logger.warning(
+                f"[{self._log_tag}] generate_text: model build failed; "
+                "deterministic fallback",
+                exc_info=True,
+            )
+            return await super().generate_text(prompt, max_tokens=max_tokens)
+
+        agent = Agent(
+            model,
+            output_type=str,
+            model_settings=self._one_shot_settings(max_tokens),
+        )
+        try:
+            result = await asyncio.wait_for(
+                # request_limit=2 leaves one retry for a malformed first reply
+                # while still bounding a one-shot call to a single real turn.
+                agent.run(prompt, usage_limits=UsageLimits(request_limit=2)),
+                timeout=self._text_gen_timeout,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                f"[{self._log_tag}] generate_text failed; deterministic fallback",
+                exc_info=True,
+            )
+            return await super().generate_text(prompt, max_tokens=max_tokens)
+
+        text = (getattr(result, "output", "") or "").strip()
+        if not text:
+            return await super().generate_text(prompt, max_tokens=max_tokens)
+        return text
 
     # --- the in-process agentic loop ---------------------------------------
 
@@ -738,11 +831,23 @@ class ApiLLMProvider(LLMProvider):
         mcp_config_dir: Optional[Path] = None,
         skill_source_dirs: Optional[list[Path]] = None,
     ) -> tuple[ActionBlock, LLMUsage]:
-        from pydantic_ai import Agent
+        from pydantic_ai import Agent, NativeOutput
 
         working_dir.mkdir(parents=True, exist_ok=True)
         is_coordinator = action_schema == COORDINATOR_ACTION_SCHEMA
-        output_type = _CoordinatorOutput if is_coordinator else _WorkerOutput
+        base_output = _CoordinatorOutput if is_coordinator else _WorkerOutput
+        # Local OpenAI-compatible endpoints (ollama /v1) only: a reasoning model
+        # (qwen3) intermittently emits a tool call ollama's /v1 parser can't
+        # extract, so the turn comes back empty (no content, no tool_call) and
+        # Pydantic AI counts it a failed output — ~66% of turns with the real
+        # coordinator prompt, which exhausts the output-retry budget and aborts the
+        # invocation. NativeOutput emits the structured result as grammar-
+        # constrained JSON *content*, bypassing tool-call extraction entirely
+        # (validated on the real prompt: 1/12 → 6/6). The _ActionsOutput
+        # stringified-actions coercion still runs (content JSON goes through the
+        # same model validators). Hosted providers keep the default ToolOutput —
+        # their tool-calling is reliable and composes with native features.
+        output_type = NativeOutput(base_output) if self._base_url else base_output
 
         web_caps = self._web_capabilities(is_coordinator)
 

@@ -56,7 +56,7 @@ class ControlMessageType(str, Enum):
     KNOWLEDGE_PACK_SYNC = "knowledge_pack_sync"  # Server notifies client to install/uninstall a knowledge pack
     AGENT_REGISTRY_CHANGE = "agent_registry_change"  # Server notifies peer runners that an agent was registered/updated
     AGENT_CARD_UPDATE = "agent_card_update"  # Server notifies the agent's owner UI of card-field bumps (last_reflected_at, last_synced_at)
-    TODAY_TAB_SYNC = "today_tab_sync"  # Server notifies the owning user that a today-tab was upserted / deleted
+    BRIEF_TAB_SYNC = "brief_tab_sync"  # Server notifies the owning user that a brief-tab was upserted / deleted
     PROJECT_REPORT_SYNC = "project_report_sync"  # Server notifies project participants that the report was upserted / deleted
 
 
@@ -288,17 +288,17 @@ class AgentCardUpdatePayload(BaseModel):
     last_synced_at: str | None = None  # None = unchanged in this envelope
 
 
-class TodayTabSyncPayload(BaseModel):
-    """Payload for TODAY_TAB_SYNC messages.
+class BriefTabSyncPayload(BaseModel):
+    """Payload for BRIEF_TAB_SYNC messages.
 
     Sent server -> the tab-owning user (not the publishing agent) whenever
-    any of the user's agents upserts or deletes a today tab via
-    ``PUT|DELETE /me/today/tabs/{slug}``. The frontend listens and
-    invalidates its ``['today-tabs']`` query so /today re-renders with the
+    any of the user's agents upserts or deletes a brief tab via
+    ``PUT|DELETE /me/brief/tabs/{slug}``. The frontend listens and
+    invalidates its ``['brief-tabs']`` query so My Desk re-renders with the
     fresh tab.
 
     Carries only the per-tab cursor; the full payload (data + render code)
-    is fetched separately via ``GET /me/today/tabs``.
+    is fetched separately via ``GET /me/brief/tabs``.
     """
     action: str            # "upsert" | "delete"
     slug: str
@@ -328,7 +328,7 @@ class ProjectReportSyncPayload(BaseModel):
 class ControlEnvelope(BaseModel):
     """Lightweight WebSocket notification - never carries file content."""
     type: ControlMessageType
-    payload: Union[ChangelogUpdatePayload, AgentStatusChangePayload, ProjectDeletedPayload, SkillSyncPayload, McpSyncPayload, AgentSettingsChangePayload, CancelLLMPayload, ActiveWorkChangePayload, McpAuthUrlForUserPayload, McpAuthCodePayload, SkillAuthUrlForUserPayload, SkillAuthCodePayload, KnowledgePackSyncPayload, AgentRegistryChangePayload, AgentCardUpdatePayload, TodayTabSyncPayload, ProjectReportSyncPayload, dict] = Field(default_factory=dict)
+    payload: Union[ChangelogUpdatePayload, AgentStatusChangePayload, ProjectDeletedPayload, SkillSyncPayload, McpSyncPayload, AgentSettingsChangePayload, CancelLLMPayload, ActiveWorkChangePayload, McpAuthUrlForUserPayload, McpAuthCodePayload, SkillAuthUrlForUserPayload, SkillAuthCodePayload, KnowledgePackSyncPayload, AgentRegistryChangePayload, AgentCardUpdatePayload, BriefTabSyncPayload, ProjectReportSyncPayload, dict] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_required_fields_for_type(self) -> "ControlEnvelope":
@@ -378,9 +378,9 @@ class ControlEnvelope(BaseModel):
         elif self.type == ControlMessageType.AGENT_CARD_UPDATE:
             if not isinstance(self.payload, AgentCardUpdatePayload):
                 raise ValueError(f"control message type {self.type} requires AgentCardUpdatePayload")
-        elif self.type == ControlMessageType.TODAY_TAB_SYNC:
-            if not isinstance(self.payload, TodayTabSyncPayload):
-                raise ValueError(f"control message type {self.type} requires TodayTabSyncPayload")
+        elif self.type == ControlMessageType.BRIEF_TAB_SYNC:
+            if not isinstance(self.payload, BriefTabSyncPayload):
+                raise ValueError(f"control message type {self.type} requires BriefTabSyncPayload")
         elif self.type == ControlMessageType.PROJECT_REPORT_SYNC:
             if not isinstance(self.payload, ProjectReportSyncPayload):
                 raise ValueError(f"control message type {self.type} requires ProjectReportSyncPayload")

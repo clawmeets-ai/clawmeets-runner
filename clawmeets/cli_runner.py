@@ -349,7 +349,7 @@ def _resolve_api_key(provider: str, settings: dict) -> Optional[str]:
 # binary). Absent keys ⇒ provider defaults.
 _API_CAP_KEYS = (
     "max_requests", "web_max_uses", "coordinator_web_max_uses", "web_fetch_max_uses",
-    "max_tokens", "enable_web", "max_total_tokens",
+    "max_tokens", "enable_web", "max_total_tokens", "reasoning_effort",
 )
 
 

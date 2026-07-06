@@ -13,6 +13,7 @@ import asyncio
 import logging
 import os
 import shutil
+import tempfile
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -29,6 +30,26 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Exception Classes (generic, shared across providers)
 # ---------------------------------------------------------------------------
+
+
+def deterministic_text_snippet(prompt: str, *, max_words: int = 8) -> str:
+    """Deterministic, model-free short-text extraction from a one-shot prompt.
+
+    Backs :meth:`LLMProvider.generate_text`'s concrete default so any provider
+    that hasn't opted into real one-shot generation still returns a usable
+    string (no network, no subprocess). Convention: callers put a short
+    instruction then a blank line then the payload — this returns a cleaned,
+    word-clamped form of the payload (the text after the final blank line, or
+    the whole prompt if there is none).
+
+    Args:
+        prompt: The one-shot prompt (instruction + ``\\n\\n`` + payload).
+        max_words: Upper bound on the number of words returned.
+    """
+    payload = prompt.rsplit("\n\n", 1)[-1]
+    collapsed = " ".join(payload.split())
+    words = collapsed.split(" ")[:max_words]
+    return " ".join(words).strip()
 
 
 class LLMInvocationError(Exception):
@@ -341,6 +362,34 @@ class LLMProvider(ABC):
         """
         ...
 
+    async def generate_text(self, prompt: str, *, max_tokens: int = 32) -> str:
+        """One-shot text generation — a lightweight sibling of :meth:`invoke`.
+
+        Distinct from the heavyweight action-turn ``invoke()`` (which drags the
+        whole working-dir + action-schema + tool harness). Used for short,
+        structure-free generations such as the DM-thread auto-title.
+
+        **CONCRETE default (MF5), NOT ``@abstractmethod``.** Every provider
+        (ClaudeCLI / CodexCLI / ApiLLMProvider) inherits this deterministic,
+        model-free default — a cleaned, word-clamped truncation of the prompt's
+        payload — so the runner still instantiates and no caller is ever left
+        without a usable string if a provider hasn't opted into real generation
+        or a live call errors. Providers OVERRIDE this to produce a real
+        one-shot completion.
+
+        Args:
+            prompt: The one-shot prompt. Convention (see
+                :func:`deterministic_text_snippet`): a short instruction, a
+                blank line, then the payload to act on.
+            max_tokens: Advisory generation budget for overriding providers;
+                the deterministic default ignores it beyond its word clamp.
+
+        Returns:
+            A short generated (or, by default, deterministically extracted)
+            string. May be empty if the prompt payload is empty.
+        """
+        return deterministic_text_snippet(prompt)
+
 
 class SubprocessLLMProvider(LLMProvider):
     """Base for LLM CLI subprocess wrappers.
@@ -467,6 +516,118 @@ class SubprocessLLMProvider(LLMProvider):
             with open(log_dir / name, "a", encoding="utf-8") as f:
                 f.write(separator)
                 f.write(content)
+
+    # --- one-shot text generation (lightweight sibling of invoke) -----------
+
+    # Short kill window for the one-shot titling call. Much tighter than
+    # ``_invoke_timeout`` (a full agent turn): titling is cheap, and if the CLI
+    # is slow we'd rather drop to the deterministic default than block the
+    # agent's real reply, which awaits this inline.
+    _text_gen_timeout: int = 60
+
+    def _prepare_text_invocation(
+        self, prompt: str, working_dir: Path, max_tokens: int
+    ) -> Optional[PreparedInvocation]:
+        """Build the launch spec for a one-shot PLAIN-TEXT completion.
+
+        Deliberately stripped down vs. ``_prepare_invocation``: no action
+        schema, no MCP, no skills, no ``additional_dirs`` — just prompt in,
+        short text out. Return ``None`` to opt out of real generation (the base
+        ``generate_text`` then returns the deterministic default).
+        """
+        return None
+
+    def _parse_text_result(self, prepared: PreparedInvocation, stdout: str) -> str:
+        """Extract the completion text from a one-shot text invocation.
+
+        Default: the raw stdout (providers whose text mode prints the
+        completion straight to stdout). Providers that route the final message
+        to a sentinel file override this to read it back.
+        """
+        return stdout
+
+    async def generate_text(self, prompt: str, *, max_tokens: int = 32) -> str:
+        """Real one-shot generation via a cheap plain-text CLI subprocess.
+
+        Overrides the deterministic base default (MF5): shells the provider's
+        binary in a stripped-down text mode (``_prepare_text_invocation``) and
+        parses the completion (``_parse_text_result``). Any failure — the
+        provider opted out, the binary is missing, a non-zero exit, a timeout,
+        or empty output — falls back to the base deterministic-truncation
+        default so a caller (e.g. the DM auto-title) is never left without a
+        usable string. Cancellation propagates so the surrounding turn stays
+        cancellable.
+        """
+        with tempfile.TemporaryDirectory(prefix="clawmeets-gentext-") as td:
+            working_dir = Path(td)
+            try:
+                prepared = self._prepare_text_invocation(prompt, working_dir, max_tokens)
+            except Exception:
+                logger.warning(
+                    f"[{self._log_tag}] generate_text prep failed; deterministic fallback",
+                    exc_info=True,
+                )
+                prepared = None
+            if prepared is None:
+                return await super().generate_text(prompt, max_tokens=max_tokens)
+
+            proc: Optional[asyncio.subprocess.Process] = None
+            try:
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        *prepared.cmd,
+                        stdin=(
+                            asyncio.subprocess.PIPE
+                            if prepared.stdin_bytes is not None
+                            else asyncio.subprocess.DEVNULL
+                        ),
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        cwd=prepared.cwd,
+                        env=self._build_env(),
+                    )
+                except FileNotFoundError:
+                    logger.warning(
+                        f"[{self._log_tag}] generate_text: {self._bin} not found; "
+                        "deterministic fallback"
+                    )
+                    return await super().generate_text(prompt, max_tokens=max_tokens)
+
+                try:
+                    stdout_b, stderr_b = await asyncio.wait_for(
+                        proc.communicate(input=prepared.stdin_bytes),
+                        timeout=self._text_gen_timeout,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        f"[{self._log_tag}] generate_text timed out after "
+                        f"{self._text_gen_timeout}s; deterministic fallback"
+                    )
+                    return await super().generate_text(prompt, max_tokens=max_tokens)
+
+                returncode = proc.returncode if proc.returncode is not None else -1
+                if returncode != 0:
+                    stderr = stderr_b.decode("utf-8", errors="replace")
+                    logger.warning(
+                        f"[{self._log_tag}] generate_text exited {returncode}; "
+                        f"deterministic fallback. stderr={stderr[:500]}"
+                    )
+                    return await super().generate_text(prompt, max_tokens=max_tokens)
+
+                stdout = stdout_b.decode("utf-8", errors="replace")
+                text = self._parse_text_result(prepared, stdout).strip()
+                if not text:
+                    return await super().generate_text(prompt, max_tokens=max_tokens)
+                return text
+            finally:
+                if proc is not None and proc.returncode is None:
+                    try:
+                        proc.kill()
+                        await proc.wait()
+                    except Exception:
+                        pass
 
     # --- the shared workflow ------------------------------------------------
 
