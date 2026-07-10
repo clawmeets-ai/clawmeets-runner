@@ -503,11 +503,18 @@ class ApiLLMProvider(LLMProvider):
         max_requests: int = 50,
         max_total_tokens: Optional[int] = None,
         reasoning_effort: Optional[str] = None,
+        output_mode: Optional[str] = None,
     ) -> None:
         provider = (provider or "anthropic").lower()
         if provider not in _PROVIDERS:
             raise LLMNotFoundError(
                 provider, install_hint=f"unknown API provider '{provider}'"
+            )
+        if output_mode not in (None, "tool", "native"):
+            raise LLMNotFoundError(
+                provider,
+                install_hint=f"invalid output_mode {output_mode!r} "
+                "(expected 'tool', 'native', or unset)",
             )
         display, default_model = _PROVIDERS[provider]
         self._provider_name = display
@@ -549,6 +556,12 @@ class ApiLLMProvider(LLMProvider):
         # honored ONLY on /v1), forcing a content/tool-call every turn. None ⇒
         # provider/model default (thinking on). See _model_settings.
         self._reasoning_effort = reasoning_effort
+        # Structured-output mode override for the ``base_url`` (OpenAI-compatible
+        # gateway) path. None ⇒ the historical default (NativeOutput iff a
+        # base_url is set — see _use_native_output). "tool" opts a gateway with
+        # working OpenAI function-calling into the tool-calling loop (so the model
+        # can drive the skill/bash tools); "native" forces single-shot JSON.
+        self._output_mode = output_mode
         # Cumulative per-turn token ceiling (None ⇒ unbounded). A runaway loop
         # (e.g. an agent re-reading its own deliverable each step) grows the
         # re-sent transcript until it trips this — aborting as a recoverable
@@ -817,6 +830,29 @@ class ApiLLMProvider(LLMProvider):
             return await super().generate_text(prompt, max_tokens=max_tokens)
         return text
 
+    def _use_native_output(self) -> bool:
+        """Whether to emit structured output as grammar-constrained JSON content
+        (``NativeOutput``) rather than through a tool call (``ToolOutput``).
+
+        ``output_mode`` (from ``local_settings``) overrides explicitly:
+        ``"native"`` → always native; ``"tool"`` → always tool-calling. Unset ⇒
+        the historical default: native ONLY on the ``base_url`` path, because a
+        local reasoning model (qwen3 via ollama /v1) intermittently emits a tool
+        call the /v1 parser can't extract — see the note in ``invoke``. Hosted
+        providers (no base_url) keep tool-calling, which is reliable there.
+
+        The cost of NativeOutput is that the model answers in one shot and never
+        calls a tool — fine for a research/reply worker, fatal for a coordinator
+        whose whole job (project creation) runs through the skill/bash tools. An
+        OpenAI-compatible gateway with real function-calling opts back in via
+        ``output_mode="tool"``.
+        """
+        if self._output_mode == "tool":
+            return False
+        if self._output_mode == "native":
+            return True
+        return bool(self._base_url)
+
     # --- the in-process agentic loop ---------------------------------------
 
     async def invoke(
@@ -836,18 +872,22 @@ class ApiLLMProvider(LLMProvider):
         working_dir.mkdir(parents=True, exist_ok=True)
         is_coordinator = action_schema == COORDINATOR_ACTION_SCHEMA
         base_output = _CoordinatorOutput if is_coordinator else _WorkerOutput
-        # Local OpenAI-compatible endpoints (ollama /v1) only: a reasoning model
-        # (qwen3) intermittently emits a tool call ollama's /v1 parser can't
-        # extract, so the turn comes back empty (no content, no tool_call) and
-        # Pydantic AI counts it a failed output — ~66% of turns with the real
-        # coordinator prompt, which exhausts the output-retry budget and aborts the
-        # invocation. NativeOutput emits the structured result as grammar-
-        # constrained JSON *content*, bypassing tool-call extraction entirely
-        # (validated on the real prompt: 1/12 → 6/6). The _ActionsOutput
-        # stringified-actions coercion still runs (content JSON goes through the
-        # same model validators). Hosted providers keep the default ToolOutput —
-        # their tool-calling is reliable and composes with native features.
-        output_type = NativeOutput(base_output) if self._base_url else base_output
+        # NativeOutput emits the structured result as grammar-constrained JSON
+        # *content*, bypassing tool-call extraction entirely. It exists for local
+        # OpenAI-compatible endpoints (ollama /v1): a reasoning model (qwen3)
+        # intermittently emits a tool call the /v1 parser can't extract, so the
+        # turn comes back empty and Pydantic AI counts it a failed output —
+        # ~66% of turns with the real coordinator prompt, which exhausts the
+        # output-retry budget and aborts (validated: 1/12 → 6/6 with native).
+        # The tradeoff: the model answers in one shot and never calls a tool,
+        # which starves a coordinator whose project-creation work runs through
+        # the skill/bash tools. So the choice is controllable (output_mode) and
+        # defaults to native ONLY on the base_url path — hosted providers keep
+        # the default ToolOutput. See _use_native_output. The _ActionsOutput
+        # stringified-actions coercion still runs on the content JSON either way.
+        output_type = (
+            NativeOutput(base_output) if self._use_native_output() else base_output
+        )
 
         web_caps = self._web_capabilities(is_coordinator)
 

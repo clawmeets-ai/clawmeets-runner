@@ -58,6 +58,8 @@ class ControlMessageType(str, Enum):
     AGENT_CARD_UPDATE = "agent_card_update"  # Server notifies the agent's owner UI of card-field bumps (last_reflected_at, last_synced_at)
     BRIEF_TAB_SYNC = "brief_tab_sync"  # Server notifies the owning user that a brief-tab was upserted / deleted
     PROJECT_REPORT_SYNC = "project_report_sync"  # Server notifies project participants that the report was upserted / deleted
+    DESK_TODO_SYNC = "desk_todo_sync"  # Server notifies the owning user that a desk to-do was captured / patched / published / removed
+    DESK_READ_STATE_SYNC = "desk_read_state_sync"  # Server notifies the owning user that a My Desk read-state watermark was upserted
 
 
 class ChangelogUpdatePayload(BaseModel):
@@ -325,10 +327,47 @@ class ProjectReportSyncPayload(BaseModel):
     generated_at: str | None = None
 
 
+class DeskTodoSyncPayload(BaseModel):
+    """Payload for DESK_TODO_SYNC messages.
+
+    Sent server -> the plate-owning user whenever their desk to-do list
+    changes — a self-capture, a status/draft patch, a reorder, a delete,
+    or an agent team member publishing a to-do via ``PUT /me/desk/todos``.
+    The frontend invalidates its ``['desk-todos']`` query so the My Desk
+    To-do rail re-renders.
+
+    Carries only the action + affected id; the full list is fetched via
+    ``GET /me/desk/todos``.
+    """
+    action: str            # "add" | "patch" | "reorder" | "delete" | "publish"
+    id: str | None = None
+
+
+class DeskReadStateSyncPayload(BaseModel):
+    """Payload for DESK_READ_STATE_SYNC messages.
+
+    Sent server -> the desk-owning user whenever they upsert a My Desk
+    read-state watermark via ``PUT /me/desk/read-state`` (single-user
+    fan-out — the owner's own sessions only). Unlike the cursor-only desk /
+    brief sync payloads, this carries the full row so an already-open device
+    can merge the watermark live without a follow-up GET: the frontend applies
+    it directly (last-writer-wins on ``updated_at``) and also invalidates its
+    read-state query.
+
+    ``updated_at`` is the identical string stored on the row and returned in
+    the PUT 200 body, so the confirming device and every other session merge on
+    one clock.
+    """
+    project_id: str
+    chatroom_name: str            # e.g. "user-communication"
+    last_seen_message_id: str     # "__dismissed__" allowed
+    updated_at: str               # ISO-8601 UTC; == the PUT 200 body's updated_at
+
+
 class ControlEnvelope(BaseModel):
     """Lightweight WebSocket notification - never carries file content."""
     type: ControlMessageType
-    payload: Union[ChangelogUpdatePayload, AgentStatusChangePayload, ProjectDeletedPayload, SkillSyncPayload, McpSyncPayload, AgentSettingsChangePayload, CancelLLMPayload, ActiveWorkChangePayload, McpAuthUrlForUserPayload, McpAuthCodePayload, SkillAuthUrlForUserPayload, SkillAuthCodePayload, KnowledgePackSyncPayload, AgentRegistryChangePayload, AgentCardUpdatePayload, BriefTabSyncPayload, ProjectReportSyncPayload, dict] = Field(default_factory=dict)
+    payload: Union[ChangelogUpdatePayload, AgentStatusChangePayload, ProjectDeletedPayload, SkillSyncPayload, McpSyncPayload, AgentSettingsChangePayload, CancelLLMPayload, ActiveWorkChangePayload, McpAuthUrlForUserPayload, McpAuthCodePayload, SkillAuthUrlForUserPayload, SkillAuthCodePayload, KnowledgePackSyncPayload, AgentRegistryChangePayload, AgentCardUpdatePayload, BriefTabSyncPayload, ProjectReportSyncPayload, DeskTodoSyncPayload, DeskReadStateSyncPayload, dict] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_required_fields_for_type(self) -> "ControlEnvelope":
@@ -384,4 +423,10 @@ class ControlEnvelope(BaseModel):
         elif self.type == ControlMessageType.PROJECT_REPORT_SYNC:
             if not isinstance(self.payload, ProjectReportSyncPayload):
                 raise ValueError(f"control message type {self.type} requires ProjectReportSyncPayload")
+        elif self.type == ControlMessageType.DESK_TODO_SYNC:
+            if not isinstance(self.payload, DeskTodoSyncPayload):
+                raise ValueError(f"control message type {self.type} requires DeskTodoSyncPayload")
+        elif self.type == ControlMessageType.DESK_READ_STATE_SYNC:
+            if not isinstance(self.payload, DeskReadStateSyncPayload):
+                raise ValueError(f"control message type {self.type} requires DeskReadStateSyncPayload")
         return self

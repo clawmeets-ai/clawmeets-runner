@@ -349,7 +349,7 @@ def _resolve_api_key(provider: str, settings: dict) -> Optional[str]:
 # binary). Absent keys ⇒ provider defaults.
 _API_CAP_KEYS = (
     "max_requests", "web_max_uses", "coordinator_web_max_uses", "web_fetch_max_uses",
-    "max_tokens", "enable_web", "max_total_tokens", "reasoning_effort",
+    "max_tokens", "enable_web", "max_total_tokens", "reasoning_effort", "output_mode",
 )
 
 
@@ -445,6 +445,10 @@ def _build_llm_provider(
             claude_plugin_dirs=plugin_dirs,
             agent_env=agent_env,
             model=model,
+            # Local-model route: a non-empty base_url retargets the CLI at a
+            # local Anthropic Messages-API endpoint (ollama, gateway, …).
+            base_url=base_url,
+            api_key=api_key,
         )
     raise LLMNotFoundError(
         f"unknown llm_provider {provider!r} "
@@ -460,6 +464,7 @@ def _build_initial_local_settings(
     git_url: Optional[str] = None,
     git_base_branch: Optional[str] = None,
     llm_base_url: Optional[str] = None,
+    output_mode: Optional[str] = None,
 ) -> dict:
     """Build the local_settings block for a freshly generated card.json.
 
@@ -488,6 +493,8 @@ def _build_initial_local_settings(
         settings["llm_api_key"] = llm_api_key
     if llm_base_url:
         settings["llm_base_url"] = llm_base_url
+    if output_mode:
+        settings["output_mode"] = output_mode
     if dwh_dir:
         settings["dwh_dir"] = dwh_dir
     if git_url:
@@ -540,11 +547,23 @@ def agent_register(
     ),
     llm_base_url: Optional[str] = typer.Option(
         None, "--llm-base-url",
-        help="Custom OpenAI-compatible endpoint for the 'openai-api' provider, "
-             "e.g. a local ollama server at 'http://localhost:11434/v1' (also "
-             "vLLM / LM Studio). Routes a LOCAL model through the in-process "
-             "provider with schema-enforced output; --llm-api-key is optional "
-             "(ollama ignores it). Written to card.json local_settings.",
+        help="Local-model endpoint. For 'openai-api': an OpenAI-compatible URL "
+             "(ollama 'http://localhost:11434/v1', vLLM, LM Studio), routing a "
+             "LOCAL model through the in-process provider with schema-enforced "
+             "output. For the 'claude' CLI: a local Anthropic Messages-API URL "
+             "(ollama 'http://localhost:11434' — no '/v1', or a gateway like "
+             "claude-code-router) so the full Claude Code harness runs on a "
+             "local model. --llm-api-key is optional (local servers ignore it). "
+             "Written to card.json local_settings.",
+    ),
+    llm_output_mode: Optional[str] = typer.Option(
+        None, "--llm-output-mode",
+        help="Structured-output mode for a '-api' provider on the --llm-base-url "
+             "path: 'tool' (function-calling loop — use for OpenAI-compatible "
+             "gateways that support tool calls, so the agent can drive skill/bash "
+             "tools) or 'native' (single-shot JSON — for local models with flaky "
+             "tool-call parsing). Omit for the default (native on base_url, "
+             "tool-calling on hosted providers).",
     ),
     dwh_dir: Optional[str] = typer.Option(
         None, "--dwh-dir",
@@ -688,7 +707,7 @@ def agent_register(
             card["user_teams"] = user_teams
         initial_local_settings = _build_initial_local_settings(
             llm_provider, llm_model, dwh_dir, llm_api_key, git_url, git_base_branch,
-            llm_base_url=llm_base_url,
+            llm_base_url=llm_base_url, output_mode=llm_output_mode,
         )
         if initial_local_settings:
             card["local_settings"] = initial_local_settings
@@ -865,12 +884,17 @@ def _resolve_project_ref(
     ref: str,
     agent_id: Optional[str] = None,
 ) -> str:
-    """Resolve a project reference (exact id or exact name) to a project id.
+    """Resolve a project reference (exact id, name, or display_name) to a project id.
 
-    Name matches are disambiguated by the caller: an agent (``agent_id``)
-    keeps projects it participates in or coordinates; a user/assistant token
-    keeps projects they created. Permissions are still enforced server-side
-    at the target endpoint — this only picks *which* project was meant.
+    Match order: exact id (``GET /projects/{ref}``) → exact ``name`` (the
+    filesystem slug, canonical) → exact ``display_name`` (the human label the
+    web UI shows). The ``display_name`` tier is a pure fallback consulted only
+    when no ``name`` matches, so the slug always wins.
+
+    Matches are disambiguated by the caller: an agent (``agent_id``) keeps
+    projects it participates in or coordinates; a user/assistant token keeps
+    projects they created. Permissions are still enforced server-side at the
+    target endpoint — this only picks *which* project was meant.
     """
     resp = client.get(f"/projects/{ref}")
     if resp.status_code == 200:
@@ -879,7 +903,10 @@ def _resolve_project_ref(
     if resp.status_code != 200:
         typer.echo(f"Error: could not list projects ({resp.status_code})", err=True)
         raise typer.Exit(1)
-    candidates = [p for p in resp.json() if p["name"] == ref]
+    projects = resp.json()
+    candidates = [p for p in projects if p["name"] == ref]
+    if not candidates:
+        candidates = [p for p in projects if p.get("display_name") == ref]
     if len(candidates) > 1:
         if agent_id:
             scoped = [
@@ -899,12 +926,18 @@ def _resolve_project_ref(
         if scoped:
             candidates = scoped
     if not candidates:
-        typer.echo(f"Error: no project matches {ref!r}.", err=True)
+        typer.echo(
+            f"Error: no project matches {ref!r} (tried name and display_name).",
+            err=True,
+        )
         raise typer.Exit(1)
     if len(candidates) > 1:
-        typer.echo(f"Error: project name {ref!r} is ambiguous:", err=True)
+        typer.echo(f"Error: project {ref!r} is ambiguous:", err=True)
         for p in candidates:
-            typer.echo(f"  {p['name']}  id={p['id']}", err=True)
+            typer.echo(
+                f"  {p['name']}  (\"{p.get('display_name') or ''}\")  id={p['id']}",
+                err=True,
+            )
         typer.echo("Pass the project id instead.", err=True)
         raise typer.Exit(1)
     return candidates[0]["id"]
@@ -1345,7 +1378,8 @@ def agent_reconfigure(
     llm_provider: Optional[str] = typer.Option(None, "--llm-provider", help=f"LLM backend, one of {_VALID_LLM_PROVIDERS} (empty string clears)."),
     llm_model: Optional[str] = typer.Option(None, "--llm-model", help="Provider-specific model (empty string clears)."),
     llm_api_key: Optional[str] = typer.Option(None, "--llm-api-key", help="BYO key for a '-api' provider (empty string clears). NOTE: prefer the web UI — keys typed into chat sync to the server."),
-    llm_base_url: Optional[str] = typer.Option(None, "--llm-base-url", help="Custom OpenAI-compatible endpoint for 'openai-api' (e.g. local ollama 'http://localhost:11434/v1'; empty string clears)."),
+    llm_base_url: Optional[str] = typer.Option(None, "--llm-base-url", help="Local-model endpoint. For 'openai-api': an OpenAI-compatible URL (ollama 'http://localhost:11434/v1'). For the 'claude' CLI: a local Anthropic Messages-API URL (ollama 'http://localhost:11434' — no '/v1', or a gateway). Empty string clears."),
+    llm_output_mode: Optional[str] = typer.Option(None, "--llm-output-mode", help="Structured-output mode for a '-api' provider on the --llm-base-url path: 'tool' (function-calling loop — for gateways that support tool calls) or 'native' (single-shot JSON — for local models with flaky tool-call parsing). Empty string clears (→ default: native on base_url)."),
     token: Optional[str] = typer.Option(None, "--token", "-t"),
     server: Optional[str] = typer.Option(None, "--server", "-s"),
     data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir"),
@@ -1354,7 +1388,7 @@ def agent_reconfigure(
 
     Supersedes the single-key ``set-dwh-dir``: sets/clears any of git_url,
     git_base_branch, knowledge_dir, dwh_dir, llm_provider, llm_model,
-    llm_api_key, llm_base_url in one call. Only flags you pass are touched; pass an empty
+    llm_api_key, llm_base_url, output_mode in one call. Only flags you pass are touched; pass an empty
     string to clear a key. Triggers AGENT_SETTINGS_CHANGE so a running runner
     picks it up on the next LLM invocation.
 
@@ -1375,6 +1409,7 @@ def agent_reconfigure(
         ("llm_model", llm_model),
         ("llm_api_key", llm_api_key),
         ("llm_base_url", llm_base_url),
+        ("output_mode", llm_output_mode),
     ):
         if value is not None:
             fields[key] = value
@@ -2106,7 +2141,14 @@ async def _runner_loop(
     def cli_factory(settings: dict) -> LLMProvider:
         provider = (settings.get("llm_provider") or "claude").lower()
         model = settings.get("llm_model") or None
-        api_key = _resolve_api_key(provider, settings) if _is_api_provider(provider) else None
+        # ``-api`` providers resolve a key with env-var fallback; the bare
+        # ``claude`` local-model route (base_url set) takes the explicit
+        # llm_api_key as the gateway bearer token (no env fallback).
+        api_key = (
+            _resolve_api_key(provider, settings)
+            if _is_api_provider(provider)
+            else (settings.get("llm_api_key") or None)
+        )
         base_url = settings.get("llm_base_url") or None
         return _build_llm_provider(
             provider,
@@ -2314,28 +2356,84 @@ async def _runner_loop(
 DM_CHATROOM_NAME = "user-communication"
 
 
+def _resolve_latest_fd_thread(
+    client: httpx.Client,
+    token: str,
+    agent_full_name: str,
+    username: str,
+) -> Optional[dict]:
+    """Newest existing split-model front-desk requester thread with a foreign
+    agent, or ``None``.
+
+    Requester threads are named ``{username}-fd-{agent_short}-{suffix}`` with
+    ``surface="frontdesk"`` (see ``_create_front_desk_requester_thread``). We
+    reuse the most-recently-active one so a follow-up ``dm send`` continues the
+    same conversation (and thus the same host thread, via the tunnel binding).
+    """
+    short = agent_full_name.split("-", 1)[1] if "-" in agent_full_name else agent_full_name
+    prefix = f"{username}-fd-{short}-"
+    resp = client.get("/projects", headers={"Authorization": f"Bearer {token}"})
+    if resp.status_code != 200:
+        return None
+    candidates = [
+        p for p in resp.json()
+        if p.get("surface") == "frontdesk" and str(p.get("name", "")).startswith(prefix)
+    ]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: p.get("last_modified") or p.get("created_at") or "")
+    return candidates[-1]
+
+
 def _ensure_dm_target(
     client: httpx.Client,
     token: str,
     agent_full_name: str,
-) -> Optional[dict]:
-    """Idempotently resolve the per-agent DM/FD project for ``agent_full_name``.
+    *,
+    as_agent_id: Optional[str] = None,
+    create_if_missing: bool = True,
+) -> tuple[Optional[dict], bool]:
+    """Resolve the DM/FD project for ``agent_full_name``.
 
-    Returns the project dict (with ``id``, ``name``) or ``None`` if no agent
-    by that name exists. Tries the own-agent DM endpoint first; on 403
-    (foreign agent) falls back to the FD endpoint.
+    Returns ``(project_dict, is_foreign)`` — ``project_dict`` is ``None`` if the
+    agent doesn't exist or (for a foreign agent with ``create_if_missing=False``)
+    no thread exists yet.
+
+    Own agents use the idempotent per-agent DM project (``/me/dms/{agent}/ensure``).
+    Foreign agents use the split-model front-desk thread (``/me/fd/{agent}/threads``),
+    which mints a ``surface="frontdesk"`` thread the reply tunnels back into
+    (visible under DMs). To reuse the SAME thread across sends — so a follow-up
+    continues one conversation and one host thread — the send path passes a
+    stable, PRINCIPAL-SCOPED ``client_thread_key``: each principal (the user, or
+    a specific delegating agent) gets its own thread. This keeps the tunnel's
+    forward-mirror partition (``from_participant_id == binding.requester_id``)
+    consistent — a user and their assistant never share one thread, which would
+    otherwise silently drop one side's messages. The legacy name-keyed
+    ``/me/fd/{agent}/ensure`` path is intentionally no longer used here.
     """
     headers = {"Authorization": f"Bearer {token}"}
+    resp = client.post(f"/me/dms/{agent_full_name}/ensure", headers=headers)
+    if resp.status_code != 403:
+        if resp.status_code != 200:
+            return None, False
+        return resp.json(), False
+
+    # Foreign agent -> split-model front-desk thread.
+    if not create_if_missing:
+        # Reuse-only (history/display): best-effort newest thread by name.
+        username = _fetch_username(client, token)
+        return _resolve_latest_fd_thread(client, token, agent_full_name, username), True
+
+    principal = f"agent:{as_agent_id}" if as_agent_id else "user"
+    thread_key = f"dm-send:{principal}:{agent_full_name}"
     resp = client.post(
-        f"/me/dms/{agent_full_name}/ensure", headers=headers,
+        f"/me/fd/{agent_full_name}/threads",
+        headers=headers,
+        json={"client_thread_key": thread_key},
     )
-    if resp.status_code == 403:
-        resp = client.post(
-            f"/me/fd/{agent_full_name}/ensure", headers=headers,
-        )
     if resp.status_code != 200:
-        return None
-    return resp.json()
+        return None, True
+    return resp.json(), True
 
 
 @dm_app.command("send")
@@ -2350,27 +2448,38 @@ def dm_send(
 ):
     """Send a direct message to an agent.
 
-    Resolves the per-agent DM project (own agent → ``{username}-dm-{short}``,
-    foreign agent → ``{username}-fd-{short}``) and posts to its
-    ``user-communication`` chatroom. The project is created lazily on first
-    use. The message appears as the user — including when the user's
-    assistant shells this command with its own bearer token.
+    Resolves the DM project (own agent → ``{username}-dm-{short}``; foreign
+    agent → a split-model front-desk thread, reusing the latest or creating
+    one) and posts to its ``user-communication`` chatroom.
+
+    For a foreign agent, when an agent shells this command (``$CLAWMEETS_AGENT_ID``
+    is set — e.g. an assistant delegating on its owner's behalf), the message is
+    attributed to that agent, so the front-desk thread is keyed by the
+    requesting agent and the host sees the assistant as the asker. A plain user
+    invocation posts as the user.
 
     Examples:
         clawmeets dm send alice-researcher "Can you help me?"
         clawmeets dm send alice-researcher "Can you help me?" -u alice -p mypassword
     """
     server_url, token = _resolve_dm_session(data_dir, username, password, token, server)
+    as_agent_id = os.environ.get("CLAWMEETS_AGENT_ID")
     with _http(server_url) as client:
-        dm_project = _ensure_dm_target(client, token, agent_name)
+        dm_project, is_foreign = _ensure_dm_target(
+            client, token, agent_name, as_agent_id=as_agent_id
+        )
         if not dm_project:
             typer.echo(f"Error: Could not resolve DM project for agent {agent_name}", err=True)
             raise typer.Exit(1)
 
-        # Send message via user-message endpoint
+        # Send message via user-message endpoint. For a foreign delegation shelled
+        # by an agent, attribute the message to that agent (as_agent_id).
+        body: dict = {"content": message}
+        if is_foreign and as_agent_id:
+            body["as_agent_id"] = as_agent_id
         resp = client.post(
             f"/projects/{dm_project['id']}/chatrooms/{DM_CHATROOM_NAME}/user-message",
-            json={"content": message},
+            json=body,
             headers={"Authorization": f"Bearer {token}"},
         )
         _ok(resp)
@@ -2452,10 +2561,13 @@ def dm_history(
     """
     server_url, token = _resolve_dm_session(data_dir, username, password, token, server)
     with _http(server_url) as client:
-        dm_project = _ensure_dm_target(client, token, agent_name)
+        # History never creates a thread — reuse-only.
+        dm_project, _is_foreign = _ensure_dm_target(
+            client, token, agent_name, create_if_missing=False
+        )
         if not dm_project:
-            typer.echo(f"Error: Could not resolve DM project for agent {agent_name}", err=True)
-            raise typer.Exit(1)
+            typer.echo(f"No conversation with @{agent_name} yet.")
+            return
 
         resp = client.get(
             f"/projects/{dm_project['id']}/chatrooms/{DM_CHATROOM_NAME}/messages",
@@ -2487,12 +2599,33 @@ def dm_history(
 # dm schedule / schedules / unschedule
 # ---------------------------------------------------------------------------
 
+_SCHEDULE_THREAD_SUFFIX = "-schedule"
+
+
+def _dm_thread_display_name(short_name: str) -> str:
+    """Render a ``{user}-dm-`` project's stripped short name for listing.
+
+    The dedicated schedule thread ``{agent}-schedule`` is rendered as
+    ``{agent} (schedule)`` so it reads cleanly and is distinguishable from the
+    agent's plain DM thread.
+    """
+    if short_name.endswith(_SCHEDULE_THREAD_SUFFIX):
+        return f"{short_name[: -len(_SCHEDULE_THREAD_SUFFIX)]} (schedule)"
+    return short_name
+
+
 @dm_app.command("schedule")
 def dm_schedule(
     agent_name: str = typer.Argument(..., help="Full agent name to schedule messages to"),
     message: str = typer.Argument(..., help="Message content"),
     cron: str = typer.Option(..., "--cron", "-c", help="Cron expression (e.g. '@daily', '0 9 * * *')"),
     end_at: Optional[str] = typer.Option(None, "--end-at", help="Expiration time (ISO 8601)"),
+    project: Optional[str] = typer.Option(
+        None, "--project", "-P",
+        help="Target DM thread / project (name or id) — e.g. the current "
+             "project when the prompt names one. Omit to use the agent's "
+             "stable, auto-created schedule thread.",
+    ),
     username: Optional[str] = typer.Option(None, "-u", "--username", help="Username (with -p; optional — defaults to token/session auth)"),
     password: Optional[str] = typer.Option(None, "-p", "--password", help="Password (with -u)"),
     token: Optional[str] = typer.Option(None, "--token", "-t", help="User JWT or assistant token (defaults to $CLAWMEETS_ASSISTANT_TOKEN / $CLAWMEETS_USER_TOKEN / saved session)"),
@@ -2501,24 +2634,48 @@ def dm_schedule(
 ):
     """Schedule a recurring DM to an agent.
 
-    Resolves the per-agent DM project (lazy-creating it on first use), then
-    schedules the message into its ``user-communication`` chatroom. The cron
-    expression is evaluated in UTC.
+    Since DMs are threaded, a recurring fire needs a well-defined home:
+
+    - ``--project <name-or-id>`` targets a specific thread/project (resolve the
+      current project name when the prompt names one). The message lands in its
+      ``user-communication`` chatroom (server-enforced).
+    - Omitted: resolves-or-creates the agent's stable, dedicated *schedule*
+      thread (``{username}-dm-{agent}-schedule``) so recurring pings survive
+      restarts and stay out of the live conversation ("create if not exist").
+
+    The cron expression is evaluated in UTC.
 
     Examples:
         clawmeets dm schedule alice-researcher "Check for new findings" --cron "@daily"
         clawmeets dm schedule alice-analyst "Run weekly report" --cron "0 9 * * 1"
+        clawmeets dm schedule alice-analyst "Sync status" --cron "@daily" --project my-live-project
     """
     server_url, token = _resolve_dm_session(data_dir, username, password, token, server)
+    as_agent_id = os.environ.get("CLAWMEETS_AGENT_ID")
     with _http(server_url) as client:
-        dm_project = _ensure_dm_target(client, token, agent_name)
-        if not dm_project:
-            typer.echo(f"Error: Could not resolve DM project for agent {agent_name}", err=True)
-            raise typer.Exit(1)
+        if project:
+            # Explicit target: an existing thread / project by name or id.
+            project_id = _resolve_project_ref(client, token, project, agent_id=as_agent_id)
+            target_desc = f"project {project!r}"
+        else:
+            # Default: the agent's stable, dedicated schedule thread.
+            resp = client.post(
+                f"/me/dms/{agent_name}/schedule-thread",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            if resp.status_code != 200:
+                typer.echo(
+                    f"Error: could not resolve schedule thread for agent "
+                    f"{agent_name} ({resp.status_code}: {resp.text})",
+                    err=True,
+                )
+                raise typer.Exit(1)
+            project_id = resp.json()["id"]
+            target_desc = f"@{agent_name} (schedule thread)"
 
         # Create scheduled message
         payload: dict = {
-            "project_id": dm_project["id"],
+            "project_id": project_id,
             "chatroom_name": DM_CHATROOM_NAME,
             "content": message,
             "cron_expression": cron,
@@ -2533,7 +2690,7 @@ def dm_schedule(
         )
         result = _ok(resp)
         typer.echo(
-            f"Scheduled message to @{agent_name}: cron={cron!r} "
+            f"Scheduled recurring message to {target_desc}: cron={cron!r} "
             f"next fire: {result['next_fire_at']}"
         )
 
@@ -2566,7 +2723,9 @@ def dm_schedules(
         dm_project_agent: dict[str, str] = {}
         for p in projects:
             if p["name"].startswith(dm_prefix):
-                dm_project_agent[p["id"]] = p["name"][len(dm_prefix):]
+                dm_project_agent[p["id"]] = _dm_thread_display_name(
+                    p["name"][len(dm_prefix):]
+                )
             elif p["name"].startswith(fd_prefix):
                 dm_project_agent[p["id"]] = p["name"][len(fd_prefix):]
 
@@ -3295,7 +3454,7 @@ def _post_dm_marker(
     marker_body: str,
 ) -> bool:
     """Send `marker_body` as a user message into agent's DM. Returns success."""
-    dm_project = _ensure_dm_target(client, token, agent_full_name)
+    dm_project, _is_foreign = _ensure_dm_target(client, token, agent_full_name)
     if not dm_project:
         typer.echo(
             f"  Warning: could not resolve DM project for '{agent_full_name}'.",
@@ -3370,8 +3529,17 @@ def assistant_register(
     ),
     llm_base_url: Optional[str] = typer.Option(
         None, "--llm-base-url",
-        help="Custom OpenAI-compatible endpoint for 'openai-api' (e.g. local "
-             "ollama 'http://localhost:11434/v1'). Written to card.json local_settings.",
+        help="Local-model endpoint: OpenAI-compatible for 'openai-api' (ollama "
+             "'http://localhost:11434/v1'), or a local Anthropic Messages-API URL "
+             "for the 'claude' CLI (ollama 'http://localhost:11434' — no '/v1'). "
+             "Written to card.json local_settings.",
+    ),
+    llm_output_mode: Optional[str] = typer.Option(
+        None, "--llm-output-mode",
+        help="Structured-output mode for a '-api' provider on the --llm-base-url "
+             "path: 'tool' (function-calling loop — for gateways that support tool "
+             "calls) or 'native' (single-shot JSON — for local models). Omit for "
+             "the default (native on base_url).",
     ),
     no_personalize: bool = typer.Option(
         False, "--no-personalize",
@@ -3411,7 +3579,7 @@ def assistant_register(
     cron_expression = _daily_at_to_cron(reflect_daily_at)
     local_settings = _build_initial_local_settings(
         llm_provider, llm_model, dwh_dir=None, llm_api_key=llm_api_key,
-        llm_base_url=llm_base_url,
+        llm_base_url=llm_base_url, output_mode=llm_output_mode,
     )
 
     if username and password:
@@ -3676,9 +3844,11 @@ def agent_team_register(
     llm_base_url: Optional[str] = typer.Option(
         None, "--llm-base-url",
         help=(
-            "Override the OpenAI-compatible endpoint (openai-api) for every "
-            "worker in this run, e.g. local ollama 'http://localhost:11434/v1'. "
-            "Wins over per-agent llm_base_url in setup.json."
+            "Override the local-model endpoint for every worker in this run: "
+            "OpenAI-compatible for 'openai-api' (ollama 'http://localhost:11434/v1'), "
+            "or a local Anthropic Messages-API URL for the 'claude' CLI (ollama "
+            "'http://localhost:11434' — no '/v1'). Wins over per-agent llm_base_url "
+            "in setup.json."
         ),
     ),
     no_personalize: bool = typer.Option(

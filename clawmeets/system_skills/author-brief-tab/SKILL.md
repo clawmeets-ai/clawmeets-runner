@@ -44,8 +44,16 @@ One-off asks ("what Burgundies does Acker have right now?") are NOT
 this skill — answer directly or delegate via a plain DM. Classify the
 ask:
 
-- **New briefing** — pick a slug (`[a-z0-9_-]+`; keep it ≤ ~20 chars so
-  it stays greppable in schedule listings) and a briefing title.
+- **New briefing** — obtain the KEY from the user (the name they give);
+  if they didn't name it, derive a candidate slug and surface it in the
+  proposal (Step 4) for confirmation — never lock in a slug the user
+  hasn't seen. First run `clawmeets brief list-tabs`: if a tab from a
+  prior one-off publish matches the user's name, reuse its slug so the
+  schedule upserts that same tile instead of creating a duplicate.
+  Slugify with the SAME deterministic rule the `brief` skill uses
+  (lowercase → trim → each run of `[^a-z0-9]` → single `-` → strip
+  leading/trailing `-`); keep it `[a-z0-9_-]+` and ≤ ~20 chars so it
+  stays greppable in schedule listings. Also pick a briefing title.
 - **Update** — the user references an existing briefing (criteria change,
   cadence change, retitle). Keep the slug stable so the briefing
   overwrites in place.
@@ -135,7 +143,9 @@ title, cadence in the user's local time, what gets checked, roughly
 one LLM turn per refresh — more for the project shape, plus any
 new-agent registration or skill install) + the exact refresh message
 body in a fenced block + "Say **go** to set it up, or tell me what to
-change." **No trigger marker outside the fenced block.**
+change." **No trigger marker outside the fenced block.** State the
+briefing key explicitly in the summary ("key: `wine` — reused on every
+refresh") so the user can correct it before it is locked in.
 
 ## Step 5 — on the next turn
 

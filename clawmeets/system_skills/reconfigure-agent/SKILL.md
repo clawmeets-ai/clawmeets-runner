@@ -18,6 +18,10 @@ which merges the change and signals the target runner to hot-apply it on its
 next turn. The CLI + server own the auth and the merge — your job is to
 **pick the mode, enforce the guard, shell one command, and confirm**.
 
+If unsure whether a setting is supported, run `clawmeets agent reconfigure
+--help` before telling the user it can't be done — don't assert a flag is
+missing from memory.
+
 Settings you can change (pass any subset; an empty string clears a key):
 
 | Flag | Sets |
@@ -29,9 +33,18 @@ Settings you can change (pass any subset; an empty string clears a key):
 | `--llm-provider` | LLM backend (claude / openai / gemini / opencode / *-api) |
 | `--llm-model` | provider-specific model |
 | `--llm-api-key` | BYO key for a `-api` provider |
+| `--llm-base-url` | local-model endpoint — for `openai-api` an OpenAI-compatible URL (ollama `http://localhost:11434/v1`, vLLM, LM Studio); for the `claude` CLI a local Anthropic Messages-API URL (ollama `http://localhost:11434` — no `/v1`, or a gateway) |
+| `--llm-output-mode` | `-api` structured-output mode on the `--llm-base-url` path: `tool` (function-calling loop — set this for an OpenAI-compatible **gateway** whose model supports tool calls, so the agent can drive skill/bash tools) or `native` (single-shot JSON — for a **local** model with flaky tool-call parsing). Omit for the default (native on base_url). Symptom that you need `tool`: the agent replies in chat but never runs its tools / never creates the project. |
 
 Changes take effect on the target's **next** turn (existing in-flight work is
 unaffected).
+
+**Local model:** to point an agent at a local server, set provider + model +
+base URL together. Two routes, and the base-URL **shape differs**:
+- In-process OpenAI-compatible: `--llm-provider openai-api --llm-model <name> --llm-base-url http://localhost:11434/v1` (note the `/v1`).
+- Full Claude Code CLI harness on a local model: `--llm-provider claude --llm-model <name> --llm-base-url http://localhost:11434` (Anthropic Messages API — **no** `/v1`; also accepts a gateway like claude-code-router / LiteLLM). `--llm-api-key` is an optional bearer token local servers ignore.
+
+Provider + model alone (no base URL) leaves it aimed at the hosted default.
 
 ## Mode A — reconfigure one of the user's OTHER agents (you are the assistant)
 

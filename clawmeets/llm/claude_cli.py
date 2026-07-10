@@ -52,6 +52,8 @@ class ClaudeCLI(SubprocessLLMProvider):
         claude_bin: str = "claude",
         claude_plugin_dirs: Optional[list[Path]] = None,
         model: Optional[str] = None,
+        base_url: Optional[str] = None,
+        api_key: Optional[str] = None,
     ) -> None:
         """Initialize ClaudeCLI.
 
@@ -69,6 +71,16 @@ class ClaudeCLI(SubprocessLLMProvider):
             claude_plugin_dirs: Directories to load as Claude plugins via --plugin-dir
             model: If set, passed to the Claude CLI as ``--model <name>`` per
                 invocation. None falls back to Claude Code's configured default.
+            base_url: If set, retargets the Claude CLI at a **local** Anthropic
+                Messages-API-compatible endpoint via ``ANTHROPIC_BASE_URL`` — e.g.
+                ollama's ``http://localhost:11434`` (no ``/v1``), or a gateway like
+                claude-code-router / LiteLLM. Lets the full Claude Code harness
+                (native skills / plugins / MCP) run on a local model. None ⇒ the
+                runner's default auth (subscription / ``ANTHROPIC_API_KEY``).
+            api_key: Bearer token for the ``base_url`` endpoint (``ANTHROPIC_AUTH_TOKEN``
+                / ``ANTHROPIC_API_KEY``). Optional — local servers like ollama accept
+                any value ("required but ignored"), so a placeholder is used when None.
+                Ignored unless ``base_url`` is set.
 
         MCP servers are surfaced via the ``mcp_config_dir`` argument to
         ``invoke()`` — the runner points at ``{agent_dir}/mcp-hub/dist/`` and
@@ -81,6 +93,8 @@ class ClaudeCLI(SubprocessLLMProvider):
         self._claude_plugin_dirs = claude_plugin_dirs or []
         self._agent_env = dict(agent_env)
         self._model = model
+        self._base_url = base_url or None
+        self._api_key = api_key or None
 
     @classmethod
     def verify_cli(cls, claude_bin: str = "claude") -> None:
@@ -114,6 +128,16 @@ class ClaudeCLI(SubprocessLLMProvider):
     def _build_env(self) -> dict[str, str]:
         env = super()._build_env()
         env["CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD"] = "1"
+        # Local-model route: point the CLI at a local Anthropic Messages-API
+        # endpoint (ollama http://localhost:11434, claude-code-router, …). Set
+        # both auth vars to cover gateways keyed on either header; ollama-style
+        # servers ignore the value ("required but ignored"), so a placeholder
+        # suffices when no key is configured.
+        if self._base_url:
+            token = self._api_key or "clawmeets-local"
+            env["ANTHROPIC_BASE_URL"] = self._base_url
+            env["ANTHROPIC_AUTH_TOKEN"] = token
+            env["ANTHROPIC_API_KEY"] = token
         return env
 
     def _prepare_invocation(

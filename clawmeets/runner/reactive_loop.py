@@ -913,7 +913,9 @@ class ReactiveControlLoop:
         # (incl. the ``-api`` variant) / model / BYO-key all resolve there.
         # Switching e.g. claude → claude-api is a llm_provider change, so it
         # still triggers the swap.
-        llm_keys = ("llm_provider", "llm_model", "llm_api_key", "llm_base_url")
+        llm_keys = (
+            "llm_provider", "llm_model", "llm_api_key", "llm_base_url", "output_mode",
+        )
         llm_changed = any(
             local_settings.get(k) != prior_settings.get(k) for k in llm_keys
         )

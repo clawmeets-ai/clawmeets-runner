@@ -137,6 +137,56 @@ class WorkTracker:
             )
         return work
 
+    async def record_response_opening_if_missing(
+        self,
+        project_id: str,
+        project_name: str,
+        chatroom_name: str,
+        participant_id: str,
+        *,
+        coordinator_id: str,
+        message_id: str,
+        message_version: int,
+        timeout_seconds: int = 1800,
+    ) -> Optional[PendingWork]:
+        """Record a response, synthesizing a one-participant batch if none is open.
+
+        A reply can arrive in a room with no open batch — e.g. an agent posts a
+        follow-up after its earlier batch already completed, or a foreign agent
+        mirrors a second (final) message through the tunnel after its first reply
+        closed the batch. Without an open batch the reply would be invisible to
+        the batch-completion machinery and the room's coordinator would never be
+        re-woken to look at it.
+
+        When no batch is open for ``(project_id, chatroom_name)`` this synthesizes
+        one expecting only ``participant_id`` (coordinator = ``coordinator_id``,
+        the room's coordinator), then records the response — so the batch is
+        immediately complete and the caller fires BATCH_COMPLETE as usual. When a
+        batch IS already open, this is exactly ``record_response`` (the reply
+        credits the existing batch).
+
+        Callers MUST guard ``participant_id != coordinator_id`` before calling —
+        synthesizing a batch whose coordinator is the replier would wake the
+        replier on its own message (infinite loop).
+        """
+        if self._pending.get((project_id, chatroom_name)) is None:
+            try:
+                await self.create_pending_work(
+                    message_id=message_id,
+                    message_version=message_version,
+                    project_id=project_id,
+                    project_name=project_name,
+                    chatroom_name=chatroom_name,
+                    coordinator_id=coordinator_id,
+                    expected_participants=[participant_id],
+                    timeout_seconds=timeout_seconds,
+                )
+            except ValueError:
+                # A concurrent reply opened a batch between the check and the
+                # create — fall through and record against whatever is now open.
+                pass
+        return await self.record_response(project_id, chatroom_name, participant_id)
+
     async def remap_expected(
         self, project_id: str, chatroom_name: str, mapping: dict[str, str]
     ) -> None:
