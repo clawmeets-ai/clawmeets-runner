@@ -37,6 +37,7 @@ from typing import Annotated, Any, Literal, Optional, Union
 from pydantic import BaseModel, Field, model_validator
 
 from ..api.actions import ActionBlock, COORDINATOR_ACTION_SCHEMA
+from ..utils import env_store
 from ..utils.notification_center import LLM_COMPLETE, LLM_ERROR, NotificationCenter
 from .base import (
     LLMInvocationError,
@@ -664,7 +665,13 @@ class ApiLLMProvider(LLMProvider):
         return models or [self._model_name]
 
     def _build_env(self) -> dict[str, str]:
+        # Env for the in-process guarded bash tool's subprocesses. Overlay the
+        # runner-local env store (read live) between os.environ and the
+        # CLAWMEETS_* identity, matching SubprocessLLMProvider._build_env.
         env = os.environ.copy()
+        agent_dir = self._agent_env.get("CLAWMEETS_AGENT_DIR")
+        if agent_dir:
+            env.update(env_store.load(Path(agent_dir)))
         env.update(self._agent_env)
         return env
 

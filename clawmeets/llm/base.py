@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Optional
 
 from ..api.actions import ActionBlock
+from ..utils import env_store
 from ..utils.notification_center import LLM_COMPLETE, LLM_ERROR, NotificationCenter
 
 logger = logging.getLogger(__name__)
@@ -497,12 +498,20 @@ class SubprocessLLMProvider(LLMProvider):
     def _build_env(self) -> dict[str, str]:
         """Build the environment passed to the subprocess.
 
-        Default: process env + `agent_env` (CLAWMEETS_AGENT_ID / TOKEN /
-        SERVER_URL / AGENT_DIR). Subclasses override to add per-provider
-        flags (e.g. ClaudeCLI sets CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD).
+        Default: process env + runner-local env store + `agent_env`
+        (CLAWMEETS_AGENT_ID / TOKEN / SERVER_URL / AGENT_DIR). Subclasses
+        override to add per-provider flags (e.g. ClaudeCLI sets
+        CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD).
+
+        Precedence: os.environ < env store < CLAWMEETS_* identity. The store is
+        read live (one small JSON read per spawn) so `clawmeets env set` lands
+        on the next turn without a runner restart.
         """
         env = os.environ.copy()
-        env.update(self._agent_env)
+        agent_dir = self._agent_env.get("CLAWMEETS_AGENT_DIR")
+        if agent_dir:
+            env.update(env_store.load(Path(agent_dir)))
+        env.update(self._agent_env)  # CLAWMEETS_* identity always wins
         return env
 
     def _write_invocation_logs(

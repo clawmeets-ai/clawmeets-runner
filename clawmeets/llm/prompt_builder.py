@@ -306,6 +306,7 @@ class PromptBuilder:
         *,
         name: str,
         description: str,
+        project_id: str,
         project_name: str,
         chatroom_name: str,
         capabilities_line: str,
@@ -332,7 +333,7 @@ class PromptBuilder:
             f"Description: {description}\n"
             f"Capabilities: {capabilities_line or 'general'}\n"
             f"\n"
-            f"Project: {project_name}\n"
+            f"Project: {project_name} (id={project_id})\n"
             f"Chatroom: {chatroom_name}\n"
         )
 
@@ -517,15 +518,16 @@ you directly within your area of expertise.
         dwh_dir: Optional[Path] = None,
         chat_history: list[tuple[str, str]] | None = None,
     ) -> str:
-        """Build a worker prompt. ``project_id`` is unused at present; kept
-        for callsite compatibility.
+        """Build a worker prompt. ``project_id`` is surfaced in the identity
+        header so the LLM can target this exact thread from CLIs that take a
+        project id (e.g. ``dm schedule --project <id>``).
         """
-        del project_id  # reserved for future use
         self._is_dm = is_dm
         capabilities_line = ", ".join(self._capabilities) if self._capabilities else ""
         return self._assemble(
             name=name,
             description=description,
+            project_id=project_id,
             project_name=project_name,
             chatroom_name=chatroom_name,
             capabilities_line=capabilities_line,
@@ -1012,7 +1014,6 @@ Use @-mentions in the workroom's init_message to address invited agents.
         DM-shaped project (False; foreign coordinator keeps create_room).
         Ignored when ``is_dm`` is False.
         """
-        del project_id
         self._is_dm = is_dm
         self._dm_is_owned = dm_is_owned
         self._first_turn = False
@@ -1022,6 +1023,7 @@ Use @-mentions in the workroom's init_message to address invited agents.
         return self._assemble(
             name=name,
             description=description,
+            project_id=project_id,
             project_name=project_name,
             chatroom_name=chatroom_name,
             capabilities_line="",
@@ -1055,7 +1057,6 @@ Use @-mentions in the workroom's init_message to address invited agents.
         steady-state coordinator block) and the inclusion of the context-files
         list in the extras. Same layout otherwise.
         """
-        del project_id
         self._is_dm = False
         self._first_turn = True
         self._invitable_agents = invitable_agents
@@ -1063,6 +1064,7 @@ Use @-mentions in the workroom's init_message to address invited agents.
         return self._assemble(
             name=name,
             description=description,
+            project_id=project_id,
             project_name=project_name,
             chatroom_name=chatroom_name,
             capabilities_line="",

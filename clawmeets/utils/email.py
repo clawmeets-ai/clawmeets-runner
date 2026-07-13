@@ -8,8 +8,10 @@ rendering primitives. ClawMeets-specific templates live in
 """
 from __future__ import annotations
 
+import base64
 import html as _html
 import logging
+import mimetypes
 import os
 import re
 from abc import ABC, abstractmethod
@@ -18,13 +20,33 @@ from typing import Optional
 import sendgrid
 from markdown_it import MarkdownIt
 from pydantic import BaseModel, Field
-from sendgrid.helpers.mail import Mail, Email, To, Content, Bcc
+from sendgrid.helpers.mail import (
+    Attachment,
+    Bcc,
+    Content,
+    Disposition,
+    Email,
+    FileContent,
+    FileName,
+    FileType,
+    Mail,
+    To,
+)
 
 logger = logging.getLogger("clawmeets.email")
 
 SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY")
 SENDGRID_FROM_EMAIL = os.environ.get("SENDGRID_FROM_EMAIL", "info@clawmeets.ai")
 SENDGRID_FROM_NAME = os.environ.get("SENDGRID_FROM_NAME", "ClawMeets AI")
+
+# Attachment caps — keep a message under SendGrid's ~30 MB hard limit and
+# avoid inlining an unbounded deliverable set. Any candidate that trips a cap
+# is dropped (and reported), never silently truncating the accepted set.
+MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024        # per-file
+MAX_TOTAL_ATTACHMENT_BYTES = int(
+    os.environ.get("CLAWMEETS_MAX_EMAIL_ATTACHMENT_BYTES", 20 * 1024 * 1024)
+)
+MAX_ATTACHMENT_COUNT = 20
 
 # ---------------------------------------------------------------------------
 # Branded HTML shell — palette / typography used by render_notification_html.
@@ -117,13 +139,74 @@ def _render_shell(
 # EmailMessage — value object + generic rendering primitives
 # ---------------------------------------------------------------------------
 
+class EmailAttachment(BaseModel):
+    """A single email attachment carried through to the transport.
+
+    ``content_b64`` is the base64 encoding of the raw file bytes — the
+    same wire form SendGrid's ``FileContent`` expects, so no re-encoding
+    happens at send time.
+    """
+    filename: str
+    content_b64: str
+    mime_type: str = "application/octet-stream"
+
+
 class EmailMessage(BaseModel):
     to_email: str
     subject: str
     body: str
     html_body: Optional[str] = None
     bcc: list[str] = Field(default_factory=list)
+    attachments: list[EmailAttachment] = Field(default_factory=list)
     log_label: str = "Email"
+
+    # ------------------------------------------------------------------
+    # Attachment helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def build_attachment(filename: str, content: bytes) -> EmailAttachment:
+        """Wrap raw bytes as an ``EmailAttachment``.
+
+        Guesses the MIME type from the filename (falling back to
+        ``application/octet-stream``) and base64-encodes the content.
+        """
+        mime_type, _ = mimetypes.guess_type(filename)
+        return EmailAttachment(
+            filename=filename,
+            content_b64=base64.b64encode(content).decode("ascii"),
+            mime_type=mime_type or "application/octet-stream",
+        )
+
+    @staticmethod
+    def select_attachments(
+        files: list[tuple[str, bytes]],
+    ) -> tuple[list[EmailAttachment], list[str]]:
+        """Apply the size/count caps over a candidate ``(name, bytes)`` list.
+
+        Drops any single file larger than ``MAX_ATTACHMENT_BYTES``, and
+        stops accepting once the running total would exceed
+        ``MAX_TOTAL_ATTACHMENT_BYTES`` or the count would reach
+        ``MAX_ATTACHMENT_COUNT``. Returns ``(accepted, skipped_filenames)``
+        so the caller can note which deliverables were left as links.
+        """
+        accepted: list[EmailAttachment] = []
+        skipped: list[str] = []
+        total = 0
+        for filename, content in files:
+            size = len(content)
+            if size > MAX_ATTACHMENT_BYTES:
+                skipped.append(filename)
+                continue
+            if (
+                len(accepted) >= MAX_ATTACHMENT_COUNT
+                or total + size > MAX_TOTAL_ATTACHMENT_BYTES
+            ):
+                skipped.append(filename)
+                continue
+            accepted.append(EmailMessage.build_attachment(filename, content))
+            total += size
+        return accepted, skipped
 
     # ------------------------------------------------------------------
     # Text utilities
@@ -191,6 +274,7 @@ class EmailMessage(BaseModel):
         intro_html: str,
         quote_content_md: Optional[str] = None,
         secondary_text: Optional[str] = None,
+        extra_html: Optional[str] = None,
         cta_url: str,
         cta_label: str,
     ) -> str:
@@ -200,7 +284,9 @@ class EmailMessage(BaseModel):
         contain trusted inline tags. ``quote_content_md`` is rendered
         through markdown into a brand-bordered quote block.
         ``secondary_text`` is plain text shown as a muted follow-up
-        paragraph.
+        paragraph. ``extra_html`` is a trusted HTML block inserted after
+        ``secondary_text`` and above the CTA (e.g. a report link or an
+        "N files attached" note) — callers must escape any dynamic parts.
         """
         parts: list[str] = [
             f'<p style="margin:0 0 12px;color:{_COLOR_BODY};line-height:1.55;">'
@@ -221,6 +307,8 @@ class EmailMessage(BaseModel):
                 f'{_html.escape(secondary_text)}'
                 f'</p>'
             )
+        if extra_html:
+            parts.append(extra_html)
         return _render_shell(
             preheader=preheader,
             headline=headline,
@@ -257,6 +345,15 @@ class SendGridMailer(Mailer):
             mail.add_content(Content("text/html", message.html_body))
         for bcc_addr in message.bcc:
             mail.add_bcc(Bcc(bcc_addr))
+        for att in message.attachments:
+            mail.add_attachment(
+                Attachment(
+                    FileContent(att.content_b64),
+                    FileName(att.filename),
+                    FileType(att.mime_type),
+                    Disposition("attachment"),
+                )
+            )
         try:
             response = sg.send(mail)
             logger.info(
@@ -283,6 +380,9 @@ class ConsoleMailer(Mailer):
         print(f"Body: {message.body}")
         if message.html_body:
             print(f"[HTML body suppressed in console — {len(message.html_body)} chars]")
+        for att in message.attachments:
+            size = len(base64.b64decode(att.content_b64))
+            print(f"Attachment: {att.filename} ({att.mime_type}, {size} bytes)")
         print("-" * (len(message.log_label) + 32) + "\n")
 
 

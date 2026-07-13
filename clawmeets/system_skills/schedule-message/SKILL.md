@@ -18,15 +18,28 @@ shapes, two command families:
 
 - **DM thread** (most common — "every morning ask bob…"): address the
   agent by name. **DMs are threaded**, so a recurring fire needs a
-  well-defined home — pick one of:
-  - `--project <name-or-id>` → an existing thread / project. When the
-    prompt names a current project, pass that name so the recurring
-    message lands in the conversation the user is actually in.
-  - omit `--project` → the agent's **stable, dedicated schedule
-    thread** (`{username}-dm-{agent}-schedule`), auto-created on first
-    use and reused forever after ("create if not exist"). It keeps
-    recurring pings out of the live conversation and survives restarts.
-    Use this default whenever the prompt does **not** name a project.
+  well-defined home. Two modes — pick one:
+  - **Mode A — THIS thread** (the live conversation you're in right
+    now): pass `--project <id>` using the id from your prompt header
+    (`Project: {name} (id=...)`). The ping lands in this thread's
+    `user-communication` room. Use when the user says "schedule this
+    **here** / in this thread / in our current conversation".
+    **Caveat:** when you're in the user's DM with the *assistant* and
+    the ping is for a *different* agent (bob), do **not** pass this
+    thread's id — that would wake the assistant in its own thread. Use
+    Mode B instead.
+  - **Mode B — the agent's GENERAL schedule thread** (default): omit
+    `--project`. Resolves-or-creates the agent's **stable, dedicated
+    schedule thread** (`{username}-dm-{agent}-schedule`), auto-created
+    on first use and reused forever after ("create if not exist"). It
+    keeps recurring pings out of the live conversation and survives
+    restarts. Use whenever the user does **not** say "this thread", or
+    whenever you're scheduling for a *different* agent than the one
+    whose thread you're in.
+
+  **Decision rule:** scheduling into the SAME thread you're in, for the
+  SAME agent → Mode A (`--project <id>`). Everything else (incl. "every
+  morning ask bob") → Mode B (omit `--project`).
 - **Regular project** ("ping the team room every Monday"): address the
   project by name or id; only its `user-communication` room accepts
   schedules (server-enforced).
@@ -41,14 +54,14 @@ automatically — no `--token`, `-u`, or `-p` needed.
 ## Commands
 
 ```bash
-# Recurring DM to an agent (by name) — lands in the agent's stable,
-# auto-created schedule thread when --project is omitted.
+# Mode B (default) — recurring DM to an agent (by name), landing in the
+# agent's stable, auto-created GENERAL schedule thread when --project is omitted.
 clawmeets dm schedule <agent-name> "<message>" --cron "@daily"
 clawmeets dm schedule <agent-name> "<message>" --cron "0 16 * * 1" --end-at 2026-09-01T00:00:00Z
 
-# Recurring DM into a SPECIFIC thread / project (e.g. the current project
-# named in the prompt). Lands in that project's user-communication room.
-clawmeets dm schedule <agent-name> "<message>" --cron "@daily" --project <name-or-id>
+# Mode A — recurring DM into THIS live thread. Copy the id from your prompt
+# header ("Project: {name} (id=...)"). Lands in this thread's user-communication room.
+clawmeets dm schedule <agent-name> "<message>" --cron "@daily" --project <id-from-header>
 
 # List / cancel recurring DMs.
 clawmeets dm schedules
@@ -71,9 +84,11 @@ clawmeets schedule cancel <schedule-id>
    and pass either the shown label or the `name=<slug>` to
    `schedule create` — matching is exact and case-sensitive, so copy the
    printed string verbatim.
-   - For `dm schedule`, choose the thread: if the prompt names a current
-     project, pass `--project <that-name-or-id>`; otherwise omit it to
-     use the agent's stable schedule thread (auto-created).
+   - For `dm schedule`, choose the thread (see the Decision rule above):
+     Mode A — same thread + same agent → pass `--project <id>` using the
+     id from your prompt header (`Project: {name} (id=...)`); Mode B —
+     everything else → omit `--project` to use the agent's stable,
+     auto-created general schedule thread.
 2. Convert the requested local time to UTC for the cron expression
    (e.g. 9am PDT → `0 16 * * *`).
 3. Write the message body as the user addressing the target agent —

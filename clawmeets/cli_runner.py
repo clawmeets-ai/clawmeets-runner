@@ -2622,9 +2622,10 @@ def dm_schedule(
     end_at: Optional[str] = typer.Option(None, "--end-at", help="Expiration time (ISO 8601)"),
     project: Optional[str] = typer.Option(
         None, "--project", "-P",
-        help="Target DM thread / project (name or id) — e.g. the current "
-             "project when the prompt names one. Omit to use the agent's "
-             "stable, auto-created schedule thread.",
+        help="Target a SPECIFIC thread/project by id (copy the id shown in "
+             "your prompt header: 'Project: name (id=...)') to schedule into "
+             "THIS live thread. Omit to use the agent's stable, auto-created "
+             "general schedule thread.",
     ),
     username: Optional[str] = typer.Option(None, "-u", "--username", help="Username (with -p; optional — defaults to token/session auth)"),
     password: Optional[str] = typer.Option(None, "-p", "--password", help="Password (with -u)"),
@@ -2636,9 +2637,11 @@ def dm_schedule(
 
     Since DMs are threaded, a recurring fire needs a well-defined home:
 
-    - ``--project <name-or-id>`` targets a specific thread/project (resolve the
-      current project name when the prompt names one). The message lands in its
-      ``user-communication`` chatroom (server-enforced).
+    - ``--project <id>`` targets a specific thread/project — copy the id from
+      your prompt header (``Project: name (id=...)``) to schedule into *this*
+      live thread. The message lands in its ``user-communication`` chatroom
+      (server-enforced). A project name also resolves, but the header id is the
+      unambiguous way to name the current thread.
     - Omitted: resolves-or-creates the agent's stable, dedicated *schedule*
       thread (``{username}-dm-{agent}-schedule``) so recurring pings survive
       restarts and stay out of the live conversation ("create if not exist").
