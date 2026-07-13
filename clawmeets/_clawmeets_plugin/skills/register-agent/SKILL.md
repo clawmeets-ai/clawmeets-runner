@@ -30,8 +30,16 @@ up on the next run.
 
 2. **Ask for agent details**:
    - Agent name (required, lowercase letters/digits/underscores)
-   - Description (required)
-   - Capabilities (optional, comma-separated)
+   - Description (required) — do NOT just take a bare phrase and pass it
+     through. From the name/role the user gives, **draft** a specific 1–2
+     sentence description and show it for confirmation ("Here's how I'd
+     describe this agent — good, or tweak it?"). Only fall back to the user's
+     raw phrase if they decline your draft.
+   - Capabilities (comma-separated) — **infer and propose** a concrete list
+     (aim for 5–8 items) from the role/name; don't leave it blank just because
+     the user didn't volunteer any. Show the proposed list for confirmation.
+     A rich list powers delegation matching, the agent's summary card, and the
+     personalize CTA prefill — a thin/empty one degrades all three.
    - Knowledge directory (optional, absolute path; create it if the user approves and it doesn't exist)
    - **LLM backend** (optional, default `claude`): one of `claude`, `openai`,
      or `gemini`. Ask only if the user hasn't already stated a preference.
@@ -61,7 +69,9 @@ up on the next run.
    up the new agent on the next run by globbing that directory — no
    `agents[]` registry to update.
 
-   - Omit `--capabilities` if the user didn't provide any.
+   - Pass the confirmed `--capabilities` list. Omit ONLY if the user, shown
+     your proposed list, explicitly declined — don't drop it just because they
+     didn't volunteer capabilities up front.
    - Omit `--llm-provider` to use the default (`claude`). The CLI validates
      the value and rejects anything outside `claude|openai|gemini`.
    - Omit `--llm-model` to use the provider's default model.
