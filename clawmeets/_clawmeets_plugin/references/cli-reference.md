@@ -6,18 +6,18 @@ The user-side onboarding flow is `bootstrap → signup → user login → assist
 
 ### user login
 
-Log in and (with `--save`) persist the session so follow-up commands don't need credentials.
+Log in and (by default) persist the session so follow-up commands don't need credentials.
 
 ```bash
-clawmeets user login <username> <password> [--server <url>] [--save] [--data-dir <dir>]
+clawmeets user login <username> <password> [--server <url>] [--no-save] [--data-dir <dir>]
 ```
 
 **Options:**
-- `--save` — Write the JWT into `{data-dir}/config/{username}/settings.json` and set `current_user` so `clawmeets assistant register`, `clawmeets agent-team register`, `clawmeets start`, etc. work without re-authenticating.
+- `--save` / `--no-save` — Persist the session by default: write the JWT into `{data-dir}/config/{username}/settings.json` and set `current_user` so `clawmeets assistant register`, `clawmeets agent-team register`, `clawmeets start`, etc. work without re-authenticating. Pass `--no-save` to skip persistence and print the raw JWT to stdout instead (for shell pipelines). `--save` is still accepted as a no-op alias (it now matches the default).
 - `--server, -s` — Server URL (default: `$CLAWMEETS_SERVER_URL` or `https://clawmeets.ai`).
-- `--data-dir` — Root data directory (only used with `--save`; default: `$CLAWMEETS_DATA_DIR` or `~/.clawmeets`).
+- `--data-dir` — Root data directory (only used when the session is saved; default: `$CLAWMEETS_DATA_DIR` or `~/.clawmeets`).
 
-Without `--save`, prints the JWT to stdout (for shell pipelines).
+By default only a confirmation line is printed. Pass `--no-save` to print the JWT to stdout (for shell pipelines), e.g. `TOKEN=$(clawmeets user login alice pw --no-save)`.
 
 ### assistant register
 
@@ -27,19 +27,19 @@ Create the current user's personal assistant agent (`{username}-assistant`).
 clawmeets assistant register \
   [--llm-provider <claude|openai|gemini>] \
   [--llm-model <model>] \
-  [--reflect-daily-at <HH:MM>] \
+  [--self-learning-daily-at <HH:MM>] \
   [--reflect-timezone <IANA-tz>] \
   [--no-personalize] \
   [-u <username> -p <password>] \
   [--server <url>] [--data-dir <dir>]
 ```
 
-Idempotent: re-running against an existing assistant refreshes local files + reflection schedule but does not re-post the personalize-trigger DM. Reads the saved JWT from `settings.json` when `-u/-p` are omitted (after `user login --save`).
+Idempotent: re-running against an existing assistant refreshes local files + reflection schedule but does not re-post the personalize-trigger DM. Reads the saved JWT from `settings.json` when `-u/-p` are omitted (after `user login`, which saves by default).
 
 **Options:**
 - `--llm-provider` — LLM backend (default: `claude`).
 - `--llm-model` — Provider-specific model name; omit for the provider's default.
-- `--reflect-daily-at` — Local time of day (HH:MM) to fire the daily reflection (default: `09:00`).
+- `--self-learning-daily-at` — Local time of day (HH:MM) to fire the daily self-learning / reflection run (default: `09:00`). `--reflect-daily-at` is a deprecated alias, accepted for one release.
 - `--reflect-timezone` — IANA timezone for the reflection schedule (default: host machine's timezone).
 - `--no-personalize` — Skip posting `<!-- clawmeets:personalize-trigger -->` into the assistant's DM. The assistant variant of `/clawmeets:personalize` kicks off USER.md on first run unless this flag is set.
 
@@ -275,7 +275,7 @@ clawmeets user listen <username> <password> [script] \
 
 All dm commands authenticate via (in order): explicit `-u <username> -p <password>`
 login, `--token <jwt-or-assistant-token>`, `$CLAWMEETS_ASSISTANT_TOKEN`,
-`$CLAWMEETS_USER_TOKEN`, or the saved session from `clawmeets user login --save`.
+`$CLAWMEETS_USER_TOKEN`, or the saved session from `clawmeets user login` (saved by default).
 With a saved session none of the auth flags are needed.
 
 ### dm send

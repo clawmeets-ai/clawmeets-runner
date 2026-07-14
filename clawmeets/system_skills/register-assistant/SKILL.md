@@ -53,7 +53,7 @@ agent's token and just refreshes local files / settings).
    clawmeets assistant register \
      --llm-provider "<provider>" \
      --llm-model "<model>" \
-     --reflect-daily-at "<HH:MM>"
+     --self-learning-daily-at "<HH:MM>"
    ```
    The CLI:
    - Reads the saved JWT from `settings.json` automatically (no `-u/-p`
@@ -88,7 +88,7 @@ agent's token and just refreshes local files / settings).
   the interview (the personalize skill's assistant variant gates on
   USER.md existence).
 - The reflection schedule is **per-user**, not per-agent. Re-running with
-  a new `--reflect-daily-at` updates the user-wide schedule that fans out
+  a new `--self-learning-daily-at` updates the user-wide schedule that fans out
   to every owned agent.
 - Adding worker agents (not the assistant) goes through
   `/clawmeets:register-agent` (single) or `/clawmeets:register-team`

@@ -224,17 +224,17 @@ def _daily_at_to_cron(daily_at: str) -> str:
     raw = daily_at.strip()
     parts = raw.split(":")
     if len(parts) != 2:
-        typer.echo(f"Error: --reflect-daily-at expects 'HH:MM' (got {daily_at!r})", err=True)
+        typer.echo(f"Error: --self-learning-daily-at expects 'HH:MM' (got {daily_at!r})", err=True)
         raise typer.Exit(1)
     try:
         hour = int(parts[0])
         minute = int(parts[1])
     except ValueError:
-        typer.echo(f"Error: --reflect-daily-at expects 'HH:MM' (got {daily_at!r})", err=True)
+        typer.echo(f"Error: --self-learning-daily-at expects 'HH:MM' (got {daily_at!r})", err=True)
         raise typer.Exit(1)
     if not (0 <= hour <= 23 and 0 <= minute <= 59):
         typer.echo(
-            f"Error: --reflect-daily-at hour 0..23 and minute 0..59 (got {daily_at!r})",
+            f"Error: --self-learning-daily-at hour 0..23 and minute 0..59 (got {daily_at!r})",
             err=True,
         )
         raise typer.Exit(1)
@@ -286,6 +286,52 @@ def _ok(resp: httpx.Response) -> dict:
         typer.echo(f"Error {resp.status_code}: {resp.text}", err=True)
         raise typer.Exit(1) from e
     return resp.json()
+
+
+def _login_request(client: httpx.Client, username: str, password: str) -> dict:
+    """POST /auth/login and return the parsed body, or exit(1) with a clear,
+    user-facing message instead of a raw traceback.
+
+    Centralizes the realistic failure modes so login never dumps a stack trace:
+      - network error (connect/timeout/DNS) -> "could not reach server"
+      - 401 -> "invalid username or password"; 403 -> "email not verified"
+      - any other non-2xx -> delegate to _ok() (prints status + body, exits 1)
+    """
+    try:
+        resp = client.post(
+            "/auth/login", json={"username": username, "password": password}
+        )
+    except httpx.RequestError as e:
+        typer.echo(
+            f"Error: could not reach clawmeets server at {client.base_url} "
+            f"({type(e).__name__}). Check the server URL and your connection.",
+            err=True,
+        )
+        raise typer.Exit(1) from e
+    if resp.status_code == 401:
+        typer.echo("Error: invalid username or password.", err=True)
+        raise typer.Exit(1)
+    if resp.status_code == 403:
+        typer.echo(
+            "Error: email not verified — check your inbox for the verification link.",
+            err=True,
+        )
+        raise typer.Exit(1)
+    return _ok(resp)
+
+
+def _require_access_token(result: dict) -> str:
+    """Return result['access_token'], or exit(1) with a clear message when the
+    server response is missing it. Replaces a bare result['access_token'] index
+    so an unexpected response shape can never crash the CLI with a KeyError.
+    """
+    token = result.get("access_token")
+    if not token:
+        typer.echo(
+            "Error: unexpected response from server (no access_token).", err=True
+        )
+        raise typer.Exit(1)
+    return token
 
 
 def _print_json(data: dict | list) -> None:
@@ -588,23 +634,27 @@ def agent_register(
              "Defaults to $CLAWMEETS_AGENT_TEAMS (comma-separated) if no --team flag is given.",
     ),
 ):
-    """Register a new agent with the server (requires admin token).
+    """Register a new agent with the server.
+
+    Uses your logged-in session (the saved token of --as-user or current_user);
+    any authenticated user can register an agent — no admin token required. Pass
+    --token only to override the saved session.
 
     Can either provide name and description as arguments, or use --from-card
     to load values from a generated card.json file.
 
     Examples:
         # Traditional registration
-        clawmeets agent register "my-agent" "My description" --token $ADMIN_TOKEN
+        clawmeets agent register "my-agent" "My description"
 
         # From card.json (simplest)
-        clawmeets agent register --from-card ./kb/card.json --token $ADMIN_TOKEN
+        clawmeets agent register --from-card ./kb/card.json
 
         # Override name from card
-        clawmeets agent register "custom-name" --from-card ./kb/card.json --token $ADMIN_TOKEN
+        clawmeets agent register "custom-name" --from-card ./kb/card.json
 
         # Override capabilities from card
-        clawmeets agent register --from-card ./kb/card.json --capabilities "new,caps" --token $ADMIN_TOKEN
+        clawmeets agent register --from-card ./kb/card.json --capabilities "new,caps"
     """
     # Auto-fill --token and --server: --token explicit > env
     # ($CLAWMEETS_ASSISTANT_TOKEN / $CLAWMEETS_USER_TOKEN — set when the
@@ -736,7 +786,7 @@ def _resolve_user_session(
       2. $CLAWMEETS_ASSISTANT_TOKEN env var (set by the runner when the
          user's `{username}-assistant` agent shells these admin commands)
       3. $CLAWMEETS_USER_TOKEN env var (escape hatch for scripted callers)
-      4. Saved user config (created by `clawmeets user login --save`)
+      4. Saved user config (created by `clawmeets user login`, which saves by default)
     """
     token = explicit_token
     server = explicit_server
@@ -758,7 +808,7 @@ def _resolve_user_session(
     server = server or DEFAULT_SERVER
     if not token:
         typer.echo(
-            "Error: not logged in. Run `clawmeets user login <user> <pass> --save` "
+            "Error: not logged in. Run `clawmeets user login <user> <pass>` "
             "or pass --token explicitly.",
             err=True,
         )
@@ -1615,25 +1665,33 @@ def user_login(
     password: str = typer.Argument(..., help="Password"),
     server: str = typer.Option(DEFAULT_SERVER, "--server", "-s"),
     save: bool = typer.Option(
-        False, "--save",
-        help="Persist the session: write token into settings.json and set current_user.",
+        True, "--save/--no-save",
+        help="Persist the session (default): write the token into settings.json "
+             "and set current_user. Pass --no-save to skip persistence and print "
+             "the raw JWT to stdout instead (for shell pipelines that capture it). "
+             "--save is accepted for back-compat and is now a no-op (the default).",
     ),
     data_dir: Path = typer.Option(
         DEFAULT_DATA_DIR, "--data-dir",
-        help="Root data directory (only used with --save).",
+        help="Root data directory (only used when the session is saved).",
     ),
 ):
-    """Login as a user. Prints the JWT token to stdout by default.
+    """Login as a user. Saves the session by default.
 
-    With --save, writes the token to ~/.clawmeets/config/{username}/settings.json
-    and marks the user as current_user, so other `clawmeets` commands can find
-    them without re-authenticating. Nothing is printed in --save mode beyond a
-    confirmation line, so shell pipelines that capture the token should omit --save.
+    By default the token is written to ~/.clawmeets/config/{username}/settings.json
+    and the user is marked current_user, so other `clawmeets` commands find them
+    without re-authenticating; only a confirmation line is printed.
+
+    Pass --no-save to skip persistence and print the raw JWT to stdout instead —
+    use this for shell pipelines that capture the token, e.g.
+    `TOKEN=$(clawmeets user login alice pw --no-save)`.
+
+    (`--save` is still accepted as a no-op alias for one release so existing
+    scripts don't break; it now matches the default.)
     """
     with _http(server) as client:
-        resp = client.post("/auth/login", json={"username": username, "password": password})
-        result = _ok(resp)
-    token = result["access_token"]
+        result = _login_request(client, username, password)
+    token = _require_access_token(result)
     if save:
         path = save_user_session(Path(data_dir).expanduser(), username, _server_url(server), token)
         typer.echo(f"Logged in as {username}. Session saved to {path}.")
@@ -3118,8 +3176,9 @@ def reflection_show(
 def _ensure_fresh_user_token(server_url: str, data_dir: Path, username: str, current_token: str) -> str:
     """Verify the saved JWT still works; auto-refresh from saved password if expired.
 
-    `clawmeets user login --save` saves both the JWT and the password into
-    settings.json. JWTs eventually expire; rather than telling users to manually
+    `clawmeets user login` saves both the JWT and the password into
+    settings.json (saving is the default). JWTs eventually expire; rather than
+    telling users to manually
     re-login, we silently re-issue using the saved password and persist the new
     token.
     """
@@ -3132,7 +3191,7 @@ def _ensure_fresh_user_token(server_url: str, data_dir: Path, username: str, cur
     if not cfg_path.exists():
         typer.echo(
             f"Error: session expired and no saved config at {cfg_path}.\n"
-            f"Run `clawmeets user login {username} <password> --save` and retry.",
+            f"Run `clawmeets user login {username} <password>` and retry.",
             err=True,
         )
         raise typer.Exit(1)
@@ -3145,7 +3204,7 @@ def _ensure_fresh_user_token(server_url: str, data_dir: Path, username: str, cur
     if not password:
         typer.echo(
             f"Error: session expired and no saved password to refresh with.\n"
-            f"Run `clawmeets user login {username} <password> --save` and retry.",
+            f"Run `clawmeets user login {username} <password>` and retry.",
             err=True,
         )
         raise typer.Exit(1)
@@ -3218,7 +3277,7 @@ def _bootstrap_session_setup(
     if username is None:
         username = get_current_user(Path(data_dir).expanduser())
     if not username:
-        typer.echo("Error: no username known. Pass -u or run `clawmeets user login --save` first.", err=True)
+        typer.echo("Error: no username known. Pass -u or run `clawmeets user login` first.", err=True)
         raise typer.Exit(1)
     data_dir_p = Path(data_dir).expanduser()
     user_jwt = _ensure_fresh_user_token(server_url, data_dir_p, username, user_jwt)
@@ -3548,9 +3607,11 @@ def assistant_register(
         False, "--no-personalize",
         help="Skip posting the personalize-trigger DM after registering.",
     ),
-    reflect_daily_at: str = typer.Option(
-        "09:00", "--reflect-daily-at",
-        help="Local time of day (HH:MM) to fire the daily reflection.",
+    self_learning_daily_at: str = typer.Option(
+        "09:00", "--self-learning-daily-at", "--reflect-daily-at",
+        help="Local time of day (HH:MM) to fire the daily self-learning "
+             "(reflection) run. `--reflect-daily-at` is a deprecated alias, "
+             "accepted for one release.",
     ),
     reflect_timezone: Optional[str] = typer.Option(
         None, "--reflect-timezone",
@@ -3567,19 +3628,19 @@ def assistant_register(
       3. Write `{data_dir}/agents/{name}-assistant-{id}/credential.json`
          and `card.json` locally.
       4. Upsert the account-level reflection schedule
-         (cron derived from `--reflect-daily-at` + `--reflect-timezone`).
+         (cron derived from `--self-learning-daily-at` + `--reflect-timezone`).
       5. Unless `--no-personalize`: post `<!-- clawmeets:personalize-trigger -->`
          as a user message into your assistant's DM so the
          `/clawmeets:personalize` skill (assistant variant) kicks off USER.md.
 
     Example:
-        clawmeets assistant register --llm-provider=claude --reflect-daily-at=03:00
+        clawmeets assistant register --llm-provider=claude --self-learning-daily-at=03:00
         clawmeets assistant register -u alice -p secret --no-personalize \\
-            --reflect-daily-at 14:00 --reflect-timezone America/Los_Angeles \\
+            --self-learning-daily-at 14:00 --reflect-timezone America/Los_Angeles \\
             --llm-provider gemini
     """
     tz = (reflect_timezone or "").strip() or _host_iana_timezone()
-    cron_expression = _daily_at_to_cron(reflect_daily_at)
+    cron_expression = _daily_at_to_cron(self_learning_daily_at)
     local_settings = _build_initial_local_settings(
         llm_provider, llm_model, dwh_dir=None, llm_api_key=llm_api_key,
         llm_base_url=llm_base_url, output_mode=llm_output_mode,
@@ -3594,7 +3655,7 @@ def assistant_register(
         if not username:
             typer.echo(
                 "Error: not logged in. Pass -u/-p, or run "
-                "`clawmeets user login <user> <pass> --save` first.",
+                "`clawmeets user login <user> <pass>` first.",
                 err=True,
             )
             raise typer.Exit(1)
@@ -3916,7 +3977,7 @@ def agent_team_register(
         if not username:
             typer.echo(
                 "Error: not logged in. Pass -u/-p, or run "
-                "`clawmeets user login <user> <pass> --save` first.",
+                "`clawmeets user login <user> <pass>` first.",
                 err=True,
             )
             raise typer.Exit(1)
