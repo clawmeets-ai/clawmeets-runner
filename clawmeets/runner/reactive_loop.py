@@ -281,9 +281,26 @@ class ReactiveControlLoop:
                             self._spawn_auto_auth_skill(
                                 payload.skill_name, payload.auth,
                             )
+                    elif payload.action == "revoke":
+                        # Explicit user-initiated disconnect: revoke the Google
+                        # grant + delete token.json, but keep the skill code
+                        # installed (next use re-triggers auth). Cancel any
+                        # in-flight auto-auth so a stale flow can't rewrite the
+                        # token we're revoking. Offloaded — revoke does a
+                        # bounded blocking HTTP POST.
+                        self._cancel_auto_auth_skill(payload.skill_name)
+                        await asyncio.to_thread(
+                            self._skill_manager.revoke_skill_token,
+                            payload.skill_name,
+                        )
                     elif payload.action == "uninstall":
                         self._cancel_auto_auth_skill(payload.skill_name)
-                        self._skill_manager.uninstall_skill(payload.skill_name)
+                        # uninstall_skill now revokes first (bounded blocking
+                        # HTTP POST) — offload to avoid stalling the event loop.
+                        await asyncio.to_thread(
+                            self._skill_manager.uninstall_skill,
+                            payload.skill_name,
+                        )
                     elif payload.action == "reauth":
                         # User clicked Re-authenticate in the web UI for an
                         # already-installed OAuth skill. Cancel any in-flight

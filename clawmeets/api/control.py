@@ -90,7 +90,7 @@ class SkillSyncPayload(BaseModel):
     """Payload for SKILL_SYNC messages."""
     agent_id: str
     agent_name: str
-    action: str  # "install" | "uninstall" | "reauth"
+    action: str  # "install" | "uninstall" | "reauth" | "revoke"
     skill_name: str
     skill_content: str  # Full SKILL.md content — sent on both install and uninstall; consumer gates on ``action``
     # Sibling files alongside SKILL.md (template.html, render.py, etc.). Keyed
