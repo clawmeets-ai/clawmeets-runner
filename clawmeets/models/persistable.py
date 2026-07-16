@@ -773,6 +773,8 @@ class PersistableParticipant(Participant, ABC):
             default_invitable_agents=self.default_invitable_agents,
             default_invitable_teams=self.default_invitable_teams,
             local_settings=card.get("local_settings", {}),
+            model_configs=card.get("model_configs") or [],
+            default_model_config_name=card.get("default_model_config_name"),
             last_reflected_at=self.last_reflected_at,
             last_synced_at=self.last_synced_at,
         )

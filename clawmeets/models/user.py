@@ -38,6 +38,22 @@ logger = logging.getLogger("clawmeets.user")
 _passwd_lock = asyncio.Lock()
 
 
+class OAuthProvisionError(Exception):
+    """Raised by ``User.oauth_authenticate_or_provision`` when provisioning a new
+    OAuth account is refused.
+
+    Carries a stable invite error ``code`` (one of ``INVITE_REQUIRED`` /
+    ``INVITE_MALFORMED`` / ``INVITE_NOT_FOUND`` / ``INVITE_ALREADY_REDEEMED`` /
+    ``INVITE_EXPIRED`` / ``INVITE_REVOKED``). The OAuth-login router maps this to
+    the ported error envelope — the model stays free of any server-layer import
+    (Layer 1 models must not depend on Layer 2 server code).
+    """
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
+
+
 @dataclass
 class NotificationConfig:
     """Configuration for user notification scripts."""
@@ -64,6 +80,11 @@ class User(Participant):
     # Short names are reserved for admin-created accounts; public
     # self-registration enforces this minimum.
     MIN_PUBLIC_USERNAME_LENGTH = 5
+
+    # password_hash value for OAuth-only accounts (no password login). bcrypt's
+    # checkpw never matches this sentinel, so verify_password always fails for
+    # such accounts — they authenticate exclusively through the OAuth flow.
+    OAUTH_PASSWORD_SENTINEL = "!oauth"
 
     _EMAIL_PATTERN = re.compile(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")
 
@@ -390,6 +411,178 @@ class User(Participant):
                 return None  # Wrong password
         return None  # User not found
 
+    # ─────────────────────────────────────────────────────────────────────────
+    # OAuth invite-login (additive — password auth untouched)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    @classmethod
+    def get_by_oauth_identity(
+        cls, provider: str, subject: str, ctx: "ModelContext",
+    ) -> Optional["User"]:
+        """Find a user by a linked (provider, provider_subject). None if unlinked."""
+        passwd_path = cls._passwd_path(ctx)
+        data = FileUtil.read(passwd_path, "json", default=None)
+        if data is None:
+            return None
+        for user_id, rec in data.get("users", {}).items():
+            for ident in rec.get("oauth_identities", []) or []:
+                if ident.get("provider") == provider and ident.get("provider_subject") == subject:
+                    return cls(user_id, ctx)
+        return None
+
+    @classmethod
+    def _unique_oauth_username(cls, users: dict, email: str, ctx: "ModelContext") -> str:
+        """Derive a unique username from an email local-part (sanitized to
+        ``[0-9a-z]``, numeric suffix on collision). Checked against BOTH existing
+        passwd usernames and every other participant type (agents/assistants), so
+        a provisioned account never collides with an agent name. Deterministic and
+        bounded; only cosmetic on collision.
+        """
+        from .participant import Participant
+
+        base = re.sub(r"[^0-9a-z]", "", email.split("@", 1)[0].lower()) or "user"
+        taken = {r.get("username") for r in users.values()}
+        candidate = base
+        n = 1
+        while candidate in taken or Participant.get_by_name(candidate, ctx) is not None:
+            n += 1
+            candidate = f"{base}{n}"
+        return candidate
+
+    @classmethod
+    def _resolve_oauth_username(
+        cls, users: dict, email: str, desired: Optional[str], ctx: "ModelContext"
+    ) -> str:
+        """Pick the username for a freshly provisioned OAuth account.
+
+        Prefer ``desired`` (the slug chosen in the sign-up flow) when it passes
+        the same rules public registration enforces — minimum length +
+        ``_validate_username`` — and is free across all participant types. On any
+        failure (too short, invalid chars, taken, or absent) fall back to
+        ``_unique_oauth_username`` so the callback never fails on a username.
+        """
+        from .participant import Participant
+
+        if desired and desired.strip():
+            candidate = desired.strip()
+            if len(candidate) >= cls.MIN_PUBLIC_USERNAME_LENGTH:
+                try:
+                    normalized = cls._validate_username(candidate)
+                except ValueError:
+                    normalized = None
+                if normalized is not None:
+                    taken = {r.get("username") for r in users.values()}
+                    if normalized not in taken and Participant.get_by_name(normalized, ctx) is None:
+                        return normalized
+        return cls._unique_oauth_username(users, email, ctx)
+
+    @classmethod
+    async def oauth_authenticate_or_provision(
+        cls,
+        *,
+        provider: str,
+        provider_subject: str,
+        verified_email: str,
+        display_name: Optional[str],
+        avatar_url: Optional[str],
+        invite_code: Optional[str],
+        ctx: "ModelContext",
+        desired_username: Optional[str] = None,
+    ) -> tuple["User", str]:
+        """THE account decision for an OAuth callback, under ``_passwd_lock``.
+
+        Order (returns ``(user, outcome)`` where outcome in login/linked/created):
+          1) (provider, subject) already linked          -> ("login")   invite untouched
+          2) else verified email matches an account       -> link identity, ("linked")  invite untouched
+          3) else NEW account -> invite REQUIRED:
+               code missing/empty                          -> OAuthProvisionError("INVITE_REQUIRED")
+               classify(code) not None                     -> OAuthProvisionError(that code)
+               validate_and_consume(code, ...)  (multi-use, UNCHANGED)
+                 False (lost race)                         -> OAuthProvisionError("INVITE_ALREADY_REDEEMED")
+                 True  -> provision record (password_hash=OAUTH_PASSWORD_SENTINEL,
+                          email_verified=True, oauth_identities=[identity]) -> ("created")
+                          The provisioned username is ``desired_username`` when valid
+                          + free, else an email-derived fallback (never fails here).
+
+        Consume-then-create mirrors the existing ``/auth/register`` ordering: a
+        crash between consume and write wastes one use of a (multi-use) code —
+        identical to today's password register. Only VERIFIED provider emails
+        reach here, so provisioned accounts are pre-verified.
+        """
+        from .invitation_code import classify, validate_and_consume
+
+        email = (verified_email or "").strip().lower()
+        async with _passwd_lock:
+            passwd_path = cls._passwd_path(ctx)
+            data = FileUtil.read(passwd_path, "json", default=None)
+            if data is None:
+                data = {"users": {}}
+            users = data.get("users", {})
+
+            # 1) already linked by (provider, subject) -> login (invite untouched)
+            for user_id, rec in users.items():
+                for ident in rec.get("oauth_identities", []) or []:
+                    if (ident.get("provider") == provider
+                            and ident.get("provider_subject") == provider_subject):
+                        return cls(user_id, ctx), "login"
+
+            # 2) verified email matches an existing account -> link (invite untouched)
+            for user_id, rec in users.items():
+                if (rec.get("email") or "").strip().lower() == email:
+                    idents = rec.setdefault("oauth_identities", [])
+                    idents.append({
+                        "provider": provider,
+                        "provider_subject": provider_subject,
+                        "verified_email": email,
+                    })
+                    # Backfill optional profile fields only when currently absent.
+                    if not rec.get("display_name") and display_name:
+                        rec["display_name"] = display_name
+                    if not rec.get("avatar_url") and avatar_url:
+                        rec["avatar_url"] = avatar_url
+                    data["users"] = users
+                    FileUtil.write(passwd_path, data, "json", atomic=True)
+                    return cls(user_id, ctx), "linked"
+
+            # 3) NEW account -> invite REQUIRED
+            if not invite_code or not str(invite_code).strip():
+                raise OAuthProvisionError("INVITE_REQUIRED")
+            code_err = await classify(invite_code, ctx.participants_dir)
+            if code_err is not None:
+                raise OAuthProvisionError(code_err)
+
+            # Honor the slug the user picked in the sign-up flow when it's valid
+            # and free; otherwise fall back to an email-derived unique name so a
+            # taken/invalid/omitted username never fails the OAuth callback.
+            username = cls._resolve_oauth_username(users, email, desired_username, ctx)
+            # Consume a use (multi-use semantics preserved). Re-checks redeemability
+            # under invitation_code's own lock — the single-use fence for a race.
+            consumed = await validate_and_consume(invite_code, ctx.participants_dir, username)
+            if not consumed:
+                raise OAuthProvisionError("INVITE_ALREADY_REDEEMED")
+
+            user_id = str(uuid.uuid4())
+            users[user_id] = {
+                "id": user_id,
+                "username": username,
+                "role": "user",
+                "password_hash": cls.OAUTH_PASSWORD_SENTINEL,
+                "created_at": _now().isoformat(),
+                "email": email,
+                "email_verified": True,          # only verified provider emails reach here
+                "verification_token": None,
+                "display_name": display_name,
+                "avatar_url": avatar_url,
+                "oauth_identities": [{
+                    "provider": provider,
+                    "provider_subject": provider_subject,
+                    "verified_email": email,
+                }],
+            }
+            data["users"] = users
+            FileUtil.write(passwd_path, data, "json", atomic=True)
+            return cls(user_id, ctx), "created"
+
     @classmethod
     async def initialize(cls, ctx: "ModelContext") -> None:
         """Initialize user store, ensuring passwd file exists.
@@ -485,6 +678,21 @@ class User(Participant):
     def verification_token(self) -> Optional[str]:
         """Get verification token (None if already verified)."""
         return self._load_passwd_entry().get("verification_token")
+
+    @property
+    def oauth_identities(self) -> list[dict]:
+        """Linked OAuth identities ([] on legacy/password-only records)."""
+        return self._load_passwd_entry().get("oauth_identities", []) or []
+
+    @property
+    def display_name(self) -> Optional[str]:
+        """OAuth profile display name (None if absent)."""
+        return self._load_passwd_entry().get("display_name")
+
+    @property
+    def avatar_url(self) -> Optional[str]:
+        """OAuth profile avatar URL (None if absent)."""
+        return self._load_passwd_entry().get("avatar_url")
 
     @property
     def description(self) -> str:
@@ -583,6 +791,43 @@ class User(Participant):
             if self._id not in users:
                 raise KeyError(f"User {self._id!r} not found")
             users[self._id]["assistant_agent_id"] = assistant_agent_id
+            data["users"] = users
+            self._save_passwd(data)
+
+    async def link_oauth_identity(
+        self,
+        *,
+        provider: str,
+        provider_subject: str,
+        verified_email: str,
+        display_name: Optional[str] = None,
+        avatar_url: Optional[str] = None,
+    ) -> None:
+        """Append a (provider, provider_subject, verified_email) identity to this
+        user's ``oauth_identities`` and backfill display_name/avatar_url only when
+        currently absent. Idempotent per identity (a duplicate provider+subject is
+        a no-op). Used for explicit linking outside the callback fast-path.
+        """
+        email = (verified_email or "").strip().lower()
+        async with _passwd_lock:
+            data = self._load_passwd()
+            users = data.get("users", {})
+            if self._id not in users:
+                raise KeyError(f"User {self._id!r} not found")
+            rec = users[self._id]
+            idents = rec.setdefault("oauth_identities", [])
+            if not any(i.get("provider") == provider
+                       and i.get("provider_subject") == provider_subject
+                       for i in idents):
+                idents.append({
+                    "provider": provider,
+                    "provider_subject": provider_subject,
+                    "verified_email": email,
+                })
+            if not rec.get("display_name") and display_name:
+                rec["display_name"] = display_name
+            if not rec.get("avatar_url") and avatar_url:
+                rec["avatar_url"] = avatar_url
             data["users"] = users
             self._save_passwd(data)
 
@@ -729,6 +974,10 @@ class User(Participant):
             "assistant_agent_id": entry.get("assistant_agent_id"),
             "created_at": entry.get("created_at", ""),
             "is_admin": entry.get("role") == "admin",
+            # Additive OAuth fields (absent/empty on legacy password-only records).
+            "oauth_identities": entry.get("oauth_identities", []) or [],
+            "display_name": entry.get("display_name"),
+            "avatar_url": entry.get("avatar_url"),
         }
 
     def __repr__(self) -> str:

@@ -71,6 +71,57 @@ def _normalize_used_by(entry: dict) -> list[str]:
     return used_by
 
 
+async def classify(code: str | None, data_dir: Path) -> str | None:
+    """Classify an invite code WITHOUT consuming it (advisory pre-check).
+
+    Returns the specific stable error CODE
+    (``INVITE_MALFORMED`` / ``INVITE_NOT_FOUND`` / ``INVITE_ALREADY_REDEEMED`` /
+    ``INVITE_EXPIRED`` / ``INVITE_REVOKED``) if the code is not redeemable, or
+    ``None`` if it is currently redeemable. NEVER mutates the codes file, so it
+    is safe to call from the advisory ``/auth/oauth/invite/validate`` precheck
+    and again just before redemption.
+
+    Honors the additive optional ``expires_at`` / ``revoked_at`` fields (absent
+    on legacy codes => never expires / not revoked). Multi-use semantics are
+    preserved: a code is "already redeemed" only once ``len(used_by)`` reaches
+    ``allowed_usage_count``.
+    """
+    if not code or not code.strip():
+        return "INVITE_MALFORMED"
+    c = code.strip().upper()
+
+    entry = None
+    for candidate in _load(data_dir)["codes"]:
+        if candidate.get("code") == c:
+            entry = candidate
+            break
+    if entry is None:
+        return "INVITE_NOT_FOUND"
+
+    if entry.get("revoked_at"):
+        return "INVITE_REVOKED"
+
+    exp = entry.get("expires_at")
+    if exp:
+        try:
+            expires = datetime.fromisoformat(exp)
+        except ValueError:
+            expires = None
+        if expires is not None:
+            now = datetime.now(UTC)
+            if expires.tzinfo is None:
+                now = now.replace(tzinfo=None)
+            if now > expires:
+                return "INVITE_EXPIRED"
+
+    used_by = _normalize_used_by(entry)
+    allowed = entry.get("allowed_usage_count", 1)
+    if len(used_by) >= allowed:
+        return "INVITE_ALREADY_REDEEMED"
+
+    return None
+
+
 async def validate_and_consume(code: str, data_dir: Path, username: str) -> bool:
     """Check if code is valid and has remaining uses, then mark it as consumed.
 

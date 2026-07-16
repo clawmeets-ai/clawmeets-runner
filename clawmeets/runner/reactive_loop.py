@@ -353,7 +353,11 @@ class ReactiveControlLoop:
                 payload: AgentSettingsChangePayload = envelope.payload
                 if payload.agent_id == self._participant.id:
                     if payload.local_settings is not None:
-                        await self._apply_local_settings(payload.local_settings)
+                        await self._apply_local_settings(
+                            payload.local_settings,
+                            model_configs=payload.model_configs,
+                            default_model_config_name=payload.default_model_config_name,
+                        )
 
             case ControlMessageType.AGENT_REGISTRY_CHANGE:
                 # A peer agent (owned by this runner's owner) was registered,
@@ -871,11 +875,23 @@ class ReactiveControlLoop:
     # Local Settings
     # ─────────────────────────────────────────────────────────
 
-    async def _apply_local_settings(self, local_settings: dict) -> None:
+    async def _apply_local_settings(
+        self,
+        local_settings: dict,
+        *,
+        model_configs: "list[dict] | None" = None,
+        default_model_config_name: "str | None" = None,
+    ) -> None:
         """Apply local_settings changes to runtime components.
 
         Updates ModelContext.knowledge_dirs so the next LLM invocation uses the
         new settings without restart. Also persists changes to local card.json.
+
+        ``model_configs`` (with ``default_model_config_name``) mirrors the
+        named model configs onto the self-card so the per-request override can
+        resolve them. ``None`` ⇒ leave the runner's existing copy untouched
+        (this envelope didn't carry them). The runner NEVER writes these back to
+        the server — the server card is the source of truth.
 
         Per-MCP config slices under ``local_settings.mcp_configs`` are written
         through to ``{knowledge_dir}/config.json`` (the file the in-tree MCPs
@@ -991,8 +1007,14 @@ class ReactiveControlLoop:
         if changed_skill:
             await self._write_through_skill_configs(changed_skill)
 
-        # Persist to the runner's own top-level card.json.
+        # Persist to the runner's own top-level card.json. Mirror the named
+        # model configs when this envelope carried them (None ⇒ leave intact),
+        # so a per-request model_config_name override resolves against a fresh
+        # self-card copy of the server's config list.
         current_card["local_settings"] = local_settings
+        if model_configs is not None:
+            current_card["model_configs"] = model_configs
+            current_card["default_model_config_name"] = default_model_config_name
         FileUtil.write(self_card_path, current_card, "json", atomic=True)
 
         logger.info(
@@ -1221,22 +1243,36 @@ class ReactiveControlLoop:
         # synced-peer cards under `agents/{name}-{id}/`, which doesn't include
         # the runner's own runtime config. So we have to reconcile this field
         # explicitly here.
-        server_settings = (resp.json() or {}).get("local_settings") or {}
-        if not server_settings:
-            return
+        server_card = resp.json() or {}
+        server_settings = server_card.get("local_settings") or {}
+        server_configs = server_card.get("model_configs") or []
+        server_default = server_card.get("default_model_config_name")
 
         self_card_path = self._model_ctx.participants_dir / "card.json"
         local_card = FileUtil.read(self_card_path, "json") or {}
         local_settings = local_card.get("local_settings") or {}
+        local_configs = local_card.get("model_configs") or []
+        local_default = local_card.get("default_model_config_name")
 
-        if server_settings == local_settings:
+        settings_drift = bool(server_settings) and server_settings != local_settings
+        configs_drift = (
+            server_configs != local_configs or server_default != local_default
+        )
+        if not settings_drift and not configs_drift:
             return
 
         logger.info(
             f"_sync_self_settings: applying drift for {self._participant.name} — "
-            f"server={server_settings} local={local_settings}"
+            f"server_settings={server_settings} local_settings={local_settings} "
+            f"configs_drift={configs_drift}"
         )
-        await self._apply_local_settings(server_settings)
+        # Fall back to the local settings when the server carries none, so a
+        # configs-only drift doesn't wipe the runner's local_settings.
+        await self._apply_local_settings(
+            server_settings or local_settings,
+            model_configs=server_configs,
+            default_model_config_name=server_default,
+        )
 
     async def _fetch_server_projects(self) -> dict[str, dict]:
         """Fetch project info from server.

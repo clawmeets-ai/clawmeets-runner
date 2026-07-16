@@ -62,6 +62,8 @@ from clawmeets.utils.notification_center import NotificationCenter
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from clawmeets.runner.invocation_registry import InvocationRegistry
 
 
@@ -134,6 +136,11 @@ class ModelContext:
         self._invocation_registry: Optional["InvocationRegistry"] = None
         self._dwh_dir = dwh_dir
         self._git_url = git_url or None
+        # Optional factory (local_settings dict -> LLMProvider), shared with the
+        # reactive loop's hot-swap path. Set on the runner so the per-request
+        # model override (model_config_name) can build a one-turn provider from a
+        # non-default config. None off the runner ⇒ no override (default cli).
+        self._cli_factory: Optional["Callable[[dict], LLMProvider]"] = None
 
     @property
     def cli(self) -> Optional["LLMProvider"]:
@@ -144,6 +151,17 @@ class ModelContext:
         """Replace the LLM provider. Takes effect on the next LLM invocation;
         in-flight invocations hold the prior reference and finish on it."""
         self._cli = cli
+
+    @property
+    def cli_factory(self) -> Optional["Callable[[dict], LLMProvider]"]:
+        """Factory (local_settings -> LLMProvider) for building a one-turn
+        provider from a non-default model config. None off the runner."""
+        return self._cli_factory
+
+    def set_cli_factory(self, factory: "Callable[[dict], LLMProvider]") -> None:
+        """Attach the CLI factory (runner startup) so a per-request
+        ``model_config_name`` override can build a one-turn provider."""
+        self._cli_factory = factory
 
     @property
     def knowledge_dirs(self) -> list[Path]:

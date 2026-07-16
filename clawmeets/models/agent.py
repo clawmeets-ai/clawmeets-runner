@@ -24,6 +24,7 @@ from ..api.actions import ActionBlock, COORDINATOR_ACTION_SCHEMA, WORKER_ACTION_
 from ..api.action_validator import ActionValidator, StateSnapshot
 from ..api.responses import AgentStatus
 from ..llm.base import LLMInvocationError, LLMRateLimitError, LLMTimeoutError
+from . import model_config as _model_config
 from ..llm.prompt_builder import CoordinatorPromptBuilder, create_prompt_builder
 from ..llm.triggers import derive_role
 from ..runner.invocation_registry import invoke_with_registry as _invoke_with_registry
@@ -1037,6 +1038,7 @@ class Agent(PersistableParticipant):
             action_schema=WORKER_ACTION_SCHEMA,
             trigger_version=trigger_version,
             role=derive_role(self.name, is_coordinator=False),
+            model_config_name=message.model_config_name,
         )
 
         logger.info(
@@ -1060,6 +1062,77 @@ class Agent(PersistableParticipant):
                 project_id, chatroom_name, trigger_version, replied_chatrooms
             )
 
+    def _runner_self_card(self) -> dict:
+        """Read this runner's own top-level card.json.
+
+        The runner's self-card lives at ``participants_dir/card.json`` (NOT under
+        ``agents/`` where ``_load_card`` looks — that is the synced-peer layout).
+        Carries the named ``model_configs`` mirrored from the server, which the
+        per-request override resolves against.
+        """
+        path = self._model_ctx.participants_dir / "card.json"
+        return FileUtil.read(path, "json") or {}
+
+    def _build_override_cli(self, model_config_name: "str | None"):
+        """Build a one-turn LLM provider for a per-request model override.
+
+        Returns an ``LLMProvider`` built from the named config, or ``None`` to
+        fall back to the agent's default ``model_ctx.cli``. Returns ``None``
+        silently only when there is nothing to honor: no name given, no factory
+        attached (off-runner / tests), or no config resolves (the card has no
+        matching config and no default). An unknown/stale name still degrades to
+        the default config via ``resolve()`` and builds normally (spec #3).
+
+        An explicit per-request selection is authoritative: whenever it resolves
+        to a config we build from that config, even when it equals the current
+        default. We deliberately do NOT short-circuit to ``model_ctx.cli`` on an
+        equals-default match — ``model_ctx.cli`` only reflects the default if the
+        AGENT_SETTINGS_CHANGE hot-swap fired and succeeded in *this* process
+        since the default last moved, which is not guaranteed (a runner that
+        started before the config existed keeps a stale CLI). Building the
+        provider here is construction-only (no subprocess; the binary runs at
+        invoke time), so honoring the selection every turn is cheap.
+
+        Raises ``LLMInvocationError`` when a resolved config's provider CANNOT be
+        built (e.g. the selected CLI binary is missing/broken). The caller turns
+        this into a user-visible error and aborts the turn — silently answering
+        on a different model than the one explicitly selected is wrong.
+        """
+        if not model_config_name:
+            return None
+        factory = self._model_ctx.cli_factory
+        if factory is None:
+            return None
+        card = self._runner_self_card()
+        # resolve() falls back to the default config for an unknown/stale name,
+        # so cfg is None only when the card has no default at all — nothing to
+        # honor, so fall back to model_ctx.cli.
+        cfg = _model_config.resolve(card, model_config_name)
+        if cfg is None:
+            return None
+        settings = dict(card.get("local_settings") or {})
+        settings["llm_provider"] = cfg.get("provider")
+        settings["llm_model"] = cfg.get("model")
+        settings["llm_base_url"] = cfg.get("base_url")
+        try:
+            provider = factory(settings)
+        except Exception as e:  # noqa: BLE001 — surface, don't silently downgrade
+            logger.warning(
+                f"Agent {self.name}: selected model "
+                f"'{model_config_name}' (provider={cfg.get('provider')!r}) "
+                f"failed to build: {e}",
+                exc_info=True,
+            )
+            raise LLMInvocationError(
+                f"Selected model {model_config_name!r} is unavailable: {e}"
+            ) from e
+        logger.info(
+            f"Agent {self.name}: per-request model override "
+            f"'{model_config_name}' → provider={cfg.get('provider')!r} "
+            f"model={cfg.get('model')!r}"
+        )
+        return provider
+
     async def _invoke_with_transient_retry(
         self,
         *,
@@ -1073,6 +1146,7 @@ class Agent(PersistableParticipant):
         trigger_version: int,
         role: str,
         correction: "str | None" = None,
+        override_cli=None,
     ) -> "tuple[ActionBlock, LLMUsage]":
         """One model invocation, with the existing transient-failure retry.
 
@@ -1097,6 +1171,7 @@ class Agent(PersistableParticipant):
                     trigger_version=trigger_version,
                     role=role,
                     correction=correction,
+                    override_cli=override_cli,
                 )
             except LLMRateLimitError as e:
                 logger.warning(
@@ -1136,6 +1211,7 @@ class Agent(PersistableParticipant):
         action_schema: dict,
         trigger_version: int,
         role: str,
+        model_config_name: "str | None" = None,
     ) -> "tuple[ActionBlock, LLMUsage, list[str]]":
         """Invoke → validate → maybe retry, up to ``_MAX_VALIDATION_RETRIES``.
 
@@ -1156,6 +1232,20 @@ class Agent(PersistableParticipant):
             self._model_ctx, project_id, include_agents=include_agents
         )
 
+        # Resolve a per-request model override once, before the retry loop, so
+        # every attempt (incl. validation corrections) runs on the same
+        # one-turn provider. None ⇒ the agent's default model_ctx.cli. If an
+        # explicitly-selected model can't be built (broken/missing CLI), surface
+        # a user-visible error and abort the turn — never silently answer on the
+        # default model. Mirrors the rate-limit post-then-raise pattern.
+        try:
+            override_cli = self._build_override_cli(model_config_name)
+        except LLMInvocationError as e:
+            await self._post_error_notification(
+                project_id, chatroom_name, self.name, e, trigger_version
+            )
+            raise
+
         correction: "str | None" = None
         block: "ActionBlock"
         usage: "LLMUsage"
@@ -1172,6 +1262,7 @@ class Agent(PersistableParticipant):
                 trigger_version=trigger_version,
                 role=role,
                 correction=correction,
+                override_cli=override_cli,
             )
             result = ActionValidator().validate(block, snapshot)
             if not result.retryable:
@@ -1595,6 +1686,7 @@ class Agent(PersistableParticipant):
             action_schema=action_schema,
             trigger_version=trigger_version,
             role=derive_role(self.name, is_coordinator=True),
+            model_config_name=message.model_config_name,
         )
 
         logger.info(
@@ -1718,6 +1810,7 @@ class Agent(PersistableParticipant):
             action_schema=action_schema,
             trigger_version=trigger_version,
             role=derive_role(self.name, is_coordinator=True),
+            model_config_name=message.model_config_name,
         )
 
         logger.info(

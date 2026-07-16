@@ -20,7 +20,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ..api.actions import ActionBlock
-    from ..llm.base import LLMUsage
+    from ..llm.base import LLMProvider, LLMUsage
     from ..models.context import ModelContext
 
 logger = logging.getLogger(__name__)
@@ -69,6 +69,7 @@ async def invoke_with_registry(
     trigger_version: int,
     role: "str | None" = None,
     correction: "str | None" = None,
+    override_cli: "LLMProvider | None" = None,
 ) -> "tuple[ActionBlock, LLMUsage]":
     """Run cli.invoke and register the task so it can be cancelled.
 
@@ -83,10 +84,16 @@ async def invoke_with_registry(
     ``correction`` is the semantic-validation feedback appended to ``prompt``
     on a retry (see ``ActionValidator`` / ``Agent._invoke_validated``). Default
     ``None`` keeps every existing caller byte-for-byte identical.
+
+    ``override_cli`` is a one-turn provider built from a per-request
+    ``model_config_name`` override (spec #3). When ``None`` (the common case)
+    the invocation uses the agent's default ``model_ctx.cli``; the override
+    never mutates ``model_ctx.cli``, so it applies to this turn only.
     """
     if correction is not None:
         prompt = f"{prompt}\n\n{correction}"
-    coro = model_ctx.cli.invoke(
+    cli = override_cli or model_ctx.cli
+    coro = cli.invoke(
         prompt,
         working_dir=working_dir,
         log_dir=log_dir,

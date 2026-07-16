@@ -75,6 +75,10 @@ class MessagePayload(ChatroomPayload):
         from clawmeets.models.chat_message import ChatMessage
         chat_message = ChatMessage.from_message_payload(payload)
     """
+    # protected_namespaces=() so the ``model_config_name`` field (per-request
+    # model override) doesn't collide with Pydantic's ``model_`` namespace.
+    model_config = {"protected_namespaces": ()}
+
     # chatroom_name inherited from ChatroomPayload
     id: str
     ts: datetime
@@ -83,6 +87,11 @@ class MessagePayload(ChatroomPayload):
     content: str
     expects_response_from: list[str] = Field(default_factory=list)
     is_ack: bool = Field(default=False)
+    # Per-request model override (spec #3): names a config on the responding
+    # agent. null/absent ⇒ use the agent's default config; overrides that one
+    # turn only. Resolved runner-side against the agent's stored configs;
+    # unknown ⇒ silent fallback to the default (never errors).
+    model_config_name: Optional[str] = None
 
 
 class FilePayload(ChatroomPayload):

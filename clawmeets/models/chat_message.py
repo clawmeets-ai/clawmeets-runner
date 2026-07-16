@@ -31,7 +31,9 @@ class ChatMessage(BaseModel):
     they let downstream consumers (frontend, CLI listeners) link a message
     to the entry that triggered it without re-reading the changelog.
     """
-    model_config = {"frozen": True}
+    # protected_namespaces=() so ``model_config_name`` (per-request model
+    # override) doesn't collide with Pydantic's ``model_`` protected namespace.
+    model_config = {"frozen": True, "protected_namespaces": ()}
 
     entry_type: Literal["message"] = "message"
     id: str
@@ -43,6 +45,7 @@ class ChatMessage(BaseModel):
     is_ack: bool = Field(default=False)  # System-only acknowledgment marker
     version: int | None = None  # This entry's changelog version
     source_version: int | None = None  # Version of the entry that triggered this message
+    model_config_name: str | None = None  # Per-request model override (spec #3)
 
     def to_log_line(self) -> str:
         """Serialize to NDJSON line for CHATS.ndjson."""
@@ -81,6 +84,7 @@ class ChatMessage(BaseModel):
             is_ack=payload.is_ack,
             version=version,
             source_version=source_version,
+            model_config_name=payload.model_config_name,
         )
 
 

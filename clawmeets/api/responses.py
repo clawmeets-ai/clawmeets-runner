@@ -10,9 +10,19 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Optional
+from typing import Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
+
+# Valid provider values for a named model config. Kept in sync with
+# ``clawmeets.models.model_config.VALID_CONFIG_PROVIDERS`` — duplicated here
+# (not imported) because api/ is Layer 0 and must not depend on models/. Used
+# as a Literal so a bad ``provider`` yields a Pydantic list-shape 422.
+_CONFIG_PROVIDER = Literal[
+    "claude", "openai", "gemini", "opencode",
+    "claude-api", "openai-api", "gemini-api", "openrouter-api",
+]
+_CONFIG_NAME_PATTERN = r"^[A-Za-z0-9 _-]+$"
 
 from clawmeets.sync.changelog import ChangelogEntry
 
@@ -52,8 +62,74 @@ class AgentResponse(BaseModel):
     default_invitable_agents: list[str] = Field(default_factory=list)
     default_invitable_teams: list[str] = Field(default_factory=list)
     local_settings: dict = Field(default_factory=dict)  # knowledge_dir, llm_provider, llm_model
+    # Named model configs + designated default (model-selector revamp). Carried
+    # on the response so the runner can reconcile them onto its self-card and the
+    # frontend settings page can render the list. Configs are ModelConfig wire
+    # dicts; default is the name of the default config (null when the list is empty).
+    model_configs: list[dict] = Field(default_factory=list)
+    default_model_config_name: Optional[str] = None
     last_reflected_at: Optional[datetime] = None  # Last successful reflection cycle
     last_synced_at: Optional[datetime] = None  # Last successful DWH sync trigger reply
+
+
+class ModelConfig(BaseModel):
+    """One named model config (canonical wire shape).
+
+    Identity/key = ``name`` (unique per agent). ``source`` and ``created_at`` are
+    server-stamped and read-only. There is no ``id``, per-config ``is_default``,
+    ``api_key``, or ``output_mode`` — the frontend derives ``isDefault`` from the
+    list response's ``default`` field.
+    """
+    model_config = ConfigDict(protected_namespaces=())  # allow a field named "model"
+
+    name: str
+    provider: str
+    model: Optional[str] = None
+    base_url: Optional[str] = None
+    source: str = "manual"  # "auto" (registration probe) | "manual"
+    created_at: datetime
+
+
+class ModelConfigCreate(BaseModel):
+    """POST body — create a named config.
+
+    ``name`` / ``provider`` are validated here so a bad value returns a Pydantic
+    list-shape 422 (the canonical validation error shape).
+    """
+    model_config = ConfigDict(protected_namespaces=())
+
+    name: str = Field(..., min_length=1, max_length=64, pattern=_CONFIG_NAME_PATTERN)
+    provider: _CONFIG_PROVIDER
+    model: Optional[str] = None
+    base_url: Optional[str] = None
+
+
+class ModelConfigPatch(BaseModel):
+    """PATCH body — partial update (all fields optional; rename via ``name``).
+
+    Only provided fields are applied (``model_dump(exclude_unset=True)``), so
+    ``model``/``base_url`` can be explicitly set to null to clear them. A
+    provided ``name``/``provider`` is validated (list-shape 422 on a bad value).
+    """
+    model_config = ConfigDict(protected_namespaces=())
+
+    name: Optional[str] = Field(
+        None, min_length=1, max_length=64, pattern=_CONFIG_NAME_PATTERN
+    )
+    provider: Optional[_CONFIG_PROVIDER] = None
+    model: Optional[str] = None
+    base_url: Optional[str] = None
+
+
+class ModelConfigList(BaseModel):
+    """GET / set-default response — the configs plus the default name."""
+    configs: list[ModelConfig] = Field(default_factory=list)
+    default: Optional[str] = None
+
+
+class SetDefaultBody(BaseModel):
+    """PUT .../model-configs/default body."""
+    name: str
 
 
 class AgentSearchResponse(BaseModel):

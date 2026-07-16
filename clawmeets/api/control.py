@@ -128,10 +128,21 @@ class AgentSettingsChangePayload(BaseModel):
     `card.json` so subsequent prompt builds see fresh values. ``local_settings``
     covers ``knowledge_dir`` / ``llm_provider`` / ``llm_model`` (the original
     runner config). May be ``None`` when unchanged in this envelope.
+
+    ``model_configs`` / ``default_model_config_name`` carry the named model
+    configs (model-selector revamp) so the runner mirrors them onto its
+    self-card — needed to resolve a per-request ``model_config_name`` override.
+    ``None`` ⇒ unchanged in this envelope (leave the runner's copy intact).
     """
+    # protected_namespaces=() so ``model_config*`` fields don't collide with
+    # Pydantic's ``model_`` protected namespace.
+    model_config = {"protected_namespaces": ()}
+
     agent_id: str
     agent_name: str
     local_settings: dict | None = None  # None = unchanged in this envelope
+    model_configs: list[dict] | None = None  # None = unchanged in this envelope
+    default_model_config_name: str | None = None  # default config name (or None)
 
 
 class CancelLLMPayload(BaseModel):

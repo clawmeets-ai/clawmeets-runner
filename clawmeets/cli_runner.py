@@ -55,6 +55,7 @@ from clawmeets.llm.codex_cli import CodexCLI
 from clawmeets.llm.gemini_cli import GeminiCLI
 from clawmeets.llm.opencode_cli import OpenCodeCLI
 from clawmeets.models.context import ModelContext
+from clawmeets.models.model_config import VALID_CONFIG_PROVIDERS
 from clawmeets.models.agent import Agent
 from clawmeets.models.user import User, NotificationConfig
 from clawmeets.sync.console_subscriber import ConsoleOutputSubscriber, ConsoleConfig
@@ -341,11 +342,9 @@ def _print_json(data: dict | list) -> None:
 # Provider values. Bare names shell the Code CLI binary (max-fidelity local);
 # the ``-api`` suffix selects the in-process BYO-key provider (no binary,
 # runner-portable). One field encodes both the model family and the execution
-# model.
-_VALID_LLM_PROVIDERS = (
-    "claude", "openai", "gemini", "opencode",
-    "claude-api", "openai-api", "gemini-api", "openrouter-api",
-)
+# model. Single source of truth lives in models/model_config.py so the CLI and
+# the named-model-config API validate against the same list.
+_VALID_LLM_PROVIDERS = VALID_CONFIG_PROVIDERS
 
 # Standard env vars a BYO-key API provider falls back to when card.json
 # carries no literal llm_api_key — convenient for hosted runners that inject
@@ -2269,6 +2268,10 @@ async def _runner_loop(
         dwh_dir=resolved_dwh_dir,
         git_url=_git_url or None,
     )
+    # Share the CLI factory so a per-request model_config_name override can build
+    # a one-turn provider from a non-default named config (same factory the
+    # reactive loop uses for the AGENT_SETTINGS_CHANGE hot-swap).
+    model_ctx.set_cli_factory(cli_factory)
 
     participant = Agent(id=agent_id, model_ctx=model_ctx)
 
