@@ -35,6 +35,9 @@ from typing import Optional
 VALID_CONFIG_PROVIDERS: tuple[str, ...] = (
     "claude", "openai", "gemini", "opencode",
     "claude-api", "openai-api", "gemini-api", "openrouter-api",
+    # In-process, BYO-key, native OpenRouter tool-loop (no Pydantic-AI). Coexists
+    # with openrouter-api as a directly A/B-comparable alternative.
+    "openrouter-native",
 )
 
 # Config name: 1–64 chars, alphanumerics + space / underscore / hyphen.

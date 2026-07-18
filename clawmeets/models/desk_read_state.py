@@ -130,6 +130,27 @@ async def list_read_state(data_dir: Path, owner_user_id: str) -> list[DeskReadSt
         return list(_load(data_dir, owner_user_id).values())
 
 
+async def list_last_read(
+    data_dir: Path,
+    owner_user_id: str,
+    limit: int = 5,
+) -> list[DeskReadState]:
+    """Return the owner's ``limit`` most-recently marked-read cards, newest first.
+
+    Read-only query over the existing store — the backing for "Last 5 Read". It
+    reuses ``_load()`` and does NOT write or touch the monotonic clock
+    (``_monotonic_now`` is never called on this path). Rows are sorted by
+    ``updated_at`` DESC; since every timestamp shares the fixed ``+00:00`` UTC
+    format, lexicographic string order equals chronological order. The snapshot
+    is taken under ``_lock`` for consistency against a concurrent upsert, then
+    sliced to ``limit`` (a non-positive ``limit`` yields an empty list).
+    """
+    async with _lock:
+        rows = list(_load(data_dir, owner_user_id).values())
+    rows.sort(key=lambda r: r.updated_at, reverse=True)
+    return rows[: limit] if limit > 0 else []
+
+
 async def upsert_read_state(
     data_dir: Path,
     owner_user_id: str,

@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-Agent runner for [ClawMeets](https://github.com/clawmeets-ai/clawmeets) multi-agent collaboration.
+Agent runner for [ClawMeets](https://clawmeets.ai) multi-agent collaboration.
 
 Connects to a ClawMeets server as an AI agent, receives work via WebSocket, and processes tasks using Claude.
 
@@ -30,9 +30,9 @@ clawmeets agent run --agent-dir ~/.clawmeets/agents/researcher-<id>/
 
 Default server is `https://clawmeets.ai`. Override with `--server <url>` or `CLAWMEETS_SERVER_URL` env var.
 
-## Set up your `/today` page
+## Publish briefings to My Desk
 
-Once your agents are running, build a personal `/today` dashboard one tab at a time by asking your assistant in plain English. See [SAMPLE_TODAY.md](SAMPLE_TODAY.md) for nine copy-paste example asks.
+Once your agents are running, publish briefings to your **My Desk** one at a time by asking your assistant in plain English. See [SAMPLE_BRIEFINGS.md](SAMPLE_BRIEFINGS.md) for nine copy-paste example asks.
 
 ## Commands
 
@@ -76,7 +76,7 @@ capabilities, and specialty profile before registering them.
 
 ## Server
 
-This package is the **agent-side client**. To run a ClawMeets server, see the [main ClawMeets repo](https://github.com/clawmeets-ai/clawmeets).
+This package is the **agent-side client**. To run your own agents against a ClawMeets server, see [clawmeets.ai](https://clawmeets.ai).
 
 ## License
 

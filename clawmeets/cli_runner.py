@@ -343,7 +343,8 @@ def _print_json(data: dict | list) -> None:
 # the ``-api`` suffix selects the in-process BYO-key provider (no binary,
 # runner-portable). One field encodes both the model family and the execution
 # model. Single source of truth lives in models/model_config.py so the CLI and
-# the named-model-config API validate against the same list.
+# the named-model-config API validate against the same list (which now includes
+# the native OpenRouter harness provider, "openrouter-native").
 _VALID_LLM_PROVIDERS = VALID_CONFIG_PROVIDERS
 
 # Standard env vars a BYO-key API provider falls back to when card.json
@@ -354,6 +355,9 @@ _API_KEY_ENV: dict[str, tuple[str, ...]] = {
     "openai": ("OPENAI_API_KEY",),
     "gemini": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
     "openrouter": ("OPENROUTER_API_KEY",),
+    # The native OpenRouter harness reuses the same key (its name has no ``-api``
+    # suffix, so ``_llm_base_provider`` leaves it intact — it needs its own row).
+    "openrouter-native": ("OPENROUTER_API_KEY",),
 }
 
 
@@ -365,6 +369,13 @@ def _llm_base_provider(provider: Optional[str]) -> str:
 
 def _is_api_provider(provider: Optional[str]) -> bool:
     return (provider or "").lower().endswith("-api")
+
+
+def _is_inprocess_provider(provider: Optional[str]) -> bool:
+    """In-process, BYO-key providers: the ``-api`` family (Pydantic-AI) plus the
+    native OpenRouter harness. Both resolve a key via env-var fallback and take the
+    ``_API_CAP_KEYS`` per-turn caps — unlike the CLI-shelling bare names."""
+    return _is_api_provider(provider) or (provider or "").lower() == "openrouter-native"
 
 
 def _resolve_api_key(provider: str, settings: dict) -> Optional[str]:
@@ -443,6 +454,21 @@ def _build_llm_provider(
     hold a reference to McpManager.
     """
     normalized = (provider or "claude").lower()
+
+    # Native OpenRouter harness: in-process, BYO-key, owns its own OpenAI-compatible
+    # tool-calling loop (no Pydantic-AI). Sits beside the untouched ``openrouter-api``
+    # path. Reuses the same key + ``_API_CAP_KEYS`` caps as the ``-api`` family.
+    if normalized == "openrouter-native":
+        from clawmeets.llm.native_harness import NativeHarnessProvider
+
+        NativeHarnessProvider.verify_cli()
+        return NativeHarnessProvider(
+            api_key=api_key or "",
+            agent_env=agent_env,
+            model=model,
+            base_url=base_url or "https://openrouter.ai/api/v1",
+            **(api_caps or {}),
+        )
 
     # ``*-api`` provider: in-process, BYO-key, no CLI binary (runner-portable).
     # One Pydantic-AI-backed provider drives all three model families; the bare
@@ -576,8 +602,9 @@ def agent_register(
              "slug like 'opencode/deepseek-v4-flash-free'). The '-api' variants "
              "run in-process with a BYO key (no binary): 'claude-api', "
              "'openai-api', 'gemini-api', 'openrouter-api' (OpenAI-compatible "
-             "gateway — set --llm-model to an OpenRouter slug). Written to "
-             "card.json local_settings.",
+             "gateway — set --llm-model to an OpenRouter slug). 'openrouter-native' "
+             "is a native OpenRouter tool-loop (no Pydantic-AI) that coexists with "
+             "'openrouter-api'. Written to card.json local_settings.",
     ),
     llm_model: Optional[str] = typer.Option(
         None, "--llm-model",
@@ -2203,7 +2230,7 @@ async def _runner_loop(
         # llm_api_key as the gateway bearer token (no env fallback).
         api_key = (
             _resolve_api_key(provider, settings)
-            if _is_api_provider(provider)
+            if _is_inprocess_provider(provider)
             else (settings.get("llm_api_key") or None)
         )
         base_url = settings.get("llm_base_url") or None

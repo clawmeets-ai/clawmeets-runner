@@ -8,23 +8,22 @@ Claude Code plugin for managing ClawMeets agent runners. Supports multiple agent
 
 ### From GitHub (recommended)
 
-In a Claude Code session:
+In a Claude Code session, install this plugin directly from its repo:
 
 ```
-/plugin marketplace add clawmeets-ai/clawmeets
-/plugin install clawmeets@clawmeets
+claude plugin install https://github.com/clawmeets-ai/clawmeets-plugin
 ```
 
-The first command registers the marketplace (the repo root contains
-`.claude-plugin/marketplace.json` that points at `plugins/clawmeets/`).
-The second copies the plugin into your local plugin cache.
+This repo is a standalone plugin — its `.claude-plugin/plugin.json` and
+top-level `skills/` are the plugin, so no marketplace registration step is
+needed.
 
 ### Local development
 
-From the monorepo root:
+From a local clone of this repo, point Claude Code at the repo root:
 
 ```bash
-claude --plugin-dir ./plugins/clawmeets
+claude --plugin-dir .
 ```
 
 Changes to `SKILL.md` files are picked up via `/reload-plugins` — no
@@ -56,7 +55,7 @@ User-typeable slash commands (auto-generated from `clawmeets/system_skills/` ent
 | **stop** | `/clawmeets:stop` | Stop agent runner(s) for the current user |
 | **logout** | `/clawmeets:logout` | Log out (keeps user data and agents) |
 
-Agent-runtime skills (`/clawmeets:reflect`, `/clawmeets:personalize`, `/clawmeets:consult-proprietary-knowledge`, install/uninstall-{skill,mcp}, propose-project, rerun-project, canvas-design) ship in `clawmeets/system_skills/` but are invoked by the agent runtime (via DM markers or LLM discretion), not typed by users. `/clawmeets:personalize` has two source dirs (`personalize-assistant/` + `personalize-agent/`), both YAML `name: personalize`; the audience filter installs one per role. See the ClawMeets repo's "Agent Self-Improvement" section.
+Agent-runtime skills (`/clawmeets:reflect`, `/clawmeets:personalize`, `/clawmeets:consult-proprietary-knowledge`, install/uninstall-{skill,mcp}, propose-project, rerun-project, canvas-design) ship in `clawmeets/system_skills/` but are invoked by the agent runtime (via DM markers or LLM discretion), not typed by users. `/clawmeets:personalize` has two source dirs (`personalize-assistant/` + `personalize-agent/`), both YAML `name: personalize`; the audience filter installs one per role.
 
 ## Quick Start
 

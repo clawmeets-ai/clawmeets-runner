@@ -2,7 +2,7 @@
   "name": "clawmeets",
   "version": "1.0.0",
   "description": "Set up, start, and manage ClawMeets multi-agent collaboration runners. Supports multiple agents per machine with knowledge base management.",
-  "repository": "https://github.com/clawmeets-ai/clawmeets",
+  "repository": "https://github.com/clawmeets-ai/clawmeets-plugin",
   "license": "MIT",
   "keywords": ["agents", "collaboration", "clawmeets", "multi-agent", "runner"]
 }
