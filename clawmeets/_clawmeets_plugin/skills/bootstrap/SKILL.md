@@ -17,10 +17,15 @@ Python toolchains and installs CLIs in isolated environments. This avoids
 PEP 668 ("externally managed environment") errors, keeps the user's Python
 clean, and works the same on macOS, Linux, and WSL.
 
-## Minimum version
+## Requirements
 
-This plugin requires `clawmeets >= 1.1.2`. Bump this version together with
-the plugin manifest when the plugin depends on newer CLI features.
+- **`clawmeets >= 1.2.4`** — bump this floor together with the plugin
+  manifest when the plugin depends on newer CLI features.
+- **Python 3.11–3.13** — clawmeets does **not** support Python 3.14+.
+  `patchright` (browser stealth) ships no 3.14 wheels, so a 3.14 install
+  either fails to resolve or silently drops browser support. Bootstrap
+  pins the CLI to Python 3.11 (step 4) so this ceiling holds regardless of
+  the machine's default interpreter.
 
 ## Steps
 
@@ -33,7 +38,7 @@ the plugin manifest when the plugin depends on newer CLI features.
      echo "clawmeets not installed"
    fi
    ```
-   - If installed and version >= 1.1.2: tell the user it is already set up
+   - If installed and version >= 1.2.4: tell the user it is already set up
      and skip to step 5.
    - If installed but older: proceed (step 4 will use `--force` to upgrade).
 
@@ -65,21 +70,27 @@ the plugin manifest when the plugin depends on newer CLI features.
      Debian/Ubuntu), `winget install --id=astral-sh.uv -e` (Windows), or
      `scoop install uv`.
 
-3. **Ensure Python 3.11+ is available to uv**:
+3. **Ensure Python 3.11 is available to uv**:
    ```bash
    uv python install 3.11
    ```
-   This is idempotent — `uv` will pick up an existing 3.11+ if present, or
+   This is idempotent — `uv` will pick up an existing 3.11 if present, or
    download one into its managed toolchain directory.
 
 4. **Install (or upgrade) `clawmeets`**:
    ```bash
    # Fresh install:
-   uv tool install 'clawmeets>=1.1.2'
+   uv tool install --python 3.11 'clawmeets>=1.2.4'
 
    # Or, if an older version was already installed:
-   uv tool install --force 'clawmeets>=1.1.2'
+   uv tool install --force --python 3.11 'clawmeets>=1.2.4'
    ```
+   Always pass `--python 3.11` explicitly. Without it, `uv` installs the
+   tool against its **default** interpreter — which on a machine whose uv
+   default is Python 3.14+ pulls in an incompatible interpreter: `patchright`
+   (browser stealth) has no 3.14 wheels, so resolution either fails or
+   silently drops that dependency and browser-driven skills break. Pinning
+   3.11 makes the install deterministic regardless of the user's uv default.
 
 5. **Verify**:
    ```bash
@@ -104,15 +115,18 @@ Only use these if `uv` cannot be installed:
   ```bash
   # macOS: brew install pipx
   # Debian/Ubuntu: sudo apt install pipx
-  pipx install 'clawmeets>=1.1.2'
+  # If the system default is Python 3.14+, point pipx at a 3.11–3.13
+  # interpreter: pipx install --python python3.11 'clawmeets>=1.2.4'
+  pipx install 'clawmeets>=1.2.4'
   ```
 
 - **`pip install --user`** (last resort; may require `--break-system-packages`
   on PEP 668 systems like recent macOS Homebrew Python or Debian 12+):
   ```bash
-  python3 -m pip install --user 'clawmeets>=1.1.2'
+  # Use a 3.11–3.13 interpreter here (e.g. python3.11) if the default is 3.14+.
+  python3 -m pip install --user 'clawmeets>=1.2.4'
   # Or if PEP 668 blocks it:
-  python3 -m pip install --user --break-system-packages 'clawmeets>=1.1.2'
+  python3 -m pip install --user --break-system-packages 'clawmeets>=1.2.4'
   ```
 
 ## Upgrading later

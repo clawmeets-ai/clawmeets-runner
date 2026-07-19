@@ -92,5 +92,7 @@ The agent registry is **derived from the filesystem** — every directory under 
 
 ## Prerequisites
 
-- Python 3.11+ (managed automatically by `uv` if missing)
-- `clawmeets` CLI — installed by `/clawmeets:bootstrap` via `uv tool install clawmeets`
+- Python 3.11–3.13 (managed automatically by `uv`; bootstrap pins 3.11). Avoid
+  3.14+ as the install interpreter — `patchright` (browser stealth) has no 3.14
+  wheels yet, so browser-driven skills degrade.
+- `clawmeets` CLI — installed by `/clawmeets:bootstrap` via `uv tool install --python 3.11 clawmeets`
