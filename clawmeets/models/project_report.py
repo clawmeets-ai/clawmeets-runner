@@ -107,3 +107,39 @@ async def delete_report(metadata_project_dir: Path) -> bool:
             return False
         path.unlink()
         return True
+
+
+def backfill_report_published_at(model_ctx) -> int:
+    """One-shot idempotent reconcile of ``Project.report_published_at`` against
+    the on-disk ``report.json`` for every project. Run once at server startup.
+
+    For each project: if ``report.json`` exists, stamp meta.json's
+    ``report_published_at`` from its ``generated_at``; otherwise clear it.
+    Delegates to :meth:`ProjectState.set_report_published_at`, which writes only
+    on a real delta — so this is safe to run on every boot and touches only
+    projects whose meta.json is out of sync with their report. Returns the number
+    of projects rewritten (logged once at startup).
+
+    Why a backfill exists: projects with a ``report.json`` predating the new meta
+    key would serialize ``report_published_at = null`` until their next
+    re-publish. This makes the field correct from first deploy without waiting on
+    a re-publish, and re-derives the value purely from the source of truth
+    (``report.json``), so it can never diverge from ``getProjectReport``.
+
+    Persistence-safety: ``report_published_at`` lives in meta.json OUTSIDE the
+    changelog, consistent with ``report.json`` itself being a non-changelog
+    artifact. Every ``ProjectState`` mutation is a read-modify-write of the full
+    meta dict (``complete`` / ``touch_activity`` / ``add_participant`` / …), which
+    preserves this key; the only wholesale rewrite, ``ProjectState.create()``,
+    runs at ``PROJECT_CREATED`` — before any report can exist. So no existing
+    write path clobbers it.
+    """
+    from .project import Project  # local import: avoid any import-time coupling
+
+    count = 0
+    for project in Project.list_all(model_ctx):
+        report = get_report(project.meta_dir)
+        desired = report.generated_at if report is not None else None
+        if project.state().set_report_published_at(desired):
+            count += 1
+    return count

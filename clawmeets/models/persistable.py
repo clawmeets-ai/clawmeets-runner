@@ -65,6 +65,56 @@ def _clean_str_list(raw: object) -> list[str]:
     return out
 
 
+def _redact_api_key(local_settings: object) -> tuple[dict, bool]:
+    """Split a raw ``local_settings`` dict into ``(safe_copy, key_is_set)``.
+
+    The API key is write-only: ``llm_api_key`` is a secret that must never leave
+    the server on a read. This centralizes redaction at the DTO boundary so every
+    ``AgentResponse`` read path (/auth/me, GET /agents, GET /agents/{id}, PUT,
+    the local-settings PATCH return) is covered uniformly — no route has to
+    remember to redact.
+
+    - ``safe_copy``: a shallow copy of the dict with ``llm_api_key`` removed.
+    - ``key_is_set``: True iff the raw dict had a non-empty ``llm_api_key``.
+
+    Does not mutate the input. Tolerates a non-dict / missing value (returns an
+    empty dict, False) since ``card.get("local_settings")`` may be absent.
+    """
+    if not isinstance(local_settings, dict):
+        return {}, False
+    key_is_set = bool(local_settings.get("llm_api_key"))
+    safe = {k: v for k, v in local_settings.items() if k != "llm_api_key"}
+    return safe, key_is_set
+
+
+def preserve_llm_api_key(incoming: dict, existing: object) -> dict:
+    """Re-inject an omitted write-only ``llm_api_key`` into a wholesale update.
+
+    Write-side counterpart to :func:`_redact_api_key`. Because the key is
+    redacted out of every read, a client that rebuilds a ``PUT /agents/{id}``
+    body from a prior read never sees it — and ``update_card`` replaces
+    ``local_settings`` wholesale, so an unrelated edit (e.g. description) would
+    silently WIPE the stored key. This merges the previously-stored key back in
+    when the incoming payload OMITS it, while honoring explicit intent — parity
+    with the ``PATCH …/local-settings`` clear semantics:
+
+      - ``llm_api_key`` absent      → preserve the previously-stored key
+      - ``llm_api_key`` empty/null  → clear (drop it, so ``llm_api_key_set`` → False)
+      - ``llm_api_key`` non-empty   → set the new key
+
+    Returns a new dict; never mutates ``incoming``. Tolerates a non-dict/missing
+    ``existing`` (nothing to preserve).
+    """
+    result = dict(incoming)
+    if "llm_api_key" not in result:
+        existing_key = existing.get("llm_api_key") if isinstance(existing, dict) else None
+        if existing_key:
+            result["llm_api_key"] = existing_key
+    elif not result["llm_api_key"]:
+        result.pop("llm_api_key")
+    return result
+
+
 class PersistableParticipant(Participant, ABC):
     """Base class with Active Record persistence for Agent/Assistant.
 
@@ -758,6 +808,12 @@ class PersistableParticipant(Participant, ABC):
             AgentResponse DTO for API serialization
         """
         card = self._load_card()
+        # Redact the write-only API key from every read path; expose only a
+        # boolean "is a key stored" marker as a sibling field (keeps the
+        # local_settings blob clean + round-trippable for runner GET→re-PATCH).
+        safe_local_settings, llm_api_key_set = _redact_api_key(
+            card.get("local_settings", {})
+        )
         return AgentResponse(
             id=self._id,
             name=self.name,
@@ -772,7 +828,8 @@ class PersistableParticipant(Participant, ABC):
             user_teams=self.user_teams,
             default_invitable_agents=self.default_invitable_agents,
             default_invitable_teams=self.default_invitable_teams,
-            local_settings=card.get("local_settings", {}),
+            local_settings=safe_local_settings,
+            llm_api_key_set=llm_api_key_set,
             model_configs=card.get("model_configs") or [],
             default_model_config_name=card.get("default_model_config_name"),
             last_reflected_at=self.last_reflected_at,

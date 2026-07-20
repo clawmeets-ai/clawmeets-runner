@@ -337,6 +337,7 @@ class LLMProvider(ABC):
         trigger_version: int,
         mcp_config_dir: Optional[Path] = None,
         skill_source_dirs: Optional[list[Path]] = None,
+        memory_dir: Optional[Path] = None,
     ) -> tuple[ActionBlock, LLMUsage]:
         """Run one agent turn and translate the result into an ActionBlock.
 
@@ -346,7 +347,7 @@ class LLMProvider(ABC):
                 subprocess backends / root of file tools for API backends).
             log_dir: Directory for per-invocation logs.
             additional_dirs: Extra dirs the model may read (project_dir when
-                different from working_dir, knowledge bases, dwh).
+                different from working_dir, knowledge bases, dwh, memory).
             notification_center: Dispatcher for LLM_COMPLETE / LLM_ERROR.
             action_schema: JSON schema for the structured action output,
                 selected per invocation by the caller (WORKER vs COORDINATOR).
@@ -356,6 +357,12 @@ class LLMProvider(ABC):
                 installed MCP servers.
             skill_source_dirs: Optional skill-source dirs to surface to the
                 model (installed + personal skill hubs).
+            memory_dir: Optional ``{agent_dir}/memory/`` — the agent's
+                reflect/personalize read+write target. Subprocess backends
+                already reach it as a read/write root via ``additional_dirs``
+                and ignore this; the in-process backends (api / native) take it
+                as an extra *writable* root so memory writebacks aren't rejected
+                by the sandbox-only write guard.
 
         Returns:
             Tuple of (action_block, usage_stats). ``action_block.actions`` may
@@ -651,6 +658,7 @@ class SubprocessLLMProvider(LLMProvider):
         trigger_version: int,
         mcp_config_dir: Optional[Path] = None,
         skill_source_dirs: Optional[list[Path]] = None,
+        memory_dir: Optional[Path] = None,
     ) -> tuple[ActionBlock, LLMUsage]:
         """Run the CLI subprocess and translate its output into an ActionBlock.
 
@@ -680,6 +688,11 @@ class SubprocessLLMProvider(LLMProvider):
                 ``_prepare_invocation`` flattens them into the CLI's native
                 cwd skill-discovery path so the spawned CLI auto-loads them
                 without a prompt-side INDEX.
+            memory_dir: Accepted for interface symmetry and ignored here — the
+                CLI harness already reaches ``memory/`` (read + write) because
+                the caller includes it in ``additional_dirs`` (→ ``--add-dir`` /
+                ``--include-directories``). Only the in-process backends need it
+                as a distinct writable root.
 
         Returns:
             Tuple of (action_block, usage_stats). action_block.actions may be
@@ -725,6 +738,27 @@ class SubprocessLLMProvider(LLMProvider):
                 logger.error(f"[{self._log_tag}] TIMEOUT after {elapsed:.1f}s")
                 logger.error(
                     f"[{self._log_tag}] prompt file saved at: {prepared.prompt_file_abs}"
+                )
+                # Kill the hung process and drain whatever it buffered, then
+                # persist it — `wait_for` cancelled the pending communicate(),
+                # so without this a hang leaves NO cli-*.log and the next hang
+                # is undiagnosable (unlike the completed path at the bottom).
+                partial_stdout = partial_stderr = ""
+                try:
+                    proc.kill()
+                    stdout_b, stderr_b = await asyncio.wait_for(
+                        proc.communicate(), timeout=5
+                    )
+                    partial_stdout = stdout_b.decode("utf-8", errors="replace")
+                    partial_stderr = stderr_b.decode("utf-8", errors="replace")
+                except Exception:
+                    logger.debug(
+                        f"[{self._log_tag}] could not drain output after timeout",
+                        exc_info=True,
+                    )
+                marker = f"[TIMED OUT after {elapsed:.0f}s]\n"
+                self._write_invocation_logs(
+                    log_dir, marker + partial_stdout, marker + partial_stderr
                 )
                 error = LLMTimeoutError(
                     timeout_seconds=self._invoke_timeout,

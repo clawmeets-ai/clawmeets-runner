@@ -76,6 +76,46 @@ _PROVIDERS: dict[str, tuple[str, str]] = {
 
 
 # ---------------------------------------------------------------------------
+# Custom base_url plumbing (M2). Every ``-api`` provider that a user can point at
+# a proxy/gateway must forward a non-empty ``base_url`` to its Pydantic-AI
+# provider constructor — historically only the openai branch did, so a custom
+# base_url on claude-api / gemini-api / openrouter-api was silently dropped.
+# ---------------------------------------------------------------------------
+
+
+def _base_url_kw(base_url: Optional[str]) -> dict:
+    """``{"base_url": base_url}`` when set, else ``{}``.
+
+    Splatted into a provider constructor so we pass ``base_url`` ONLY when the
+    user configured one — never overriding a provider's hosted default with an
+    empty/None value. Used by the Anthropic and Google branches, whose
+    pydantic-ai providers both accept a top-level ``base_url`` kwarg
+    (verified against pydantic-ai 1.107; resolves plan risks R1/R2 for those two).
+    """
+    return {"base_url": base_url} if base_url else {}
+
+
+def _openrouter_provider(api_key: Optional[str], base_url: Optional[str]):
+    """Build the OpenRouter provider, honoring a custom ``base_url``.
+
+    ``OpenRouterProvider`` hard-codes the openrouter.ai endpoint and exposes no
+    ``base_url`` kwarg (pydantic-ai 1.107). When a user sets a custom base_url we
+    fall back to ``OpenAIProvider(base_url=..., api_key=...)`` — OpenRouter speaks
+    OpenAI Chat Completions and rides the same ``OpenAIChatModel`` wrapper, so the
+    proxy is reached without changing the model class. With no base_url the path is
+    byte-for-byte the historical ``OpenRouterProvider(api_key=...)`` (keeps the
+    app-header behavior for the default endpoint). See plan risk R1.
+    """
+    from pydantic_ai.providers.openrouter import OpenRouterProvider
+
+    if base_url:
+        from pydantic_ai.providers.openai import OpenAIProvider
+
+        return OpenAIProvider(base_url=base_url, api_key=api_key)
+    return OpenRouterProvider(api_key=api_key)
+
+
+# ---------------------------------------------------------------------------
 # Structured output — self-contained, Literal-discriminated for cross-provider
 # robustness (OpenAI strict mode / Gemini both prefer a clean discriminator).
 # Dumped back to list[dict] so the ActionBlock contract is unchanged.
@@ -238,6 +278,7 @@ def _build_file_tools(
     write_root: Path,
     env: dict[str, str],
     read_roots: Optional[list[Path]] = None,
+    write_roots: Optional[list[Path]] = None,
 ) -> list:
     """Build per-invocation file + bash tools for this turn.
 
@@ -256,12 +297,21 @@ def _build_file_tools(
     ``grep`` resolve a RELATIVE path against the sandbox first then those read
     roots (via ``_abs_read``) — so an agent that reads a synced file by its
     relative ``chatrooms/...`` path resolves to the project dir instead of
-    failing. Absolute paths reach anywhere. WRITES stay sandbox-only (``_abs``).
+    failing. Absolute paths reach anywhere.
+
+    ``write_roots`` are extra WRITABLE roots beyond the sandbox — today just the
+    agent ``memory_dir`` so ``/reflect`` and ``/personalize`` writebacks (absolute
+    paths under ``{agent_dir}/memory/``) succeed. Knowledge/project read roots are
+    deliberately NOT writable, so user reference material stays read-only. Every
+    other write stays sandbox-only (``_abs`` + ``_guard_write``).
     The sandbox (``write_root``) is always included.
     """
     write_root = write_root.resolve()
     extra_read_roots = [
         r.resolve() for r in (read_roots or []) if r.resolve() != write_root
+    ]
+    extra_write_roots = [
+        r.resolve() for r in (write_roots or []) if r.resolve() != write_root
     ]
     glob_roots = [write_root] + extra_read_roots
 
@@ -287,8 +337,9 @@ def _build_file_tools(
 
     def _guard_write(path: str) -> Path:
         p = _abs(path).resolve()
-        if p == write_root or write_root in p.parents:
-            return p
+        for root in (write_root, *extra_write_roots):
+            if p == root or root in p.parents:
+                return p
         raise ValueError(f"path '{path}' is outside the writable sandbox")
 
     def read_file(path: str) -> str:
@@ -596,8 +647,14 @@ class ApiLLMProvider(LLMProvider):
             from pydantic_ai.models.anthropic import AnthropicModel
             from pydantic_ai.providers.anthropic import AnthropicProvider
 
+            # base_url forwards a custom Anthropic Messages-API endpoint (proxy /
+            # gateway / self-hosted). Absent unless the user set one — see
+            # _base_url_kw. AnthropicProvider takes it as a top-level kwarg.
             return AnthropicModel(
-                self._model_name, provider=AnthropicProvider(api_key=self._api_key)
+                self._model_name,
+                provider=AnthropicProvider(
+                    api_key=self._api_key, **_base_url_kw(self._base_url)
+                ),
             )
         if self._provider == "openai":
             from pydantic_ai.providers.openai import OpenAIProvider
@@ -642,19 +699,25 @@ class ApiLLMProvider(LLMProvider):
             # `llm_model` may be a comma-separated ordered fallback chain; the
             # FIRST slug is the primary, the rest ride OpenRouter's `models`
             # fallback array (see _model_settings).
+            # A custom base_url re-points at an OpenAI-compatible proxy in front of
+            # OpenRouter; _openrouter_provider handles the OpenAIProvider fallback
+            # (OpenRouterProvider has no base_url kwarg). Default endpoint unchanged.
             from pydantic_ai.models.openai import OpenAIChatModel
-            from pydantic_ai.providers.openrouter import OpenRouterProvider
 
             return OpenAIChatModel(
                 self._openrouter_models()[0],
-                provider=OpenRouterProvider(api_key=self._api_key),
+                provider=_openrouter_provider(self._api_key, self._base_url),
             )
-        # google
+        # google — GoogleProvider accepts a top-level base_url kwarg (a custom
+        # Gemini/GenAI endpoint or gateway); forwarded only when the user set one.
         from pydantic_ai.models.google import GoogleModel
         from pydantic_ai.providers.google import GoogleProvider
 
         return GoogleModel(
-            self._model_name, provider=GoogleProvider(api_key=self._api_key)
+            self._model_name,
+            provider=GoogleProvider(
+                api_key=self._api_key, **_base_url_kw(self._base_url)
+            ),
         )
 
     def _openrouter_models(self) -> list[str]:
@@ -873,6 +936,7 @@ class ApiLLMProvider(LLMProvider):
         trigger_version: int,
         mcp_config_dir: Optional[Path] = None,
         skill_source_dirs: Optional[list[Path]] = None,
+        memory_dir: Optional[Path] = None,
     ) -> tuple[ActionBlock, LLMUsage]:
         from pydantic_ai import Agent, NativeOutput
 
@@ -899,10 +963,17 @@ class ApiLLMProvider(LLMProvider):
         web_caps = self._web_capabilities(is_coordinator)
 
         env = self._build_env()
-        # additional_dirs (synced project dir + knowledge dirs) become first-class
-        # read roots so glob can span them — CLI `--add-dir` parity. Previously
-        # accepted but unused, leaving glob sandbox-only.
-        tools = _build_file_tools(working_dir, env, read_roots=additional_dirs)
+        # additional_dirs (synced project dir + knowledge dirs + memory) become
+        # first-class read roots so glob can span them — CLI `--add-dir` parity.
+        # memory_dir is additionally passed as a writable root so reflect /
+        # personalize writebacks under {agent_dir}/memory/ aren't rejected by the
+        # sandbox-only write guard (knowledge/project roots stay read-only).
+        tools = _build_file_tools(
+            working_dir,
+            env,
+            read_roots=additional_dirs,
+            write_roots=[memory_dir] if memory_dir else None,
+        )
         tools.append(_build_skill_tool(skill_source_dirs or []))
         # All non-Anthropic providers (openai/gemini/openrouter) get the local
         # budget-wrapped, tightly-clipped, error-tolerant web tools instead of a

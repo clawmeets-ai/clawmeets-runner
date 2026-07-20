@@ -107,6 +107,18 @@ class Project(BaseModel):
                                           # None only on legacy/pre-migration rows -> callers render `name` (the slug).
     last_request_ts: Optional[datetime] = None   # ts of the most recent non-ack USER message across the project.
     last_response_ts: Optional[datetime] = None  # ts of the most recent non-ack AGENT/ASSISTANT message.
+    # ISO timestamp of the project's published completion report (mirrors
+    # report.json's ``generated_at``). None when no report exists — including a
+    # completed project that has no report. Non-null EXACTLY when
+    # ``GET /projects/{id}/report`` would return a real report. Denormalized into
+    # meta.json on report upsert/delete (ProjectState.set_report_published_at) so
+    # the list scan reads it from the single meta.json read it already performs —
+    # no per-project report.json read (avoids the N+1). A stored field, not a
+    # @computed_field: a computed field re-reading report.json on every Project
+    # load would re-introduce that N+1 in list_all. Default None keeps it
+    # back-compatible for any meta.json predating the key. Rides model_dump() into
+    # GET /projects (admin list) and GET /projects/{id} (detail) with no route change.
+    report_published_at: Optional[datetime] = None
 
     # Private runtime state (not serialized)
     _ctx: Optional["ModelContext"] = PrivateAttr(default=None)
@@ -749,3 +761,29 @@ class ProjectState:
         project_dict = FileUtil.read(meta_path, "json")
         project_dict["display_name"] = display_name
         FileUtil.write(meta_path, project_dict, "json", atomic=True)
+
+    def set_report_published_at(self, ts: Optional[str]) -> bool:
+        """Denormalize the report's ``generated_at`` into meta.json.
+
+        ``ts`` is the ISO string from ``ProjectReport.generated_at`` on publish,
+        or ``None`` to clear the field on delete. Read-modify-write of the full
+        meta dict — preserves every other key, mirroring ``complete()`` /
+        ``touch_activity()``.
+
+        Idempotent: writes only on a real delta (re-stamping the same value, or
+        clearing an already-absent value, is a no-op). This keeps the live
+        publish/delete path and the one-shot startup backfill both safe to run
+        repeatedly with no needless atomic rewrite. Returns True iff it wrote.
+
+        Written directly (not via the changelog) because ``report.json`` itself
+        is a non-changelog file artifact; this field is a projection of it, kept
+        adjacent to its source. See the persistence-safety note in
+        ``models/project_report.py::backfill_report_published_at``.
+        """
+        meta_path = self._project.meta_path
+        project_dict = FileUtil.read(meta_path, "json")
+        if project_dict.get("report_published_at") == ts:
+            return False  # already in the desired state; no write
+        project_dict["report_published_at"] = ts
+        FileUtil.write(meta_path, project_dict, "json", atomic=True)
+        return True

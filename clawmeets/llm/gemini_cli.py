@@ -118,11 +118,12 @@ class GeminiCLI(SubprocessLLMProvider):
 
     def _build_env(self) -> dict[str, str]:
         env = super()._build_env()
-        # Gemini CLI's trusted-folders feature refuses headless runs in an
-        # untrusted cwd (exit 55: "not running in a trusted directory") —
-        # and the agent's sandbox dir is never interactively trusted.
-        # Trusting the workspace is the same decision --approval-mode yolo
-        # already encodes.
+        # Fallback bypass of Gemini CLI's trusted-folders gate, which refuses
+        # headless runs in an untrusted cwd (exit 55: "not running in a trusted
+        # directory") — and the agent's sandbox dir is never interactively
+        # trusted. The `--skip-trust` flag in _prepare_invocation is the primary
+        # bypass; this env var covers CLI versions predating that flag. Both
+        # encode the same decision --approval-mode yolo already makes.
         env.setdefault("GEMINI_CLI_TRUST_WORKSPACE", "true")
         return env
 
@@ -205,6 +206,12 @@ class GeminiCLI(SubprocessLLMProvider):
             self._bin,
             "-o", "json",
             "--approval-mode", "yolo",
+            # Primary bypass of gemini's trusted-folder gate. The agent sandbox
+            # is never interactively trusted, so without this gemini refuses to
+            # run headless (exit 55, or a hang on older versions blocking on the
+            # interactive trust prompt). GEMINI_CLI_TRUST_WORKSPACE in
+            # _build_env is the fallback for CLI versions predating the flag.
+            "--skip-trust",
         ]
 
         if self._model:

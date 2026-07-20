@@ -979,11 +979,7 @@ class Agent(PersistableParticipant):
         sandbox_dir = self._model_ctx.sandbox_dir(project_id, project.name)
         log_dir = self._model_ctx.llm_log_dir(project_id, project.name)
 
-        # Compute additional_dirs: data_dir (if different from sandbox) + knowledge_dirs
-        additional_dirs: list[Path] = []
-        if data_dir != sandbox_dir:
-            additional_dirs.append(data_dir)
-        additional_dirs.extend(self._model_ctx.knowledge_dirs)
+        additional_dirs = self._extra_dirs(data_dir, sandbox_dir)
 
         # Create prompt builder on-demand for worker mode
         # Use project.coordinator_name to avoid lookup (worker may not have coordinator's card)
@@ -1132,6 +1128,26 @@ class Agent(PersistableParticipant):
             f"model={cfg.get('model')!r}"
         )
         return provider
+
+    def _extra_dirs(self, data_dir: Path, sandbox_dir: Path) -> list[Path]:
+        """Extra read/write roots beyond the sandbox cwd, shared by every
+        invoke site.
+
+        Order: the synced project data dir (only when distinct from the
+        sandbox cwd), the knowledge dirs, then the agent ``memory_dir``. The
+        memory dir is appended so every provider that gates file access on the
+        allow-list (gemini ``--include-directories``, codex/claude
+        ``--add-dir``) can reach ``memory/`` — the reflect/personalize
+        read+write target that previously sat outside every allowed root.
+        Centralizing the four formerly-identical blocks here keeps that wiring
+        from drifting between call sites again.
+        """
+        dirs: list[Path] = []
+        if data_dir != sandbox_dir:
+            dirs.append(data_dir)
+        dirs.extend(self._model_ctx.knowledge_dirs)
+        dirs.append(self._model_ctx.memory_dir)
+        return dirs
 
     async def _invoke_with_transient_retry(
         self,
@@ -1493,11 +1509,7 @@ class Agent(PersistableParticipant):
         sandbox_dir = self._model_ctx.sandbox_dir(project_id, project.name)
         log_dir = self._model_ctx.llm_log_dir(project_id, project.name)
 
-        # Compute additional_dirs: data_dir (if different from sandbox) + knowledge_dirs
-        additional_dirs: list[Path] = []
-        if data_dir != sandbox_dir:
-            additional_dirs.append(data_dir)
-        additional_dirs.extend(self._model_ctx.knowledge_dirs)
+        additional_dirs = self._extra_dirs(data_dir, sandbox_dir)
 
         # Build batch status — the incoming "message" the coordinator sees is
         # synthetic: "batch complete in <room>; responded X, timed out Y".
@@ -1610,11 +1622,7 @@ class Agent(PersistableParticipant):
         sandbox_dir = self._model_ctx.sandbox_dir(project_id, project.name)
         log_dir = self._model_ctx.llm_log_dir(project_id, project.name)
 
-        # Compute additional_dirs: data_dir (if different from sandbox) + knowledge_dirs
-        additional_dirs: list[Path] = []
-        if data_dir != sandbox_dir:
-            additional_dirs.append(data_dir)
-        additional_dirs.extend(self._model_ctx.knowledge_dirs)
+        additional_dirs = self._extra_dirs(data_dir, sandbox_dir)
 
         # Create coordinator prompt builder for this task
         coordinator_builder = create_prompt_builder(
@@ -1762,10 +1770,7 @@ class Agent(PersistableParticipant):
         sandbox_dir = self._model_ctx.sandbox_dir(project_id, project.name)
         log_dir = self._model_ctx.llm_log_dir(project_id, project.name)
 
-        additional_dirs: list[Path] = []
-        if data_dir != sandbox_dir:
-            additional_dirs.append(data_dir)
-        additional_dirs.extend(self._model_ctx.knowledge_dirs)
+        additional_dirs = self._extra_dirs(data_dir, sandbox_dir)
 
         prompt_builder = create_prompt_builder(
             OperationalMode.COORDINATOR,

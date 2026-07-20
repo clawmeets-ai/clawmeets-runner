@@ -267,16 +267,21 @@ def build_harness_tools(
     web_budget: int,
     web_fetch_budget: int,
     enable_web: bool,
+    write_roots: Optional[list[Path]] = None,
 ) -> list[HarnessTool]:
     """Wrap ``api_provider``'s plain callables behind explicit JSON schemas.
 
     Writes stay sandbox-confined exactly as ``_build_file_tools`` enforces (the
-    reused callables guard writes against ``working_dir``); reads span the sandbox
-    plus ``read_roots``. This is why there is ONE harness implementation.
+    reused callables guard writes against ``working_dir``), plus any extra
+    ``write_roots`` (today the agent ``memory_dir``, so reflect/personalize
+    writebacks succeed); reads span the sandbox plus ``read_roots``. This is why
+    there is ONE harness implementation.
     """
     file_fns = {
         f.__name__: f
-        for f in _build_file_tools(working_dir, env, read_roots=read_roots)
+        for f in _build_file_tools(
+            working_dir, env, read_roots=read_roots, write_roots=write_roots
+        )
     }
     tools: list[HarnessTool] = [
         _tool(

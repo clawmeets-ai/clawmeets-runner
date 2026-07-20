@@ -103,6 +103,7 @@ async def invoke_with_registry(
         trigger_version=trigger_version,
         mcp_config_dir=model_ctx.mcp_dist_dir,
         skill_source_dirs=model_ctx.skill_source_dirs(role=role),
+        memory_dir=model_ctx.memory_dir,
     )
     registry = model_ctx.invocation_registry
     if registry is None:

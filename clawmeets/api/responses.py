@@ -62,6 +62,10 @@ class AgentResponse(BaseModel):
     default_invitable_agents: list[str] = Field(default_factory=list)
     default_invitable_teams: list[str] = Field(default_factory=list)
     local_settings: dict = Field(default_factory=dict)  # knowledge_dir, llm_provider, llm_model
+    # Write-only API-key indicator. The raw ``llm_api_key`` is REDACTED out of
+    # ``local_settings`` above (never leaves the server); this derived boolean is
+    # the only thing read paths expose — True iff a non-empty key is stored.
+    llm_api_key_set: bool = False
     # Named model configs + designated default (model-selector revamp). Carried
     # on the response so the runner can reconcile them onto its self-card and the
     # frontend settings page can render the list. Configs are ModelConfig wire
@@ -203,3 +207,4 @@ class ParticipantProjectResponse(BaseModel):
     surface: Optional[str] = None  # "regular" | "dm"
     display_name: Optional[str] = None  # raw model-set label; frontend renders `display_name ?? name`
     last_modified: datetime  # ISO-8601, non-null; sidebar sorts the PROJECTS list by this desc
+    report_published_at: Optional[datetime] = None  # Same meaning as Project.report_published_at: ISO ts string | null, non-null EXACTLY when the project has a real completion report. Present on every row of the desk's non-admin list (GET /participants/{id}/projects).

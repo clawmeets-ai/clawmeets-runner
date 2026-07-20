@@ -166,6 +166,7 @@ class NativeHarnessProvider(LLMProvider):
         trigger_version: int,
         mcp_config_dir: Optional[Path] = None,
         skill_source_dirs: Optional[list[Path]] = None,
+        memory_dir: Optional[Path] = None,
     ) -> tuple[ActionBlock, LLMUsage]:
         """Run one agent turn and translate the result into an ``ActionBlock``.
 
@@ -192,6 +193,7 @@ class NativeHarnessProvider(LLMProvider):
                 web_budget,
                 self._web_fetch_max_uses,
                 self._enable_web,
+                write_roots=[memory_dir] if memory_dir else None,
             )
             tools += build_mcp_tools(mcp_config_dir, env)
             tools_by_name = {t.name: t for t in tools}
