@@ -40,6 +40,14 @@ VALID_CONFIG_PROVIDERS: tuple[str, ...] = (
     "openrouter-native",
 )
 
+# Keyed (BYO-key) providers: a per-config ``api_key`` is REQUIRED (non-empty) at
+# create time (enforced in ``add_config``). The CLI/subscription providers
+# (claude/openai/gemini/opencode) take an OPTIONAL key. ``api/responses.py``
+# duplicates this membership in a NOTE (it's Layer 0 and can't import models/).
+KEYED_PROVIDERS: tuple[str, ...] = (
+    "claude-api", "openai-api", "gemini-api", "openrouter-api", "openrouter-native",
+)
+
 # Config name: 1–64 chars, alphanumerics + space / underscore / hyphen.
 NAME_RE = re.compile(r"^[A-Za-z0-9 _-]{1,64}$")
 
@@ -102,7 +110,14 @@ def _validate_provider(provider: object) -> None:
 
 
 def _to_wire(entry: dict) -> dict:
-    """Normalize a stored entry to the canonical wire shape (all 6 keys)."""
+    """Normalize a stored entry to the canonical wire shape (client-facing).
+
+    The raw ``api_key`` is write-only and NEVER emitted — it is replaced by the
+    derived ``api_key_set`` boolean. This is the single redaction point every
+    client-facing read (GET list, create/patch return, ``redact_model_configs``)
+    flows through. The runner-facing AGENT_SETTINGS_CHANGE broadcast deliberately
+    ships the RAW stored dicts (not this shape) because the runner needs the key.
+    """
     return {
         "name": entry.get("name"),
         "provider": entry.get("provider"),
@@ -110,6 +125,7 @@ def _to_wire(entry: dict) -> dict:
         "base_url": entry.get("base_url") or None,
         "source": entry.get("source") or "manual",
         "created_at": entry.get("created_at") or _now_iso(),
+        "api_key_set": bool(entry.get("api_key")),
     }
 
 
@@ -130,25 +146,58 @@ def list_configs(card: dict) -> tuple[list[dict], Optional[str]]:
     return configs, default
 
 
-def resolve(card: dict, name: Optional[str]) -> Optional[dict]:
-    """Resolve an override to a config dict.
+def resolve_raw(card: dict, name: Optional[str]) -> Optional[dict]:
+    """Resolve an override to the RAW stored config dict — ``api_key`` intact.
 
-    Returns the config matching ``name`` (case-insensitive); if ``name`` is
-    falsy or unknown, falls back to the default config; if there is no default,
-    returns None. Never raises — a stale selector value degrades to the default
-    rather than breaking a turn.
+    Same fallback semantics as :func:`resolve` (explicit ``name`` → default →
+    None; never raises), but returns a copy of the stored entry verbatim instead
+    of the redacted wire shape. This is the sanctioned raw-key accessor for the
+    RUNNER-side resolution paths that must feed the per-config BYO key to the
+    provider at invoke time: ``effective_local_settings`` (default path) and
+    ``Agent._build_override_cli`` (per-request path). Every CLIENT-facing read
+    MUST use :func:`resolve` / ``_to_wire`` instead so the raw key stays redacted.
     """
     configs = _get_list(card)
     if name:
         match = next((c for c in configs if _name_eq(c.get("name"), name)), None)
         if match is not None:
-            return _to_wire(match)
+            return dict(match)
     default = card.get("default_model_config_name")
     if default:
         match = next((c for c in configs if _name_eq(c.get("name"), default)), None)
         if match is not None:
-            return _to_wire(match)
+            return dict(match)
     return None
+
+
+def resolve(card: dict, name: Optional[str]) -> Optional[dict]:
+    """Resolve an override to a config dict in the redacted wire shape.
+
+    Returns the config matching ``name`` (case-insensitive); if ``name`` is
+    falsy or unknown, falls back to the default config; if there is no default,
+    returns None. Never raises — a stale selector value degrades to the default
+    rather than breaking a turn. The raw ``api_key`` is stripped (replaced by
+    ``api_key_set``) — use :func:`resolve_raw` for the runner paths that need the
+    key at invoke time.
+    """
+    match = resolve_raw(card, name)
+    return _to_wire(match) if match is not None else None
+
+
+def redact_model_configs(configs: object) -> list[dict]:
+    """Return client-safe copies of stored ``model_configs``.
+
+    Each entry is normalized to the canonical wire shape via ``_to_wire`` — the
+    raw ``api_key`` is stripped and replaced by ``api_key_set``. EVERY client-
+    facing surface that echoes stored configs (the ``AgentResponse`` read path
+    used by GET /agents, /auth/me, the PUT/PATCH returns) MUST pass through this.
+    The runner-targeted AGENT_SETTINGS_CHANGE broadcast deliberately does NOT —
+    the runner needs the raw key to invoke a keyed provider. Tolerates a
+    non-list / malformed input (returns an empty list / skips non-dict entries).
+    """
+    if not isinstance(configs, list):
+        return []
+    return [_to_wire(c) for c in configs if isinstance(c, dict)]
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +215,15 @@ def add_config(card: dict, cfg: dict, *, source: str = "manual") -> dict:
     _validate_name(name)
     _validate_provider(provider)
 
+    # Presence-only, provider-aware key requirement (Option A, owner-locked): the
+    # BYO-key providers MUST carry a non-empty ``api_key``; CLI providers may omit
+    # it. A ValueError here surfaces as the single-string 422
+    # ``{"detail": "api_key is required for provider '<p>'"}`` via the route.
+    api_key = cfg.get("api_key")
+    has_key = bool(api_key and str(api_key).strip())
+    if provider in KEYED_PROVIDERS and not has_key:
+        raise ValueError(f"api_key is required for provider '{provider}'")
+
     configs = _get_list(card)
     if any(_name_eq(c.get("name"), name) for c in configs):
         raise DuplicateConfigError(f"a config named {name!r} already exists")
@@ -178,6 +236,10 @@ def add_config(card: dict, cfg: dict, *, source: str = "manual") -> dict:
         "source": source,
         "created_at": cfg.get("created_at") or _now_iso(),
     }
+    # Store the raw key on the entry (disk) only when non-empty. Never surfaced by
+    # ``_to_wire``; the runner reads it off the mirrored dict at invoke time.
+    if has_key:
+        entry["api_key"] = api_key
     configs.append(entry)
     card["model_configs"] = configs
     if not card.get("default_model_config_name"):
@@ -190,7 +252,9 @@ def update_config(card: dict, name: str, patch: dict) -> dict:
 
     ``patch`` carries only the fields the client provided (``model``/``base_url``
     may be explicitly null to clear). ``source`` / ``created_at`` are read-only
-    and never patched. Raises ConfigNotFoundError if ``name`` is absent, or
+    and never patched. ``api_key`` is TRI-STATE: absent from ``patch`` → the
+    stored key is left untouched; a non-empty value → set/replace; ``""``/``None``
+    → clear the stored key. Raises ConfigNotFoundError if ``name`` is absent, or
     DuplicateConfigError if a rename collides with another config.
     """
     configs = _get_list(card)
@@ -222,6 +286,11 @@ def update_config(card: dict, name: str, patch: dict) -> dict:
         current["model"] = patch["model"] or None
     if "base_url" in patch:
         current["base_url"] = patch["base_url"] or None
+    if "api_key" in patch:  # tri-state: only when the client explicitly sent it
+        if patch["api_key"] and str(patch["api_key"]).strip():
+            current["api_key"] = patch["api_key"]  # set / replace
+        else:
+            current.pop("api_key", None)  # "" or None → clear
 
     configs[idx] = current
     card["model_configs"] = configs
@@ -271,16 +340,31 @@ def effective_local_settings(card: dict) -> dict:
 
     Returns a patch to splat over ``card["local_settings"]`` so the existing
     startup + AGENT_SETTINGS_CHANGE paths keep resolving the current default's
-    provider/model/base_url. Always returns all three keys (None when there is
-    no default) so switching away from a base_url config clears the stale value.
+    provider/model/base_url AND its BYO ``api_key``. Always returns all four keys
+    (None when there is no default / no key) so switching away from a base_url or
+    keyed config clears the stale value.
+
+    ``llm_api_key`` carries the default config's RAW key so ``cli_factory``'s
+    ``_resolve_api_key`` (which reads ``local_settings.llm_api_key``) feeds it to
+    a ``-api`` provider at invoke time. It is shipped RAW only on the runner-
+    targeted AGENT_SETTINGS_CHANGE broadcast and is stripped from every client
+    read by ``persistable._strip_legacy_llm_api_key`` — so the key never leaks to
+    a browser while the runner still resolves it. Uses ``resolve_raw`` (not the
+    redacted ``resolve``) precisely because the raw key is needed here.
     """
-    cfg = resolve(card, None)
+    cfg = resolve_raw(card, None)
     if cfg is None:
-        return {"llm_provider": None, "llm_model": None, "llm_base_url": None}
+        return {
+            "llm_provider": None,
+            "llm_model": None,
+            "llm_base_url": None,
+            "llm_api_key": None,
+        }
     return {
         "llm_provider": cfg.get("provider"),
         "llm_model": cfg.get("model"),
         "llm_base_url": cfg.get("base_url"),
+        "llm_api_key": cfg.get("api_key"),
     }
 
 

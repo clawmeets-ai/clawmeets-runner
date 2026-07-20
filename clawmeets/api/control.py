@@ -133,6 +133,12 @@ class AgentSettingsChangePayload(BaseModel):
     configs (model-selector revamp) so the runner mirrors them onto its
     self-card — needed to resolve a per-request ``model_config_name`` override.
     ``None`` ⇒ unchanged in this envelope (leave the runner's copy intact).
+
+    SECURITY: ``model_configs`` entries carry each config's write-only, RAW
+    ``api_key`` — this envelope is delivered ONLY to the agent's own runner
+    (``ws_hub.send_to(agent.id)``), which needs the key to invoke a keyed
+    provider. It must NEVER be forwarded to browser/user clients; those read the
+    redacted shape over HTTP (``redact_model_configs`` → ``api_key_set`` only).
     """
     # protected_namespaces=() so ``model_config*`` fields don't collide with
     # Pydantic's ``model_`` protected namespace.

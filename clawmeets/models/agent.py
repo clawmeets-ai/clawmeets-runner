@@ -1100,16 +1100,23 @@ class Agent(PersistableParticipant):
         if factory is None:
             return None
         card = self._runner_self_card()
-        # resolve() falls back to the default config for an unknown/stale name,
-        # so cfg is None only when the card has no default at all — nothing to
-        # honor, so fall back to model_ctx.cli.
-        cfg = _model_config.resolve(card, model_config_name)
+        # resolve_raw() falls back to the default config for an unknown/stale
+        # name, so cfg is None only when the card has no default at all — nothing
+        # to honor, so fall back to model_ctx.cli. We use resolve_raw (not the
+        # redacted resolve) because we need the config's own RAW api_key below.
+        cfg = _model_config.resolve_raw(card, model_config_name)
         if cfg is None:
             return None
         settings = dict(card.get("local_settings") or {})
         settings["llm_provider"] = cfg.get("provider")
         settings["llm_model"] = cfg.get("model")
         settings["llm_base_url"] = cfg.get("base_url")
+        # Feed the SELECTED config's own BYO key to the provider builder. This
+        # overrides any default-config key already mirrored onto local_settings
+        # so a NON-default selection uses ITS key, not the default's. None for a
+        # keyless CLI config, which the factory treats as "no BYO key" (env-var
+        # fallback for -api providers). The raw key never leaves the runner.
+        settings["llm_api_key"] = cfg.get("api_key")
         try:
             provider = factory(settings)
         except Exception as e:  # noqa: BLE001 — surface, don't silently downgrade

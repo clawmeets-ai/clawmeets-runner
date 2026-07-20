@@ -20,9 +20,16 @@ from pydantic import BaseModel, ConfigDict, Field
 # as a Literal so a bad ``provider`` yields a Pydantic list-shape 422.
 _CONFIG_PROVIDER = Literal[
     "claude", "openai", "gemini", "opencode",
-    "claude-api", "openai-api", "gemini-api", "openrouter-api",
+    "claude-api", "openai-api", "gemini-api", "openrouter-api", "openrouter-native",
 ]
 _CONFIG_NAME_PATTERN = r"^[A-Za-z0-9 _-]+$"
+# NOTE: a per-config ``api_key`` is REQUIRED (non-empty) for the keyed (BYO-key)
+# providers (``*-api`` / ``openrouter-native``) and OPTIONAL for the CLI providers
+# (claude/openai/gemini/opencode). That check lives in ``model_config.add_config``
+# (not a Pydantic validator here) so a missing key raises the single-string 422
+# shape ``{"detail": "api_key is required for provider '<p>'"}`` via the route's
+# ValueError→HTTPException(422) path — a model_validator would emit the wrong
+# Pydantic list-shape detail.
 
 from clawmeets.sync.changelog import ChangelogEntry
 
@@ -62,10 +69,10 @@ class AgentResponse(BaseModel):
     default_invitable_agents: list[str] = Field(default_factory=list)
     default_invitable_teams: list[str] = Field(default_factory=list)
     local_settings: dict = Field(default_factory=dict)  # knowledge_dir, llm_provider, llm_model
-    # Write-only API-key indicator. The raw ``llm_api_key`` is REDACTED out of
-    # ``local_settings`` above (never leaves the server); this derived boolean is
-    # the only thing read paths expose — True iff a non-empty key is stored.
-    llm_api_key_set: bool = False
+    # NOTE: the agent-level API key was RETIRED — keys now live per model config
+    # (``model_configs[].api_key``, write-only, surfaced only as ``api_key_set``).
+    # Any legacy ``local_settings.llm_api_key`` is stripped from this read path
+    # (``_strip_legacy_llm_api_key``); there is no agent-level key field anymore.
     # Named model configs + designated default (model-selector revamp). Carried
     # on the response so the runner can reconcile them onto its self-card and the
     # frontend settings page can render the list. Configs are ModelConfig wire
@@ -80,9 +87,10 @@ class ModelConfig(BaseModel):
     """One named model config (canonical wire shape).
 
     Identity/key = ``name`` (unique per agent). ``source`` and ``created_at`` are
-    server-stamped and read-only. There is no ``id``, per-config ``is_default``,
-    ``api_key``, or ``output_mode`` — the frontend derives ``isDefault`` from the
-    list response's ``default`` field.
+    server-stamped and read-only. The raw per-config ``api_key`` is write-only and
+    NEVER returned — read paths expose only ``api_key_set`` (True iff a non-empty
+    key is stored). The frontend derives ``isDefault`` from the list response's
+    ``default`` field.
     """
     model_config = ConfigDict(protected_namespaces=())  # allow a field named "model"
 
@@ -92,6 +100,7 @@ class ModelConfig(BaseModel):
     base_url: Optional[str] = None
     source: str = "manual"  # "auto" (registration probe) | "manual"
     created_at: datetime
+    api_key_set: bool = False  # write-only indicator; True iff a raw key is stored
 
 
 class ModelConfigCreate(BaseModel):
@@ -106,6 +115,9 @@ class ModelConfigCreate(BaseModel):
     provider: _CONFIG_PROVIDER
     model: Optional[str] = None
     base_url: Optional[str] = None
+    # Write-only secret. REQUIRED (non-empty) for keyed providers, OPTIONAL for
+    # CLI providers — enforced in ``model_config.add_config`` (single-string 422).
+    api_key: Optional[str] = None
 
 
 class ModelConfigPatch(BaseModel):
@@ -123,6 +135,10 @@ class ModelConfigPatch(BaseModel):
     provider: Optional[_CONFIG_PROVIDER] = None
     model: Optional[str] = None
     base_url: Optional[str] = None
+    # Write-only secret, TRI-STATE (driven by ``model_dump(exclude_unset=True)``):
+    # field OMITTED → leave the stored key unchanged; non-empty string → set/replace;
+    # empty string "" (or null) → clear the stored key. Applied in ``update_config``.
+    api_key: Optional[str] = None
 
 
 class ModelConfigList(BaseModel):
