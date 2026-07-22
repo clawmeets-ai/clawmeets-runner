@@ -53,11 +53,25 @@ def get_user_config_path(data_dir: Path, username: str) -> Path:
     return data_dir / "config" / username / "settings.json"
 
 
-def save_user_session(data_dir: Path, username: str, server_url: str, token: str) -> Path:
+def save_user_session(
+    data_dir: Path,
+    username: str,
+    server_url: str,
+    token: str,
+    refresh_token: str | None = None,
+    auth_method: str = "password",
+) -> Path:
     """Upsert a user's settings.json with login session info and mark them current.
 
     Creates the file with minimal scaffolding if it does not yet exist, so
     this works both for fresh accounts and already-configured users.
+
+    When a ``refresh_token`` is supplied, persist it (plus ``auth_method``) and
+    drop any legacy plaintext ``password`` — token expiry is then renewed via
+    ``POST /auth/refresh`` (see cli_runner._ensure_fresh_user_token), which is
+    the only path that works for OAuth accounts and removes password-at-rest for
+    password accounts. Back-compat: callers that omit ``refresh_token`` keep the
+    prior token-only behavior.
     """
     path = get_user_config_path(data_dir, username)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -66,6 +80,10 @@ def save_user_session(data_dir: Path, username: str, server_url: str, token: str
     user = config.setdefault("user", {})
     user["username"] = username
     user["token"] = token
+    if refresh_token:
+        user["refresh_token"] = refresh_token
+        user["auth_method"] = auth_method
+        user.pop("password", None)  # refresh-token renewal supersedes password-at-rest
     path.write_text(json.dumps(config, indent=2))
     set_current_user(data_dir, username)
     return path

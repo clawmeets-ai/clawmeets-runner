@@ -40,6 +40,7 @@ import websockets
 from clawmeets.api.responses import AgentRegistrationResponse
 from clawmeets.api.control import ControlEnvelope, ControlMessageType
 from clawmeets.api.client import ClawMeetsClient
+from clawmeets import cli_oauth
 from clawmeets.cli_lifecycle import (
     clear_user_token,
     get_current_user,
@@ -1687,8 +1688,25 @@ def _create_dispatch_callback() -> callable:
 
 @user_app.command("login")
 def user_login(
-    username: str = typer.Argument(..., help="Username"),
-    password: str = typer.Argument(..., help="Password"),
+    username: Optional[str] = typer.Argument(None, help="Username (password login only)"),
+    password: Optional[str] = typer.Argument(None, help="Password (password login only; omit to be prompted)"),
+    provider: str = typer.Option(
+        "password", "--provider",
+        help="Login method: 'password' (default), 'google', or 'github'. "
+             "google/github open the browser OAuth flow — required for accounts "
+             "created through 'Continue with Google/GitHub'.",
+    ),
+    no_browser: bool = typer.Option(
+        False, "--no-browser",
+        help="Headless OAuth (--provider google|github): print the URL and paste "
+             "the code back instead of opening a browser + loopback listener "
+             "(SSH / containers).",
+    ),
+    port: int = typer.Option(
+        0, "--port",
+        help="Loopback port for the OAuth browser redirect (--provider "
+             "google|github; 0 = ephemeral).",
+    ),
     server: str = typer.Option(DEFAULT_SERVER, "--server", "-s"),
     save: bool = typer.Option(
         True, "--save/--no-save",
@@ -1704,23 +1722,85 @@ def user_login(
 ):
     """Login as a user. Saves the session by default.
 
-    By default the token is written to ~/.clawmeets/config/{username}/settings.json
-    and the user is marked current_user, so other `clawmeets` commands find them
-    without re-authenticating; only a confirmation line is printed.
+    One flag selects the method (`--provider`, default `password`):
+      - password: `clawmeets user login <username> [<password>]`
+                  the password is prompted (hidden) when omitted, keeping it out
+                  of shell history.
+      - OAuth:    `clawmeets user login --provider google|github`
+                  opens the browser (or `--no-browser` to paste a code) and logs
+                  in the Google/GitHub account, the same flow as the web app.
+
+    By default the token + refresh token are written to
+    ~/.clawmeets/config/{username}/settings.json and the user is marked
+    current_user, so other `clawmeets` commands find them without
+    re-authenticating; only a confirmation line is printed. Token expiry is
+    renewed silently via the saved refresh token (works for OAuth accounts,
+    which have no password).
 
     Pass --no-save to skip persistence and print the raw JWT to stdout instead —
     use this for shell pipelines that capture the token, e.g.
     `TOKEN=$(clawmeets user login alice pw --no-save)`.
-
-    (`--save` is still accepted as a no-op alias for one release so existing
-    scripts don't break; it now matches the default.)
     """
-    with _http(server) as client:
-        result = _login_request(client, username, password)
+    provider = (provider or "password").lower()
+    if provider not in ("password", "google", "github"):
+        typer.echo(
+            "Error: --provider must be 'password', 'google', or 'github'.", err=True
+        )
+        raise typer.Exit(1)
+
+    if provider == "password":
+        if no_browser or port:
+            typer.echo(
+                "Error: --no-browser/--port only apply to --provider google|github.",
+                err=True,
+            )
+            raise typer.Exit(1)
+        if not username:
+            typer.echo("Error: username is required for password login.", err=True)
+            raise typer.Exit(1)
+        if password is None:
+            # Hidden prompt keeps the password out of shell history.
+            password = typer.prompt("Password", hide_input=True)
+        with _http(server) as client:
+            result = _login_request(client, username, password)
+        auth_method = "password"
+    else:
+        if password is not None:
+            typer.echo(
+                f"Error: --provider {provider} takes no password argument "
+                "(the browser handles the credential).", err=True,
+            )
+            raise typer.Exit(1)
+        with _http(server) as client:
+            try:
+                if no_browser:
+                    result = cli_oauth.login_via_paste(
+                        client, provider, invite=None, username=username, echo=typer.echo
+                    )
+                else:
+                    result = cli_oauth.login_via_browser(
+                        client, provider, invite=None, port=port, username=username
+                    )
+            except cli_oauth.CliOAuthError as e:
+                typer.echo(f"Error: {e}", err=True)
+                raise typer.Exit(1) from e
+        auth_method = "oauth"
+
     token = _require_access_token(result)
+    refresh = result.get("refresh_token")
     if save:
-        path = save_user_session(Path(data_dir).expanduser(), username, _server_url(server), token)
-        typer.echo(f"Logged in as {username}. Session saved to {path}.")
+        # OAuth callers may pass no username; the server's login body carries it.
+        resolved_username = username or ((result.get("user") or {}).get("username"))
+        if not resolved_username:
+            typer.echo(
+                "Error: could not determine username from the login response.", err=True
+            )
+            raise typer.Exit(1)
+        path = save_user_session(
+            Path(data_dir).expanduser(), resolved_username, _server_url(server), token,
+            refresh_token=refresh, auth_method=auth_method,
+        )
+        typer.echo(f"Logged in as {resolved_username}. Session saved to {path}.")
     else:
         typer.echo(token)
 
@@ -3204,13 +3284,14 @@ def reflection_show(
 # SKILL.md.
 
 def _ensure_fresh_user_token(server_url: str, data_dir: Path, username: str, current_token: str) -> str:
-    """Verify the saved JWT still works; auto-refresh from saved password if expired.
+    """Verify the saved JWT still works; silently renew it when expired.
 
-    `clawmeets user login` saves both the JWT and the password into
-    settings.json (saving is the default). JWTs eventually expire; rather than
-    telling users to manually
-    re-login, we silently re-issue using the saved password and persist the new
-    token.
+    Renewal prefers the saved **refresh token** (`POST /auth/refresh`) — the
+    only path that works for OAuth accounts (which have no password) and the one
+    `clawmeets user login` now persists. A legacy session that predates the
+    refresh-token switch (a stored plaintext `password`, no `refresh_token`) is
+    still honored via a password re-login and self-upgraded to a refresh token
+    (dropping the password) on success, so nobody is forced to re-authenticate.
     """
     with httpx.Client(base_url=server_url, timeout=30) as c:
         ping = c.get("/auth/user/me", headers={"Authorization": f"Bearer {current_token}"})
@@ -3221,7 +3302,8 @@ def _ensure_fresh_user_token(server_url: str, data_dir: Path, username: str, cur
     if not cfg_path.exists():
         typer.echo(
             f"Error: session expired and no saved config at {cfg_path}.\n"
-            f"Run `clawmeets user login {username} <password>` and retry.",
+            f"Run `clawmeets user login {username} <password>` "
+            f"(or `--provider google|github`) and retry.",
             err=True,
         )
         raise typer.Exit(1)
@@ -3230,26 +3312,45 @@ def _ensure_fresh_user_token(server_url: str, data_dir: Path, username: str, cur
     except (json.JSONDecodeError, OSError):
         typer.echo(f"Error: settings.json at {cfg_path} is corrupt; can't refresh.", err=True)
         raise typer.Exit(1)
-    password = (cfg.get("user") or {}).get("password")
-    if not password:
+
+    user_cfg = cfg.get("user") or {}
+    new_token: str | None = None
+    new_refresh: str | None = None
+
+    refresh = user_cfg.get("refresh_token")
+    if refresh:
+        with httpx.Client(base_url=server_url, timeout=30) as c:
+            resp = c.post("/auth/refresh", json={"refresh_token": refresh})
+        if resp.status_code == 200:
+            body = resp.json()
+            new_token = body.get("access_token")
+            new_refresh = body.get("refresh_token")
+
+    if not new_token:
+        # Legacy fallback: a pre-refresh-token session with a stored password.
+        password = user_cfg.get("password")
+        if password:
+            with httpx.Client(base_url=server_url, timeout=30) as c:
+                resp = c.post("/auth/login", json={"username": username, "password": password})
+            if resp.status_code == 200:
+                body = resp.json()
+                new_token = body.get("access_token")
+                new_refresh = body.get("refresh_token")
+
+    if not new_token:
+        method = user_cfg.get("auth_method", "password")
+        relogin = "clawmeets user login --provider google" if method == "oauth" else f"clawmeets user login {username} <password>"
         typer.echo(
-            f"Error: session expired and no saved password to refresh with.\n"
-            f"Run `clawmeets user login {username} <password>` and retry.",
+            f"Error: session expired and could not be refreshed.\nRun `{relogin}` and retry.",
             err=True,
         )
         raise typer.Exit(1)
 
-    with httpx.Client(base_url=server_url, timeout=30) as c:
-        resp = c.post("/auth/login", json={"username": username, "password": password})
-    if resp.status_code != 200:
-        typer.echo(f"Error: token refresh failed ({resp.text}).", err=True)
-        raise typer.Exit(1)
-    new_token = resp.json().get("access_token")
-    if not new_token:
-        typer.echo("Error: refresh succeeded but server returned no token.", err=True)
-        raise typer.Exit(1)
-
-    cfg.setdefault("user", {})["token"] = new_token
+    saved = cfg.setdefault("user", {})
+    saved["token"] = new_token
+    if new_refresh:
+        saved["refresh_token"] = new_refresh
+        saved.pop("password", None)  # self-upgrade off password-at-rest
     cfg_path.write_text(json.dumps(cfg, indent=2))
     typer.echo("  (refreshed expired session)")
     return new_token
