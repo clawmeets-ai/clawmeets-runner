@@ -78,7 +78,26 @@ The personal assistant should already exist (run
    - HTTP 4xx fetching the URL → likely a typo in the short name, or the
      server requires auth on the templates endpoint.
 
-6. **Confirm**: "Registered {N} agents: {names}. Run `clawmeets start`
+6. **Recommend skills (batched).** After the workers register, run
+   `clawmeets skill list` once. For each registered worker, read its
+   `description` + `capabilities` from the template's `setup.json` and pick
+   the 2–4 best-fit skills (same matching rule as single-agent). Present the
+   picks as **one summary table** — do not prompt per agent:
+
+   | Agent | Suggested skills | Why |
+   |---|---|---|
+   | research | `deep-research` | multi-source, fact-checked reports |
+   | … | … | … |
+
+   Then ask once: *"Install all / pick per agent / skip?"* On approval,
+   install per worker:
+   ```bash
+   clawmeets skill install "<worker-name>" <skill1> [<skill2> ...]
+   ```
+   Skip any worker with no clear fit. If the run is fully non-interactive
+   (e.g. `--no-personalize`, no user to confirm against), skip this step.
+
+7. **Confirm**: "Registered {N} agents: {names}. Run `clawmeets start`
    to bring them online." If the personalize-trigger DMs were posted,
    add: "Each worker will self-personalize on first connect."
 

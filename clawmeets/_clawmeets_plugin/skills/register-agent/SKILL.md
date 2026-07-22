@@ -115,6 +115,31 @@ up on the next run.
    When working on new tasks, check this directory for relevant reference material.
    ```
 
+4.5 **Recommend skills** (opt-in — do this after `agent register` succeeds,
+    before the final confirm):
+   ```bash
+   clawmeets skill list
+   ```
+   Using the description and capabilities you confirmed in Step 2, pick the
+   **2–4 best-fit skills** — match on each skill's name / summary / tags /
+   description, and skip anything already implied by the agent's built-in
+   capabilities. Present them as an opt-in shortlist, one line of *why* each:
+
+   > *Based on this agent's profile, I'd suggest installing:*
+   > - `<skill>` — <one-line reason>
+   > - `<skill>` — <one-line reason>
+   >
+   > *Want all of these, a subset, or none?*
+
+   On the user's yes, install the accepted set in one call (bare `<name>`
+   from Step 2 — the CLI resolves it via the saved session):
+   ```bash
+   clawmeets skill install "<name>" <skill1> [<skill2> ...]
+   ```
+   If nothing in the catalog is a clear fit, say so and skip — don't pad the
+   list to hit a count. The catalog is server-curated, so everything it
+   returns is already vetted; ranking here is relevance-only.
+
 5. **Confirm**: "Agent '{name}' registered and linked to {current_user}. Run `/clawmeets:start` to start the runner."
 
 ## Error Handling
