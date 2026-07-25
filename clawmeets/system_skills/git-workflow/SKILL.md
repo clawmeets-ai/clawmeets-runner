@@ -1,13 +1,14 @@
 ---
 name: git-workflow
 description: >
-  Your standard workflow for making code changes in the git repo you are bound
-  to. Invoke whenever a task asks you to write, edit, or fix code AND you have a
-  bound repo (the FILES & STATE block shows a "Bound git repo" line and
-  `$CLAWMEETS_AGENT_GIT_URL` is set). Clones the repo into your sandbox, cuts a
-  per-request branch, commits, pushes, and announces the branch so a human can
-  open a PR. Do NOT use the `update_file` action for source code — code lives in
-  git, not in chat-synced files.
+  Your standard workflow for making code changes to the EXISTING codebase in the
+  git repo you are bound to. Invoke whenever a task asks you to write, edit, or
+  fix code AND you have a bound repo (the FILES & STATE block shows a "Bound git
+  repo" line and `$CLAWMEETS_AGENT_GIT_URL` is set). Clones the repo into your
+  sandbox, cuts a per-request branch, and extends the code already there (never
+  scaffold a new/parallel project), commits, pushes, and announces the branch so
+  a human can open a PR. Do NOT use the `update_file` action for source code —
+  code lives in git, not in chat-synced files.
 ---
 
 # Git workflow
@@ -88,10 +89,15 @@ recutting it from base.
 
 ## 4. Read repo conventions, then make changes
 
-Before editing, read `$CLAWMEETS_AGENT_DIR/memory/REPO.md` if it exists — it
-holds the architecture, conventions, and gotchas you've accumulated for this
-repo. Follow them. (You don't write `REPO.md` here; your reflection cycle keeps
-it current.)
+**This repo already contains a working codebase — you are extending it, not
+starting fresh.** Before editing, explore what is already there (`ls`, read the
+README and the relevant entry points) and integrate your change into the
+existing modules, structure, and conventions. Do NOT create a new standalone
+project scaffold alongside the existing code.
+
+Also read `$CLAWMEETS_AGENT_DIR/memory/REPO.md` if it exists — it holds the
+architecture, conventions, and gotchas you've accumulated for this repo. Follow
+them. (You don't write `REPO.md` here; your reflection cycle keeps it current.)
 
 Make your edits inside `$REPO_DIR`.
 

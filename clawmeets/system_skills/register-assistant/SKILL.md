@@ -44,9 +44,10 @@ agent's token and just refreshes local files / settings).
      account-level reflection schedule that consolidates the day's
      activity into `learnings/`. Phrase it lightly: *"What local time
      should your assistant reflect each day? (HH:MM, default 09:00)"*
-   - **Bootstrap interview** (default yes): a one-shot interview that
-     populates `USER.md` from your public profile + answers. Skip with
-     `--no-personalize` only if the user asks to suppress it.
+   - **Bootstrap interview** (default no — opt-in): a one-shot interview
+     that populates `USER.md` from your public profile + answers. Enable
+     with `--auto-personalize` only if the user wants it to run on first
+     launch; otherwise it stays reachable via the DM's **Personalize** button.
 
 3. **Register the assistant**:
    ```bash
@@ -65,11 +66,13 @@ agent's token and just refreshes local files / settings).
    - Upserts the account-level reflection schedule (`--reflect-timezone`
      defaults to your host TZ; pass it explicitly only if you want a
      different timezone).
-   - Posts `<!-- clawmeets:personalize-trigger -->` into your assistant DM
-     so the assistant variant of `/clawmeets:personalize` kicks off USER.md
-     on first run.
+   - With `--auto-personalize`: posts `<!-- clawmeets:personalize-trigger -->`
+     into your assistant DM so the assistant variant of
+     `/clawmeets:personalize` kicks off USER.md on first run. Off by default.
 
-   Add `--no-personalize` if the user opted out of the interview.
+   Add `--auto-personalize` only if the user wants the interview to run on
+   first launch; otherwise tell them to click **Personalize** in the DM when
+   ready.
 
 4. **Handle errors**:
    - "not logged in" → run `/clawmeets:login` and retry.

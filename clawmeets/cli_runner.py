@@ -3734,9 +3734,10 @@ def assistant_register(
              "calls) or 'native' (single-shot JSON — for local models). Omit for "
              "the default (native on base_url).",
     ),
-    no_personalize: bool = typer.Option(
-        False, "--no-personalize",
-        help="Skip posting the personalize-trigger DM after registering.",
+    auto_personalize: bool = typer.Option(
+        False, "--auto-personalize",
+        help="Post the personalize-trigger DM after registering so the "
+             "assistant runs the USER.md interview on first run. Off by default.",
     ),
     self_learning_daily_at: str = typer.Option(
         "09:00", "--self-learning-daily-at", "--reflect-daily-at",
@@ -3760,13 +3761,15 @@ def assistant_register(
          and `card.json` locally.
       4. Upsert the account-level reflection schedule
          (cron derived from `--self-learning-daily-at` + `--reflect-timezone`).
-      5. Unless `--no-personalize`: post `<!-- clawmeets:personalize-trigger -->`
+      5. If `--auto-personalize`: post `<!-- clawmeets:personalize-trigger -->`
          as a user message into your assistant's DM so the
          `/clawmeets:personalize` skill (assistant variant) kicks off USER.md.
+         Off by default — otherwise personalize on demand via the DM's
+         **Personalize** button.
 
     Example:
         clawmeets assistant register --llm-provider=claude --self-learning-daily-at=03:00
-        clawmeets assistant register -u alice -p secret --no-personalize \\
+        clawmeets assistant register -u alice -p secret --auto-personalize \\
             --self-learning-daily-at 14:00 --reflect-timezone America/Los_Angeles \\
             --llm-provider gemini
     """
@@ -3859,7 +3862,7 @@ def assistant_register(
             f"  Reflection schedule set (next fire: {schedule.get('next_fire_at')})"
         )
 
-        if not no_personalize:
+        if auto_personalize:
             if _post_dm_marker(client, token, agent_name, _PERSONALIZE_TRIGGER_MARKER + "\n"):
                 typer.echo(
                     f"  Posted personalize-trigger DM to '{agent_name}'."
@@ -4046,21 +4049,22 @@ def agent_team_register(
             "in setup.json."
         ),
     ),
-    no_personalize: bool = typer.Option(
-        False, "--no-personalize",
-        help="Skip the personalize-trigger DM fan-out after registering.",
+    auto_personalize: bool = typer.Option(
+        False, "--auto-personalize",
+        help="Fan out personalize-trigger DMs to each worker after "
+             "registering so they self-personalize. Off by default.",
     ),
 ):
     """Bulk-register a team of worker agents from a setup.json template.
 
-    For each registered worker, by default a personalize-trigger DM is posted
-    into the worker's per-agent DM project (`user-communication`) so the
-    worker self-personalizes on its own runner. Pass `--no-personalize` to
-    skip the fan-out.
+    Personalize-trigger DMs are posted into each registered worker's per-agent
+    DM project (`user-communication`) only when `--auto-personalize` is passed,
+    so the workers self-personalize on their own runners. Off by default —
+    otherwise wake each worker on demand via its DM's **Personalize** button.
 
     Example:
         clawmeets agent-team register https://example.com/team.json
-        clawmeets agent-team register ./team.json -u alice -p secret --no-personalize
+        clawmeets agent-team register ./team.json -u alice -p secret --auto-personalize
     """
     if llm_provider is not None and llm_provider.lower() not in _VALID_LLM_PROVIDERS:
         typer.echo(
@@ -4126,7 +4130,7 @@ def agent_team_register(
             if result is not None:
                 registered_names.append(result.get("agent_name") or entry["name"])
 
-        if not no_personalize and registered_names:
+        if auto_personalize and registered_names:
             typer.echo("\n  Posting personalize-trigger DMs...")
             for worker_name in registered_names:
                 if _post_dm_marker(

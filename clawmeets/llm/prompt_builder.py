@@ -200,9 +200,10 @@ def _build_runtime_context(
         )
     if git_url:
         lines.append(
-            f"- Bound git repo (your code goes here): {git_url}  "
-            "(clone it into ./repos/ under your sandbox, branch per request, commit & push; "
-            "repo conventions in memory/REPO.md)"
+            f"- Bound git repo (EXISTING codebase — build on it): {git_url}  "
+            "(for any coding task, clone it into ./repos/ under your sandbox and extend the code "
+            "already there — never scaffold a new/parallel project; branch per request, commit & "
+            "push; repo conventions in memory/REPO.md)"
         )
     if knowledge_dirs:
         kd = ", ".join(str(d) for d in knowledge_dirs)
@@ -269,6 +270,30 @@ Your working directory is a sandbox. To share a file with the chatroom:
   2. Emit update_file with the same relative path; the server syncs it to
      all participants.
 """
+
+
+# ---------------------------------------------------------------------------
+# Shared turn-continuity rule
+# ---------------------------------------------------------------------------
+
+# Injected into the NON-DELEGATING role contracts only (worker, DM-worker,
+# owned-DM coordinator). Those surfaces have action schema
+# ``["reply", "update_file"]`` and no re-wake path — nothing invokes them again
+# on their own. It forbids ONLY self-resumption promises ("I'll go do X and
+# update you"); it deliberately blesses the two legitimate cross-turn patterns
+# (asking the user and continuing on their reply; a worker reporting BLOCKED)
+# and intra-turn parallel/background work. Regular / FD-tunnel coordinators are
+# left out: they DO get re-woken via BATCH_COMPLETE, so their promise is real.
+_ACT_THIS_TURN = """== NOTHING RESUMES YOU AUTOMATICALLY ==
+You run only when a message arrives; nothing wakes you to continue work you
+started on your own. If you NEED input from someone to proceed — a clarifying
+answer, a decision, missing info — ASK for it and stop; their reply brings you
+back to continue. That is fine. But if the work only needs YOU, FINISH it this
+turn and share the result. Never promise to keep working on your own and report
+later ("I'll start on this and update you when it's done" / "working on it, back
+shortly") — no such follow-up turn is coming, so the work would silently never
+happen. (Running tasks in parallel within a turn is fine — just wait for them
+before you reply.)"""
 
 
 # ---------------------------------------------------------------------------
@@ -478,7 +503,7 @@ If CANNOT_COMPLETE, add **Reason** and **Recommendation**.
 - Do NOT post to user-communication (coordinator handles user contact).
 - Do NOT ask the coordinator questions — instead report a BLOCKED status
   with your proposed assumption and the risk. Avoids round-trips.
-- Focus on your assigned task only."""
+- Focus on your assigned task only.""" + "\n\n" + _ACT_THIS_TURN
 
     def _dm_role_contract(self) -> str:
         return """== DIRECT MESSAGE CONVERSATION ==
@@ -500,7 +525,7 @@ you directly within your area of expertise.
 == WHAT NOT TO DO ==
 - Do NOT create or reference PLAN.md — it does not apply here.
 - Do NOT frame your work as "Milestone 1 / Milestone 2 …".
-- Do NOT ask reflexive clarifying questions. If actionable, act."""
+- Do NOT ask reflexive clarifying questions. If actionable, act.""" + "\n\n" + _ACT_THIS_TURN
 
     def build_prompt(
         self,
@@ -884,7 +909,7 @@ user-communication is a self-contained request.
 A 1:1 DM is conversational. Spawning a workroom from here produces an
 orphan thread the user can't easily follow. Cross-domain work belongs in
 a dedicated project (which you scope via the proposal flow above); a
-single-domain question belongs in your reply."""
+single-domain question belongs in your reply.""" + "\n\n" + _ACT_THIS_TURN
 
     def _fd_tunnel_dm_role_contract(self) -> str:
         allowlist = self._invitable_agents

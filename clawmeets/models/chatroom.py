@@ -49,7 +49,13 @@ if TYPE_CHECKING:
     from .context import ModelContext
 
 
-_MENTION_RE = re.compile(r'(?:^|(?<=[^a-zA-Z0-9_]))@([a-zA-Z][a-zA-Z0-9_-]*)')
+# A mention is @<handle> at a word boundary. The handle charset mirrors
+# FileUtil.validate_fs_name (used at user/agent registration): [a-zA-Z0-9_-],
+# never a dot. So the trailing negative lookahead `(?!\.[a-zA-Z])` — which
+# skips a domain/TLD suffix like `@clawmeets.ai` — can never clip a real
+# handle. The name class is possessive (`*+`, 3.11+) so the engine can't
+# backtrack into a truncated match (`clawmeet` out of `@clawmeets.ai`).
+_MENTION_RE = re.compile(r'(?:^|(?<=[^a-zA-Z0-9_]))@([a-zA-Z][a-zA-Z0-9_-]*+)(?!\.[a-zA-Z])')
 
 
 class Chatroom(BaseModel):
@@ -211,8 +217,10 @@ class Chatroom(BaseModel):
         """Extract @agent-name mentions from a message in this room.
 
         Returns names without the ``@`` prefix, deduplicated, preserving
-        order of first occurrence. Matches ``@`` only at word boundaries
-        (so ``user@x.com`` is rejected, ``**@agent**`` is accepted).
+        order of first occurrence. Matches ``@`` only at word boundaries and
+        excludes domain/email tokens: both ``user@x.com`` (email local-part)
+        and a bare ``@x.com`` (domain/TLD) are rejected, while ``**@agent**``
+        is accepted. Valid handles never contain a dot (see ``_MENTION_RE``).
         """
         if not content:
             return []

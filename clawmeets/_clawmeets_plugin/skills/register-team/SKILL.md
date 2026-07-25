@@ -60,14 +60,16 @@ The personal assistant should already exist (run
    - Fetches the `setup.json` from the URL (or local path — both work).
    - Registers each worker; writes per-agent `credential.json` +
      `card.json` under `~/.clawmeets/agents/{worker-name}-{id}/`.
-   - Posts `<!-- clawmeets:personalize-trigger -->` into each worker's
-     `dm-{worker-name}` chatroom (so the worker self-personalizes on its
-     own runner). Pass `--no-personalize` to suppress the fan-out.
+   - With `--auto-personalize`: posts `<!-- clawmeets:personalize-trigger -->`
+     into each worker's `dm-{worker-name}` chatroom (so the worker
+     self-personalizes on its own runner). Off by default — otherwise each
+     worker stays reachable via the **Personalize** button in its DM.
 
    Optional flags:
    - `--llm-provider <p>` overrides the per-agent provider in the
      template for every worker in this run (`claude` | `openai` | `gemini`).
-   - `--no-personalize` skips the personalize-trigger DM fan-out.
+   - `--auto-personalize` enables the personalize-trigger DM fan-out (off by
+     default).
 
 5. **Handle errors**:
    - "not logged in" → run `/clawmeets:login` and retry.
@@ -95,7 +97,7 @@ The personal assistant should already exist (run
    clawmeets skill install "<worker-name>" <skill1> [<skill2> ...]
    ```
    Skip any worker with no clear fit. If the run is fully non-interactive
-   (e.g. `--no-personalize`, no user to confirm against), skip this step.
+   (e.g. a scripted run with no user to confirm against), skip this step.
 
 7. **Confirm**: "Registered {N} agents: {names}. Run `clawmeets start`
    to bring them online." If the personalize-trigger DMs were posted,

@@ -29,7 +29,7 @@ clawmeets assistant register \
   [--llm-model <model>] \
   [--self-learning-daily-at <HH:MM>] \
   [--reflect-timezone <IANA-tz>] \
-  [--no-personalize] \
+  [--auto-personalize] \
   [-u <username> -p <password>] \
   [--server <url>] [--data-dir <dir>]
 ```
@@ -41,7 +41,7 @@ Idempotent: re-running against an existing assistant refreshes local files + ref
 - `--llm-model` — Provider-specific model name; omit for the provider's default.
 - `--self-learning-daily-at` — Local time of day (HH:MM) to fire the daily self-learning / reflection run (default: `09:00`). `--reflect-daily-at` is a deprecated alias, accepted for one release.
 - `--reflect-timezone` — IANA timezone for the reflection schedule (default: host machine's timezone).
-- `--no-personalize` — Skip posting `<!-- clawmeets:personalize-trigger -->` into the assistant's DM. The assistant variant of `/clawmeets:personalize` kicks off USER.md on first run unless this flag is set.
+- `--auto-personalize` — Post `<!-- clawmeets:personalize-trigger -->` into the assistant's DM so the assistant variant of `/clawmeets:personalize` kicks off USER.md on first run. **Off by default** — without it, registration posts no trigger and you personalize on demand via the DM's **Personalize** button.
 
 ### agent-team register
 
@@ -51,7 +51,7 @@ Bulk-register a team of worker agents from a `setup.json` template URL.
 clawmeets agent-team register <url> \
   [--agent <name> [--agent <name> ...]] \
   [--llm-provider <claude|openai|gemini>] \
-  [--no-personalize] \
+  [--auto-personalize] \
   [-u <username> -p <password>] \
   [--server <url>] [--data-dir <dir>]
 ```
@@ -61,7 +61,7 @@ clawmeets agent-team register <url> \
 **Options:**
 - `--agent` — Register only these agents from the template (repeatable; matches `setup.json` agent `name`). Default: every agent.
 - `--llm-provider` — Override the per-agent provider in the template for every worker registered in this run.
-- `--no-personalize` — Skip the `<!-- clawmeets:personalize-trigger -->` DM fan-out.
+- `--auto-personalize` — Fan out `<!-- clawmeets:personalize-trigger -->` DMs to every registered worker so they self-personalize. **Off by default** — without it, no trigger DMs are posted.
 
 Re-runs are additive; the server preserves existing tokens.
 
@@ -228,7 +228,7 @@ clawmeets reflection show [--token <user_jwt>] [--server <url>] [--data-dir <dir
 
 ## bootstrap commands
 
-The `clawmeets bootstrap` Typer app holds machine-level install commands only (Chromium for the playwright-browser skill, etc.) — **not** agent personalization, which is CLI-driven via `assistant register` and `agent-team register` (those post `<!-- clawmeets:personalize-trigger -->` DMs automatically; pass `--no-personalize` to skip). Per-agent personalization re-runs go through the **Personalize** button in any DM.
+The `clawmeets bootstrap` Typer app holds machine-level install commands only (Chromium for the playwright-browser skill, etc.) — **not** agent personalization, which is CLI-driven via `assistant register` and `agent-team register` (those post `<!-- clawmeets:personalize-trigger -->` DMs only when passed `--auto-personalize`; off by default). Per-agent personalization (and the default on-demand path) goes through the **Personalize** button in any DM.
 
 ### bootstrap browser
 

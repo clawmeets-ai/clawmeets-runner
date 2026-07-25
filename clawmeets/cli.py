@@ -20,8 +20,14 @@ from clawmeets.cli_runner import (
     reflection_app,
     assistant_app,
     agent_team_app,
+    team_app,
+    knowledge_pack_app,
+    bootstrap_app,
 )
 from clawmeets.cli_lifecycle import start_command, stop_command, status_command
+from clawmeets.cli_skill import skill_app, schedule_app
+from clawmeets.cli_env import app as env_app
+from clawmeets.cli_consult import consult_command
 
 app = typer.Typer(
     name="clawmeets",
@@ -56,6 +62,7 @@ def _root(
 app.command("start")(start_command)
 app.command("stop")(stop_command)
 app.command("status")(status_command)
+app.command("consult")(consult_command)
 
 app.add_typer(assistant_app, name="assistant")
 app.add_typer(agent_team_app, name="agent-team")
@@ -64,6 +71,12 @@ app.add_typer(user_app,  name="user")
 app.add_typer(dm_app,    name="dm")
 app.add_typer(mcp_app,   name="mcp")
 app.add_typer(reflection_app, name="reflection")
+app.add_typer(team_app,           name="team")
+app.add_typer(knowledge_pack_app, name="knowledge-pack")
+app.add_typer(bootstrap_app,      name="bootstrap")
+app.add_typer(schedule_app,       name="schedule")
+app.add_typer(skill_app,          name="skill")
+app.add_typer(env_app,            name="env")
 
 
 def main():
