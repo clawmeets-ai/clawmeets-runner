@@ -647,12 +647,13 @@ def agent_register(
         None, "--git-url", envvar="CLAWMEETS_AGENT_GIT_URL",
         help="Bind this agent to a git repo (URL or path). Surfaced to the LLM as "
              "$CLAWMEETS_AGENT_GIT_URL; the git-workflow skill clones it into the "
-             "sandbox, branches per request, commits and pushes. Written to card.json "
-             "local_settings.",
+             "sandbox, joins the shared project/<project-slug> branch, commits and "
+             "pushes. Written to card.json local_settings.",
     ),
     git_base_branch: Optional[str] = typer.Option(
         None, "--git-base-branch",
-        help="Branch new work branches are cut from (default: the repo's default branch). "
+        help="Branch the project branch is first cut from (default: the repo's default "
+             "branch); ignored once project/<project-slug> exists on the remote. "
              "Surfaced as $CLAWMEETS_AGENT_GIT_BASE_BRANCH. Written to card.json local_settings.",
     ),
     team: list[str] = typer.Option(
@@ -2275,7 +2276,8 @@ async def _runner_loop(
     }
 
     # Git binding (optional). When set, the git-workflow skill reads these to
-    # clone the repo into the sandbox and branch per request. Empty/unset means
+    # clone the repo into the sandbox and join the shared project branch
+    # (`project/<project-slug>`, one per repo). Empty/unset means
     # the agent does no git at all. Kept on the shared agent_env dict so a
     # settings hot-swap (reactive_loop._apply_local_settings) can update them
     # for the next invocation.

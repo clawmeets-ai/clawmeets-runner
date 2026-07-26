@@ -202,8 +202,8 @@ def _build_runtime_context(
         lines.append(
             f"- Bound git repo (EXISTING codebase — build on it): {git_url}  "
             "(for any coding task, clone it into ./repos/ under your sandbox and extend the code "
-            "already there — never scaffold a new/parallel project; branch per request, commit & "
-            "push; repo conventions in memory/REPO.md)"
+            "already there — never scaffold a new/parallel project; all agents on a project share "
+            "one branch per repo, commit & push; repo conventions in memory/REPO.md)"
         )
     if knowledge_dirs:
         kd = ", ".join(str(d) for d in knowledge_dirs)
@@ -659,6 +659,13 @@ rather than reusing the failed one.
   Workers cannot see files from other work rooms — always include relevant
   findings or deliverable summaries directly in the delegation message.
 - PARALLEL only when truly independent.
+- CODING WORK: agents bound to the SAME repo all push to one shared branch
+  (project/<project-slug>). Do NOT delegate two same-repo agents onto
+  overlapping files in the same wave — they will collide on push. Serialize
+  them across milestones so the second builds on the first's committed code.
+  Agents on DIFFERENT repos are independent and can run in parallel; give
+  each an explicit interface contract in the delegation, because they cannot
+  see each other's code.
 
 You LEAD every room you create. Workers can only reply when YOU @-mention
 them. They cannot @-mention each other. If a room needs multiple turns,

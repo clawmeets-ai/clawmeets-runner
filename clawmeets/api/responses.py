@@ -160,6 +160,41 @@ class AgentSearchResponse(BaseModel):
     limit: int
 
 
+class AdminUserRow(BaseModel):
+    """One row of the admin Users directory (``GET /admin/users``).
+
+    Identity fields mirror ``User.to_dict``; the four counts are derived
+    aggregates computed per request (see ``server/routes/admin_users.py``).
+
+    ``is_admin`` and ``email_verified`` are carried so the client can disable
+    its Impersonate action up front — the impersonation gate blocks admin →
+    admin, and the picker excludes unverified accounts, so offering the action
+    on those rows would only ever produce a 403.
+    """
+    id: str
+    username: str
+    email: Optional[str] = None
+    display_name: Optional[str] = None    # OAuth-only field; None on password accounts
+    created_at: str = ""                  # ISO-8601; "" on rows predating the field
+    is_admin: bool = False
+    email_verified: bool = False
+    agents_created: int = 0               # agent cards with registered_by == id
+    dm_threads: int = 0                   # projects created_by == id, surface == "dm"
+    projects: int = 0                     # projects created_by == id, surface == "regular"
+    agents_in_progress: int = 0           # owned agents outstanding in an open work batch
+
+
+class AdminUserListResponse(BaseModel):
+    """Paginated admin Users directory. Envelope mirrors AgentSearchResponse.
+
+    ``total`` is the match count BEFORE the offset/limit slice.
+    """
+    users: list[AdminUserRow]
+    total: int
+    offset: int
+    limit: int
+
+
 class AgentRegistrationResponse(BaseModel):
     """Flat response from agent registration.
 

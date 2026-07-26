@@ -60,6 +60,7 @@ class ControlMessageType(str, Enum):
     PROJECT_REPORT_SYNC = "project_report_sync"  # Server notifies project participants that the report was upserted / deleted
     DESK_TODO_SYNC = "desk_todo_sync"  # Server notifies the owning user that a desk to-do was captured / patched / published / removed
     DESK_READ_STATE_SYNC = "desk_read_state_sync"  # Server notifies the owning user that a My Desk read-state watermark was upserted
+    DESK_SOP_SYNC = "desk_sop_sync"  # Server notifies the owning user that a desk SOP was created / edited / removed
 
 
 class ChangelogUpdatePayload(BaseModel):
@@ -360,6 +361,22 @@ class DeskTodoSyncPayload(BaseModel):
     id: str | None = None
 
 
+class DeskSopSyncPayload(BaseModel):
+    """Payload for DESK_SOP_SYNC messages.
+
+    Sent server -> the library-owning user whenever their desk SOP list
+    changes — a create, an edit, or a delete. Fanned out to EVERY live
+    session the owner holds (``WSHub.send_to``), so a library edited in one
+    browser tab updates in all the others without a reload. The originating
+    session receives it too; the resulting refetch is idempotent.
+
+    Carries only the action + affected id; the full list is fetched via
+    ``GET /me/desk/sops``, which stays the source of truth.
+    """
+    action: str            # "add" | "patch" | "delete"
+    id: str | None = None
+
+
 class DeskReadStateSyncPayload(BaseModel):
     """Payload for DESK_READ_STATE_SYNC messages.
 
@@ -382,9 +399,21 @@ class DeskReadStateSyncPayload(BaseModel):
 
 
 class ControlEnvelope(BaseModel):
-    """Lightweight WebSocket notification - never carries file content."""
+    """Lightweight WebSocket notification - never carries file content.
+
+    NOTE on ``payload``: this is a plain (non-discriminated) Union, so a
+    payload *constructed* as a model instance keeps its exact type, but a
+    payload *parsed from a dict* resolves to the first member whose shape
+    fits. Structurally identical siblings — today ``DeskTodoSyncPayload`` and
+    ``DeskSopSyncPayload``, both ``{action, id}`` — are therefore not
+    distinguishable on re-parse, and the leftmost wins. This is harmless on
+    the outbound path, which only ever ``model_dump``s (see
+    ``server/routes/websocket.py``), and on the inbound path, which only ever
+    carries HEARTBEAT. Anything that starts re-validating stored envelopes
+    would need a real discriminator first.
+    """
     type: ControlMessageType
-    payload: Union[ChangelogUpdatePayload, AgentStatusChangePayload, ProjectDeletedPayload, SkillSyncPayload, McpSyncPayload, AgentSettingsChangePayload, CancelLLMPayload, ActiveWorkChangePayload, McpAuthUrlForUserPayload, McpAuthCodePayload, SkillAuthUrlForUserPayload, SkillAuthCodePayload, KnowledgePackSyncPayload, AgentRegistryChangePayload, AgentCardUpdatePayload, BriefTabSyncPayload, ProjectReportSyncPayload, DeskTodoSyncPayload, DeskReadStateSyncPayload, dict] = Field(default_factory=dict)
+    payload: Union[ChangelogUpdatePayload, AgentStatusChangePayload, ProjectDeletedPayload, SkillSyncPayload, McpSyncPayload, AgentSettingsChangePayload, CancelLLMPayload, ActiveWorkChangePayload, McpAuthUrlForUserPayload, McpAuthCodePayload, SkillAuthUrlForUserPayload, SkillAuthCodePayload, KnowledgePackSyncPayload, AgentRegistryChangePayload, AgentCardUpdatePayload, BriefTabSyncPayload, ProjectReportSyncPayload, DeskTodoSyncPayload, DeskReadStateSyncPayload, DeskSopSyncPayload, dict] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_required_fields_for_type(self) -> "ControlEnvelope":
@@ -446,4 +475,7 @@ class ControlEnvelope(BaseModel):
         elif self.type == ControlMessageType.DESK_READ_STATE_SYNC:
             if not isinstance(self.payload, DeskReadStateSyncPayload):
                 raise ValueError(f"control message type {self.type} requires DeskReadStateSyncPayload")
+        elif self.type == ControlMessageType.DESK_SOP_SYNC:
+            if not isinstance(self.payload, DeskSopSyncPayload):
+                raise ValueError(f"control message type {self.type} requires DeskSopSyncPayload")
         return self

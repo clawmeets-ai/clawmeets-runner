@@ -2,9 +2,16 @@
 """
 Runner-only CLI entry point for clawmeets package.
 
-Provides only the runner-side commands: agent, user, dm.
-Server-side commands (server, admin, project, chatroom, message, file, generate)
-are available in the full clawmeets package.
+Provides every command group a skill can shell: the runner-side groups (agent,
+user, dm, mcp, skill, …), the client-side resource groups (project, chatroom,
+message, file — pure HTTP, from cli_client), and the integration groups behind
+the hub skills (gmail, gcal, gdrive, browser, …).
+
+Only the genuinely server-side groups are absent — `server` and `admin` need
+uvicorn + clawmeets.server.app, which the wheel does not carry.
+
+Group names here must match clawmeets/cli.py exactly; a skill shelling
+`clawmeets <group>` has no idea which package it landed in.
 """
 from __future__ import annotations
 
@@ -28,6 +35,29 @@ from clawmeets.cli_lifecycle import start_command, stop_command, status_command
 from clawmeets.cli_skill import skill_app, schedule_app
 from clawmeets.cli_env import app as env_app
 from clawmeets.cli_consult import consult_command
+from clawmeets.cli_client import proj_app, room_app, msg_app, file_app
+
+# Integration groups — each is the CLI surface of one hub skill.
+from clawmeets.cli_gmail import app as gmail_app
+from clawmeets.cli_gcal import app as gcal_app
+from clawmeets.cli_gdrive import app as gdrive_app
+from clawmeets.cli_gdrive_write import app as gdrive_write_app
+from clawmeets.cli_browser import app as browser_app
+from clawmeets.cli_caldav import app as caldav_app
+from clawmeets.cli_mailbox import app as mailbox_app
+from clawmeets.cli_media import app as media_app
+from clawmeets.cli_homekit import app as homekit_app
+from clawmeets.cli_osxphotos import app as osxphotos_app
+from clawmeets.cli_database import app as database_app
+from clawmeets.cli_http_api import app as http_api_app
+from clawmeets.cli_brief import app as brief_app
+from clawmeets.cli_todo import app as todo_app
+from clawmeets.cli_dwh import app as dwh_app
+from clawmeets.cli_knowledge_dir import app as knowledge_dir_app
+from clawmeets.cli_etl import app as etl_app
+from clawmeets.cli_website_monitor import app as website_monitor_app
+from clawmeets.cli_om import app as om_app
+from clawmeets.cli_ib import app as ib_app
 
 app = typer.Typer(
     name="clawmeets",
@@ -77,6 +107,35 @@ app.add_typer(bootstrap_app,      name="bootstrap")
 app.add_typer(schedule_app,       name="schedule")
 app.add_typer(skill_app,          name="skill")
 app.add_typer(env_app,            name="env")
+
+# Client-side resource groups (pure HTTP; shelled by the bundled system skills
+# propose-project / manage-project-roster / post-chat-message / *-completion-report).
+app.add_typer(proj_app, name="project")
+app.add_typer(room_app, name="chatroom")
+app.add_typer(msg_app,  name="message")
+app.add_typer(file_app, name="file")
+
+# Integration groups (one per hub skill).
+app.add_typer(gmail_app, name="gmail")
+app.add_typer(gcal_app, name="gcal")
+app.add_typer(gdrive_app, name="gdrive")
+app.add_typer(gdrive_write_app, name="gdrive-write")
+app.add_typer(browser_app, name="browser")
+app.add_typer(caldav_app, name="caldav")
+app.add_typer(mailbox_app, name="mailbox")
+app.add_typer(media_app, name="media")
+app.add_typer(homekit_app, name="homekit")
+app.add_typer(osxphotos_app, name="osxphotos")
+app.add_typer(database_app, name="database")
+app.add_typer(http_api_app, name="http-api")
+app.add_typer(brief_app, name="brief")
+app.add_typer(todo_app, name="todo")
+app.add_typer(dwh_app, name="dwh")
+app.add_typer(knowledge_dir_app, name="knowledge-dir")
+app.add_typer(etl_app, name="etl")
+app.add_typer(website_monitor_app, name="website-monitor")
+app.add_typer(om_app, name="om")
+app.add_typer(ib_app, name="ib")
 
 
 def main():

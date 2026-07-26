@@ -463,6 +463,38 @@ class PersistableParticipant(Participant, ABC):
         return result
 
     @classmethod
+    def list_all_cards(cls, ctx: "ModelContext") -> list[dict]:
+        """Every non-deleted card.json as a raw dict — one read per card, no
+        instances.
+
+        The bulk-read counterpart to :meth:`list_all`. Instance properties go
+        through :meth:`_load_card`, which re-reads ``card.json`` on EVERY
+        access, so aggregating over the whole roster via instances is one file
+        read per property touch. Callers that just need fields (ownership
+        rollups, admin listings) read the dicts once through this method — the
+        same "load each card once and filter in memory" shape :meth:`search`
+        already uses internally.
+
+        Soft-deleted participants (``DELETED-`` dir prefix) and cards missing an
+        ``id`` are skipped, matching :meth:`list_all`. No visibility filtering is
+        applied: this is a raw store read, so callers own their own access
+        control.
+
+        Args:
+            ctx: ModelContext for filesystem operations
+
+        Returns:
+            List of raw card dicts.
+        """
+        cards: list[dict] = []
+        for entry in cls._list_dirs(ctx):
+            data = FileUtil.read(entry / "card.json", "json")
+            if not data or not data.get("id"):
+                continue
+            cards.append(data)
+        return cards
+
+    @classmethod
     def search(
         cls,
         ctx: "ModelContext",

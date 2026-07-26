@@ -39,6 +39,14 @@ _lock = asyncio.Lock()
 
 TODOS_DIR = "desk-todos"
 
+# Distinguishes "key absent from a PATCH body" (leave the stored value
+# untouched) from an explicit JSON ``null`` (clear the field). Used only by
+# ``patch_todo`` for the three-way ``draft_recipient_*`` merge; the route
+# layer detects key presence off the raw request body (see
+# ``server/routes/desk_todos.py``) since a non-serializable sentinel can't be
+# a FastAPI ``Body`` default.
+_UNSET: object = object()
+
 
 class DeskTodoSource(BaseModel):
     """The external nudge a self-captured task came from (Slack/Email/…)."""
@@ -92,6 +100,12 @@ class DeskTodo(BaseModel):
     suggest_agent_id: str | None = None
     suggest_agent_name: str | None = None
     draft_prompt: str | None = None
+    # Recipient the manager picked in the take-over composer, stored alongside
+    # the draft. Both id and name are persisted so the plate pill still labels
+    # correctly after a rename/removal; the frontend re-resolves against the
+    # live roster and falls back if the agent is gone. Null until set.
+    draft_recipient_id: str | None = None
+    draft_recipient_name: str | None = None
     context: str | None = None
     files: list[DeskTodoFileRef] = Field(default_factory=list)
     done_steps: list[str] = Field(default_factory=list)
@@ -238,9 +252,17 @@ async def patch_todo(
     text: str | None = None,
     due: str | None = None,
     draft_prompt: str | None = None,
+    draft_recipient_id: str | None = _UNSET,  # _UNSET → leave untouched
+    draft_recipient_name: str | None = _UNSET,  # None → clear, str → set
     drafted: bool | None = None,
 ) -> DeskTodo | None:
-    """Patch a task in place. Returns the updated task, or None if missing."""
+    """Patch a task in place. Returns the updated task, or None if missing.
+
+    ``draft_recipient_id`` / ``draft_recipient_name`` are three-way: ``_UNSET``
+    (the default, when the caller omits them) leaves the stored value alone,
+    an explicit ``None`` clears it, and a string overwrites it. The older
+    scalar fields collapse absent+None into "untouched" (a ``None`` never
+    clears them)."""
     async with _lock:
         todos = _load(data_dir, owner_user_id)
         target: DeskTodo | None = None
@@ -262,6 +284,10 @@ async def patch_todo(
             target.due = due or None
         if draft_prompt is not None:
             target.draft_prompt = draft_prompt
+        if draft_recipient_id is not _UNSET:
+            target.draft_recipient_id = draft_recipient_id
+        if draft_recipient_name is not _UNSET:
+            target.draft_recipient_name = draft_recipient_name
         if drafted is not None:
             target.drafted = drafted
         target.updated_at = _now()

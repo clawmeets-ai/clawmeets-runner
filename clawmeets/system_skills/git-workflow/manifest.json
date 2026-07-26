@@ -1,6 +1,6 @@
 {
   "audiences": ["worker", "coordinator"],
   "surfaces": ["agent_runtime"],
-  "version": "1.0.0",
-  "description": "Clone, branch, commit and push your bound git repo for any code change."
+  "version": "2.0.0",
+  "description": "Clone your bound git repo, join the project's shared branch, commit and push for any code change."
 }

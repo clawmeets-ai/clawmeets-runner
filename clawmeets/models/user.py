@@ -260,6 +260,32 @@ class User(Participant):
         return [cls(user_id, ctx) for user_id in users.keys()]
 
     @classmethod
+    def list_all_entries(cls, ctx: "ModelContext") -> dict[str, dict]:
+        """Raw passwd rows, ``user_id -> entry``, from ONE file read.
+
+        The bulk-read counterpart to :meth:`list_all`. Every ``User`` property
+        calls :meth:`_load_passwd_entry`, which re-reads and re-parses the whole
+        passwd file — so a caller that builds N rows by touching K properties
+        each performs N*K full parses. Callers that need many fields for many
+        users (admin listings, exports) should read the dicts once through this
+        method and never touch a ``User`` instance property in the loop.
+
+        Keys are the same as :meth:`to_dict`'s source entry: ``username``,
+        ``email``, ``email_verified``, ``created_at``, ``role``,
+        ``display_name``, ``assistant_agent_id``, ``oauth_identities``.
+
+        Args:
+            ctx: ModelContext for filesystem operations
+
+        Returns:
+            ``{user_id: passwd_entry}``; empty dict when no passwd file exists.
+        """
+        data = FileUtil.read(cls._passwd_path(ctx), "json", default=None)
+        if data is None:
+            return {}
+        return data.get("users", {}) or {}
+
+    @classmethod
     def get_by_email(cls, email: str, ctx: "ModelContext") -> Optional["User"]:
         """Load user by email address (case-insensitive).
 

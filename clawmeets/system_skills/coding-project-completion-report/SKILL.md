@@ -59,33 +59,60 @@ place.
 
 ## § Gather the diff
 
+Every coding worker pushed to the shared project branch
+`project/<project-slug>` and announced **which repo** it pushed to
+(`git-workflow` §3, §6). That branch is what you diff.
+
 The agent-env injects `$CLAWMEETS_AGENT_DIR` and the FILES & STATE
 block shows the repo subdir (`sandbox/projects/<name-id>/repos/<repo>`).
 Inside the repo:
 
 ```bash
 REPO="$( … repo dir from FILES & STATE … )"
-PROJ_BRANCH="project/<project_name>"
+PROJ_BRANCH="project/<project-slug>"      # same slug the workers derived
 
-# Pick the base: the commit the project branched from
-BASE=$(git -C "$REPO" merge-base origin/main "$PROJ_BRANCH" \
-       || git -C "$REPO" merge-base main "$PROJ_BRANCH")
+git -C "$REPO" fetch origin "$PROJ_BRANCH"
+
+# Pick the base: the commit the project branch was cut from
+BASE=$(git -C "$REPO" merge-base origin/main "origin/$PROJ_BRANCH" \
+       || git -C "$REPO" merge-base main "origin/$PROJ_BRANCH")
 
 # Overview: per-file +/- stats
-git -C "$REPO" log --stat "$BASE..$PROJ_BRANCH"
+git -C "$REPO" log --stat "$BASE..origin/$PROJ_BRANCH"
 
 # Full diff to read + summarize
-git -C "$REPO" diff "$BASE..$PROJ_BRANCH"
+git -C "$REPO" diff "$BASE..origin/$PROJ_BRANCH"
 
-# Per-commit messages (useful for the "summary" bullets)
-git -C "$REPO" log --pretty=format:"%h %s" "$BASE..$PROJ_BRANCH"
+# Per-commit messages, with the author agent (the `Agent:` commit trailer)
+git -C "$REPO" log --pretty=format:"%h %s%n    %(trailers:key=Agent,valueonly)" \
+    "$BASE..origin/$PROJ_BRANCH"
 ```
 
-If the project doesn't have a `project/<name>` branch (no merges yet —
-unlikely at wrap-up), fall back to `HEAD` against the repo's default
-branch.
+**Projects that span several repos.** `git_url` binds to the *agent*, so a
+frontend worker and a backend worker may be on different repos. Each repo
+then carries its own `project/<project-slug>` branch and ships its own PR.
+Run the block above **once per repo**, then write ONE report over the
+union:
 
-Capture the full `git diff "$BASE..$PROJ_BRANCH"` output verbatim into
+- Collect the repos from the workers' announcements in chat.
+- For a repo you aren't bound to, clone it read-only into your sandbox
+  (`git clone <url> repos/<name>`) — you only need to read it.
+- Concatenate the per-repo diffs into `unified_diff` in a stable order,
+  and prefix each `diff_files[].path` / `annotations[].file_path` /
+  `risk_areas[].file` with `<repo>/` so the reader can tell them apart.
+- Sum `metrics` across repos, and say in `review` how the pieces fit
+  together across the repo boundary — that seam is where cross-repo
+  projects actually break, because those agents never saw each other's
+  code.
+- If a repo is unreachable (no clone access), report on the ones you can
+  read and state plainly which repo was excluded and why.
+
+If a repo has no `project/<project-slug>` branch (a worker pushed
+somewhere else, or the coordinator's delegation named an override), use
+the branch the worker actually announced; fall back to `HEAD` against the
+repo's default branch only when nothing was announced at all.
+
+Capture the full `git diff "$BASE..origin/$PROJ_BRANCH"` output verbatim into
 `unified_diff` in `data.json` (it's plain text — escape backslash + quote
 when JSON-encoding). The renderer (`lib.Diff2HtmlUI`) consumes the raw
 unified-diff text directly; do NOT pre-parse it into structured lines.

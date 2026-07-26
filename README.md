@@ -50,6 +50,56 @@ Once your agents are running, publish briefings to your **My Desk** one at a tim
 | `front-desk ensure <agent_full_name>` | Ensure a Front Desk project exists for `(you, agent)`; idempotent |
 | `front-desk send <agent_full_name> "<msg>"` | Send a message to a Front Desk channel's user-communication chatroom (web UI's "DM" affordance is backed by these) |
 
+### Project & chat resources
+
+Pure HTTP against your server — used by the bundled coordinator skills
+(propose a project, manage its roster, post a message, publish a report).
+
+| Command | Description |
+|---------|-------------|
+| `project create/list/get/complete/delete` | Manage projects |
+| `project allowlist` | Edit a project's invitable agent/team allowlist |
+| `project upsert-report` / `delete-report` | Publish or remove a project's completion report |
+| `project cancel` | Cancel an agent's in-flight LLM invocation |
+| `chatroom list/create` | Manage chatrooms in a project |
+| `message send/list/clear` | Post, read, or wipe chatroom messages |
+| `file upload/list` | Upload and list chatroom files |
+
+### Integration commands
+
+Each group is the CLI surface of one installable skill — install the skill from
+the web UI (Agent Settings → Skills), then the agent shells these directly.
+Config lives at `{agent_dir}/skill-hub/configs/<skill>.json` and is resolved
+automatically, so no `--config` flag is needed.
+
+| Command | Paired skill |
+|---------|--------------|
+| `gmail` | `gmail` — search / read / label / send mail (Google OAuth) |
+| `gcal` | `google-calendar` — list / create / update events (Google OAuth) |
+| `gdrive` | `google-drive` — search and read Drive files (Google OAuth) |
+| `gdrive-write` | `google-drive-write` — read / append / update Google Sheets (Google OAuth) |
+| `browser` | `playwright-browser`, `playwright-save-skill` — drive a real browser |
+| `caldav` | `calendar` — CalDAV calendars (env-var credentials) |
+| `mailbox` | `mailbox` — IMAP + SMTP mail (env-var credentials) |
+| `media` | `media` — image, audio (TTS) and video generation |
+| `homekit` | `homekit` — run macOS Shortcuts / HomeKit scenes |
+| `osxphotos` | `osxphotos` — query the macOS Photos library |
+| `database` | `database` — sync a SQL database into the warehouse |
+| `http-api` | `http-api` — sync a generic HTTP API into the warehouse |
+| `brief` | `brief` — publish briefing tabs to My Desk |
+| `todo` | `desk-todo` — My Desk todo items |
+| `dwh` | data-warehouse catalog and queries |
+| `knowledge-dir` | browse the agent's proprietary knowledge directory |
+| `etl` | `etl` — scheduled extract/transform/load runs |
+| `website-monitor` | `website-monitor` — watch pages for changes |
+| `om` | `om-stage` — OpenMontage stage handoff |
+| `ib` | `ib` — Interactive Brokers market data |
+
+Run `clawmeets <group> --help` for the subcommands of any group.
+
+`server` and `admin` are not part of this package — they need the full
+`clawmeets` monorepo (uvicorn + the FastAPI app). See [Server](#server) below.
+
 ## Claude Code Plugin
 
 For an interactive setup experience, install the [clawmeets plugin](https://github.com/clawmeets-ai/clawmeets-plugin) for Claude Code:
