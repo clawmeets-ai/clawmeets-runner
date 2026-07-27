@@ -30,7 +30,7 @@ import re
 import shutil
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, ClassVar, Optional
 
 from pydantic import BaseModel, Field, PrivateAttr, computed_field
 
@@ -167,15 +167,60 @@ class Chatroom(BaseModel):
                 return bool(entry.get("external", False))
         return False
 
+    # -------------------------------------------------------------------------
+    # Room-name predicates
+    #
+    # Each rule is defined ONCE, here, as a name-only static method, so a caller
+    # holding a bare room name — a changelog payload, a mirrored search-index
+    # row — can ASK the model instead of restating the rule in its own language.
+    # The instance properties below are thin delegates.
+    #
+    # This shape is deliberate: the M5 search-ACL leak was a SQL `LIKE` that
+    # restated `is_user_communication_room` and silently drifted from it, because
+    # SQLite's LIKE is ASCII-case-insensitive while `startswith` is not. A
+    # restatement can drift; a call cannot.
+    # -------------------------------------------------------------------------
+
+    #: The two rooms that are never deletable — see `is_system_room_name`.
+    SYSTEM_ROOM_NAMES: ClassVar[tuple[str, ...]] = ("shared-context", "user-communication")
+
+    @staticmethod
+    def is_shared_context_name(name: str) -> bool:
+        """True if ``name`` is a shared-context room. Case-SENSITIVE prefix match."""
+        return name.startswith("shared-context")
+
+    @staticmethod
+    def is_user_communication_name(name: str) -> bool:
+        """True if ``name`` is a user-communication room. Case-SENSITIVE prefix
+        match, so ``user-communication-2`` is one and ``User-communication`` is
+        not — the case sensitivity is load-bearing for authorization, because
+        this predicate is what `_is_fd_requester` uses to decide whether a Front
+        Desk requester may read a room in someone else's project.
+        """
+        return name.startswith("user-communication")
+
+    @classmethod
+    def is_system_room_name(cls, name: str) -> bool:
+        """True for the two rooms that must never lose their contents.
+
+        EXACT match, not a prefix match — deliberately narrower than the two
+        predicates above. `ModelContext._handle_room_deleted` refuses exactly
+        these two names, and `routes/projects._delete_project_in_place` relies
+        on that refusal: it emits ROOM_DELETED for a room in a *different,
+        surviving* project. Any derived store that reacts to ROOM_DELETED has to
+        apply the same skip or it will wipe a live room's data.
+        """
+        return name in cls.SYSTEM_ROOM_NAMES
+
     @property
     def is_shared_context_room(self) -> bool:
         """Check if this is the shared-context room for project-wide knowledge."""
-        return self.name.startswith("shared-context")
+        return self.is_shared_context_name(self.name)
 
     @property
     def is_user_communication_room(self) -> bool:
         """Check if this is the user-communication room for user<->assistant chat."""
-        return self.name.startswith("user-communication")
+        return self.is_user_communication_name(self.name)
 
     @property
     def last_cleared_at(self) -> Optional[datetime]:

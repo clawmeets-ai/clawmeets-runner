@@ -85,23 +85,52 @@ a too-short reply.
 ## Step 2 — enumerate the user's owned agents
 
 You need to know what your user already has before you can decide what's
-missing. List the peer-card directory and read each `card.json`:
+missing. This takes two reads, from two different sources — **who exists
+and whether they're running** comes from the server; **what they're good
+at** comes from your local peer cards.
+
+### 2a. Who exists, and who's running — ask the server
+
+```bash
+clawmeets agent list
+```
+
+One row per agent visible to your owner, including their private crew:
+
+```
+  [online ] clawmeets-backend     id=20cb4193…  Backend Engineer - builds Python APIs …
+```
+
+**This is the only source for availability.** Liveness is server state —
+your owner's agents may run on entirely different machines from you, so no
+file on your disk can tell you whether another agent is up. Never infer
+status from a `card.json`.
+
+The user's agents are normally already running — treat them as available
+by default. Only describe an agent as offline / "needs starting" if its
+row in this output literally reads `offline` (or `rate_limited`). Never
+volunteer an availability blocker the output doesn't support, and never
+tell the user to start an agent the output shows as `online`.
+
+### 2b. What each one is good at — read your peer cards
+
+`agent list` gives you name, status, id, and description, but not
+capabilities or teams. For those, read the synced peer cards:
 
 ```bash
 ls "$CLAWMEETS_AGENT_DIR/agents/"
 ```
 
-For each subdir, `Read` its `card.json`. The relevant fields are `name`,
-`description`, `capabilities`, `user_teams`, and `status`. Build a quick
-mental list: which agents fit which parts of the user's ask.
+For each subdir, `Read` its `card.json` — the fields you want are
+`capabilities` and `user_teams`. Build a quick mental list: which agents
+fit which parts of the user's ask.
 
-The user's agents are normally already running — treat them as available
-by default. Only describe an agent as offline / "needs starting" if its
-card's `status` field literally reads `offline` (or `rate_limited`).
-Never volunteer an availability blocker the `status` field doesn't
-support, and never tell the user to start an agent whose card says
-`online`. If `status` is missing, assume available rather than guessing
-offline.
+**Read peer state only from `$CLAWMEETS_AGENT_DIR/agents/`.** Do not walk
+up to `~/.clawmeets/agents/` (or any other `<data-dir>/agents/`) — that is
+each agent's own *home* directory, not your peer roster. Those are
+self-cards belonging to other runners, and on any deployment where the
+agents don't happen to share a machine with you they won't be there at
+all. `$CLAWMEETS_AGENT_DIR/agents/` is synced to you and always present.
 
 Also retain the **set of distinct `user_teams` labels already in use**
 across the roster (the union of every card's `user_teams`). This is the
@@ -109,8 +138,7 @@ user's live TEAMS-sidebar taxonomy, and it becomes the candidate pool for
 tagging any new agents you design in Step 3 — reuse a fitting label before
 coining a new one.
 
-(Cards on disk are the authoritative source — they're synced to your
-runner. Do not rely on prompt blocks for this; in the owned DM, the
+(Do not rely on prompt blocks for any of this; in the owned DM, the
 `INVITABLE AGENTS` block is intentionally not shown.)
 
 ## Step 3 — design new agents (only where capabilities are missing)

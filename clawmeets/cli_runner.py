@@ -50,6 +50,7 @@ from clawmeets.cli_lifecycle import (
 from clawmeets.models.chat_message import ChatMessage
 from clawmeets.utils.file_io import FileUtil
 from clawmeets.utils.notification_center import NotificationCenter
+from clawmeets.utils.version import installed_clawmeets_version
 from clawmeets.llm.base import LLMNotFoundError, LLMProvider
 from clawmeets.llm.claude_cli import ClaudeCLI
 from clawmeets.llm.codex_cli import CodexCLI
@@ -1663,12 +1664,22 @@ def agent_run(
     ))
 
 
-async def _ws_heartbeat_task(ws, agent_id: str) -> None:
-    """Send periodic heartbeats to keep connection alive."""
+async def _ws_heartbeat_task(ws, agent_id: str, loop_obj=None) -> None:
+    """Send periodic heartbeats to keep connection alive.
+
+    Each tick also stamps ``status``/``last_heartbeat`` onto the runner's own
+    card.json. The envelope updates the SERVER's copy; without the local stamp
+    the self-card's presence fields freeze at whatever the server reported on
+    connect, so a runner alive for hours looks stale (and, before this existed,
+    read a permanent ``offline`` from registration). One small atomic write per
+    30s is the price of a self-card readers can trust.
+    """
     while True:
         await asyncio.sleep(30)
         env = ControlEnvelope(type="heartbeat")
         await ws.send(env.model_dump_json(by_alias=True))
+        if loop_obj is not None:
+            await loop_obj.stamp_self_presence("online")
 
 
 def _create_dispatch_callback() -> callable:
@@ -2426,14 +2437,32 @@ async def _runner_loop(
     handle_exception = _create_dispatch_callback()
     reconnect_delay = 2.0
 
+    # Resolved ONCE, here, before the reconnect loop — deliberately not
+    # per-connect. importlib.metadata reads *.dist-info off disk at call time,
+    # so a `uv tool upgrade clawmeets` against a still-running runner would
+    # otherwise start reporting the NEW version while this process is still
+    # executing the OLD code — clearing the very banner that asks the user to
+    # restart it. Cached at startup => reported == running until restart.
+    # Do not move this call inside the loop.
+    runner_version: Optional[str] = installed_clawmeets_version()
+
     while True:
         close_code: Optional[int] = None
         try:
             async with websockets.connect(ws_connect_url) as ws:
                 logging.getLogger("clawmeets").info(f"WebSocket connected to {ws_url}")
 
-                # Send auth message (server expects this as first message)
-                await ws.send(json.dumps({"token": token}))
+                # Send auth message (server expects this as first message).
+                # `clawmeets_version` rides the SAME frame as the token, so it
+                # is re-sent on every reconnect by construction: this line is
+                # inside the `websockets.connect` context manager, inside the
+                # `while True:` loop. There is exactly one place a socket is
+                # established, so "sent on connect" and "sent on reconnect"
+                # cannot drift apart.
+                await ws.send(json.dumps({
+                    "token": token,
+                    "clawmeets_version": runner_version,  # str | None
+                }))
 
                 reconnect_delay = 2.0  # reset on success
 
@@ -2454,7 +2483,9 @@ async def _runner_loop(
                 # HTTP-based catch-up on connect
                 await loop_obj.catch_up()
 
-                hb_task = asyncio.create_task(_ws_heartbeat_task(ws, agent_id))
+                hb_task = asyncio.create_task(
+                    _ws_heartbeat_task(ws, agent_id, loop_obj)
+                )
 
                 try:
                     async for raw in ws:
@@ -2498,6 +2529,17 @@ async def _runner_loop(
             reconnect_delay = min(reconnect_delay * 2, 60)
             continue
         except asyncio.CancelledError:
+            # Graceful shutdown (Ctrl-C, or an explicit cancel of the runner
+            # task). Stamp `offline` so the self-card doesn't sit on a stale
+            # `online`.
+            #
+            # NOTE: `clawmeets stop` sends a bare SIGTERM and the runner installs
+            # no asyncio signal handler, so that path terminates the process
+            # without reaching this branch. Such a runner is detected instead by
+            # the age of `last_heartbeat` (stamped every 30s above) — which is
+            # also the only available signal for a hard kill, where no in-process
+            # cleanup can run at all.
+            await loop_obj.stamp_self_presence("offline")
             await loop_obj.stop()
             await http_client.aclose()
             break

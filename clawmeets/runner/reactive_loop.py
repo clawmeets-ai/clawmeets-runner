@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import shutil
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -36,6 +37,28 @@ _SKILL_TO_CLI_NAME = {
     "google-drive-write": "gdrive-write",
     "gmail": "gmail",
 }
+
+# Server-authoritative fields mirrored from the server card onto the runner's
+# own top-level card.json on every (re)connect, so the self-card carries the
+# same shape as a synced peer card instead of a frozen registration snapshot.
+#
+# `local_settings` / `model_configs` / `default_model_config_name` are
+# deliberately EXCLUDED: those two sides can legitimately diverge (the user
+# edits server-side, the runner writes locally) and
+# `_sync_self_settings_from_server` already has drift resolution for them. A
+# blind mirror would defeat it. `name` is excluded too — it's load-bearing for
+# the on-disk directory layout.
+_SELF_CARD_MIRROR_FIELDS = (
+    "status",
+    "last_heartbeat",
+    "description",
+    "capabilities",
+    "user_teams",
+    "is_verified",
+    "discoverable_through_registry",
+    "registered_at",
+    "registered_by",
+)
 
 if TYPE_CHECKING:
     from clawmeets.api.client import ClawMeetsClient
@@ -129,6 +152,20 @@ class ReactiveControlLoop:
         # independent, so they get independent locks (avoids serializing
         # one behind the other unnecessarily).
         self._skill_config_write_lock = asyncio.Lock()
+        # Serializes read-modify-write of the runner's own top-level card.json.
+        # Three writers touch it: _apply_local_settings (settings/model_configs),
+        # _sync_self_settings_from_server (server presence mirror), and the
+        # heartbeat presence stamp.
+        #
+        # What actually prevents clobbering is that _update_self_card re-reads at
+        # WRITE time rather than committing a snapshot taken before an await —
+        # which is the bug _apply_local_settings used to have (it read the card,
+        # awaited the MCP/skill write-through, then wrote the stale dict). The
+        # lock is defensive on top of that: the helper's read-update-write body
+        # has no await inside it, so today it can't interleave anyway, but it
+        # keeps that guarantee from resting on an implementation detail of
+        # FileUtil staying synchronous.
+        self._self_card_lock = asyncio.Lock()
         # In the relay flow, an MCP_AUTH_CODE envelope arrives over WS while
         # the auto-auth task is awaiting it. The Future is keyed by the
         # one-shot state token the runner minted in build_authorization_url.
@@ -872,6 +909,65 @@ class ReactiveControlLoop:
             )
 
     # ─────────────────────────────────────────────────────────
+    # Self-card
+    # ─────────────────────────────────────────────────────────
+
+    @property
+    def _self_card_path(self) -> Path:
+        """The runner's OWN card — ``{agent_dir}/card.json``.
+
+        NOT under ``participants_dir/agents/``, where
+        ``PersistableParticipant.card_path`` looks. ``update_card()`` from inside
+        the runner process resolves to the *peer* path: it would miss the real
+        self-card and instead spawn an orphan ``agents/unknown-{id}/card.json``
+        holding only the written field, which crashes ``list_all()`` on the next
+        startup. So every self-card write must go through here.
+        """
+        return self._model_ctx.participants_dir / "card.json"
+
+    async def _update_self_card(self, **fields) -> None:
+        """Merge ``fields`` into the runner's own card.json under a lock.
+
+        Re-reads inside the lock so concurrent writers (settings apply, server
+        presence mirror, heartbeat stamp) merge instead of clobbering each other.
+        Best-effort: a failed write is logged, never raised — the caller is
+        always either a background stamp or a settings apply whose runtime
+        effects have already been applied in memory.
+        """
+        if not fields:
+            return
+        async with self._self_card_lock:
+            try:
+                card = FileUtil.read(self._self_card_path, "json") or {}
+                card.update(fields)
+                FileUtil.write(self._self_card_path, card, "json", atomic=True)
+            except Exception as e:  # noqa: BLE001 — never break the turn
+                logger.warning(
+                    f"{self._participant.name}: self-card update failed "
+                    f"({sorted(fields)}): {e}"
+                )
+
+    async def stamp_self_presence(self, status: str) -> None:
+        """Record live presence on the self-card: ``status`` + ``last_heartbeat``.
+
+        Called from the runner's heartbeat tick (every 30s) and once with
+        ``offline`` on graceful shutdown. This is what makes the self-card's
+        ``status`` trustworthy for the whole session rather than freezing at the
+        value the server reported on connect.
+
+        A hard-killed runner cannot write its own ``offline`` — the process that
+        would do it is the one that died — so a crashed runner's card reads a
+        stale ``online``. That is why ``last_heartbeat`` is stamped alongside it:
+        readers can tell a live ``online`` from a frozen one by its age. The
+        server has no such gap (its WS-disconnect handler flips the flag from
+        the outside).
+        """
+        await self._update_self_card(
+            status=status,
+            last_heartbeat=datetime.now(UTC).isoformat(),
+        )
+
+    # ─────────────────────────────────────────────────────────
     # Local Settings
     # ─────────────────────────────────────────────────────────
 
@@ -908,15 +1004,13 @@ class ReactiveControlLoop:
         provider name), the prior CLI stays in service and the failure is
         logged.
         """
-        # The runner's own card lives at participants_dir/card.json — NOT under
-        # participants_dir/agents/, where PersistableParticipant.card_path looks.
-        # Using update_card() here would miss the real self-card and instead
-        # spawn an orphan agents/unknown-{id}/card.json that contains only
-        # local_settings and crashes list_all() on the next startup. Read and
-        # write the top-level self-card directly.
-        self_card_path = self._model_ctx.participants_dir / "card.json"
-        current_card = FileUtil.read(self_card_path, "json") or {}
-        prior_settings = current_card.get("local_settings") or {}
+        # Read the prior settings for diffing only — the write goes through
+        # _update_self_card so a heartbeat presence stamp landing mid-flight
+        # isn't clobbered (see _self_card_path for why update_card() can't be
+        # used here).
+        prior_settings = (
+            FileUtil.read(self._self_card_path, "json") or {}
+        ).get("local_settings") or {}
 
         # Git binding — update the shared agent_env so the next-built CLI
         # exposes the new CLAWMEETS_AGENT_GIT_URL / _GIT_BASE_BRANCH. The
@@ -1011,11 +1105,11 @@ class ReactiveControlLoop:
         # model configs when this envelope carried them (None ⇒ leave intact),
         # so a per-request model_config_name override resolves against a fresh
         # self-card copy of the server's config list.
-        current_card["local_settings"] = local_settings
+        updates: dict = {"local_settings": local_settings}
         if model_configs is not None:
-            current_card["model_configs"] = model_configs
-            current_card["default_model_config_name"] = default_model_config_name
-        FileUtil.write(self_card_path, current_card, "json", atomic=True)
+            updates["model_configs"] = model_configs
+            updates["default_model_config_name"] = default_model_config_name
+        await self._update_self_card(**updates)
 
         logger.info(
             f"Applied local_settings for {self._participant.name}: "
@@ -1218,14 +1312,22 @@ class ReactiveControlLoop:
         await self._reconcile_deleted_projects(set(server_projects.keys()))
 
     async def _sync_self_settings_from_server(self) -> None:
-        """Re-fetch this runner's own card.json from the server and apply
-        any `local_settings` drift via `_apply_local_settings`.
+        """Re-fetch this runner's own card from the server, mirror the
+        server-authoritative fields onto the self-card, and apply any
+        `local_settings` drift via `_apply_local_settings`.
 
         Closes the offline-while-user-edits gap: AGENT_SETTINGS_CHANGE is a
         live broadcast — runners that were offline when the user saved a
         new `knowledge_dir` (or `llm_provider`) miss it. Without this catch-up
         step, the next runtime call would use stale settings until the user
         happened to edit again with this runner online.
+
+        Also the repair path for the self-card's presence + identity fields.
+        Registration seeds `status`/`capabilities`/… once and nothing refreshed
+        them afterwards, so every self-card read `status: offline` with empty
+        `capabilities` for its whole life — misleading anything that landed on
+        it. Mirroring here means a restart is enough to repair a stale card; no
+        separate migration.
         """
         try:
             resp = await self._client._http.get(f"/agents/{self._participant.id}")
@@ -1248,8 +1350,16 @@ class ReactiveControlLoop:
         server_configs = server_card.get("model_configs") or []
         server_default = server_card.get("default_model_config_name")
 
-        self_card_path = self._model_ctx.participants_dir / "card.json"
-        local_card = FileUtil.read(self_card_path, "json") or {}
+        # Mirror the server-authoritative presence + identity fields. Runs
+        # BEFORE the drift early-return below, which is about local_settings
+        # only — presence must refresh on every connect regardless.
+        await self._update_self_card(**{
+            k: server_card[k]
+            for k in _SELF_CARD_MIRROR_FIELDS
+            if k in server_card
+        })
+
+        local_card = FileUtil.read(self._self_card_path, "json") or {}
         local_settings = local_card.get("local_settings") or {}
         local_configs = local_card.get("model_configs") or []
         local_default = local_card.get("default_model_config_name")

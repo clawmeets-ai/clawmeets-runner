@@ -663,11 +663,13 @@ class ModelContextChangelogSubscriber(ChangelogSubscriber):
 
         Idempotent: missing dirs are a no-op. Defends `shared-context` and
         `user-communication` here too — those rooms are never deletable
-        through this entry even if a buggy caller emitted one.
+        through this entry even if a buggy caller emitted one. The two names
+        live on `Chatroom.is_system_room_name`, so a derived store that also
+        reacts to ROOM_DELETED can apply exactly this skip.
         """
         payload: RoomDeletedPayload = entry.payload  # type: ignore[assignment]
         chatroom_name = payload.chatroom_name
-        if chatroom_name in ("shared-context", "user-communication"):
+        if Chatroom.is_system_room_name(chatroom_name):
             logger.warning(
                 f"ROOM_DELETED: refusing to delete system room {chatroom_name!r} "
                 f"in project {self._project_id[:8]}"

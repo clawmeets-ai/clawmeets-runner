@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import secrets
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -102,6 +103,45 @@ def get_viewers_for_project(project_id: str, data_dir: Path) -> list[str]:
         if entry["project_id"] == project_id:
             viewers.update(entry["viewers"])
     return list(viewers)
+
+
+# Memoized inverse index for `get_projects_for_viewer`, keyed on the token
+# file's (absolute path, mtime_ns, size). The path is part of the key so two
+# data dirs can never alias each other on a coincidental (mtime, size) match,
+# and any write through `_save` moves the key, so the cache self-invalidates.
+_viewer_index_key: tuple[str, int, int] | None = None
+_viewer_index: dict[str, frozenset[str]] = {}
+_viewer_index_lock = threading.Lock()
+
+
+def get_projects_for_viewer(user_id: str, data_dir: Path) -> frozenset[str]:
+    """Project IDs ``user_id`` can read as a share-token viewer.
+
+    The inverse of :func:`get_viewers_for_project`, and memoized: this is on the
+    chat-search query path, where it is the ONLY filesystem touch left (see
+    ``server/chat_search_index``'s module docstring on the ACL mirror). Steady
+    state is one ``stat()`` and zero parses.
+    """
+    global _viewer_index_key, _viewer_index
+
+    path = _tokens_path(data_dir)
+    try:
+        st = path.stat()
+    except OSError:
+        return frozenset()
+    key = (str(path), st.st_mtime_ns, st.st_size)
+    with _viewer_index_lock:
+        if _viewer_index_key != key:
+            by_user: dict[str, set[str]] = {}
+            for entry in (_load(data_dir).get("tokens") or {}).values():
+                project_id = entry.get("project_id")
+                if not project_id:
+                    continue
+                for viewer_id in entry.get("viewers") or []:
+                    by_user.setdefault(viewer_id, set()).add(project_id)
+            _viewer_index_key = key
+            _viewer_index = {k: frozenset(v) for k, v in by_user.items()}
+        return _viewer_index.get(user_id, frozenset())
 
 
 async def remove_viewer(project_id: str, user_id: str, data_dir: Path) -> bool:
