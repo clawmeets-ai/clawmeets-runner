@@ -291,7 +291,7 @@ def _ok(resp: httpx.Response) -> dict:
     return resp.json()
 
 
-def _login_request(client: httpx.Client, username: str, password: str) -> dict:
+def _login_request(client: httpx.Client, identifier: str, password: str) -> dict:
     """POST /auth/login and return the parsed body, or exit(1) with a clear,
     user-facing message instead of a raw traceback.
 
@@ -302,7 +302,7 @@ def _login_request(client: httpx.Client, username: str, password: str) -> dict:
     """
     try:
         resp = client.post(
-            "/auth/login", json={"username": username, "password": password}
+            "/auth/login", json={"identifier": identifier, "password": password}
         )
     except httpx.RequestError as e:
         typer.echo(
@@ -939,7 +939,7 @@ def _resolve_dm_session(
         )
         with _http(server) as client:
             resp = client.post(
-                "/auth/login", json={"username": username, "password": password}
+                "/auth/login", json={"identifier": username, "password": password}
             )
             if resp.status_code != 200:
                 typer.echo("Error: Invalid username or password", err=True)
@@ -978,7 +978,14 @@ def _resolve_project_ref(
     resp = client.get(f"/projects/{ref}")
     if resp.status_code == 200:
         return resp.json()["id"]
-    resp = client.get("/projects")
+    # `GET /projects` is authenticated and caller-scoped, so the token has to go
+    # on the wire here. Inside a runner `_http`'s default headers already carry
+    # the agent identity; this override matters for the user-session path, where
+    # there is no default Authorization at all.
+    resp = client.get(
+        "/projects",
+        headers={"Authorization": f"Bearer {token}"} if token else {},
+    )
     if resp.status_code != 200:
         typer.echo(f"Error: could not list projects ({resp.status_code})", err=True)
         raise typer.Exit(1)
@@ -2007,7 +2014,7 @@ def user_listen(
 
     # Authenticate user
     with _http(server) as client:
-        resp = client.post("/auth/login", json={"username": username, "password": password})
+        resp = client.post("/auth/login", json={"identifier": username, "password": password})
         try:
             result = _ok(resp)
         except SystemExit:
@@ -3375,7 +3382,7 @@ def _ensure_fresh_user_token(server_url: str, data_dir: Path, username: str, cur
         password = user_cfg.get("password")
         if password:
             with httpx.Client(base_url=server_url, timeout=30) as c:
-                resp = c.post("/auth/login", json={"username": username, "password": password})
+                resp = c.post("/auth/login", json={"identifier": username, "password": password})
             if resp.status_code == 200:
                 body = resp.json()
                 new_token = body.get("access_token")
@@ -3575,12 +3582,12 @@ def bootstrap_browser(
 _PERSONALIZE_TRIGGER_MARKER = "<!-- clawmeets:personalize-trigger -->"
 
 
-def _login_for_jwt(server: str, username: str, password: str) -> str:
+def _login_for_jwt(server: str, identifier: str, password: str) -> str:
     """Login and return the JWT token. Exits on failure."""
     with _http(server) as client:
         resp = client.post(
             "/auth/login",
-            json={"username": username, "password": password},
+            json={"identifier": identifier, "password": password},
         )
         try:
             result = _ok(resp)

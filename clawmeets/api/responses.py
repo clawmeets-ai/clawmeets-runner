@@ -161,7 +161,7 @@ class AgentSearchResponse(BaseModel):
 
 
 class AdminUserRow(BaseModel):
-    """One row of the admin Users directory (``GET /admin/users``).
+    """One row of the admin Users directory (``GET /admin-api/users``).
 
     Identity fields mirror ``User.to_dict``; the four counts are derived
     aggregates computed per request (see ``server/routes/admin_users.py``).

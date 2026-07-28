@@ -38,6 +38,27 @@ logger = logging.getLogger("clawmeets.user")
 _passwd_lock = asyncio.Lock()
 
 
+# bcrypt digest of a 32-byte random secret, generated ONCE offline at cost 12;
+# the plaintext was discarded and never belonged to any account. It exists
+# solely so that the unknown-identifier and OAuth-only branches of
+# User.verify_credentials do the SAME bcrypt work as a real password check
+# (AUTH_CONTRACT §6.3) — without it, "no such user" answers measurably faster
+# than "wrong password" and the endpoint becomes an account-existence oracle.
+#
+# A SOURCE LITERAL, not bcrypt.hashpw(...) at import time: a cost-12 hash costs
+# ~250ms, and this module is imported by the server AND by every `clawmeets`
+# CLI invocation in the shipped runner wheel — a quarter-second added to every
+# command, to compute a value that never needs to vary. Committing it leaks
+# nothing: bcrypt is not reversible and the plaintext never existed as anyone's
+# password.
+#
+# Cost 12 must track bcrypt's gensalt() default or the dummy path stops
+# matching the real one. tests/test_auth_login_identifier.py compares this
+# literal's cost against a freshly generated live hash, so drift fails a test
+# rather than silently reopening the timing gap.
+_DUMMY_PASSWORD_HASH = "$2b$12$6.CEUQyzFfVgJcsot6UBY.Wk7ooPUDXlU98jkK.B3BlBcsMNb1TB2"
+
+
 class OAuthProvisionError(Exception):
     """Raised by ``User.oauth_authenticate_or_provision`` when provisioning a new
     OAuth account is refused.
@@ -122,20 +143,41 @@ class User(Participant):
 
     @staticmethod
     def _validate_username(username: str) -> str:
-        """Validate and normalize username.
+        """Validate a username. Returns it unchanged; rejects what it dislikes.
+
+        Usernames must be lowercase. The rule REJECTS rather than canonicalizes:
+        quietly storing ``alice`` for someone who typed ``Alice`` renames their
+        account behind their back and they only find out much later, whereas an
+        error at sign-up is the one moment they can still choose differently.
+
+        The lowercase rule lives here, NOT in ``FileUtil.validate_fs_name``,
+        which deliberately still permits ``A-Z``. That validator is shared by
+        project names, chatroom names, agent names, knowledge-pack names and
+        every integration mailbox/calendar/drive name; tightening it to satisfy
+        usernames would invalidate existing names across all of them.
+
+        This constrains what may be STORED, not what may be TYPED — sign-in
+        lookup stays case-insensitive (see :meth:`get_by_username`), so users
+        who learned their name as ``Alice`` still sign in with ``Alice``.
 
         Args:
             username: The username to validate
 
         Returns:
-            Normalized username (lowercase, stripped)
+            The username unchanged, if valid
 
         Raises:
             ValueError: If username is invalid
         """
+        # Charset/length/reserved-name gate first, so anything reaching the
+        # rules below is already ASCII and bounded at MAX_FS_NAME_LENGTH.
         username = FileUtil.validate_fs_name(username)
         if "-" in username:
             raise ValueError("Username cannot contain hyphens (-). Use underscores (_) instead.")
+        if username != username.lower():
+            raise ValueError(
+                f"Username must be lowercase. Use '{username.lower()}' instead of '{username}'."
+            )
         return username
 
     @staticmethod
@@ -159,6 +201,24 @@ class User(Participant):
         if not User._EMAIL_PATTERN.match(email):
             raise ValueError(f"Invalid email format: {email}")
         return email
+
+    @staticmethod
+    def _is_email_identifier(identifier: str) -> bool:
+        """True iff a sign-in identifier should be resolved as an email.
+
+        Reuses ``_EMAIL_PATTERN`` — one regex, one notion of "email"
+        (AUTH_CONTRACT §6.1). Usernames cannot contain ``@`` (enforced by
+        ``_validate_username`` -> ``FileUtil.validate_fs_name``) and every email
+        must, so the two namespaces are provably disjoint and this branch can
+        never send a valid username down the email path.
+
+        A string that is neither — ``"!!!"``, ``"a@b"`` — is NOT an error: it
+        falls to the username branch, finds nothing, and gets the same 401 as a
+        wrong password. Rejecting it earlier would be a shape oracle.
+
+        Assumes the caller has already stripped.
+        """
+        return bool(User._EMAIL_PATTERN.match(identifier))
 
     @staticmethod
     def _hash_password(password: str) -> str:
@@ -220,7 +280,19 @@ class User(Participant):
 
     @classmethod
     def get_by_username(cls, username: str, ctx: "ModelContext") -> Optional["User"]:
-        """Load user by username.
+        """Load user by username (case-insensitive on BOTH sides).
+
+        This lowercases the stored value as well as the needle. It used to
+        lowercase only the needle and compare against ``user_data["username"]``
+        verbatim, so any account whose stored username carried an uppercase
+        letter was unreachable by every caller of this method — login, password
+        change, participant resolution, and ``register``'s uniqueness check
+        (which meant ``alice`` could be registered alongside an existing
+        ``Alice``). ``get_by_email`` always did it correctly; this now matches.
+
+        Registration refuses uppercase usernames (see ``_validate_username``),
+        so new records are lowercase anyway — but what users may TYPE stays
+        case-insensitive, which is what this method governs.
 
         Args:
             username: The username to find
@@ -237,7 +309,7 @@ class User(Participant):
 
         users = data.get("users", {})
         for user_id, user_data in users.items():
-            if user_data.get("username") == username:
+            if (user_data.get("username") or "").lower() == username:
                 return cls(user_id, ctx)
         return None
 
@@ -407,6 +479,77 @@ class User(Participant):
             return cls(user_id, ctx)
 
     @classmethod
+    async def verify_credentials(
+        cls,
+        identifier: str,
+        password: str,
+        ctx: "ModelContext",
+    ) -> Optional["User"]:
+        """Resolve a username OR an email to a user and check its password.
+
+        THE credential path for ``POST /auth/login`` (AUTH_CONTRACT §6). A
+        ``None`` return never distinguishes "no such account" from "wrong
+        password" — the caller cannot tell them apart, by construction, and
+        neither can anyone timing the response.
+
+        Steps, in this order:
+
+        1. ``identifier.strip()``. ``password`` is NOT stripped — leading and
+           trailing whitespace in a password is significant (§2.2).
+        2. EXACTLY ONE lookup, chosen by :meth:`_is_email_identifier`: email
+           shaped -> :meth:`get_by_email`, otherwise -> :meth:`get_by_username`.
+           Never both, never "try one then fall back to the other" (§6.1).
+           Both lookups are case-insensitive on both sides (§6.2).
+        3. Pick the hash to verify against:
+
+           - no user found                  -> ``_DUMMY_PASSWORD_HASH``
+           - ``OAUTH_PASSWORD_SENTINEL``    -> ``_DUMMY_PASSWORD_HASH``
+           - missing/empty stored hash      -> ``_DUMMY_PASSWORD_HASH``
+           - otherwise                      -> the stored hash
+
+           The OAuth-only row matters: ``checkpw`` against ``"!oauth"`` fails
+           in microseconds because the string is not a valid bcrypt digest, so
+           short-circuiting it — or letting it through — would be its own
+           timing signature (§6.3).
+        4. Call ``_verify_password_hash`` EXACTLY ONCE, unconditionally. There
+           is no ``return`` anywhere between step 1 and this call, on any
+           branch. That absence is the entire point of this method.
+        5. Return the user iff a user was found AND the check passed.
+
+        Deliberately does NOT check ``email_verified``. That is the caller's,
+        and it MUST happen after this returns a user: the 403 is only not an
+        enumeration oracle because it is unreachable until the password has
+        already proven correct (§4.2).
+
+        Args:
+            identifier: A username or an email address, as typed
+            password: The password to verify, exactly as sent
+            ctx: ModelContext for filesystem operations
+
+        Returns:
+            User instance if the credentials are valid, None otherwise
+        """
+        identifier = (identifier or "").strip()
+
+        if cls._is_email_identifier(identifier):
+            user = cls.get_by_email(identifier, ctx)
+        else:
+            user = cls.get_by_username(identifier, ctx)
+
+        password_hash = _DUMMY_PASSWORD_HASH
+        if user is not None:
+            stored = user._load_passwd_entry().get("password_hash") or ""
+            if stored and stored != cls.OAUTH_PASSWORD_SENTINEL:
+                password_hash = stored
+
+        # The one bcrypt bar every path crosses. Do not guard this call.
+        verified = cls._verify_password_hash(password, password_hash)
+
+        if user is not None and verified:
+            return user
+        return None
+
+    @classmethod
     async def verify_password(
         cls,
         username: str,
@@ -414,6 +557,17 @@ class User(Participant):
         ctx: "ModelContext",
     ) -> Optional["User"]:
         """Verify username/password and return user if valid.
+
+        NOT the sign-in path. ``POST /auth/login`` goes through
+        :meth:`verify_credentials`; the only caller left here is
+        ``POST /auth/change-password``, an authenticated re-check of your own
+        password. See the note on the early return below before adding a
+        caller.
+
+        Case-insensitive on BOTH sides, same fix as :meth:`get_by_username` —
+        before it, ``/auth/change-password`` answered "Current password is
+        incorrect" to the CORRECT password for any account stored with an
+        uppercase letter.
 
         Args:
             username: The username
@@ -431,11 +585,28 @@ class User(Participant):
 
         users = data.get("users", {})
         for user_id, user_data in users.items():
-            if user_data.get("username") == username:
+            if (user_data.get("username") or "").lower() == username:
                 if cls._verify_password_hash(password, user_data.get("password_hash", "")):
                     return cls(user_id, ctx)
-                return None  # Wrong password
-        return None  # User not found
+                # Wrong password. This returns WITHOUT the constant-work bcrypt
+                # pass that AUTH_CONTRACT §6.3 mandates for sign-in — and that
+                # is safe HERE, and only here, because of who calls this method:
+                #
+                #   /auth/change-password already holds a valid access token for
+                #   this very account, so "does this account exist" is not a
+                #   secret it could leak. There is no existence oracle to close,
+                #   and forcing a dummy bcrypt pass would cost that endpoint
+                #   ~250ms on the wrong-password branch to hide nothing.
+                #
+                # The safety is a property of the CALL GRAPH, not of this
+                # function. Route /auth/login (or any other unauthenticated
+                # caller) back through here and this line becomes the timing
+                # oracle it used to be. Unauthenticated credential checks belong
+                # in verify_credentials, which has no early return before the
+                # hash step on any branch.
+                return None
+        # User not found — same reasoning; the caller is already authenticated.
+        return None
 
     # ─────────────────────────────────────────────────────────────────────────
     # OAuth invite-login (additive — password auth untouched)
@@ -486,11 +657,20 @@ class User(Participant):
         ``_validate_username`` — and is free across all participant types. On any
         failure (too short, invalid chars, taken, or absent) fall back to
         ``_unique_oauth_username`` so the callback never fails on a username.
+
+        ``desired`` is lowercased here, at the call site, because usernames must
+        be lowercase (``_validate_username``) and this is the one in-repo caller
+        that could hand the rule a mixed-case name. It is the OAuth CALLBACK —
+        there is no response to show an error in and no form to send anyone back
+        to, so the alternative is not "reject" but "silently fall back to an
+        email-derived name", which discards the slug the user actually chose.
+        Lowercasing keeps their choice. The rule stays strict; the caller adapts.
+        The password sign-up path does NOT do this — it rejects, because it can.
         """
         from .participant import Participant
 
         if desired and desired.strip():
-            candidate = desired.strip()
+            candidate = desired.strip().lower()
             if len(candidate) >= cls.MIN_PUBLIC_USERNAME_LENGTH:
                 try:
                     normalized = cls._validate_username(candidate)

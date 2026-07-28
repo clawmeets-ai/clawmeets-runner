@@ -26,6 +26,7 @@ they flow through the distributed changelog system.
 """
 from __future__ import annotations
 
+import os
 import re
 from datetime import UTC, datetime
 from pathlib import Path
@@ -198,10 +199,22 @@ class Project(BaseModel):
         Derived from filesystem: lists directories under
         metadata/projects/{name}-{id}/chatrooms/
 
+        A project with no rooms yet has **no** ``chatrooms/`` dir at all —
+        ``ProjectState.create`` doesn't make one, it appears when the first room
+        does. That is an ordinary state (8 of 544 projects on the reference box),
+        so it answers ``[]`` rather than raising ``FileNotFoundError``: "this
+        project has no rooms" is data, not a failure. Raising here surfaced as a
+        500 on ``GET /projects/{id}/chatrooms`` for exactly those projects, and
+        would have turned ``results[pid] == []`` into ``errors[pid]`` on the batch
+        route — collapsing "no rooms" into "you can't see this", the one
+        distinction that envelope exists to preserve.
+
         Returns:
-            Sorted list of chatroom names
+            Sorted list of chatroom names; ``[]`` when the project has no rooms.
         """
         chatrooms_dir = self.meta_dir / "chatrooms"
+        if not chatrooms_dir.is_dir():
+            return []
         return sorted(d.name for d in chatrooms_dir.iterdir() if d.is_dir())
 
     @property
@@ -348,13 +361,20 @@ class Project(BaseModel):
     def list_chatrooms(self) -> list:
         """Load all chatrooms in this project.
 
+        Uses ``Chatroom.get_in(self, name)`` rather than ``Chatroom.get(id, name,
+        ctx)``: we already hold the Project, and ``Chatroom.get`` would re-resolve
+        it with a ``glob("*-{id}")`` over the whole metadata dir **once per
+        room**. On a 544-project box that re-glob is ~64–69% of the cost of
+        listing rooms; at P=20,000 it is ~1.5 s per 50 projects. Same results,
+        zero extra directory scans.
+
         Returns:
             List of Chatroom objects
         """
         from .chatroom import Chatroom
         result = []
         for chatroom_name in self.chatrooms:
-            room = Chatroom.get(self.id, chatroom_name, self.ctx)
+            room = Chatroom.get_in(self, chatroom_name)
             if room is not None:
                 result.append(room)
         return result
@@ -369,7 +389,7 @@ class Project(BaseModel):
             Chatroom, or None when the room doesn't exist (Chatroom.get contract)
         """
         from .chatroom import Chatroom
-        return Chatroom.get(self.id, chatroom_name, self.ctx)
+        return Chatroom.get_in(self, chatroom_name)
 
     def get_shared_context_room(self):
         """Get the shared-context room for project-wide knowledge.
@@ -478,6 +498,103 @@ class Project(BaseModel):
         instance = cls.model_validate(data)
         object.__setattr__(instance, "_ctx", ctx)
         return instance
+
+    @classmethod
+    def get_many(
+        cls,
+        project_ids: Iterable[str],
+        ctx: "ModelContext",
+    ) -> dict[str, "Project"]:
+        """Batch sibling of :meth:`get` — resolve many ids in ONE directory pass.
+
+        ``Project.get`` runs ``metadata_dir.glob(f"*-{project_id}")``, which is
+        O(P) in the number of projects on the box *per id*. Resolving N ids that
+        way is O(N·P): at P=20,000 and N=50 that measured 850 ms. This does one
+        ``os.scandir`` of the same directory and answers every id from an
+        in-memory map — 20.0 ms for all 50 ids at P=20,000, which is 1.18× the
+        cost of a *single* glob.
+
+        The primitive is ``os.scandir`` + ``DirEntry.is_dir()`` deliberately, not
+        ``Path.iterdir()`` and not ``Path.glob("*")``: both of those allocate a
+        ``Path`` per entry, and ``Path.is_dir()`` is a ``stat()`` syscall per
+        entry (~6.8 µs). ``DirEntry.is_dir()`` is served from the dirent
+        ``d_type``, measured at ~0.35 µs/entry. That per-entry work — not the
+        directory scan — is the whole gap (149.9 ms vs 20.0 ms at P=20,000).
+
+        Accepts the same two id forms ``get`` does, with the same precedence:
+        the bare id (matching the ``{name}-{id}`` directory *suffix*, i.e. what
+        ``glob("*-{id}")`` matches) and — only when no suffix match exists — the
+        full ``{name}-{id}`` slug an agent sees as its synced project dir.
+        Deliberately NOT a uuid-shape heuristic: ``get``'s glob is a plain
+        suffix test, so hand-made fixture ids like ``proj-1`` must resolve
+        identically or the two resolvers disagree about ``project.name``.
+
+        Unlike ``get``, an id that does not resolve is simply **absent** from the
+        returned mapping rather than raising — the batch callers need absence,
+        not an exception, so one unknown id cannot fail a whole request.
+        ``get``'s raising contract is untouched.
+
+        Args:
+            project_ids: Ids (or ``{name}-{id}`` slugs) to resolve.
+            ctx: ModelContext for filesystem operations.
+
+        Returns:
+            ``{requested_id: Project}`` for every id that resolved.
+        """
+        wanted = {pid for pid in project_ids if pid}
+        if not wanted or not ctx.metadata_dir.exists():
+            return {}
+
+        # Requested ids share very few distinct lengths (every real id is a
+        # 36-char uuid4), so testing each dir name at just those offsets is the
+        # whole-listing equivalent of N globs at O(P) total instead of O(N·P) —
+        # no per-id rescan, and no `endswith` sweep over the cross product.
+        lengths = sorted({len(pid) for pid in wanted})
+
+        # `Project.get` tries `glob("*-{id}")` FIRST and only falls back to an
+        # exact-dir match, so the two forms are kept apart and merged with that
+        # same precedence below.
+        suffix_dir: dict[str, str] = {}
+        exact_dir: dict[str, str] = {}
+
+        def _offer(into: dict[str, str], key: str, dir_name: str) -> None:
+            # `Project.get` takes `sorted(matches)[0]`, so on the (pathological)
+            # duplicate-id case the lexicographically smallest dir wins. Match
+            # that, or the two resolvers could disagree about project.name.
+            current = into.get(key)
+            if current is None or dir_name < current:
+                into[key] = dir_name
+
+        with os.scandir(ctx.metadata_dir) as entries:
+            for entry in entries:
+                # `DirEntry.is_dir()` is served from the dirent `d_type` — no
+                # `stat()` per entry, which is the whole point of scandir here.
+                if not entry.is_dir():
+                    continue
+                name = entry.name
+                if name in wanted:
+                    _offer(exact_dir, name, name)
+                for length in lengths:
+                    # Equivalent to `name.endswith(f"-{pid}")` for any wanted pid
+                    # of this length, but one slice instead of a scan per id.
+                    if len(name) > length and name[-length - 1] == "-":
+                        candidate = name[-length:]
+                        if candidate in wanted:
+                            _offer(suffix_dir, candidate, name)
+
+        dir_for = {**exact_dir, **suffix_dir}
+
+        resolved: dict[str, "Project"] = {}
+        for pid, dir_name in dir_for.items():
+            data = FileUtil.read(ctx.metadata_dir / dir_name / "meta.json", "json")
+            if not data:
+                # Dir present but metadata missing/corrupt — same as "not found"
+                # for the caller, which reports one opaque code either way.
+                continue
+            instance = cls.model_validate(data)
+            object.__setattr__(instance, "_ctx", ctx)
+            resolved[pid] = instance
+        return resolved
 
     @classmethod
     def list_all(cls, ctx: "ModelContext") -> list["Project"]:

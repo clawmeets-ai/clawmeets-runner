@@ -95,6 +95,21 @@ def is_viewer(project_id: str, user_id: str, data_dir: Path) -> bool:
     return False
 
 
+def viewer_project_ids(user_id: str, data_dir: Path) -> set[str]:
+    """Every project id ``user_id`` is a share-token viewer of, in ONE file read.
+
+    ``is_viewer`` re-reads the whole share-token file on every call, so asking it
+    about N projects costs N reads. Batch authorization checks (which ask about
+    up to 50 projects per request) use this instead and pay one.
+    """
+    data = _load(data_dir)
+    return {
+        entry["project_id"]
+        for entry in data["tokens"].values()
+        if user_id in entry["viewers"]
+    }
+
+
 def get_viewers_for_project(project_id: str, data_dir: Path) -> list[str]:
     """Get all viewer user IDs for a project (deduplicated)."""
     data = _load(data_dir)

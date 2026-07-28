@@ -61,6 +61,24 @@ class ControlMessageType(str, Enum):
     DESK_TODO_SYNC = "desk_todo_sync"  # Server notifies the owning user that a desk to-do was captured / patched / published / removed
     DESK_READ_STATE_SYNC = "desk_read_state_sync"  # Server notifies the owning user that a My Desk read-state watermark was upserted
     DESK_SOP_SYNC = "desk_sop_sync"  # Server notifies the owning user that a desk SOP was created / edited / removed
+    # Server -> the ONE owning user: a full snapshot of that user's live
+    # runners and the clawmeets version each reports.
+    #
+    # RECIPIENT WARNING — read before touching any call site.
+    # The recipient is a SINGLE user: ``participant.registered_by``, delivered
+    # with ``ws_hub.send_to``. It is NEVER
+    # ``server/routes/websocket.get_status_broadcast_recipients``, which
+    # returns a mixed set of agent ids and user ids spanning every shared
+    # project — and which runners themselves consume
+    # (``runner/reactive_loop.py``). Sending this envelope there would ship one
+    # user's agent NAMES and VERSION NUMBERS to other users and to other
+    # people's runners, and version numbers map directly to known-vulnerability
+    # surface.
+    #
+    # The name is RUNNER_VERSIONS, not RUNNER_STATUS, precisely because the
+    # latter sat one word from AGENT_STATUS_CHANGE — the shared, cross-tenant
+    # envelope — and invited exactly that mistake.
+    RUNNER_VERSIONS = "runner_versions"
 
 
 class ChangelogUpdatePayload(BaseModel):
@@ -398,6 +416,52 @@ class DeskReadStateSyncPayload(BaseModel):
     updated_at: str               # ISO-8601 UTC; == the PUT 200 body's updated_at
 
 
+class RunnerVersion(BaseModel):
+    """One live runner in a ``RUNNER_VERSIONS`` snapshot.
+
+    ``version`` is the string the runner reported in its WebSocket handshake,
+    or ``None`` when it sent no version field (an older release) or could not
+    determine one. It is NEVER the string ``"unknown"`` — ``None`` is the
+    single undeterminable signal, and the client's matcher keys off it.
+
+    Declared with no default so a caller cannot construct a record that omits
+    the version: ``model_dump(mode="json")`` then always emits ``"version":
+    null`` rather than dropping the key, which is what lets the client read
+    ``version`` without optional chaining.
+    """
+    id: str
+    name: str
+    version: str | None
+
+
+class RunnerVersionsPayload(BaseModel):
+    """Payload for RUNNER_VERSIONS messages — see the enum member's warning.
+
+    Every runner the recipient user owns that holds at least one live socket.
+    Offline runners are ABSENT, not ``null``-versioned: nothing persists a
+    reported version, so a version not backed by a live socket does not exist.
+
+    **Full snapshot, never a delta.** The client replaces its list wholesale,
+    which makes the push idempotent — the duplicate push during a runner
+    reconnect is harmless and a reconnecting browser is always fully resynced.
+
+    ``runners`` is REQUIRED and carries NO DEFAULT, deliberately. Two reasons:
+
+    1. It is the strongest encoding of the wire contract's "the ``runners`` key
+       is always present". A field that cannot be omitted cannot be omitted.
+    2. ``ControlEnvelope.payload`` is a NON-discriminated Union — a payload
+       parsed from a dict resolves to the first member whose shape fits, and
+       every existing member is saved only by having at least one required
+       field. A ``default_factory=list`` here would leave this model with zero
+       required fields, so it would match ANY dict — including the empty
+       ``{}`` payload that rides every inbound HEARTBEAT frame.
+
+    For the same reason this member is appended LAST among the typed union
+    members.
+    """
+    runners: list[RunnerVersion]
+
+
 class ControlEnvelope(BaseModel):
     """Lightweight WebSocket notification - never carries file content.
 
@@ -413,7 +477,7 @@ class ControlEnvelope(BaseModel):
     would need a real discriminator first.
     """
     type: ControlMessageType
-    payload: Union[ChangelogUpdatePayload, AgentStatusChangePayload, ProjectDeletedPayload, SkillSyncPayload, McpSyncPayload, AgentSettingsChangePayload, CancelLLMPayload, ActiveWorkChangePayload, McpAuthUrlForUserPayload, McpAuthCodePayload, SkillAuthUrlForUserPayload, SkillAuthCodePayload, KnowledgePackSyncPayload, AgentRegistryChangePayload, AgentCardUpdatePayload, BriefTabSyncPayload, ProjectReportSyncPayload, DeskTodoSyncPayload, DeskReadStateSyncPayload, DeskSopSyncPayload, dict] = Field(default_factory=dict)
+    payload: Union[ChangelogUpdatePayload, AgentStatusChangePayload, ProjectDeletedPayload, SkillSyncPayload, McpSyncPayload, AgentSettingsChangePayload, CancelLLMPayload, ActiveWorkChangePayload, McpAuthUrlForUserPayload, McpAuthCodePayload, SkillAuthUrlForUserPayload, SkillAuthCodePayload, KnowledgePackSyncPayload, AgentRegistryChangePayload, AgentCardUpdatePayload, BriefTabSyncPayload, ProjectReportSyncPayload, DeskTodoSyncPayload, DeskReadStateSyncPayload, DeskSopSyncPayload, RunnerVersionsPayload, dict] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_required_fields_for_type(self) -> "ControlEnvelope":
@@ -478,4 +542,7 @@ class ControlEnvelope(BaseModel):
         elif self.type == ControlMessageType.DESK_SOP_SYNC:
             if not isinstance(self.payload, DeskSopSyncPayload):
                 raise ValueError(f"control message type {self.type} requires DeskSopSyncPayload")
+        elif self.type == ControlMessageType.RUNNER_VERSIONS:
+            if not isinstance(self.payload, RunnerVersionsPayload):
+                raise ValueError(f"control message type {self.type} requires RunnerVersionsPayload")
         return self

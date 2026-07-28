@@ -99,10 +99,25 @@ def project_create(
 def project_list(
     server: str = typer.Option(DEFAULT_SERVER, "--server", "-s"),
     full: bool = typer.Option(False, "--full", "-f", help="Show full IDs"),
+    token: Optional[str] = typer.Option(
+        None, "--token", "-t",
+        help="Auth token (user JWT or agent token). Omit inside an agent runner, "
+             "where the per-process agent identity is sent automatically.",
+    ),
 ):
-    """List all projects."""
+    """List the projects you can see.
+
+    ``GET /projects`` is authenticated and caller-scoped: a user gets their own
+    projects (owned + Front Desk requester ends + shared-to-them), an admin gets
+    all of them. Shelled inside a runner the agent identity in ``_http``'s
+    default headers authenticates as the agent's owner, so ``--token`` is only
+    needed for interactive use against a server with no saved session.
+    """
+    headers = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     with _http(server) as client:
-        projects = _ok(client.get("/projects"))
+        projects = _ok(client.get("/projects", headers=headers))
     if not projects:
         typer.echo("No projects.")
         return
