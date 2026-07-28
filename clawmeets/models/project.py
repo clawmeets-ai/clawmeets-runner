@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import os
 import re
+import unicodedata
 from datetime import UTC, datetime
 from pathlib import Path
 from collections.abc import Iterable
@@ -59,6 +60,96 @@ ProjectSurface = Literal["regular", "dm", "frontdesk"]
 # runs only while ``display_name == NEW_CHAT_PLACEHOLDER`` and the mutation flips
 # it, so every later message reads a non-placeholder value and skips.
 NEW_CHAT_PLACEHOLDER = "New chat"
+
+# Max length of a thread display name, in Unicode CODE POINTS, measured AFTER
+# ``normalize_thread_display_name`` has run. The single source of truth for the
+# API, the frontend's inline counter, and the tests — when this number is
+# revisited it must be a one-line change here.
+#
+# 60 is not a UX preference, it is a coupling constraint: the DM auto-titler
+# (``models/agent.py:_clean_dm_title``, ``max_chars=60``) writes THIS field
+# through THAT route, so the storage ceiling must be >= the generation ceiling
+# or a shipped path starts 400-ing. See the plan's "why 60 and not 30". The
+# "keep it short" intent is expressed by the frontend's soft counter at 40, not
+# by a hard cap that breaks a shipped writer.
+THREAD_DISPLAY_NAME_MAX_LEN = 60
+
+# Invisible directional-formatting characters, stripped by
+# ``normalize_thread_display_name``. They render as nothing but reorder the
+# visible text around them, which makes a thread title a spoofing surface in
+# every sidebar that renders it. ZWJ (U+200D) and VS16 (U+FE0F) are deliberately
+# ABSENT: stripping every invisible would shatter emoji sequences (👨‍👩‍👧 would
+# render as three separate people).
+# Spelled with escapes on purpose: literal copies of these characters would be
+# invisible in this file and in every diff of it.
+_DISPLAY_NAME_BIDI_OVERRIDES = frozenset(
+    "\u200e\u200f"                                  # LRM, RLM
+    "\u202a\u202b\u202c\u202d\u202e"              # LRE, RLE, PDF, LRO, RLO
+    "\u2066\u2067\u2068\u2069"                    # LRI, RLI, FSI, PDI
+)
+
+
+def normalize_thread_display_name(raw: str) -> str:
+    """Canonicalize a user- or model-supplied thread name into its stored form.
+
+    Pipeline, in order — the order matters, since each step feeds the next:
+
+    1. NFC normalize, so ``e`` + U+0301 and ``é`` are one stored value with one
+       length. Without this, two visually identical names would disagree on
+       whether they fit under :data:`THREAD_DISPLAY_NAME_MAX_LEN`.
+    2. Drop the bidi overrides in :data:`_DISPLAY_NAME_BIDI_OVERRIDES` and the
+       Cc control characters — but NOT the Cc characters that are whitespace
+       (tab, newline, CR). Those are left for step 3 to turn into a space:
+       deleting them here instead would glue the words on either side together
+       (``"Trip\\tplan"`` -> ``"Tripplan"``).
+    3. Collapse every run of Unicode whitespace to a single U+0020 and strip
+       both ends. This IS the trim rule: ``"  Trip   plan \\n"`` stores as
+       ``"Trip plan"``.
+
+    Steps 1-3 rewrite silently — a trailing space is not an error, it is
+    normalized away. Only two conditions raise, and their messages are
+    user-facing verbatim (the route passes ``str(e)`` straight into
+    ``{"detail": ...}`` for inline display next to the input):
+
+    - empty after normalization
+    - longer than :data:`THREAD_DISPLAY_NAME_MAX_LEN` **code points**
+
+    Length is code points, not bytes and not grapheme clusters. A family emoji
+    is ~7 code points against the budget; a grapheme-aware count would need a
+    new dependency for a cosmetic gain. The frontend counts the same way
+    (``[...s].length``, NOT ``s.length``, which counts UTF-16 units and would
+    disagree above U+FFFF).
+
+    Pure and side-effect-free, so the route, the auto-title path and the tests
+    can all call it. It lives on the model rather than the route because it is
+    a rule about the *field*, not about HTTP.
+
+    Args:
+        raw: The submitted name, straight off the wire.
+
+    Returns:
+        The canonical value to persist.
+
+    Raises:
+        ValueError: Empty or over-length, carrying the user-facing message.
+    """
+    text = unicodedata.normalize("NFC", raw)
+    text = "".join(
+        ch
+        for ch in text
+        if ch not in _DISPLAY_NAME_BIDI_OVERRIDES
+        and not (unicodedata.category(ch) == "Cc" and not ch.isspace())
+    )
+    text = " ".join(text.split())
+
+    if not text:
+        raise ValueError("Thread name cannot be empty.")
+    if len(text) > THREAD_DISPLAY_NAME_MAX_LEN:
+        raise ValueError(
+            f"Thread name must be {THREAD_DISPLAY_NAME_MAX_LEN} characters or fewer."
+        )
+    return text
+
 
 # Front Desk / DM-shaped project name shape: ``{requester}-fd-{agent_short}``.
 # Mirrors the frontend FRONT_DESK_NAME_RE (web/frontend/src/types/index.ts).
