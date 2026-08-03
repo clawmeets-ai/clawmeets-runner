@@ -48,6 +48,7 @@ from clawmeets.cli_lifecycle import (
     save_user_session,
 )
 from clawmeets.models.chat_message import ChatMessage
+from clawmeets.utils import invoke_timeout
 from clawmeets.utils.file_io import FileUtil
 from clawmeets.utils.notification_center import NotificationCenter
 from clawmeets.utils.version import installed_clawmeets_version
@@ -434,8 +435,45 @@ def _build_llm_provider(
     api_key: Optional[str] = None,
     api_caps: Optional[dict] = None,
     base_url: Optional[str] = None,
+    invoke_timeout: Optional[int] = None,
 ) -> LLMProvider:
-    """Construct a fresh CLI for the given provider+model.
+    """Construct a fresh CLI for the given provider+model, with its kill window.
+
+    ``invoke_timeout`` (seconds) overrides ``LLMProvider._invoke_timeout`` on
+    the constructed instance — one assignment covering all three provider
+    families, since every one of them wraps its invocation in
+    ``asyncio.wait_for(..., timeout=self._invoke_timeout)``. ``None`` leaves
+    the class default in place. Applied here rather than threaded through six
+    constructors: the providers stay ignorant of ``card.json``, and settings
+    resolution stays in the runner, which owns it.
+    """
+    cli = _construct_llm_provider(
+        provider,
+        model,
+        plugin_dirs=plugin_dirs,
+        skill_dirs=skill_dirs,
+        agent_env=agent_env,
+        api_key=api_key,
+        api_caps=api_caps,
+        base_url=base_url,
+    )
+    if invoke_timeout is not None:
+        cli._invoke_timeout = invoke_timeout
+    return cli
+
+
+def _construct_llm_provider(
+    provider: str,
+    model: Optional[str],
+    *,
+    plugin_dirs: list[Path],
+    skill_dirs: list[Path],
+    agent_env: dict[str, str],
+    api_key: Optional[str] = None,
+    api_caps: Optional[dict] = None,
+    base_url: Optional[str] = None,
+) -> LLMProvider:
+    """Dispatch provider name → constructed provider instance.
 
     Shared by the startup path and the AGENT_SETTINGS_CHANGE hot-swap path
     so both build identical instances. ``verify_cli()`` raises
@@ -1412,6 +1450,110 @@ def knowledge_pack_uninstall(
     typer.echo(f"Uninstalled '{slug}' from '{agent_name}'.")
 
 
+def _parse_invoke_timeout(raw: str) -> int:
+    """Parse the human-supplied invocation timeout, in seconds.
+
+    Rejects junk at the CLI boundary with exit 1 rather than silently clamping:
+    someone who typed ``--invoke-timeout 2h`` deserves to be told, unlike a
+    value already stored on a card, which must never crash a turn (see
+    ``utils.invoke_timeout.resolve``). Out-of-band *numbers* do clamp, with a
+    note — the intent there is unambiguous.
+    """
+    parsed = invoke_timeout.parse(raw)
+    if parsed is None:
+        typer.echo(
+            f"Error: --invoke-timeout must be a whole number of seconds "
+            f"between {invoke_timeout.MIN_SECONDS} and "
+            f"{invoke_timeout.MAX_SECONDS} (got {raw!r}).",
+            err=True,
+        )
+        raise typer.Exit(1)
+    if str(parsed) != str(raw).strip():
+        typer.echo(
+            f"Note: clamped {raw!r} to {parsed}s "
+            f"(band: {invoke_timeout.MIN_SECONDS}..{invoke_timeout.MAX_SECONDS}).",
+            err=True,
+        )
+    return parsed
+
+
+@agent_app.command("invoke-timeout")
+def agent_invoke_timeout(
+    agent: str = typer.Argument(
+        ...,
+        help="Agent name or id, or 'self' (agent reads/sets its own via runner-injected env)",
+    ),
+    seconds: Optional[str] = typer.Argument(
+        None,
+        help=(
+            "New per-turn LLM invocation timeout in seconds "
+            "(60..21600). Omit to show the current value."
+        ),
+    ),
+    clear: bool = typer.Option(
+        False, "--clear", help="Reset to the 1800s default."
+    ),
+    token: Optional[str] = typer.Option(None, "--token", "-t"),
+    server: Optional[str] = typer.Option(None, "--server", "-s"),
+    data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir"),
+):
+    """Show or set an agent's per-turn LLM invocation timeout.
+
+    The window bounds one turn end-to-end. It is enforced twice — the runner
+    kills its own invocation at the deadline, and the server cancels the batch
+    at the same deadline — so both read this one card value and neither can be
+    raised on its own.
+
+    A change takes effect on the agent's NEXT turn: the current turn's kill
+    window was committed when the invocation started, and its batch window when
+    the message was posted. Raise it BEFORE taking on long work; it cannot
+    rescue a turn already running.
+
+    Examples::
+
+        clawmeets agent invoke-timeout self            # show
+        clawmeets agent invoke-timeout self 7200       # 2 hours
+        clawmeets agent invoke-timeout self --clear    # back to 1800s
+    """
+    if seconds is not None and clear:
+        typer.echo("Error: pass either SECONDS or --clear, not both.", err=True)
+        raise typer.Exit(1)
+
+    server_url, token, agent_id, agent_name = _resolve_session_for_config(
+        data_dir, token, server, agent,
+    )
+
+    if seconds is None and not clear:
+        with _http(server_url) as client:
+            current = _ok(client.get(
+                f"/agents/{agent_id}",
+                headers={"Authorization": f"Bearer {token}"},
+            ))
+        settings = current.get("local_settings") or {}
+        raw = settings.get(invoke_timeout.SETTINGS_KEY)
+        effective = invoke_timeout.resolve(settings)
+        origin = "set on card" if raw is not None else "default"
+        typer.echo(f"{agent_name}: invoke timeout {effective}s ({origin}).")
+        return
+
+    value: object = "" if clear else _parse_invoke_timeout(seconds or "")
+    with _http(server_url) as client:
+        _ok(client.patch(
+            f"/agents/{agent_id}/local-settings",
+            json={"local_settings": {invoke_timeout.SETTINGS_KEY: value}},
+            headers={"Authorization": f"Bearer {token}"},
+        ))
+    if clear:
+        typer.echo(
+            f"{agent_name}: invoke timeout reset to the "
+            f"{invoke_timeout.DEFAULT_SECONDS}s default (effective next turn)."
+        )
+    else:
+        typer.echo(
+            f"{agent_name}: invoke timeout set to {value}s (effective next turn)."
+        )
+
+
 # ---------------------------------------------------------------------------
 # agent list
 # ---------------------------------------------------------------------------
@@ -1466,6 +1608,7 @@ def agent_reconfigure(
     llm_api_key: Optional[str] = typer.Option(None, "--llm-api-key", help="BYO key for a '-api' provider (empty string clears). NOTE: prefer the web UI — keys typed into chat sync to the server."),
     llm_base_url: Optional[str] = typer.Option(None, "--llm-base-url", help="Local-model endpoint. For 'openai-api': an OpenAI-compatible URL (ollama 'http://localhost:11434/v1'). For the 'claude' CLI: a local Anthropic Messages-API URL (ollama 'http://localhost:11434' — no '/v1', or a gateway). Empty string clears."),
     llm_output_mode: Optional[str] = typer.Option(None, "--llm-output-mode", help="Structured-output mode for a '-api' provider on the --llm-base-url path: 'tool' (function-calling loop — for gateways that support tool calls) or 'native' (single-shot JSON — for local models with flaky tool-call parsing). Empty string clears (→ default: native on base_url)."),
+    invoke_timeout_seconds: Optional[str] = typer.Option(None, "--invoke-timeout", help="Per-turn LLM invocation timeout in seconds (60..21600, default 1800). Empty string clears. See `clawmeets agent invoke-timeout` to read the current value."),
     token: Optional[str] = typer.Option(None, "--token", "-t"),
     server: Optional[str] = typer.Option(None, "--server", "-s"),
     data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir"),
@@ -1474,9 +1617,13 @@ def agent_reconfigure(
 
     Supersedes the single-key ``set-dwh-dir``: sets/clears any of git_url,
     git_base_branch, knowledge_dir, dwh_dir, llm_provider, llm_model,
-    llm_api_key, llm_base_url, output_mode in one call. Only flags you pass are touched; pass an empty
+    llm_api_key, llm_base_url, output_mode, invoke_timeout_seconds in one call.
+    Only flags you pass are touched; pass an empty
     string to clear a key. Triggers AGENT_SETTINGS_CHANGE so a running runner
     picks it up on the next LLM invocation.
+
+    ``--invoke-timeout`` is also readable via the dedicated
+    ``clawmeets agent invoke-timeout <agent>`` (this command has no read mode).
 
     Use ``self`` to target the calling agent (self-reconfigure from inside a
     runner subprocess, using the runner-injected CLAWMEETS_AGENT_* env). Any
@@ -1484,8 +1631,10 @@ def agent_reconfigure(
     server scopes the self-token to the calling agent only.
     """
     # Only flags actually supplied (None = untouched). Empty string is kept —
-    # the server treats it as a clear.
-    fields: dict[str, Optional[str]] = {}
+    # the server treats it as a clear. Typed `object` rather than `str` because
+    # invoke_timeout_seconds must land on the card as a real int: the server's
+    # max() over declared windows would otherwise compare a str.
+    fields: dict[str, object] = {}
     for key, value in (
         ("git_url", git_url),
         ("git_base_branch", git_base_branch),
@@ -1499,6 +1648,11 @@ def agent_reconfigure(
     ):
         if value is not None:
             fields[key] = value
+    if invoke_timeout_seconds is not None:
+        fields[invoke_timeout.SETTINGS_KEY] = (
+            "" if invoke_timeout_seconds == ""
+            else _parse_invoke_timeout(invoke_timeout_seconds)
+        )
     if not fields:
         typer.echo("Error: pass at least one setting flag (e.g. --git-url).", err=True)
         raise typer.Exit(1)
@@ -2325,6 +2479,12 @@ async def _runner_loop(
     def cli_factory(settings: dict) -> LLMProvider:
         provider = (settings.get("llm_provider") or "claude").lower()
         model = settings.get("llm_model") or None
+        # Per-turn kill window. Also republished into agent_env so the agent
+        # can read the window in force for the current turn without an HTTP
+        # round-trip; providers copy agent_env at construction, so writing it
+        # here (before the constructor) is what makes a hot-swap visible.
+        window = invoke_timeout.resolve(settings)
+        agent_env[invoke_timeout.ENV_VAR] = str(window)
         # ``-api`` providers resolve a key with env-var fallback; the bare
         # ``claude`` local-model route (base_url set) takes the explicit
         # llm_api_key as the gateway bearer token (no env fallback).
@@ -2343,6 +2503,7 @@ async def _runner_loop(
             api_key=api_key,
             api_caps=_api_caps_from_settings(settings),
             base_url=base_url,
+            invoke_timeout=window,
         )
 
     try:

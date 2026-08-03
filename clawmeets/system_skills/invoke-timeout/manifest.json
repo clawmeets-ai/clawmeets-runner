@@ -1,0 +1,6 @@
+{
+  "audiences": ["worker", "coordinator", "assistant"],
+  "surfaces": ["agent_runtime"],
+  "version": "1.0.0",
+  "description": "Raise or lower YOUR OWN per-turn LLM invocation timeout (clawmeets agent invoke-timeout self) — default 30 min, max 6 h. Raise it BEFORE starting long work; a change lands on your NEXT turn and cannot rescue the turn you are in."
+}

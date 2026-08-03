@@ -78,7 +78,13 @@ class LLMTimeoutError(LLMInvocationError):
         provider: str = "LLM",
     ) -> None:
         self.timeout_seconds = timeout_seconds
-        message = f"{provider} invocation timed out after {timeout_seconds} seconds"
+        message = (
+            f"{provider} invocation timed out after {timeout_seconds} seconds. "
+            f"If this work legitimately needs longer, raise the window with "
+            f"`clawmeets agent invoke-timeout self <seconds>` (see the "
+            f"'invoke-timeout' skill) BEFORE retrying — it applies to the next "
+            f"turn, not the one that just died"
+        )
         if prompt_file:
             message += f". Prompt file: {prompt_file}"
         super().__init__(message, prompt_file, working_dir)
@@ -304,7 +310,11 @@ class LLMProvider(ABC):
     ``_install_hint``) are shared by both.
     """
 
-    # Per-invocation kill window; aligned with server's --batch-timeout.
+    # Per-invocation kill window, in seconds. This is the class *default*,
+    # aligned with the server's --batch-timeout; the runner overrides it per
+    # instance from ``local_settings.invoke_timeout_seconds`` (see
+    # ``cli_runner._build_llm_provider`` and ``utils/invoke_timeout.py``), so
+    # providers stay ignorant of card.json.
     _invoke_timeout: int = 1800
 
     # Subclass identity — override as class attributes.

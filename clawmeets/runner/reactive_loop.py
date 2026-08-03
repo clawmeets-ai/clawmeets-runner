@@ -1040,8 +1040,12 @@ class ReactiveControlLoop:
         # (incl. the ``-api`` variant) / model / BYO-key all resolve there.
         # Switching e.g. claude → claude-api is a llm_provider change, so it
         # still triggers the swap.
+        # ``invoke_timeout_seconds`` rides this list because the kill window is
+        # baked onto the provider instance at construction — the only way to
+        # change it without a restart is to rebuild.
         llm_keys = (
             "llm_provider", "llm_model", "llm_api_key", "llm_base_url", "output_mode",
+            "invoke_timeout_seconds",
         )
         llm_changed = any(
             local_settings.get(k) != prior_settings.get(k) for k in llm_keys
