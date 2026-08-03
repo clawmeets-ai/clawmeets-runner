@@ -5,10 +5,13 @@ clawmeets/models/desk_sop.py
 Desk SOP store — the My Desk right-rail "SOP" library: stored, reusable
 prompts the manager hands to an agent over and over.
 
-An SOP body carries typed blanks written ``{{Label|kind:config}}`` (see
-``web/frontend/src/components/composer/placeholders.ts`` for the syntax).
-Clicking one in the rail loads it into the desk composer as fillable chips,
-already addressed to ``agent_id``.
+An SOP body carries typed blanks written ``{{Label|kind:config}}``. The grammar
+has two implementations, kept in lockstep by the shared corpus at
+``tests/fixtures/sop_templates.json``: ``models/sop_template.py`` (server + CLI)
+and ``web/frontend/src/components/composer/placeholders.ts`` (browser). Clicking
+one in the rail loads it into the desk composer as fillable chips, already
+addressed to ``agent_id``; ``clawmeets sop trigger`` fills the same blanks from
+``--set`` pairs and DMs the result to that agent.
 
 Unlike the to-do plate this list is *searched*, not dragged — so there is no
 reorder verb and no ordering contract beyond "newest first". It is still one

@@ -281,6 +281,40 @@ class Agent(PersistableParticipant):
             return None
         return cls.get_by_name(f"{owner.username}-{name}", ctx)
 
+    @classmethod
+    def get_by_name_for_owner(
+        cls,
+        name: str,
+        owner_user_id: Optional[str],
+        ctx: "ModelContext",
+    ) -> Optional["Agent"]:
+        """Resolve an agent by the short or full name a human would type,
+        inside one owner's namespace.
+
+        Exact match on the full registry name first, then
+        ``{owner.username}-{name}``. Returns None when neither hits — callers
+        treat that as "keep the raw string as a display label" rather than an
+        error, because a to-do or SOP naming a since-deleted agent should still
+        save with the name visible.
+
+        Sibling of ``resolve_with_namespace``, which does the same two tiers
+        keyed off a *project's* owner. This one takes the owner id directly,
+        for the desk routes, where the namespace comes from the calling agent's
+        ``registered_by``.
+        """
+        from .user import User
+
+        agent = cls.get_by_name(name, ctx)
+        if agent is not None:
+            return agent
+
+        if not owner_user_id:
+            return None
+        owner = User.get(owner_user_id, ctx)
+        if owner is None:
+            return None
+        return cls.get_by_name(f"{owner.username}-{name}", ctx)
+
     @staticmethod
     def short_name(full_name: str, owner_username: Optional[str]) -> str:
         """Strip ``{owner_username}-`` prefix from a full agent name."""

@@ -1,0 +1,6 @@
+{
+  "audiences": ["assistant"],
+  "surfaces": ["agent_runtime"],
+  "version": "1.0.0",
+  "description": "Manage and run the owner's My Desk SOP library of stored, reusable prompts (assistant-only; running one is a two-turn interview)."
+}

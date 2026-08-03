@@ -2,8 +2,14 @@
 """
 clawmeets/models/desk_read_state.py
 
-Desk read-state store — the server-side memory of the My Desk "Mark Read"
-action, so a card marked read on one device is read on every device.
+Desk read-state store — the server-side memory of the My Desk **Sign Off**
+action, so a card signed off on one device is signed off on every device.
+
+Sign Off is the ONLY writer: ``dismiss()`` in ``UpdateCard.tsx`` is the single
+caller of the client's ``markRead``. Send Back deliberately does not write here
+(it leaves the card on the desk, re-laned to *Working*), so every row in this
+store is a sign-off by construction — that is what lets the read side
+(``models/desk_sign_off.py``) call itself "Signed off today" honestly.
 
 Granularity is one watermark per desk card = per ``(project_id,
 chatroom_name)`` (today ``chatroom_name == "user-communication"``). The value
@@ -130,25 +136,60 @@ async def list_read_state(data_dir: Path, owner_user_id: str) -> list[DeskReadSt
         return list(_load(data_dir, owner_user_id).values())
 
 
-async def list_last_read(
+class SignOffWindow(BaseModel):
+    """The answer to one sign-off query.
+
+    Both fields are computed from a SINGLE snapshot, so the window and the
+    all-time high can never disagree with each other.
+    """
+
+    rows: list[DeskReadState]        # inside the window, newest-first
+    last_signed_off_at: str | None = None   # newest updated_at across ALL rows
+
+
+def _parsed(row: DeskReadState) -> datetime:
+    """``row.updated_at`` as an aware datetime; unparseable rows sort oldest.
+
+    Every stamp this module writes is ``_monotonic_now``'s fixed ``+00:00``
+    format, but a hand-edited / legacy file could hold anything, and a raise
+    here would take the whole feed down for one bad row.
+    """
+    try:
+        parsed = datetime.fromisoformat(row.updated_at)
+    except (TypeError, ValueError):
+        return datetime.min.replace(tzinfo=UTC)
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+async def list_sign_offs(
     data_dir: Path,
     owner_user_id: str,
-    limit: int = 5,
-) -> list[DeskReadState]:
-    """Return the owner's ``limit`` most-recently marked-read cards, newest first.
+    since: datetime | None = None,
+) -> SignOffWindow:
+    """All of the owner's sign-offs at or after ``since``, newest first.
 
-    Read-only query over the existing store — the backing for "Last 5 Read". It
-    reuses ``_load()`` and does NOT write or touch the monotonic clock
-    (``_monotonic_now`` is never called on this path). Rows are sorted by
-    ``updated_at`` DESC; since every timestamp shares the fixed ``+00:00`` UTC
-    format, lexicographic string order equals chronological order. The snapshot
-    is taken under ``_lock`` for consistency against a concurrent upsert, then
-    sliced to ``limit`` (a non-positive ``limit`` yields an empty list).
+    Also returns the newest ``updated_at`` across EVERY row (ignoring
+    ``since``), so a caller can say "nothing today; last one was Tuesday"
+    without a second query.
+
+    ``since`` is an aware datetime and each row's ISO ``updated_at`` is PARSED
+    and compared as a datetime. A string compare would be wrong the moment the
+    caller's boundary is expressed in a non-UTC offset or with a ``Z`` suffix —
+    lexicographic order only equals chronological order while every value
+    shares this module's fixed ``+00:00`` format, and the boundary comes from
+    the client. ``since=None`` means no window.
+
+    No limit, no clamp, no skip — the caller windows. Read-only: it reuses
+    ``_load()`` and never touches the monotonic clock. The snapshot is taken
+    under ``_lock`` for consistency against a concurrent upsert.
     """
     async with _lock:
         rows = list(_load(data_dir, owner_user_id).values())
-    rows.sort(key=lambda r: r.updated_at, reverse=True)
-    return rows[: limit] if limit > 0 else []
+    rows.sort(key=_parsed, reverse=True)
+    last = rows[0].updated_at if rows else None
+    if since is not None:
+        rows = [r for r in rows if _parsed(r) >= since]
+    return SignOffWindow(rows=rows, last_signed_off_at=last)
 
 
 async def upsert_read_state(

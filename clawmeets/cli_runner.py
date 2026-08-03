@@ -2655,6 +2655,134 @@ def _ensure_dm_target(
     return resp.json(), True
 
 
+def resolve_dm_recipient(
+    client: httpx.Client,
+    token: str,
+    ref: str,
+    *,
+    agent_id: Optional[str] = None,
+) -> Optional[str]:
+    """Resolve a short or full agent name to the full registry name, or None.
+
+    The DM thread routes match on the full registry name only, while a human
+    (and therefore an assistant relaying a human) says the short one. This
+    applies the same two tiers ``Agent.get_by_name_for_owner`` does server-side:
+    exact name, then the ``{username}-{short}`` suffix, resolved against the
+    owner's live roster.
+
+    Returns None when the ref matches no agent, or ambiguously matches more than
+    one — the caller decides whether that is an error or a no-op. That is the
+    difference from ``_resolve_agent_id``, which exits: a trigger verb needs to
+    report "recipient_gone" and stop, not die.
+
+    Doubles as the liveness check, so a departed recipient is caught before a
+    thread is minted. Pass ``agent_id`` when ``token`` is an agent bearer —
+    ``GET /agents`` resolves an agent credential to its owner only with the
+    accompanying ``X-Agent-ID``.
+    """
+    headers = {"Authorization": f"Bearer {token}"}
+    if agent_id:
+        headers["X-Agent-ID"] = agent_id
+    resp = client.get("/agents", headers=headers)
+    if resp.status_code != 200:
+        return None
+    names = [
+        a.get("name", "")
+        for a in resp.json()
+        if isinstance(a, dict) and a.get("name")
+    ]
+    if ref in names:
+        return ref
+    matches = [n for n in names if n.endswith(f"-{ref}")]
+    return matches[0] if len(matches) == 1 else None
+
+
+def send_dm_as_owner(
+    client: httpx.Client,
+    token: str,
+    agent_full_name: str,
+    content: str,
+    *,
+    files: Optional[List[tuple[str, str]]] = None,
+    new_thread: bool = False,
+    thread_key: Optional[str] = None,
+    as_agent_id: Optional[str] = None,
+) -> Optional[dict]:
+    """Send one message to ``agent_full_name`` with the OWNER's authority.
+
+    ``token`` is a user JWT or the owner's assistant bearer (see
+    ``_resolve_dm_session``). The single dispatch path behind ``dm send``,
+    ``clawmeets todo trigger`` and ``clawmeets sop trigger``, so the three
+    cannot drift into sending different things.
+
+    Thread choice is the caller's, because the two use cases genuinely differ.
+    ``dm send`` continues the ONE long-lived per-agent DM project
+    (``/me/dms/{name}/ensure``); a trigger opens a FRESH thread
+    (``/me/dms/{name}/threads``) exactly as the desk's send button does — a
+    dispatched task is its own conversation, and its reply surfaces on the desk
+    feed as a distinct thread. ``/threads`` is own-agents-only, so a foreign
+    recipient falls back to the front-desk thread path ``_ensure_dm_target``
+    already owns rather than reporting a bogus "recipient gone".
+
+    ``thread_key`` is the server's idempotency token: a retried trigger lands in
+    the thread the first attempt made instead of minting a second one.
+
+    ``files`` are ``(filename, text)`` pairs, base64'd into
+    ``UserMessageBody.files`` so the attachments and the message land atomically
+    (the endpoint's own contract). This is what lets a to-do's ``context`` blob
+    travel as a real ``.md``, matching the desk take-over rather than being
+    flattened into the prose.
+
+    Returns the DM/FD project dict, or ``None`` when the recipient cannot be
+    resolved at all (unknown name, or a foreign agent with no thread) — the
+    caller decides whether that is an error or a no-op. A resolvable recipient
+    whose *send* then fails exits non-zero via ``_ok``.
+    """
+    headers = {"Authorization": f"Bearer {token}"}
+    project: Optional[dict] = None
+    is_foreign = False
+
+    if new_thread:
+        body: dict = {}
+        if thread_key:
+            body["client_thread_key"] = thread_key
+        resp = client.post(
+            f"/me/dms/{agent_full_name}/threads", headers=headers, json=body
+        )
+        if resp.status_code == 200:
+            project = resp.json()
+        elif resp.status_code != 403:
+            # 404 unknown agent, or anything else we can't act on.
+            return None
+        # 403 == "not your agent"; fall through to the front-desk path.
+
+    if project is None:
+        project, is_foreign = _ensure_dm_target(
+            client, token, agent_full_name, as_agent_id=as_agent_id
+        )
+        if not project:
+            return None
+
+    msg: dict = {"content": content}
+    if is_foreign and as_agent_id:
+        msg["as_agent_id"] = as_agent_id
+    if files:
+        msg["files"] = [
+            {
+                "filename": name,
+                "content_b64": base64.b64encode(text.encode("utf-8")).decode("ascii"),
+            }
+            for name, text in files
+        ]
+    resp = client.post(
+        f"/projects/{project['id']}/chatrooms/{DM_CHATROOM_NAME}/user-message",
+        json=msg,
+        headers=headers,
+    )
+    _ok(resp)
+    return project
+
+
 @dm_app.command("send")
 def dm_send(
     agent_name: str = typer.Argument(..., help="Full agent name to message (e.g. 'alice-researcher')"),
@@ -2684,24 +2812,15 @@ def dm_send(
     server_url, token = _resolve_dm_session(data_dir, username, password, token, server)
     as_agent_id = os.environ.get("CLAWMEETS_AGENT_ID")
     with _http(server_url) as client:
-        dm_project, is_foreign = _ensure_dm_target(
-            client, token, agent_name, as_agent_id=as_agent_id
+        # new_thread=False keeps the long-lived per-agent DM project this command
+        # has always continued; the attachment + fresh-thread paths of
+        # send_dm_as_owner are the trigger verbs' business, not this one's.
+        dm_project = send_dm_as_owner(
+            client, token, agent_name, message, as_agent_id=as_agent_id
         )
         if not dm_project:
             typer.echo(f"Error: Could not resolve DM project for agent {agent_name}", err=True)
             raise typer.Exit(1)
-
-        # Send message via user-message endpoint. For a foreign delegation shelled
-        # by an agent, attribute the message to that agent (as_agent_id).
-        body: dict = {"content": message}
-        if is_foreign and as_agent_id:
-            body["as_agent_id"] = as_agent_id
-        resp = client.post(
-            f"/projects/{dm_project['id']}/chatrooms/{DM_CHATROOM_NAME}/user-message",
-            json=body,
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        _ok(resp)
         typer.echo(f"Message sent to @{agent_name}")
 
 
