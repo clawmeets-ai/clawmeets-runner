@@ -360,8 +360,11 @@ def _sync_one_slice(
 
 
 # ---------------------------------------------------------------------------
-# Interactive tool bodies (search / get / labels / attachment / send)
+# Interactive tool bodies (search / get / labels / attachment / send / archive)
 # ---------------------------------------------------------------------------
+
+INBOX_LABEL = "INBOX"
+BATCH_MODIFY_MAX_IDS = 1000  # Gmail API hard limit per batchModify call
 
 
 def search_messages(svc, query: str, max_results: int = 20) -> list[dict]:
@@ -476,6 +479,74 @@ def send_message(
         userId="me", body={"raw": raw},
     ).execute()
     return {"id": sent.get("id"), "thread_id": sent.get("threadId")}
+
+
+def _modify_chunk(svc, ids: list[str], *, undo: bool = False) -> list[dict]:
+    """Apply the INBOX label change to one chunk of <= ``BATCH_MODIFY_MAX_IDS``.
+
+    ``batchModify`` is all-or-nothing per call and returns an empty body, so a
+    chunk that raises is retried id-by-id via ``messages.modify`` to attribute
+    the error to the offending id(s) instead of dropping the whole chunk.
+    Returns the per-id failure records — empty list on full success. Never
+    raises.
+    """
+    key = "addLabelIds" if undo else "removeLabelIds"
+    try:
+        svc.users().messages().batchModify(
+            userId="me", body={"ids": list(ids), key: [INBOX_LABEL]},
+        ).execute()
+        return []
+    except Exception:
+        pass
+
+    failures: list[dict] = []
+    for message_id in ids:
+        try:
+            svc.users().messages().modify(
+                userId="me", id=message_id, body={key: [INBOX_LABEL]},
+            ).execute()
+        except Exception as exc:
+            failures.append({
+                "id": message_id,
+                "error": f"{type(exc).__name__}: {exc}"[:300],
+            })
+    return failures
+
+
+def archive_messages(svc, message_ids: list[str], *, undo: bool = False) -> dict:
+    """Archive messages by removing the ``INBOX`` label (Gmail has no archive
+    endpoint — archiving *is* dropping that label). With ``undo=True`` the
+    label is added back, moving the messages to the inbox.
+
+    Idempotent: archiving an already-archived id is a silent no-op success, so
+    the call is safe to retry. Nothing is deleted — archived mail stays in All
+    Mail. Ids are de-duplicated (order preserved) and chunked at
+    ``BATCH_MODIFY_MAX_IDS``; an empty list does zero API calls.
+
+    Returns ``{"action", "requested", "archived": [id...],
+    "failed": [{"id", "error"}...]}``.
+    """
+    seen: set[str] = set()
+    ids: list[str] = []
+    for message_id in message_ids or []:
+        if message_id and message_id not in seen:
+            seen.add(message_id)
+            ids.append(message_id)
+
+    action = "unarchive" if undo else "archive"
+    failures: list[dict] = []
+    for start in range(0, len(ids), BATCH_MODIFY_MAX_IDS):
+        failures.extend(
+            _modify_chunk(svc, ids[start:start + BATCH_MODIFY_MAX_IDS], undo=undo)
+        )
+
+    failed_ids = {f["id"] for f in failures}
+    return {
+        "action": action,
+        "requested": len(ids),
+        "archived": [i for i in ids if i not in failed_ids],
+        "failed": failures,
+    }
 
 
 # ---------------------------------------------------------------------------

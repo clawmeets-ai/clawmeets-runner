@@ -1,0 +1,6 @@
+{
+  "audiences": ["assistant", "worker", "coordinator"],
+  "surfaces": ["agent_runtime"],
+  "version": "1.0.0",
+  "description": "The project plan in PLAN.md — read it, propose changes as notes, and (coordinator or owner only) write a section."
+}

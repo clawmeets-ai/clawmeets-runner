@@ -1,0 +1,6 @@
+{
+  "audiences": ["assistant"],
+  "surfaces": ["agent_runtime"],
+  "version": "1.0.0",
+  "description": "Register a new agent inside a short onboarding project so a mentor's knowledge dump and the agent's own deep research land in its durable memory/learnings/."
+}

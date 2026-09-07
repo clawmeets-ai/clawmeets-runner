@@ -2,5 +2,5 @@
   "audiences": ["assistant"],
   "surfaces": ["agent_runtime"],
   "version": "1.0.0",
-  "description": "Manage and fire what is already on the owner's My Desk plate — list / update / done / reopen / delete / trigger (assistant-only)."
+  "description": "Manage and fire what is already on the owner's My Desk plate and curate its label vocabulary — list / update / done / reopen / delete / trigger / labels (assistant-only)."
 }

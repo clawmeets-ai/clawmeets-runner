@@ -98,6 +98,17 @@ class ActionBlockExecutor:
                     )
                     logger.debug(f"Created chatroom {name}")
 
+                elif action_type == "invite_agent":
+                    room_name = action["room"]
+                    await self._client.invite_to_chatroom(
+                        project_id=project_id,
+                        chatroom_name=room_name,
+                        participant_names=action["invite"],
+                        message=action["message"],
+                        source_version=source_version,
+                    )
+                    logger.debug(f"Invited {action['invite']} to {room_name}")
+
                 elif action_type == "update_file":
                     file_path = action["file_path"]
                     room_name = action["room"]
@@ -182,6 +193,9 @@ def _format_failure_summary(action: dict, exc: httpx.HTTPStatusError) -> str:
     if action_type == "create_room":
         invite = action.get("invite") or []
         ctx = f"chatroom {action.get('name')!r} (inviting {invite!r})"
+    elif action_type == "invite_agent":
+        invite = action.get("invite") or []
+        ctx = f"chatroom {action.get('room')!r} (inviting {invite!r})"
     elif action_type == "reply":
         ctx = f"chatroom {action.get('room')!r}"
     elif action_type == "update_file":

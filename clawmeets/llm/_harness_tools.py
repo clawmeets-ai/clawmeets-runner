@@ -52,7 +52,7 @@ class EmitterSpec:
 
     ``params`` is an ordered ``(name, description)`` tuple; every param is
     required. ``array_params`` names those declared as array-of-string rather
-    than string (only ``emit_create_room.invite`` today).
+    than string (``emit_create_room.invite`` and ``emit_invite_agent.invite``).
     """
 
     tool_name: str
@@ -88,6 +88,16 @@ COORDINATOR_EMITTERS: tuple[EmitterSpec, ...] = WORKER_EMITTERS + (
             ("name", "Name of the new chatroom."),
             ("invite", "Array of agent names to invite."),
             ("init_message", "Opening message (use @mentions to address agents)."),
+        ),
+        array_params=frozenset({"invite"}),
+    ),
+    EmitterSpec(
+        "emit_invite_agent",
+        "invite_agent",
+        (
+            ("room", "Name of the EXISTING chatroom to add agents to."),
+            ("invite", "Array of agent names to invite."),
+            ("message", "Message to post after inviting (@mention every invitee)."),
         ),
         array_params=frozenset({"invite"}),
     ),

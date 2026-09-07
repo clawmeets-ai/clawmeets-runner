@@ -19,13 +19,13 @@ from pydantic import BaseModel, ConfigDict, Field
 # (not imported) because api/ is Layer 0 and must not depend on models/. Used
 # as a Literal so a bad ``provider`` yields a Pydantic list-shape 422.
 _CONFIG_PROVIDER = Literal[
-    "claude", "openai", "gemini", "opencode",
+    "claude", "openai", "gemini", "opencode", "antigravity",
     "claude-api", "openai-api", "gemini-api", "openrouter-api", "openrouter-native",
 ]
 _CONFIG_NAME_PATTERN = r"^[A-Za-z0-9 _-]+$"
 # NOTE: a per-config ``api_key`` is REQUIRED (non-empty) for the keyed (BYO-key)
 # providers (``*-api`` / ``openrouter-native``) and OPTIONAL for the CLI providers
-# (claude/openai/gemini/opencode). That check lives in ``model_config.add_config``
+# (claude/openai/gemini/opencode/antigravity). That check lives in ``model_config.add_config``
 # (not a Pydantic validator here) so a missing key raises the single-string 422
 # shape ``{"detail": "api_key is required for provider '<p>'"}`` via the route's
 # ValueError→HTTPException(422) path — a model_validator would emit the wrong
@@ -239,6 +239,78 @@ class ChangelogBatch(BaseModel):
     entries: list[ChangelogEntry] = Field(default_factory=list)
 
 
+class Deviation(BaseModel):
+    """The open deviation note a project's plan carries, if it carries one
+    (§6.2, D23). **Five members.**
+
+    ``base_section`` is in: §5.4 pins *"``section`` + ``base_section`` are the
+    contract clause it departed from — a real locator rather than a free-text
+    description"*, and the card renders it in the callout.
+
+    ``status`` is deliberately **out**. §6.2 types this member as *"the open
+    deviation note, **if there is one**"*, so presence **is** the predicate and a
+    ``status`` that is always ``"open"`` is a second name for a fact already on
+    the wire — the argument §6.2 uses to refuse ``halted: bool``. A client tests
+    ``!!plan.deviation``, never ``plan.deviation.status === "open"``.
+
+    ``id`` rides so the card's *"Review deviation"* control can open the note and
+    act on it with no second fetch.
+    """
+    id: str
+    by: str
+    comment: str
+    section: str
+    base_section: str
+
+
+class PlanSummary(BaseModel):
+    """What the My Desk card is given about a project's plan (§6.2, D23).
+
+    **Seven members. No body, no note list, no index.** It hangs on the project
+    record and rides the project list, because there is no desk feed: the desk is
+    composed client-side out of the project and DM lists, and the exact precedent
+    is one lane over — ``report_published_at`` is a project field the desk's list
+    already carries, read with no per-card request. **No new route.**
+
+    ``plan`` being **absent** is the signal that a project has no plan at all — a
+    DM (no ``shared-context`` room to hang one on) or a pre-feature project with
+    no PLAN.md, which is the same case ``GET …/plan`` answers ``404``. Both
+    render as *no plan*, and nobody has to define a sentinel.
+
+    ``surface`` ships with the fields it discriminates, and **the four fields it
+    discriminates are null exactly where it says they are meaningless** (ruling
+    6.1). On a front-desk project there is no user in the accepting role (§7.2),
+    so ``phase``, ``revision``, ``accepted`` and ``accepted_revision`` are all
+    ``None`` — sending ``accepted: false`` there is precisely the *not yet* vs
+    *never* confusion §6.2 property 3 refuses in prose before typing them
+    non-null anyway. ``accepted_revision`` is additionally ``None`` on a regular
+    project **before acceptance** (ruling 6.2): ``0`` is a sentinel the sidecar
+    keeps internally, and putting a sentinel on the wire asks every client to
+    know it.
+
+    ``open_notes_for_you`` is the one member that is never null on any shape — a
+    front-desk plan still collects notes for the user, and the number that stops
+    work may not arrive as ``null``.
+
+    **There is no ``halted: bool`` and this model must not grow one.** The gated
+    state is ``phase == "executing" && open_notes_for_you > 0`` on a ``regular``
+    project — a conjunction of two members already here — and a third name for it
+    is how two names for one fact drift apart (§3.3).
+
+    ``open_notes_for_you`` is §3.3's number with §3.3's definition and exactly one
+    server-side implementation (``project_plan.open_notes_for_you``). It is the
+    integer the execution gate reads, so a second count computed in a route is
+    not a shortcut, it is the defect.
+    """
+    surface: str                       # "regular" | "frontdesk"; "dm" never reaches here
+    phase: Optional[str] = None        # "spec-ing"|"executing"|"complete"|"failed"; null iff frontdesk
+    revision: Optional[int] = None     # null iff frontdesk
+    accepted: Optional[bool] = None    # null iff frontdesk
+    accepted_revision: Optional[int] = None  # null on frontdesk AND null before acceptance
+    open_notes_for_you: int            # NEVER null, on any shape
+    deviation: Optional[Deviation] = None
+
+
 class ParticipantProjectResponse(BaseModel):
     """Response for participant's project membership with sync info.
 
@@ -259,3 +331,5 @@ class ParticipantProjectResponse(BaseModel):
     display_name: Optional[str] = None  # raw model-set label; frontend renders `display_name ?? name`
     last_modified: datetime  # ISO-8601, non-null; sidebar sorts the PROJECTS list by this desc
     report_published_at: Optional[datetime] = None  # Same meaning as Project.report_published_at: ISO ts string | null, non-null EXACTLY when the project has a real completion report. Present on every row of the desk's non-admin list (GET /participants/{id}/projects).
+    plan_updated_at: Optional[datetime] = None  # Same meaning as Project.plan_updated_at: when PLAN.md or its sidecar last moved. From meta.json — no extra read.
+    plan: Optional[PlanSummary] = None  # D23, §6.2. ABSENT means: this project has no plan at all (a DM, or a pre-feature project with no PLAN.md).

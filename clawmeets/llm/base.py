@@ -54,16 +54,26 @@ def deterministic_text_snippet(prompt: str, *, max_words: int = 8) -> str:
 
 
 class LLMInvocationError(Exception):
-    """Base exception for LLM CLI invocation errors."""
+    """Base exception for LLM CLI invocation errors.
+
+    ``status_code`` is the provider's HTTP-ish status for the failure, when it
+    reported one. It exists so retry classification can be structural instead
+    of grepping the message: ``>= 500`` is the backend's problem and worth a
+    retry, ``4xx`` is ours and is not. Providers that cannot report a status
+    leave it ``None``, and classification falls back to string matching.
+    """
 
     def __init__(
         self,
         message: str,
         prompt_file: Optional[str] = None,
         working_dir: Optional[str] = None,
+        *,
+        status_code: Optional[int] = None,
     ) -> None:
         self.prompt_file = prompt_file
         self.working_dir = working_dir
+        self.status_code = status_code
         super().__init__(message)
 
 
@@ -512,6 +522,22 @@ class SubprocessLLMProvider(LLMProvider):
 
     # --- shared helpers (overridable) ---------------------------------------
 
+    def _error_status_code(
+        self,
+        prepared: PreparedInvocation,
+        stdout: str,
+        stderr: str,
+        returncode: int,
+    ) -> Optional[int]:
+        """HTTP-ish status for a failed invocation, or `None` if unavailable.
+
+        Deliberately concrete (not abstract): a provider that cannot report a
+        status keeps the inherited `None` and its errors classify by string
+        match, exactly as before. Only providers whose output carries a real
+        status need to override.
+        """
+        return None
+
     def _build_env(self) -> dict[str, str]:
         """Build the environment passed to the subprocess.
 
@@ -826,6 +852,9 @@ class SubprocessLLMProvider(LLMProvider):
                 f"{self._provider_name} exited with code {returncode}:\n{detail}",
                 prompt_file=prepared.prompt_file_abs,
                 working_dir=prepared.cwd,
+                status_code=self._error_status_code(
+                    prepared, stdout, stderr, returncode
+                ),
             )
             await notification_center.publish(
                 LLM_ERROR, sandbox_dir=working_dir, error=error

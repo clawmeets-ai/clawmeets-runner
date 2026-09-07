@@ -22,10 +22,11 @@ Examples
 
 Validation
 ----------
-Provider must be in {"claude", "openai", "gemini"}. `composite` is rejected
-to prevent nesting. `--model` is honored in single-provider mode only;
-`--config` model pins apply per-provider in both single and parallel modes
-(explicit `--model` wins).
+Provider must be in {"claude", "openai", "gemini", "opencode",
+"antigravity"} — the CLI tier of ``model_config.VALID_CONFIG_PROVIDERS``.
+`composite` is rejected to prevent nesting. `--model` is honored in
+single-provider mode only; `--config` model pins apply per-provider in both
+single and parallel modes (explicit `--model` wins).
 
 Observability
 -------------
@@ -52,11 +53,22 @@ from clawmeets.utils.jsonc import parse_jsonc
 
 logger = logging.getLogger(__name__)
 
-_VALID_PROVIDERS = ("claude", "openai", "gemini")
+_VALID_PROVIDERS = ("claude", "openai", "gemini", "opencode", "antigravity")
 _DEFAULT_TIMEOUT_SECONDS = 600
 
 
-def _provider_command(provider: str, model: Optional[str], question: str) -> list[str]:
+def _provider_command(
+    provider: str, model: Optional[str], question: str, timeout: int
+) -> list[str]:
+    """Build the one-shot CLI command for `provider`.
+
+    ``timeout`` is consult's own per-provider budget. Only `antigravity` reads
+    it: `agy` has an INTERNAL ``--print-timeout`` that defaults to 5 minutes and
+    *exits* at that bound, so without an explicit value above our own budget
+    every consult longer than 300s is silently truncated by `agy` before
+    consult's ``asyncio.wait_for`` ever fires. The other binaries have no
+    internal cap and ignore it.
+    """
     if provider == "claude":
         cmd = [
             "claude",
@@ -80,6 +92,24 @@ def _provider_command(provider: str, model: Optional[str], question: str) -> lis
             cmd += ["-m", model]
         cmd.append(question)
         return cmd
+    if provider == "opencode":
+        cmd = ["opencode", "run", question]
+        if model:
+            cmd += ["-m", model]
+        return cmd
+    if provider == "antigravity":
+        # No permission-bypass flag on either new branch: a consult is a
+        # read-only one-shot question, matching codex's `--sandbox read-only`.
+        # `--disable-slash-commands` stops `agy` expanding a `/foo` that appears
+        # inside the question text as its own slash command.
+        cmd = [
+            "agy", "-p", question,
+            "--disable-slash-commands",
+            "--print-timeout", f"{timeout + 60}s",
+        ]
+        if model:
+            cmd += ["--model", model]
+        return cmd
     raise ValueError(f"unknown provider {provider!r}")
 
 
@@ -90,7 +120,7 @@ async def _run_one(
     timeout: int,
 ) -> dict:
     started = time.monotonic()
-    cmd = _provider_command(provider, model, question)
+    cmd = _provider_command(provider, model, question, timeout)
 
     try:
         proc = await asyncio.create_subprocess_exec(

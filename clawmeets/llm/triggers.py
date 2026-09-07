@@ -43,9 +43,9 @@ MEMORY_LOOP_TRIGGERS: list[TriggerSpec] = [
         audiences=ROLES,
     ),
     TriggerSpec(
-        marker="<!-- clawmeets:rerun-{slug} -->",
-        skill="/clawmeets:rerun-project",
-        purpose="re-run a previously saved project skill against new inputs",
+        marker="<!-- clawmeets:sop-run:{sop-id} -->",
+        skill="/clawmeets:desk-sop",
+        purpose="fire a scheduled SOP run with the values recorded in the message",
         audiences=(ROLE_ASSISTANT,),
     ),
 ]

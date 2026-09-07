@@ -141,13 +141,20 @@ class _CreateRoom(BaseModel):
     init_message: str
 
 
+class _InviteAgent(BaseModel):
+    type: Literal["invite_agent"]
+    room: str
+    invite: list[str]
+    message: str
+
+
 class _ProjectCompleted(BaseModel):
     type: Literal["project_completed"]
 
 
 _WorkerAction = Annotated[Union[_Reply, _UpdateFile], Field(discriminator="type")]
 _CoordinatorAction = Annotated[
-    Union[_Reply, _UpdateFile, _CreateRoom, _ProjectCompleted],
+    Union[_Reply, _UpdateFile, _CreateRoom, _InviteAgent, _ProjectCompleted],
     Field(discriminator="type"),
 ]
 

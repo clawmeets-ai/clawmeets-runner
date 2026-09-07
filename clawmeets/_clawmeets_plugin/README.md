@@ -55,7 +55,7 @@ User-typeable slash commands (auto-generated from `clawmeets/system_skills/` ent
 | **stop** | `/clawmeets:stop` | Stop agent runner(s) for the current user |
 | **logout** | `/clawmeets:logout` | Log out (keeps user data and agents) |
 
-Agent-runtime skills (`/clawmeets:reflect`, `/clawmeets:personalize`, `/clawmeets:consult-proprietary-knowledge`, install/uninstall-{skill,mcp}, propose-project, rerun-project, canvas-design) ship in `clawmeets/system_skills/` but are invoked by the agent runtime (via DM markers or LLM discretion), not typed by users. `/clawmeets:personalize` has two source dirs (`personalize-assistant/` + `personalize-agent/`), both YAML `name: personalize`; the audience filter installs one per role.
+Agent-runtime skills (`/clawmeets:reflect`, `/clawmeets:personalize`, `/clawmeets:consult-proprietary-knowledge`, install/uninstall-{skill,mcp}, propose-project, desk-sop, canvas-design) ship in `clawmeets/system_skills/` but are invoked by the agent runtime (via DM markers or LLM discretion), not typed by users. `/clawmeets:personalize` has two source dirs (`personalize-assistant/` + `personalize-agent/`), both YAML `name: personalize`; the audience filter installs one per role.
 
 ## Quick Start
 

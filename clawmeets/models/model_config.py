@@ -33,7 +33,7 @@ from typing import Optional
 # binary; the ``-api`` suffix selects the in-process BYO-key provider. Kept
 # here (Layer 1, pure) and re-exported by cli_runner as ``_VALID_LLM_PROVIDERS``.
 VALID_CONFIG_PROVIDERS: tuple[str, ...] = (
-    "claude", "openai", "gemini", "opencode",
+    "claude", "openai", "gemini", "opencode", "antigravity",
     "claude-api", "openai-api", "gemini-api", "openrouter-api",
     # In-process, BYO-key, native OpenRouter tool-loop (no Pydantic-AI). Coexists
     # with openrouter-api as a directly A/B-comparable alternative.
@@ -42,7 +42,7 @@ VALID_CONFIG_PROVIDERS: tuple[str, ...] = (
 
 # Keyed (BYO-key) providers: a per-config ``api_key`` is REQUIRED (non-empty) at
 # create time (enforced in ``add_config``). The CLI/subscription providers
-# (claude/openai/gemini/opencode) take an OPTIONAL key. ``api/responses.py``
+# (claude/openai/gemini/opencode/antigravity) take an OPTIONAL key. ``api/responses.py``
 # duplicates this membership in a NOTE (it's Layer 0 and can't import models/).
 KEYED_PROVIDERS: tuple[str, ...] = (
     "claude-api", "openai-api", "gemini-api", "openrouter-api", "openrouter-native",

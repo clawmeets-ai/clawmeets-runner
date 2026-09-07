@@ -122,6 +122,15 @@ class ChatBatchTimeoutEvent(BaseModel):
     (matches the chip's per-message keying). ``source_version`` mirrors
     the changelog entry's source_version, which points at that same
     @mention's changelog version.
+
+    ``offline_participants`` is the subset of ``timed_out_participants`` whose
+    runner was disconnected **when the timeout fired** (re-checked there, never
+    cached from dispatch). Defaulted, so every ``batch_timeout`` row written
+    before it existed still parses — same as every other list field here.
+
+    Kept distinct from :class:`ChatAgentOfflineEvent` on purpose: an agent that
+    received the message, worked on it and died mid-flight is not an agent that
+    never received it, and only the second is fixed by resending.
     """
     model_config = {"frozen": True}
 
@@ -131,6 +140,46 @@ class ChatBatchTimeoutEvent(BaseModel):
     coordinator_id: str
     responded_participants: list[str] = Field(default_factory=list)
     timed_out_participants: list[str] = Field(default_factory=list)
+    offline_participants: list[str] = Field(default_factory=list)
+    version: int | None = None
+    source_version: int | None = None
+
+
+class ChatAgentOfflineEvent(BaseModel):
+    """One agent-offline row in CHATS.ndjson.
+
+    Emitted at DISPATCH time, alongside an AGENT_OFFLINE changelog entry, when one or more @mentioned agents had no live runner connection
+    in the hub. It is the sibling of :class:`ChatBatchTimeoutEvent`, not a
+    field on it — the timeout row means "we waited 1800s and nobody came",
+    this row means "we did not wait, nobody was there".
+
+    This row is the ONLY carrier of the offline state. The ``ChatMessage``
+    that ``POST .../messages`` returns deliberately does not repeat it: one
+    carrier, one source of truth, and ``GET .../messages`` already surfaces
+    this row typed through :data:`ChatLogEntry`.
+
+    ``offline_participants`` and ``dispatched_participants`` carry AGENT IDS,
+    never names — the web UI indexes per-recipient status by id, so a name
+    would silently miss every lookup and leave the chip on "processing".
+
+    NOT a retraction of delivery. ``expects_response_from`` on the message is
+    durable in the changelog and nothing here removes it; when the runner
+    reconnects, catch-up replays the message and the agent answers. The UI
+    copy must say the message is still queued, never "send it again".
+
+    ``message_id`` points at the @mention message that would have opened the
+    batch (matches the chip's per-message keying), and ``source_version``
+    mirrors the changelog entry's source_version, which points at that same
+    message's changelog version.
+    """
+    model_config = {"frozen": True}
+
+    entry_type: Literal["agent_offline"] = "agent_offline"
+    ts: datetime
+    message_id: str
+    coordinator_id: str
+    offline_participants: list[str] = Field(default_factory=list)
+    dispatched_participants: list[str] = Field(default_factory=list)
     version: int | None = None
     source_version: int | None = None
 
@@ -138,7 +187,12 @@ class ChatBatchTimeoutEvent(BaseModel):
 # Discriminated union of log-entry rows persisted to CHATS.ndjson.
 # Existing rows without `entry_type` default to ChatMessage (entry_type="message").
 ChatLogEntry = Annotated[
-    Union[ChatMessage, ChatFileEvent, ChatBatchTimeoutEvent],
+    Union[
+        ChatMessage,
+        ChatFileEvent,
+        ChatBatchTimeoutEvent,
+        ChatAgentOfflineEvent,
+    ],
     Field(discriminator="entry_type"),
 ]
 

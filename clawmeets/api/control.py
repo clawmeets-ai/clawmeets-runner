@@ -58,9 +58,11 @@ class ControlMessageType(str, Enum):
     AGENT_CARD_UPDATE = "agent_card_update"  # Server notifies the agent's owner UI of card-field bumps (last_reflected_at, last_synced_at)
     BRIEF_TAB_SYNC = "brief_tab_sync"  # Server notifies the owning user that a brief-tab was upserted / deleted
     PROJECT_REPORT_SYNC = "project_report_sync"  # Server notifies project participants that the report was upserted / deleted
+    PROJECT_PLAN_SYNC = "project_plan_sync"  # Server notifies project participants that PLAN.md or its sidecar moved
     DESK_TODO_SYNC = "desk_todo_sync"  # Server notifies the owning user that a desk to-do was captured / patched / published / removed
     DESK_READ_STATE_SYNC = "desk_read_state_sync"  # Server notifies the owning user that a My Desk read-state watermark was upserted
     DESK_SOP_SYNC = "desk_sop_sync"  # Server notifies the owning user that a desk SOP was created / edited / removed
+    DESK_LABEL_SYNC = "desk_label_sync"  # Server notifies the owning user that their label registry moved — created / renamed / recoloured / reordered / deleted / merged
     # Server -> the ONE owning user: a full snapshot of that user's live
     # runners and the clawmeets version each reports.
     #
@@ -344,6 +346,34 @@ class BriefTabSyncPayload(BaseModel):
     generated_at: str | None = None
 
 
+class ProjectPlanSyncPayload(BaseModel):
+    """Payload for PROJECT_PLAN_SYNC messages (§6, D4).
+
+    Broadcast to every participant of a project on **every** plan mutation, and
+    exactly once per mutation (AC-3.1). Modelled on
+    :class:`ProjectReportSyncPayload`: it carries the cursor, never the body.
+    The plan tab refetches ``GET /projects/{id}/plan``.
+
+    ``sections`` is the list of slugs that **moved** — the one member a client
+    cannot derive from a refetch, because after the refetch the previous body is
+    gone. It is ``[]`` for an action that wrote no bytes (a note, a draft, a
+    refusal), which is honest rather than empty: those actions moved no section.
+
+    **What the frontend does with it** (§6): with nothing staged and nothing
+    being typed the tab silently reloads; with a tray or unsaved typing it shows
+    a non-blocking banner and reloading never discards the tray, because rows
+    carry their own ``base``.
+    """
+    project_id: str
+    #: create|write|refused|note|apply|resolve|draft|review|round-close|approve|revoke
+    action: str
+    sections: list[str] = Field(default_factory=list)
+    sha: str = ""
+    revision: int = 0
+    by_agent_name: str = ""
+    updated_at: str = ""
+
+
 class ProjectReportSyncPayload(BaseModel):
     """Payload for PROJECT_REPORT_SYNC messages.
 
@@ -393,6 +423,49 @@ class DeskSopSyncPayload(BaseModel):
     """
     action: str            # "add" | "patch" | "delete"
     id: str | None = None
+
+
+class DeskLabelSyncPayload(BaseModel):
+    """Payload for DESK_LABEL_SYNC messages.
+
+    Sent server -> the registry-owning user whenever their label vocabulary
+    changes. Fanned out to EVERY live session the owner holds
+    (``WSHub.send_to``), so a label renamed in one browser tab updates in all
+    the others without a reload. The originating session receives it too; the
+    resulting refetch is idempotent.
+
+    Carries the action + the affected slug; the full list is fetched via
+    ``GET /me/desk/labels``, which stays the source of truth.
+
+    TWO THINGS THE CLIENT CANNOT INFER FROM THIS SHAPE, both of which cost real
+    time if missed:
+
+    1. **These envelopes arrive from more than the six registry endpoints.** A
+       ``POST`` or ``PATCH`` of a *to-do* carrying an unregistered slug
+       auto-registers it and emits ``{action: "add", slug}``. A client that
+       wires its registry refetch only to the registry endpoints' own round
+       trips holds a stale registry after its OWN capture, and renders a label
+       it just adopted as dashed-unregistered.
+
+    2. **``delete`` and ``merge`` change BOTH documents, so they send TWO
+       envelopes** — ``DESK_TODO_SYNC`` first, then this one, mirroring the
+       write order. Refetching only the registry shows correct groups over
+       stale items. The ordering is fixed rather than incidental: the transient
+       frame it produces is a registry listing a label no item carries, which
+       renders as an empty group the rail already handles. The reverse order
+       produces the alarming transient instead — every chip on the plate
+       resolving against a row that is already gone, i.e. rendered
+       dashed-unregistered for a frame.
+
+    ``into`` is populated on ``merge`` only. Without it, ``{action: "merge",
+    slug: "offce"}`` does not say what ``offce`` became, so "a filter on a
+    merged label follows the merge" would be implementable in the originating
+    tab (which can read ``into`` off the HTTP response) and would degrade to
+    "filter cleared" in every other tab.
+    """
+    action: str            # "add" | "patch" | "reorder" | "delete" | "merge"
+    slug: str | None = None
+    into: str | None = None   # merge only — the slug the source folded into
 
 
 class DeskReadStateSyncPayload(BaseModel):
@@ -470,14 +543,18 @@ class ControlEnvelope(BaseModel):
     payload *parsed from a dict* resolves to the first member whose shape
     fits. Structurally identical siblings — today ``DeskTodoSyncPayload`` and
     ``DeskSopSyncPayload``, both ``{action, id}`` — are therefore not
-    distinguishable on re-parse, and the leftmost wins. This is harmless on
+    distinguishable on re-parse, and the leftmost wins.
+    ``DeskLabelSyncPayload`` is keyed on ``slug`` rather than ``id``, but it
+    sits after both of them for the same reason and offers no more protection:
+    extra keys are ignored, so a ``{action, slug}`` dict still re-parses as the
+    leftmost member. It is appended, not inserted. This is harmless on
     the outbound path, which only ever ``model_dump``s (see
     ``server/routes/websocket.py``), and on the inbound path, which only ever
     carries HEARTBEAT. Anything that starts re-validating stored envelopes
     would need a real discriminator first.
     """
     type: ControlMessageType
-    payload: Union[ChangelogUpdatePayload, AgentStatusChangePayload, ProjectDeletedPayload, SkillSyncPayload, McpSyncPayload, AgentSettingsChangePayload, CancelLLMPayload, ActiveWorkChangePayload, McpAuthUrlForUserPayload, McpAuthCodePayload, SkillAuthUrlForUserPayload, SkillAuthCodePayload, KnowledgePackSyncPayload, AgentRegistryChangePayload, AgentCardUpdatePayload, BriefTabSyncPayload, ProjectReportSyncPayload, DeskTodoSyncPayload, DeskReadStateSyncPayload, DeskSopSyncPayload, RunnerVersionsPayload, dict] = Field(default_factory=dict)
+    payload: Union[ChangelogUpdatePayload, AgentStatusChangePayload, ProjectDeletedPayload, SkillSyncPayload, McpSyncPayload, AgentSettingsChangePayload, CancelLLMPayload, ActiveWorkChangePayload, McpAuthUrlForUserPayload, McpAuthCodePayload, SkillAuthUrlForUserPayload, SkillAuthCodePayload, KnowledgePackSyncPayload, AgentRegistryChangePayload, AgentCardUpdatePayload, BriefTabSyncPayload, ProjectReportSyncPayload, ProjectPlanSyncPayload, DeskTodoSyncPayload, DeskReadStateSyncPayload, DeskSopSyncPayload, DeskLabelSyncPayload, RunnerVersionsPayload, dict] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_required_fields_for_type(self) -> "ControlEnvelope":
@@ -533,6 +610,9 @@ class ControlEnvelope(BaseModel):
         elif self.type == ControlMessageType.PROJECT_REPORT_SYNC:
             if not isinstance(self.payload, ProjectReportSyncPayload):
                 raise ValueError(f"control message type {self.type} requires ProjectReportSyncPayload")
+        elif self.type == ControlMessageType.PROJECT_PLAN_SYNC:
+            if not isinstance(self.payload, ProjectPlanSyncPayload):
+                raise ValueError(f"control message type {self.type} requires ProjectPlanSyncPayload")
         elif self.type == ControlMessageType.DESK_TODO_SYNC:
             if not isinstance(self.payload, DeskTodoSyncPayload):
                 raise ValueError(f"control message type {self.type} requires DeskTodoSyncPayload")
@@ -542,6 +622,9 @@ class ControlEnvelope(BaseModel):
         elif self.type == ControlMessageType.DESK_SOP_SYNC:
             if not isinstance(self.payload, DeskSopSyncPayload):
                 raise ValueError(f"control message type {self.type} requires DeskSopSyncPayload")
+        elif self.type == ControlMessageType.DESK_LABEL_SYNC:
+            if not isinstance(self.payload, DeskLabelSyncPayload):
+                raise ValueError(f"control message type {self.type} requires DeskLabelSyncPayload")
         elif self.type == ControlMessageType.RUNNER_VERSIONS:
             if not isinstance(self.payload, RunnerVersionsPayload):
                 raise ValueError(f"control message type {self.type} requires RunnerVersionsPayload")

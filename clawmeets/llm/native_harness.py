@@ -29,7 +29,9 @@ from ..api.actions import ActionBlock, COORDINATOR_ACTION_SCHEMA
 from ..utils import env_store
 from ..utils.notification_center import LLM_COMPLETE, LLM_ERROR, NotificationCenter
 from ._harness_tools import (
+    COORDINATOR_EMITTERS,
     FINALIZE_TOOL_NAME,
+    WORKER_EMITTERS,
     HarnessTool,
     assemble,
     build_emitter_schemas,
@@ -375,9 +377,13 @@ class NativeHarnessProvider(LLMProvider):
                 "Load a skill's full instructions on demand with the `skill` tool "
                 "(skill(name)).\n" + index
             )
-        emit_list = "emit_reply, emit_update_file"
-        if is_coordinator:
-            emit_list += ", emit_create_room, emit_project_completed"
+        # Derived from the EmitterSpec registry, never hand-listed: a new
+        # emitter must not be able to reach the model's tool surface while
+        # staying invisible in the prompt that tells it what to call.
+        emit_list = ", ".join(
+            e.tool_name
+            for e in (COORDINATOR_EMITTERS if is_coordinator else WORKER_EMITTERS)
+        )
         parts.append(
             "\n\n== HOW TO RESPOND ==\n"
             "Use the provided tools to do the work (read/write files, run bash, load "

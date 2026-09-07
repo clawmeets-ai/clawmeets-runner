@@ -10,6 +10,7 @@ Subcommands:
   labels       List labels.
   attachment   Fetch one attachment (optionally to disk).
   send         Send a plaintext email.
+  archive      Archive messages (remove INBOX) by id or search query.
   sync         Run sync_to_warehouse per --config.
   auth         Run Google OAuth (local installed-app flow).
 
@@ -24,7 +25,7 @@ import base64
 import json
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 import typer
 
@@ -111,6 +112,67 @@ def send(
     if body == "-":
         body = sys.stdin.read()
     _emit_json(_lib.send_message(_svc(token), to, subject, body, cc=cc, bcc=bcc))
+
+
+@app.command()
+def archive(
+    message_ids: Optional[List[str]] = typer.Argument(
+        None, help="Message ids to archive. Omit when using --query.",
+    ),
+    query: str = typer.Option(
+        "", "--query", "-q",
+        help="Archive everything matching this Gmail search query instead of ids.",
+    ),
+    max_results: int = typer.Option(
+        20, "--max", help="Cap on --query matches (also caps what is archived).",
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Resolve and report the targets; archive nothing.",
+    ),
+    undo: bool = typer.Option(
+        False, "--undo", help="Invert: move the messages back to the inbox.",
+    ),
+    token: str = typer.Option("", "--token"),
+) -> None:
+    """Archive messages — Gmail archive is removing the INBOX label.
+
+    Exactly one input mode: positional ids OR --query (neither or both exits 2).
+    Nothing is deleted; archived mail stays in All Mail and --undo restores it.
+    """
+    ids = list(message_ids or [])
+    query = query.strip()
+    if bool(ids) == bool(query):
+        typer.echo(
+            "Error: pass either message ids or --query, not neither and not both.",
+            err=True,
+        )
+        raise typer.Exit(2)
+
+    svc = _svc(token)
+    payload = {
+        "action": "unarchive" if undo else "archive",
+        "dry_run": dry_run,
+        "truncated": False,
+    }
+
+    if query:
+        matched = _lib.search_messages(svc, query, max_results=max_results)
+        ids = [m["id"] for m in matched]
+        payload["truncated"] = len(matched) >= max_results
+    else:
+        matched = [{"id": i} for i in ids]
+    payload["matched"] = matched
+
+    if dry_run:
+        payload.update({"requested": len(ids), "archived": [], "failed": []})
+    else:
+        result = _lib.archive_messages(svc, ids, undo=undo)
+        payload.update({
+            "requested": result["requested"],
+            "archived": result["archived"],
+            "failed": result["failed"],
+        })
+    _emit_json(payload)
 
 
 @app.command()

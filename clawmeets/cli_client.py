@@ -47,10 +47,20 @@ file_app = typer.Typer(help="File commands",    no_args_is_help=True)
 
 @proj_app.command("create")
 def project_create(
-    name: str = typer.Argument(...),
+    name: str = typer.Argument(
+        ...,
+        help="Filesystem-safe slug: letters, digits, - and _ only, no spaces, "
+             "max 64 chars (e.g. clawmeets-landing-redesign). It becomes a "
+             "directory name. Put the prose title in --display-name.",
+    ),
     coordinator_id: str = typer.Argument(..., help="Agent ID of the coordinator"),
     request: str = typer.Argument(..., help="User request / task description"),
     server: str = typer.Option(DEFAULT_SERVER, "--server", "-s"),
+    display_name: Optional[str] = typer.Option(
+        None, "--display-name",
+        help="Human-readable title shown in the UI (max 60 characters). NAME is a "
+             "filesystem slug; this is what people actually read.",
+    ),
     created_by: str = typer.Option(None, "--created-by", "-u", help="User ID of creator"),
     token: Optional[str] = typer.Option(None, "--token", "-t", help="Auth token (coordinator agent token or user JWT)"),
     agent_pool: str = typer.Option("verified", "--agent-pool", help="Agent pool: owned, verified (default), or all"),
@@ -87,6 +97,8 @@ def project_create(
         }
         if created_by:
             payload["created_by"] = created_by
+        if display_name:
+            payload["display_name"] = display_name
         if team:
             payload["agent_teams"] = team
         if agent:
@@ -337,19 +349,31 @@ def project_cancel(
 def project_delete(
     project_id: str = typer.Argument(..., help="Project ID to delete"),
     server: str = typer.Option(DEFAULT_SERVER, "--server", "-s"),
-    token: str = typer.Option(..., "--token", "-t", help="User JWT token"),
+    token: Optional[str] = typer.Option(
+        None, "--token", "-t",
+        help="Auth token: the owner's user JWT, the owner's assistant token, or — "
+             "for a project you coordinate and created — your own agent token. Omit "
+             "inside an agent runner, where the per-process agent identity is sent "
+             "automatically.",
+    ),
     force: bool = typer.Option(False, "--force", help="Skip confirmation"),
 ):
-    """Delete a project and all its data. Requires user JWT token."""
+    """Delete a project and all its data.
+
+    Accepts the project owner's credential, or the project's own coordinator
+    agent token for a project that coordinator created — so an agent can clean
+    up after itself instead of leaving dead projects on its owner's desk.
+    """
     if not force:
         confirm = typer.confirm(f"Delete project {project_id[:8]}…? This cannot be undone")
         if not confirm:
             raise typer.Abort()
 
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
     with _http(server) as client:
         _ok(client.delete(
             f"/projects/{project_id}",
-            headers={"Authorization": f"Bearer {token}"},
+            headers=headers,
         ))
     typer.echo(f"Project {project_id[:8]}… deleted.")
 

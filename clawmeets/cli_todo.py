@@ -29,12 +29,15 @@ Auth resolved from env (standard agent-runtime injection — same pattern as
 
 Subcommands:
   publish   Push a to-do onto the owner's plate.
-  list      Show every to-do the owner currently has.
-  update    Edit a to-do's text / due / draft prompt.
+  list      Show every to-do the owner currently has (optionally filtered by label).
+  update    Edit a to-do's text / due / draft prompt / labels.
+  labels    Curate the owner's label vocabulary (nested sub-app).
   done      Mark a to-do done.
   reopen    Move a done to-do back to open.
   delete    Remove a to-do by id.
   trigger   Fire a to-do's saved draft at its designated recipient.
+
+All of ``labels`` except ``labels list`` is likewise the assistant's.
 
 ``update`` / ``done`` / ``reopen`` and ``trigger`` are the **assistant's** verbs:
 they go through credentials that only the owner's ``{username}-assistant``
@@ -53,6 +56,7 @@ import httpx
 import typer
 
 from clawmeets.cli_runner import resolve_dm_recipient, send_dm_as_owner
+from clawmeets.models.desk_todo import LabelError, normalize_label
 
 app = typer.Typer(
     name="todo",
@@ -82,13 +86,145 @@ def _client() -> tuple[httpx.Client, dict[str, str]]:
     return httpx.Client(base_url=server, timeout=30), headers
 
 
+# The label error format: ``{"detail": "labels.<code>: <human sentence>"}``.
+_LABEL_CODE = re.compile(r"^labels\.[a-z0-9_]+: ")
+
+
+def _detail(resp: httpx.Response) -> str:
+    """The human sentence out of an error response.
+
+    Parses ``{"detail": "..."}``, then applies the contract's parse rule ONCE
+    for the whole CLI: a ``detail`` starting with ``labels.<code>: `` has the
+    prefix stripped and the remainder printed. A ``detail`` that does not match
+    is printed unchanged — and that fallback is load-bearing rather than
+    defensive, because every OTHER error in this codebase is uncoded and a CLI
+    that assumed a code would mangle the first 401.
+
+    Falls back to the raw body when it is not JSON.
+
+    Note the blast radius, which is deliberate: this sits in ``_ok``, which
+    every subcommand shares, so error output changes for EVERY todo verb — from
+    ``Error 404: {"detail":"To-do 't-x' not found"}`` to ``Error 404: To-do
+    't-x' not found``. That is an improvement, and it is why the assistant never
+    reads "labels.cap_exceeded:" aloud.
+    """
+    try:
+        body = resp.json()
+    except Exception:
+        return resp.text
+    detail = body.get("detail") if isinstance(body, dict) else None
+    if not isinstance(detail, str):
+        return resp.text
+    match = _LABEL_CODE.match(detail)
+    return detail[match.end():] if match else detail
+
+
 def _ok(resp: httpx.Response) -> dict | list:
     if resp.status_code >= 400:
-        typer.echo(f"Error {resp.status_code}: {resp.text}", err=True)
+        typer.echo(f"Error {resp.status_code}: {_detail(resp)}", err=True)
         raise typer.Exit(1)
     if not resp.content:
         return {}
     return resp.json()
+
+
+def _norm(raw: str) -> str:
+    """One label through the SERVER's normalizer, so ``--label @office``,
+    ``--label Office`` and ``--label office`` all match the stored slug.
+
+    Imported rather than re-implemented: a second grammar in the CLI is a second
+    thing to get wrong, and the failure mode is silent (a filter that matches
+    nothing) rather than loud."""
+    try:
+        return normalize_label(raw)
+    except LabelError as e:
+        typer.echo(f"Error: {e.sentence}", err=True)
+        raise typer.Exit(1)
+
+
+def _label_rows(client: httpx.Client, headers: dict[str, str]) -> list[dict] | None:
+    """The owner's registry, or None if it could not be read.
+
+    None is a real answer, not an error: the plate is readable with the registry
+    gone, so a filter degrades rather than failing. The reason goes to STDERR so
+    stdout stays parseable JSON."""
+    try:
+        resp = client.get("/me/desk/labels", headers=headers)
+    except Exception as e:
+        typer.echo(f"Note: could not read the label list ({e}).", err=True)
+        return None
+    if resp.status_code >= 400:
+        typer.echo(
+            f"Note: could not read the label list ({resp.status_code}); "
+            f"filtering across every label together and omitting label detail.",
+            err=True,
+        )
+        return None
+    body = resp.json()
+    rows = body.get("labels") if isinstance(body, dict) else body
+    return rows if isinstance(rows, list) else []
+
+
+def _matches(item: dict, wanted: list[str], kinds: dict[str, str], match_all: bool) -> bool:
+    """OR within a kind, AND across kinds — the rail's default.
+
+    ``--label office --label home --label next`` reads "next actions I could do
+    at the office or at home". A slug with no registry row counts as a CONTEXT,
+    which is the benign absence: filtering must decide something, so it takes
+    the harmless default.
+
+    ``--match-all`` collapses to strict AND over every named label.
+
+    Filtering is client-side over the full GET. No query params are added to the
+    server, ever — a client that has only seen a filtered subset cannot compute
+    a correct global order to send to ``/reorder``.
+    """
+    carried = set(item.get("labels") or [])
+    if match_all:
+        return all(slug in carried for slug in wanted)
+    groups: dict[str, list[str]] = {}
+    for slug in wanted:
+        groups.setdefault(kinds.get(slug, "context"), []).append(slug)
+    return all(
+        any(slug in carried for slug in group) for group in groups.values()
+    )
+
+
+def _label_detail(slugs: list[str], rows: list[dict]) -> list[dict]:
+    """Join a to-do's slugs against the registry ALREADY loaded for ``_matches``.
+
+    One dict per slug, same length and same order as ``labels``, so the two
+    arrays index together and neither is a re-ordering of the other::
+
+        {"slug": "wait-for", "name": "Wait For", "kind": "state", "registered": true}
+        {"slug": "offce",    "name": "offce",    "kind": null,    "registered": false}
+
+    An unregistered slug renders as its own name with a NULL kind, and the kind
+    is never guessed. Note the deliberate divergence from ``_matches``, which
+    counts an unregistered slug as a context: FILTERING must decide something,
+    so it takes the harmless default; RENDERING must not, because a guessed kind
+    is read out loud as a fact about the owner's own vocabulary.
+    ``registered: false`` is what lets the assistant say "that one isn't in your
+    list" — the CLI's half of the nag group the browser draws dashed.
+
+    ``labels`` itself is NEVER rewritten. It stays exactly the slugs the server
+    sent, so anything already reading it keeps working and there is one source
+    of truth for what is stored.
+    """
+    by_slug = {r.get("slug"): r for r in rows if isinstance(r, dict)}
+    out = []
+    for slug in slugs:
+        row = by_slug.get(slug)
+        if row is None:
+            out.append({"slug": slug, "name": slug, "kind": None, "registered": False})
+        else:
+            out.append({
+                "slug": slug,
+                "name": row.get("name") or slug,
+                "kind": row.get("kind") or "context",
+                "registered": True,
+            })
+    return out
 
 
 def _split2(raw: str, sep: str = "::") -> tuple[str, str]:
@@ -217,8 +353,19 @@ def publish(
         "", "--linked",
         help='A source to open as "label::icon" (e.g. "Finance briefing::chart").',
     ),
+    label: list[str] = typer.Option(
+        None, "--label",
+        help="A GTD context or state to file this under (repeatable). "
+             "Write `office` or `@office` — both land as the same label.",
+    ),
 ) -> None:
-    """Publish a to-do onto the owner's My Desk plate."""
+    """Publish a to-do onto the owner's My Desk plate.
+
+    ``--label`` uses the owner's OWN vocabulary — run ``clawmeets todo labels
+    list`` first and reuse what is there. A label you invent still shows on the
+    item but stays unregistered and is treated as a context whatever you meant
+    by it; publishing never creates a state and never adds to the owner's list.
+    """
     body: dict = {"text": text}
     if due:
         body["due"] = due
@@ -241,9 +388,11 @@ def publish(
             {"k": k, "v": v} for k, v in (_split2(f) for f in fact) if k
         ]
     if linked:
-        label, icon = _split2(linked)
-        if label:
-            body["linked"] = {"label": label, "icon": icon or "chart"}
+        link_label, icon = _split2(linked)
+        if link_label:
+            body["linked"] = {"label": link_label, "icon": icon or "chart"}
+    if label:
+        body["labels"] = [_norm(l) for l in label if l.strip()]
 
     client, headers = _client()
     with client:
@@ -252,12 +401,73 @@ def publish(
 
 
 @app.command("list")
-def list_todos() -> None:
-    """List every to-do the calling agent's owner currently has."""
+def list_todos(
+    label: list[str] = typer.Option(
+        None, "--label",
+        help="Only to-dos carrying this label (repeatable). Several contexts "
+             "are OR'd together; a state narrows them.",
+    ),
+    match_all: bool = typer.Option(
+        False, "--match-all",
+        help="Require EVERY named label instead of the default OR-within-a-kind.",
+    ),
+    any_: bool = typer.Option(False, "--any", hidden=True),
+) -> None:
+    """List every to-do the calling agent's owner currently has.
+
+    Unfiltered, this is a verbatim passthrough of the server's plate — including
+    each item's ``labels`` (bare slugs, stored order). It costs nothing and works
+    with the label registry gone.
+
+    Filtered, it also fetches the registry, because the default filter cannot be
+    computed without knowing each requested label's kind:
+
+        --label office --label home --label next
+            -> (office OR home) AND next     "what's next, at the office or at home"
+        --label office --label home --match-all
+            -> office AND home
+
+    On the filtered path each row gains a sibling ``labels_detail`` array — same
+    length and same order as ``labels`` — carrying each slug's display name,
+    kind, and whether it is registered at all. That is what lets the assistant
+    say "two of these are also waiting on someone" instead of reading raw slugs
+    aloud. ``labels`` itself is never rewritten.
+
+    If the registry cannot be read, ``labels_detail`` is OMITTED rather than
+    emitted half-joined or with invented kinds, the filter degrades to a flat OR
+    across every named label, and the reason goes to stderr so stdout stays
+    parseable JSON.
+
+    """
+    # `--any` is a hidden no-op alias for the default, kept so anything that
+    # already says it keeps working. It is NOT an inversion of `--match-all`:
+    # under an OR default, a flag named `--any` that turned ON strict AND reads
+    # backwards and the voice path gets it wrong every time. It stays out of
+    # `--help` and out of the SKILL.md, which is why this note is a comment and
+    # not part of the docstring typer renders.
     client, headers = _client()
     with client:
-        resp = client.get("/me/desk/todos", headers=headers)
-    typer.echo(json.dumps(_ok(resp), indent=2, ensure_ascii=False))
+        todos = _ok(client.get("/me/desk/todos", headers=headers))
+        if not label:
+            typer.echo(json.dumps(todos, indent=2, ensure_ascii=False))
+            return
+
+        wanted = [_norm(l) for l in label if l.strip()]
+        rows = _label_rows(client, headers)
+        kinds = (
+            {r.get("slug"): (r.get("kind") or "context") for r in rows}
+            if rows is not None else {}
+        )
+        items = [
+            t for t in todos
+            if isinstance(t, dict) and _matches(t, wanted, kinds, match_all)
+        ]
+        if rows is not None:
+            items = [
+                {**t, "labels_detail": _label_detail(t.get("labels") or [], rows)}
+                for t in items
+            ]
+    typer.echo(json.dumps(items, indent=2, ensure_ascii=False))
 
 
 @app.command("update")
@@ -268,12 +478,30 @@ def update(
     draft_prompt: str = typer.Option(
         "", "--draft-prompt", help="Replace the saved draft prompt."
     ),
+    label: list[str] = typer.Option(
+        None, "--label",
+        help="REPLACE the whole label set with these (repeatable).",
+    ),
+    add_label: list[str] = typer.Option(
+        None, "--add-label", help="Add one label, leaving the rest (repeatable).",
+    ),
+    remove_label: list[str] = typer.Option(
+        None, "--remove-label", help="Remove one label (repeatable).",
+    ),
+    clear_labels: bool = typer.Option(
+        False, "--clear-labels", help="Remove every label from this to-do.",
+    ),
 ) -> None:
-    """Edit a to-do's text, due hint, or draft prompt.
+    """Edit a to-do's text, due hint, draft prompt, or labels.
 
     Only the flags you actually pass are sent, so an omitted flag never clears a
     stored field — an empty string means "untouched", never "clear". Requires the
     owner's assistant credential.
+
+    PREFER ``--add-label`` / ``--remove-label`` over ``--label``: they cannot
+    clobber a label the owner just set in the browser, and a retried command
+    cannot double-apply. Both are idempotent — adding a label the item already
+    carries and removing one it does not are successes, not errors.
     """
     body: dict = {}
     if text:
@@ -282,10 +510,40 @@ def update(
         body["due"] = due
     if draft_prompt:
         body["draft_prompt"] = draft_prompt
+
+    # The wire defines a precedence for replace-then-add-then-remove so a
+    # confused client still gets a defined result. The CLI refuses the
+    # combination instead, because at a human boundary "replace these AND also
+    # add that" has no reading anybody would bet on. Different jobs, both right.
+    if label and (add_label or remove_label or clear_labels):
+        typer.echo(
+            "Error: --label replaces the whole set; use --add-label / "
+            "--remove-label to adjust it.",
+            err=True,
+        )
+        raise typer.Exit(1)
+    if clear_labels and (add_label or remove_label):
+        typer.echo(
+            "Error: --clear-labels removes every label; it cannot be combined "
+            "with --add-label / --remove-label.",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    if clear_labels:
+        body["labels"] = []
+    elif label:
+        body["labels"] = [_norm(l) for l in label if l.strip()]
+    if add_label:
+        body["add_labels"] = [_norm(l) for l in add_label if l.strip()]
+    if remove_label:
+        body["remove_labels"] = [_norm(l) for l in remove_label if l.strip()]
+
     if not body:
         typer.echo(
             "Error: nothing to update — pass at least one of --text / --due / "
-            "--draft-prompt.",
+            "--draft-prompt / --label / --add-label / --remove-label / "
+            "--clear-labels.",
             err=True,
         )
         raise typer.Exit(1)
@@ -454,6 +712,238 @@ def trigger(
             out["consumed"] = "failed"
             out["consume_error"] = f"{resp.status_code}: {resp.text}"
         typer.echo(json.dumps(out, indent=2, ensure_ascii=False))
+
+
+# ===========================================================================
+# `clawmeets todo labels <verb>` — curating the owner's vocabulary
+#
+# Nested under the existing `todo` app rather than a new top-level command, so
+# the desk-todo skill stays the single home for the plate. A label is only ever
+# a property of a to-do; there is no owner question `labels list` answers on its
+# own, so splitting it off would create a skill whose every useful invocation
+# immediately needs the other skill's verbs.
+#
+# There is NO `labels set-kind` verb and there should not be one: a label's kind
+# is immutable after creation, and the repair is delete-then-add, which is
+# honest about detaching the slug from every item on the way through.
+# ===========================================================================
+
+labels_app = typer.Typer(
+    name="labels",
+    help="List and curate the owner's label vocabulary (contexts and states).",
+    no_args_is_help=True,
+)
+app.add_typer(labels_app)
+
+
+def _registry_rows() -> list[dict]:
+    """The owner's registry rows. Exits 1 if they cannot be read — unlike the
+    filtered ``list`` path, a ``labels`` verb is ABOUT the registry, so there is
+    nothing to degrade to."""
+    client, headers = _client()
+    with client:
+        body = _ok(client.get("/me/desk/labels", headers=headers))
+    rows = body.get("labels") if isinstance(body, dict) else body
+    return rows if isinstance(rows, list) else []
+
+
+def _resolve_kind(raw: str) -> str:
+    """The forgiving --kind parser.
+
+    Voice will never say the word "kind", so the assistant transcribing "make
+    that a state" must not have to guess a canonical spelling. Case-insensitive,
+    after stripping a leading sigil and surrounding whitespace::
+
+        state | states | ! | !state             -> "state"
+        context | contexts | @ | @context       -> "context"
+        any registered label's slug OR display  -> that label's kind
+          name (next, !next, "Wait For")           (LOOKUP, not string match)
+        omitted                                 -> "context"
+        anything else                           -> exit 1, never a silent default
+
+    Resolution by lookup is what "make it a state like Next" means, and it costs
+    nothing — the caller already holds the registry.
+
+    This is a CLI-side parse ONLY. The wire still carries the strict enum and
+    still answers ``labels.invalid_kind``, because a forgiving boundary over a
+    strict wire is the correct split; the inverse is how a third kind value gets
+    stored by accident.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return "context"
+    if raw == "!":
+        return "state"
+    if raw == "@":
+        return "context"
+    token = raw.lstrip("@!").strip().lower()
+    if token in ("state", "states"):
+        return "state"
+    if token in ("context", "contexts"):
+        return "context"
+    # Only a LOOKUP needs the registry, so the round trip is paid only by the
+    # callers that actually say "the same kind as Next".
+    for row in _registry_rows():
+        if not isinstance(row, dict):
+            continue
+        if token in (
+            str(row.get("slug", "")).lower(),
+            str(row.get("name", "")).strip().lower(),
+        ):
+            return row.get("kind") or "context"
+    typer.echo(
+        f"Error: --kind must be 'context' or 'state' (or the name of a label "
+        f"you already have); {raw!r} matched neither.",
+        err=True,
+    )
+    raise typer.Exit(1)
+
+
+@labels_app.command("list")
+def labels_list() -> None:
+    """Show the owner's label vocabulary, in the order it is grouped in.
+
+    Readable by every agent — run it before you `publish --label` so you reuse
+    the owner's own vocabulary instead of inventing a near-duplicate. Each row
+    carries its `kind`, which is the only source of truth for whether a label is
+    a context or a state; do not infer that from how the slug is spelled.
+    """
+    client, headers = _client()
+    with client:
+        resp = client.get("/me/desk/labels", headers=headers)
+    typer.echo(json.dumps(_ok(resp), indent=2, ensure_ascii=False))
+
+
+@labels_app.command("add")
+def labels_add(
+    name: str = typer.Argument(..., help='The label, e.g. "@errands" or "Waiting on bank".'),
+    kind: str = typer.Option(
+        "", "--kind",
+        help='"context" (default) or "state". Also accepts a sigil (@ / !) or '
+             "the name of a label you already have, meaning \"the same kind as "
+             'that one\".',
+    ),
+    color: str = typer.Option(
+        "", "--color",
+        help="A palette token: blue green indigo teal amber pink slate plum. "
+             "Omit it and the server picks the least-used one.",
+    ),
+) -> None:
+    """Create a label. The `@` / `!` sigil is stripped — it is how the rail
+    renders a kind, never part of the name."""
+    body: dict = {"name": name, "kind": _resolve_kind(kind)}
+    if color:
+        body["color"] = color
+    client, headers = _client()
+    with client:
+        resp = client.post("/me/desk/labels", json=body, headers=headers)
+    typer.echo(json.dumps(_ok(resp), indent=2, ensure_ascii=False))
+
+
+@labels_app.command("rename")
+def labels_rename(
+    slug: str = typer.Argument(..., help="The label to rename."),
+    name: str = typer.Option(..., "--name", help="The new display name."),
+) -> None:
+    """Change a label's DISPLAY NAME. No to-do is touched and the slug does not
+    move, so this is safe and instant.
+
+    There is deliberately no way to change a label's kind here. A context that
+    three tasks carry cannot be promoted to a state without retroactively
+    breaking at-most-one-state on all three, silently, in a write the owner
+    reads as a rename. The repair is `delete` then `add` — say first how many
+    items that will detach it from, AND that you cannot put the new label back
+    on them automatically.
+    """
+    client, headers = _client()
+    with client:
+        resp = client.patch(
+            f"/me/desk/labels/{_norm(slug)}", json={"name": name}, headers=headers
+        )
+    typer.echo(json.dumps(_ok(resp), indent=2, ensure_ascii=False))
+
+
+@labels_app.command("recolor")
+def labels_recolor(
+    slug: str = typer.Argument(..., help="The label to recolour."),
+    color: str = typer.Option(
+        ..., "--color",
+        help="blue | green | indigo | teal | amber | pink | slate | plum.",
+    ),
+) -> None:
+    """Change a label's colour. No to-do is touched."""
+    client, headers = _client()
+    with client:
+        resp = client.patch(
+            f"/me/desk/labels/{_norm(slug)}", json={"color": color}, headers=headers
+        )
+    typer.echo(json.dumps(_ok(resp), indent=2, ensure_ascii=False))
+
+
+@labels_app.command("reorder")
+def labels_reorder(
+    slugs: list[str] = typer.Argument(..., help="Labels in the order you want them."),
+) -> None:
+    """Set the order labels are grouped and listed in.
+
+    Position IS the order. Labels you leave out keep their relative order after
+    the ones you named, and a slug the owner does not have is ignored rather
+    than refused — so a partial list (say, just the contexts) never drops the
+    rest.
+    """
+    client, headers = _client()
+    with client:
+        resp = client.post(
+            "/me/desk/labels/reorder",
+            json={"ordered_slugs": [_norm(s) for s in slugs]},
+            headers=headers,
+        )
+    typer.echo(json.dumps(_ok(resp), indent=2, ensure_ascii=False))
+
+
+@labels_app.command("merge")
+def labels_merge(
+    slug: str = typer.Argument(..., help="The label to fold away (usually a typo)."),
+    into: str = typer.Option(..., "--into", help="The label it should become."),
+) -> None:
+    """Fold one label into another, rewriting every to-do that carries it.
+
+    The typo repair: `merge offce --into office`. Both labels must be the SAME
+    KIND — a context into a context, a state into a state. Anything else comes
+    back `kind_mismatch`, and that is not a bug to work around: merging across
+    kinds is the same kind-change that `rename` refuses, asking to be done the
+    long way.
+
+    Prints `moved`, the number of to-dos rewritten.
+    """
+    client, headers = _client()
+    with client:
+        resp = client.post(
+            f"/me/desk/labels/{_norm(slug)}/merge",
+            json={"into": _norm(into)},
+            headers=headers,
+        )
+    typer.echo(json.dumps(_ok(resp), indent=2, ensure_ascii=False))
+
+
+@labels_app.command("delete")
+def labels_delete(
+    slug: str = typer.Argument(..., help="The label to remove."),
+) -> None:
+    """Remove a label from the owner's list AND from every to-do carrying it.
+
+    This NEVER deletes a to-do. An item whose only label was this one just
+    becomes unlabelled. The response carries `detached_from` — say the number
+    out loud: "Dropped @errands — it came off 6 items, all still on your plate."
+
+    States delete exactly like contexts, and deleting every state is allowed.
+    An owner running contexts-only is using the product correctly; it is not a
+    mistake to correct or re-seed.
+    """
+    client, headers = _client()
+    with client:
+        resp = client.delete(f"/me/desk/labels/{_norm(slug)}", headers=headers)
+    typer.echo(json.dumps(_ok(resp), indent=2, ensure_ascii=False))
 
 
 if __name__ == "__main__":

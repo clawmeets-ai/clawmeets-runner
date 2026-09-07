@@ -1,20 +1,27 @@
 ---
 name: control-agent
 description: >
-  Actively start or stop one of the user's other agents on a DM request.
-  Use when the user says "start <agent>", "spin up <agent>", "bring <agent>
-  online", "stop <agent>", "shut down <agent>", "take <agent> offline", or
-  asks whether an agent is running. You perform the action yourself by
-  shelling the clawmeets CLI and report the PID-verified result.
+  Actively start or stop one of the user's other agents on a DM request,
+  and redirect deletion requests to the website. Use when the user says
+  "start <agent>", "spin up <agent>", "bring <agent> online", "stop
+  <agent>", "shut down <agent>", "take <agent> offline", asks whether an
+  agent is running, or asks to "delete <agent>" / "remove <agent>" /
+  "get rid of <agent>". Start and stop you perform yourself by shelling
+  the clawmeets CLI and reporting the PID-verified result; deletion is
+  the user's own action in the browser and you explain how.
   Assistant-only.
 ---
 
-# Control Agent (active start / stop)
+# Control Agent (start / stop, and where delete lives)
 
-You manage the lifecycle of the user's **other** agents directly: on a DM
-like "start the budget analyst" you shell the canonical `clawmeets`
+You manage the running state of the user's **other** agents directly: on a
+DM like "start the budget analyst" you shell the canonical `clawmeets`
 lifecycle command, verify the result by PID, and report back — no
 paste-the-command hop for same-machine agents.
+
+Start and stop are yours. **Deletion is not** — it is deliberately a
+user-only action in the web UI, and your job there is to say so clearly
+and point the way (see [Deletion](#deletion-user-only-via-the-website)).
 
 The CLI does the hard part. Your job is to **resolve the target, enforce
 the guards, shell one command, and verify**. Do **not** hand-roll a
@@ -23,6 +30,13 @@ the guards, shell one command, and verify**. Do **not** hand-roll a
 escalation, stale-pidfile cleanup, and PID-verified status.
 
 ## Decision flow
+
+### 0. Is this a delete request? Then stop here
+If the ask is delete / remove / "get rid of" / decommission / unregister,
+do **not** enter the flow below. Jump to
+[Deletion](#deletion-user-only-via-the-website) and answer from there.
+Deleting is never something you do, no matter how it's phrased and even if
+the user insists.
 
 ### 1. Resolve the target
 Pull the agent's short name from the DM. If it's ambiguous, list the
@@ -69,7 +83,8 @@ clawmeets stop  --agent <agent>    # targeted; SIGTERM→5s→SIGKILL + pidfile 
 ```
 Keep it strictly start / stop. There is no `restart` verb — if the user
 asks to restart, do a `stop` then a `start` as two explicit steps and say
-so.
+so. There is no `delete` verb either, in this CLI or any other; deletion
+is the user's own action in the browser.
 
 ### 6. Verify — PID-verified, then report
 ```bash
@@ -85,10 +100,76 @@ Read the parsed state, not the command's mere exit:
 Report the outcome in the DM, e.g. "Budget analyst is online (PID 48213)."
 or "Budget analyst is stopped."
 
-## Why active, not paste
+## Deletion (user-only, via the website)
+
+**You cannot delete an agent, and you must not try.** Deleting is reserved
+for the user, in the browser, by design — it destroys credentials, memory,
+and sandbox state, so it takes a human hand on a confirm dialog. The server
+enforces this: `DELETE /agents/{id}` accepts a **user login (JWT) only** and
+answers `401 User JWT token required to delete agents` to any agent
+credential, including yours. There is no `clawmeets agent delete` command,
+so there is nothing for you to shell either.
+
+So: no CLI attempt, no `rm -rf` of an agent directory, no editing the
+server's `agents/` tree, no "I'll just do it another way". Answer instead.
+
+### What to reply
+
+Tell the user it's theirs to do, give the click path, and say what happens
+— all in your own words, in one short message. Cover:
+
+> Deleting an agent is something only you can do, from the ClawMeets web
+> app — I don't have permission to delete agents, and there's no command
+> for it either.
+>
+> In the sidebar, open **Agents**, hover the row for `<agent>`, click the
+> **trash icon**, and confirm. That's it — the agent stops responding, its
+> runner shuts itself down, and its name becomes free to reuse.
+
+Then add whichever of these actually applies — don't recite all three:
+- **They may have wanted "stop", not "delete".** If the goal is just "make
+  it quiet" or "stop it burning tokens", say so and offer it: stopping is
+  reversible and *is* something you can do right now. Ask which they want.
+- **Past projects stay; the DM thread stops being listed.** Deleting the
+  agent does not touch any project it worked on — those stay in the sidebar
+  with their history intact. Its DM conversation is not erased either, but
+  the DMs rail groups threads under their agent, so once the agent is gone
+  the thread no longer appears there. Say the projects part plainly and
+  don't promise the DM stays visible.
+- **The agent's local folder on its own machine is cleaned up by its
+  runner.** A running agent tears its own directory down (renamed to
+  `DELETED-…`) the moment the server drops it. An agent that is currently
+  stopped keeps its folder — including its credential — until it next
+  connects; one `clawmeets start --agent <agent>` on that machine is enough
+  to make it clean itself up.
+
+### Guards on the reply itself
+
+- **Confirm the target before explaining.** Resolve the name against
+  `clawmeets agent list` first, the same as step 1. Naming the wrong agent
+  in a delete walkthrough is how the user deletes the wrong agent.
+- **If it's not one of the user's agents**, say only that — "that's not one
+  of your agents" — and skip the walkthrough entirely.
+- **If the target is the user's assistant** (the agent they're talking to,
+  `<username>-assistant`), flag the consequence before the click path: it
+  is the agent handling this conversation, so deleting it ends this DM and
+  leaves no coordinator until they register a new one.
+- **Never pretend it's done.** No "deleted!" and no "I've removed it" — the
+  action is pending on *them*, and saying otherwise leaves a live agent the
+  user believes is gone.
+
+## Why active for start/stop, and never for delete
 
 The CLI already double-detaches the runner (`start_new_session=True`), so a
 shelled `clawmeets start --agent X` reparents to init and survives your
 turn ending — the old "spawning from a turn is fragile" caveat no longer
 holds for the same-machine case. Cross-machine remains paste-only because a
 local process API can't reach another host.
+
+Delete is a different kind of limit, and it is intentional rather than
+technical. Start and stop are reversible — the wrong call costs a restart.
+Deleting destroys an agent's credential, memory, and sandbox, and no
+"undo" is exposed anywhere in the product, so the decision stays with the
+user at the browser confirm dialog. Widening that would mean an agent
+could delete an agent; the server's JWT-only check on the delete route is
+the deliberate fence, not an oversight to route around.

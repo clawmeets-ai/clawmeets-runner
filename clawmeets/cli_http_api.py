@@ -32,7 +32,10 @@ def sync(
 # --- Ad-hoc HTTP client (get / post / put / patch / delete) ------------------
 # Independent of `sync`. A session jar (--save-session / --session) makes login
 # just another request that writes cookies. Redirects are OFF by default so a
-# login's 302 auth signal is not masked as a final 200. See skills/http-api.
+# login's 3xx auth signal is not masked as a final 200. Because a failed login
+# is itself an ordinary 3xx with its own cookie, --expect-location /
+# --expect-status let the caller declare what success looks like; an unmet
+# expectation exits 23 and suppresses the jar write. See skills/http-api.
 #
 # get() takes no body; post/put/patch/delete share the body-carrying option set
 # below. All delegate to _client.run(), whose int return becomes the exit code.
@@ -56,12 +59,24 @@ def get(
     output: str = typer.Option("body", "--output", help="body | json | full."),
     timeout: float = typer.Option(30.0, "--timeout", help="Per-request timeout (s)."),
     fail: bool = typer.Option(False, "--fail", help="Exit 22 on HTTP status >= 400."),
+    expect_location: str = typer.Option(
+        "", "--expect-location",
+        help="Require the landing URL to match this glob (a leading '/' matches "
+             "the path, so '/' is exact and '/dashboard*' is a prefix); else "
+             "exit 23 and skip --save-session.",
+    ),
+    expect_status: str = typer.Option(
+        "", "--expect-status",
+        help="Require the status to match, e.g. '200', '2xx', '200,303'; else "
+             "exit 23 and skip --save-session.",
+    ),
 ) -> None:
     """GET a URL, optionally replaying a session jar."""
     raise typer.Exit(_client.run(
         method="GET", url=url, header=header, query=query, data=[], json_body=[],
         session=session, save_session=save_session, follow=follow,
         output=output, timeout=timeout, fail=fail,
+        expect_location=expect_location, expect_status=expect_status,
     ))
 
 
@@ -78,12 +93,15 @@ def _run_body_command(
     output: str,
     timeout: float,
     fail: bool,
+    expect_location: str,
+    expect_status: str,
 ) -> None:
     """Shared body-carrying request path for post/put/patch/delete."""
     raise typer.Exit(_client.run(
         method=method, url=url, header=header, query=query, data=data,
         json_body=json_body, session=session, save_session=save_session,
         follow=follow, output=output, timeout=timeout, fail=fail,
+        expect_location=expect_location, expect_status=expect_status,
     ))
 
 
@@ -100,10 +118,13 @@ def post(
     output: str = typer.Option("body", "--output"),
     timeout: float = typer.Option(30.0, "--timeout"),
     fail: bool = typer.Option(False, "--fail"),
+    expect_location: str = typer.Option("", "--expect-location"),
+    expect_status: str = typer.Option("", "--expect-status"),
 ) -> None:
     """POST (form via --data or JSON via --json). Login = POST + --save-session."""
     _run_body_command("POST", url, header, query, data, json_body,
-                      session, save_session, follow, output, timeout, fail)
+                      session, save_session, follow, output, timeout, fail,
+                      expect_location, expect_status)
 
 
 @app.command()
@@ -119,10 +140,13 @@ def put(
     output: str = typer.Option("body", "--output"),
     timeout: float = typer.Option(30.0, "--timeout"),
     fail: bool = typer.Option(False, "--fail"),
+    expect_location: str = typer.Option("", "--expect-location"),
+    expect_status: str = typer.Option("", "--expect-status"),
 ) -> None:
     """PUT (form via --data or JSON via --json)."""
     _run_body_command("PUT", url, header, query, data, json_body,
-                      session, save_session, follow, output, timeout, fail)
+                      session, save_session, follow, output, timeout, fail,
+                      expect_location, expect_status)
 
 
 @app.command()
@@ -138,10 +162,13 @@ def patch(
     output: str = typer.Option("body", "--output"),
     timeout: float = typer.Option(30.0, "--timeout"),
     fail: bool = typer.Option(False, "--fail"),
+    expect_location: str = typer.Option("", "--expect-location"),
+    expect_status: str = typer.Option("", "--expect-status"),
 ) -> None:
     """PATCH (form via --data or JSON via --json)."""
     _run_body_command("PATCH", url, header, query, data, json_body,
-                      session, save_session, follow, output, timeout, fail)
+                      session, save_session, follow, output, timeout, fail,
+                      expect_location, expect_status)
 
 
 @app.command()
@@ -157,7 +184,10 @@ def delete(
     output: str = typer.Option("body", "--output"),
     timeout: float = typer.Option(30.0, "--timeout"),
     fail: bool = typer.Option(False, "--fail"),
+    expect_location: str = typer.Option("", "--expect-location"),
+    expect_status: str = typer.Option("", "--expect-status"),
 ) -> None:
     """DELETE (optionally with a --data / --json body)."""
     _run_body_command("DELETE", url, header, query, data, json_body,
-                      session, save_session, follow, output, timeout, fail)
+                      session, save_session, follow, output, timeout, fail,
+                      expect_location, expect_status)

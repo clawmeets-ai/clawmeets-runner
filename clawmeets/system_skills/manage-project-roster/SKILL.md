@@ -5,9 +5,11 @@ description: >
   allowlist — the set of specialists you, the coordinator, are permitted to
   pull into the project via create_room. Use when a project you coordinate
   needs an agent the owner did NOT include at creation: most often when a
-  `create_room` is rejected with "not in this project's invitable allowlist",
-  or when you're planning work that clearly needs a specialist outside the
-  current roster. The allowlist is a guardrail the owner set — NEVER widen it
+  `create_room` is rejected with "not in this project's invitable allowlist"
+  (the server's 403) or with "is a real agent but is NOT invitable in this
+  project" (the runner's pre-flight validator, which is what you will usually
+  see), or when you're planning work that clearly needs a specialist outside
+  the current roster. The allowlist is a guardrail the owner set — NEVER widen it
   silently: surface the gap, propose the exact addition, and only run the CLI
   after the user approves. Assistant-only. (To set the roster AT creation
   time, that's the propose-project flow's `--agent`/`--team` flags, not this.)
@@ -16,19 +18,31 @@ description: >
 # Manage project roster
 
 A project's invitable allowlist (`agent_names` + `agent_teams` on its
-`meta.json`) is fixed at creation and hard-enforced server-side: any
-`create_room` that invites an agent outside it is rejected with **403 — "not
-in this project's invitable allowlist"**. This skill is the *only* way to
-change that allowlist after the project exists. It shells one CLI command,
-which emits a `PROJECT_ALLOWLIST_UPDATED` changelog entry that replays into
-the project `meta.json` on the server and on your own runner — so your **next
-turn** in the project sees the widened roster and the `create_room` succeeds.
-No restart.
+`meta.json`) is set at creation and enforced in **two** places, which is why
+the rejection you see may be worded two different ways:
+
+- **Your own runner, before the action is ever sent** — the pre-flight action
+  validator rejects the `create_room` with *"`<name>` is a real agent but is
+  **NOT invitable** in this project (outside its invitable allowlist)"*. This
+  fires first, so in practice it is the message you actually get.
+- **The server** — `POST /chatrooms` returns **403 — "not in this project's
+  invitable allowlist"** for anything that reaches it.
+
+Same rule, same fix. This skill is the *only* way to change the allowlist
+after the project exists. It shells one CLI command, which emits a
+`PROJECT_ALLOWLIST_UPDATED` changelog entry that replays into the project
+`meta.json` on the server and on your own runner. No restart — and you do not
+have to wait for your next turn either: the validator re-reads the invitable
+set (union only, never shrinking) between retry attempts, so widening the
+roster and re-emitting the **same** `create_room` **within the same turn**
+works.
 
 ## When this fires
 
-- You tried to delegate to a specialist and `create_room` came back **403 …
-  not in this project's invitable allowlist**.
+- You tried to delegate to a specialist and `create_room` was rejected —
+  either **"is a real agent but is NOT invitable in this project"** (your
+  runner's pre-flight validator, the common case) or **403 … not in this
+  project's invitable allowlist** (the server). Both mean the same thing.
 - You're scoping work in a project you already coordinate and it plainly
   needs an agent the owner didn't list at creation.
 
@@ -48,6 +62,10 @@ your own — and never claim you added an agent that you haven't.
 3. **Wait for the user's approval.** Only then run the CLI.
 4. **Confirm** once it lands, and continue the work (the `create_room` will
    now go through).
+
+If the user has **already** asked for that agent on this project, step 3 is
+satisfied — do not stall a turn re-asking. Run the CLI and re-emit the same
+`create_room` in the same turn.
 
 ## Command
 
@@ -77,8 +95,8 @@ exactly what you pass.
 
 ## Finding the project_id
 
-- Reacting **inside** the project (the 403 case): use *this* project's id — it's
-  the project you're currently coordinating.
+- Reacting **inside** the project (either rejection above): use *this*
+  project's id — it's the project you're currently coordinating.
 - Otherwise list them: `clawmeets project list` (the id is the trailing UUID).
 
 ## Effect
@@ -90,8 +108,13 @@ Allowlist for <project-name> updated — agent_names=[...] agent_teams=[...]
 ```
 
 Behind it: a `PROJECT_ALLOWLIST_UPDATED` entry replays into the project's
-`meta.json` everywhere, so your next coordinator turn resolves the new agent as
-invitable and `create_room` succeeds.
+`meta.json` everywhere, so the new agent resolves as invitable — on your next
+`create_room` attempt in this turn, and on every later turn.
+
+**One thing not to do:** if a `create_room` is rejected for a name you know is
+spelled right, do NOT retry it with spelling variants and do NOT widen the
+roster again under a second spelling. Both rejections are the allowlist, not
+the spelling. Widen once, re-emit the same name.
 
 ## Error handling
 

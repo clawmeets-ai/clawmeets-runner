@@ -5,7 +5,10 @@ description: >
   prompts. INVOKE when the user asks you to (a) add / edit / rename / delete
   an SOP, list what SOPs they have, or set which agent one goes to; or
   (b) RUN one ("run my weekly restock SOP", "kick off the Monday review",
-  "fire the onboarding SOP for Acme"). Running one is a TWO-TURN interview:
+  "fire the onboarding SOP for Acme"); or (c) SCHEDULE one to run on a
+  cadence ("run my restock SOP every Monday at 9", "schedule this SOP
+  daily"), and list or cancel those schedules. Running one is a TWO-TURN
+  interview:
   `clawmeets sop show` hands you the template's blanks, you ask the user for
   those values IN ONE MESSAGE AND END YOUR TURN, then their reply brings you
   back to run `clawmeets sop trigger --set …`, which DMs the filled prompt to
@@ -162,6 +165,81 @@ Reply one line, naming the recipient:
 
 Don't paste the filled prompt back; the user wrote the template and just
 supplied the values.
+
+## § Scheduling one — put it on a cadence
+
+A scheduled SOP is a recurring message **to yourself** carrying a marker;
+each fire wakes you and you dispatch the SOP. Nothing else is stored —
+the schedule holds the values, the SOP holds the work.
+
+The desk's schedule button drafts the request for you, already carrying
+the SOP id and a filled value per blank. When it arrives:
+
+1. `clawmeets sop list` → resolve the SOP the user named.
+2. `clawmeets sop show <id>` → check every blank has a value in the
+   request. One missing? Ask for it and **END YOUR TURN**, exactly as in
+   the interview above — a schedule fires unattended, so a guessed value
+   is wrong every day, not once.
+3. Convert the cadence to a **UTC** cron and say the local time back, so
+   the user can catch a timezone slip:
+
+   ```bash
+   clawmeets dm schedule "<your own agent name>" "<!-- clawmeets:sop-run:<sop-id> -->
+   Run SOP <sop-id> with: Inventory=Chelsea, Par threshold=6" --cron "0 13 * * *"
+   ```
+
+   Your own name is the `You are …` line at the top of this prompt. You
+   schedule it to **yourself** because you are the one who can read the
+   library and call `sop trigger`.
+4. Confirm in one line: SOP title, cadence in the user's local time, and
+   the `next fire` the CLI printed.
+
+List and cancel through the same DM schedule surface:
+
+```bash
+clawmeets dm schedules --full          # grep the output for sop-run:<sop-id>
+clawmeets dm unschedule <schedule-id>
+```
+
+Changing a cadence or a value is unschedule + re-create — there is no
+edit verb. Changing the *work* needs neither: edit the SOP body and the
+next fire picks it up, because the fire re-reads the library.
+
+## § Firing a scheduled run
+
+A message whose body carries `<!-- clawmeets:sop-run:<sop-id> -->` is a
+schedule firing. Parse the `Label=value` pairs out of the body and
+dispatch straight away:
+
+```bash
+clawmeets sop trigger <sop-id> --set "Inventory=Chelsea" --set "Par threshold=6"
+```
+
+Do **not** re-run the interview — the values were settled when the
+schedule was created, and there is no user waiting at 2am to answer.
+A blank with no value in the body means the schedule was built wrong:
+say which blank, and stop rather than guessing.
+
+Report the run in one line. This is the owner's audit trail for an
+unattended job, so name the SOP and the recipient.
+
+## § Folding what a run taught you back into the SOP
+
+The SOP body is the durable record of how this job is done — it is what
+the next fire reads. When a run surfaces something the next run should
+know (a source that moved, a step that needs ordering differently, a
+threshold that was wrong), put it in the SOP rather than in your reply:
+
+1. `clawmeets sop show <id>` → take the CURRENT body.
+2. Append to a `## Prior-run notes` section at the very **end**. Create
+   that heading if it is not there yet.
+3. `clawmeets sop update <id> --body-file <path>` with the whole body.
+
+Never regenerate the template above that heading — you are appending to
+a document the owner wrote and can edit, and a rewrite silently throws
+their wording away. Keep notes terse and general ("the vendor feed moved
+to a weekly cadence, so a daily pull sees no change"), never
+run-specific: no credentials, no personal data, no one-off ids.
 
 ## § One thing to be careful about
 

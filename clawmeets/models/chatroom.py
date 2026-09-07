@@ -37,6 +37,7 @@ from pydantic import BaseModel, Field, PrivateAttr, computed_field
 from ..utils.file_io import FileUtil
 from .chat_message import (
     ChatBatchTimeoutEvent,
+    ChatAgentOfflineEvent,
     ChatFileEvent,
     ChatLogEntry,
     ChatMessage,
@@ -684,6 +685,23 @@ class ChatroomState:
 
         Args:
             event: The ChatBatchTimeoutEvent to append
+        """
+        FileUtil.write(
+            self._chatroom.chats_path,
+            event.model_dump(by_alias=True),
+            "ndjson",
+            mode="a",
+            ensure_dir=True,
+            atomic=False,
+        )
+
+    def append_agent_offline(
+        self, event: ChatAgentOfflineEvent
+    ) -> None:
+        """Append a participants-offline event to CHATS.ndjson.
+
+        Args:
+            event: The ChatAgentOfflineEvent to append
         """
         FileUtil.write(
             self._chatroom.chats_path,

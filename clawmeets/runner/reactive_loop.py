@@ -510,6 +510,25 @@ class ReactiveControlLoop:
                     "SKILL_AUTH_URL_FOR_USER unexpectedly delivered to runner; ignoring"
                 )
 
+            case ControlMessageType.PROJECT_PLAN_SYNC:
+                # **A BROWSER signal that is broadcast to the whole project**, so
+                # it arrives here too and must not be an error. It was: this arm
+                # did not exist, every plan mutation fell through to the raise
+                # below, and each one logged a traceback on every participating
+                # runner — 92 of them on one project before anybody noticed,
+                # because nothing downstream depended on the envelope.
+                #
+                # IGNORED, NOT HANDLED, and the difference is not stylistic:
+                # `ProjectPlanSyncPayload` carries no changelog version, and a
+                # version is the whole of `_sync_changelog`'s cheap path — the
+                # `new_version <= last_processed_version` early return is what
+                # makes a duplicate push free. There is nothing here to sync TO.
+                # A runner learns the same facts as changelog entries
+                # (`PROJECT_PLAN_STATE`, and the `FILE_UPDATED` for PLAN.md)
+                # behind the `CHANGELOG_UPDATE` the server now sends beside this
+                # one whenever the changelog actually moved.
+                pass
+
             case _:
                 raise ValueError(f"Unknown control message type: {envelope.type}")
 

@@ -57,6 +57,21 @@ _CREATE_ROOM_ACTION_SCHEMA = {
     "additionalProperties": False
 }
 
+_INVITE_AGENT_ACTION_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "type": {"const": "invite_agent"},
+        "room": {"type": "string"},
+        "invite": {
+            "type": "array",
+            "items": {"type": "string"}
+        },
+        "message": {"type": "string"},
+    },
+    "required": ["type", "room", "invite", "message"],
+    "additionalProperties": False
+}
+
 _PROJECT_COMPLETED_ACTION_SCHEMA = {
     "type": "object",
     "properties": {
@@ -84,7 +99,8 @@ WORKER_ACTION_SCHEMA = {
     "additionalProperties": False
 }
 
-# Coordinator schema: all actions including create_room and project_completed
+# Coordinator schema: all actions including create_room, invite_agent and
+# project_completed
 COORDINATOR_ACTION_SCHEMA = {
     "type": "object",
     "properties": {
@@ -95,6 +111,7 @@ COORDINATOR_ACTION_SCHEMA = {
                     _REPLY_ACTION_SCHEMA,
                     _UPDATE_FILE_ACTION_SCHEMA,
                     _CREATE_ROOM_ACTION_SCHEMA,
+                    _INVITE_AGENT_ACTION_SCHEMA,
                     _PROJECT_COMPLETED_ACTION_SCHEMA,
                 ]
             }
@@ -110,6 +127,7 @@ class ActionType(str, Enum):
     REPLY = "reply"
     UPDATE_FILE = "update_file"
     CREATE_ROOM = "create_room"
+    INVITE_AGENT = "invite_agent"
     PROJECT_COMPLETED = "project_completed"
 
 
@@ -146,13 +164,34 @@ class CreateRoomAction(BaseModel):
     init_message: str           # initial message with @mentions to address agents
 
 
+class InviteAgentAction(BaseModel):
+    """Add agents to a chatroom that ALREADY exists, then address them.
+
+    The continuation counterpart to :class:`CreateRoomAction`: when the work is
+    a continuation of a thread already running, pulling the specialist into that
+    room beats opening a second one and hand-carrying context between the two.
+
+    ``message`` is required rather than optional because an un-@mentioned
+    invitee is never triggered — the same failure the create_room guidance warns
+    about. Bundling membership and the ask makes the action's success condition
+    ("the invitee is in the room AND has been asked something") atomic.
+    """
+    type: ActionType = ActionType.INVITE_AGENT
+    room: str                   # existing chatroom name
+    invite: list[str]           # agent names to add
+    message: str                # message with @mentions addressing the invitees
+
+
 class ProjectCompletedAction(BaseModel):
     """Mark the project as complete."""
     type: ActionType = ActionType.PROJECT_COMPLETED
 
 
 # Union type used by ActionParser
-Action = Union[ReplyAction, UpdateFileAction, CreateRoomAction, ProjectCompletedAction]
+Action = Union[
+    ReplyAction, UpdateFileAction, CreateRoomAction, InviteAgentAction,
+    ProjectCompletedAction,
+]
 
 
 class ActionBlock(BaseModel):
@@ -175,6 +214,8 @@ class ActionBlock(BaseModel):
                 result.append(UpdateFileAction(**a))
             elif t == ActionType.CREATE_ROOM:
                 result.append(CreateRoomAction(**a))
+            elif t == ActionType.INVITE_AGENT:
+                result.append(InviteAgentAction(**a))
             elif t == ActionType.PROJECT_COMPLETED:
                 result.append(ProjectCompletedAction(**a))
         return result

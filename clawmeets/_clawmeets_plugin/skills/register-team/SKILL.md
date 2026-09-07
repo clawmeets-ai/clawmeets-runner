@@ -67,7 +67,8 @@ The personal assistant should already exist (run
 
    Optional flags:
    - `--llm-provider <p>` overrides the per-agent provider in the
-     template for every worker in this run (`claude` | `openai` | `gemini`).
+     template for every worker in this run (`claude` | `openai` | `gemini` |
+     `opencode` | `antigravity`).
    - `--auto-personalize` enables the personalize-trigger DM fan-out (off by
      default).
 

@@ -17,6 +17,13 @@ agent to an already-logged-in user. The agent's credential + card are
 written to `{data_dir}/agents/{name}-{id}/`; `clawmeets start` picks it
 up on the next run.
 
+**This skill only provisions.** The new agent comes up with an empty
+`memory/learnings/`. If you also want it to *start knowing something* — a
+mentor agent's brief on the job, its own deep research on the domain, both
+distilled into its durable memory — follow **`onboard-agent`** instead: it
+wraps this same registration in a short project where that can actually
+happen. Use this skill when the user just wants the agent to exist.
+
 ## Steps
 
 1. **Check CLI and login**:
@@ -41,24 +48,58 @@ up on the next run.
      A rich list powers delegation matching, the agent's summary card, and the
      personalize CTA prefill — a thin/empty one degrades all three.
    - Knowledge directory (optional, absolute path; create it if the user approves and it doesn't exist)
-   - **LLM backend** (optional, default `claude`): one of `claude`, `openai`,
-     or `gemini`. Ask only if the user hasn't already stated a preference.
-     Phrase it lightly: *"Which LLM should this agent use? (claude / openai /
-     gemini, default claude)"*
+   - **Git repo** (optional, but ask whenever the role is engineering-shaped —
+     backend, frontend, data, devops, anything that will write code). The repo
+     URL or path binds the agent to a codebase; without it the agent's
+     `git-workflow` skill has nothing to clone and it cannot contribute code
+     at all. Phrase it lightly: *"Which repo should this agent work in?
+     (URL or path — leave blank if it won't write code)"*. Optionally also ask
+     which branch new work should be cut from, if they don't want the repo
+     default.
+   - **LLM backend** (optional, default `claude`). Two tiers:
+     - Shell an installed Code CLI: `claude` (default), `openai`, `gemini`,
+       `opencode`, `antigravity`.
+     - Run in-process with the user's own API key — no CLI binary needed:
+       `claude-api`, `openai-api`, `gemini-api`, `openrouter-api`,
+       `openrouter-native`.
+
+     Ask only if the user hasn't already stated a preference. Phrase it
+     lightly: *"Which LLM should this agent use? (default claude — or a
+     BYO-key variant like `claude-api` / `openrouter-api` if you'd rather it
+     ran on your own API key)"*
    - **LLM model** (optional): provider-specific override. Skip for Claude
      (uses Claude Code's default). For OpenAI/Codex, common values are
      `o3`, `o3-mini`, `gpt-5-codex`. For Gemini, common values are
-     `gemini-2.5-pro`, `gemini-2.5-flash`. If the user has no preference,
-     skip — each provider has a sensible default.
-   - **Tags** (optional): one or more owner-defined labels for the TAGS
+     `gemini-2.5-pro`, `gemini-2.5-flash`. For `opencode`, a
+     `<provider>/<model>` slug. For `antigravity`, a **bare** slug such as
+     `gemini-3.1-pro-high` (no `provider/` prefix — the `-high`/`-medium`/`-low`
+     suffix is the reasoning effort). For `openrouter-api`, an OpenRouter slug. If
+     the user has no preference, skip — each provider has a sensible default.
+   - **`antigravity` prerequisite** (only if they pick it): the binary is
+     **`agy`**, not `antigravity`, and its auth is Google OAuth held in the
+     system keyring — nothing passes through clawmeets. A human must run `agy`
+     **once, interactively, on each runner box** to complete the sign-in before
+     an `antigravity`-backed agent can run there. Say this out loud when the
+     user picks it; it is the same constraint `opencode` carries.
+   - **API key** (only for a `-api` / `-native` provider): ask for it, or
+     confirm the matching env var (`ANTHROPIC_API_KEY` / `OPENAI_API_KEY` /
+     `GEMINI_API_KEY` / `OPENROUTER_API_KEY`) is already set on the machine
+     that will run the agent.
+   - **Local model** (optional): if the user wants this agent on a local
+     endpoint (ollama, vLLM, LM Studio), take the base URL. It pairs with
+     `openai-api` (an OpenAI-compatible `/v1` URL) or with the bare `claude`
+     CLI (an Anthropic Messages-API URL, **no** `/v1`).
+   - **Teams** (optional): one or more owner-defined labels for the TEAMS
      sidebar. Ask only if the user mentions grouping. Phrase it lightly:
-     *"Any tags to file this agent under in the sidebar? (e.g. Marketing,
+     *"Any teams to file this agent under in the sidebar? (e.g. Marketing,
      Outbound — leave blank for none)"*
 
 3. **Register the agent**:
    ```bash
    clawmeets agent register "<name>" "<description>" \
      --capabilities "<caps>" \
+     --knowledge-dir "<path>" \
+     --git-url "<repo>" --git-base-branch "<branch>" \
      --llm-provider "<provider>" \
      --llm-model "<model>" \
      --team "<team1>" --team "<team2>"
@@ -72,9 +113,24 @@ up on the next run.
    - Pass the confirmed `--capabilities` list. Omit ONLY if the user, shown
      your proposed list, explicitly declined — don't drop it just because they
      didn't volunteer capabilities up front.
-   - Omit `--llm-provider` to use the default (`claude`). The CLI validates
-     the value and rejects anything outside `claude|openai|gemini`.
+   - Pass `--knowledge-dir` if the user gave one. It lands in `card.json`
+     `local_settings` from this call — the runner then passes the directory to
+     the LLM as a read-only extra dir and indexes it into
+     `memory/REFERENCES.md`. **Do not skip this flag and assume the directory
+     is picked up by convention; it isn't.** (To change it later:
+     `clawmeets agent reconfigure <name> --knowledge-dir <path>`.)
+   - Pass `--git-url` for any code-writing agent, plus `--git-base-branch` if
+     they named a non-default base. Both land in `local_settings` and surface
+     to the agent as `$CLAWMEETS_AGENT_GIT_URL` /
+     `$CLAWMEETS_AGENT_GIT_BASE_BRANCH`.
+   - Omit `--llm-provider` to use the default (`claude`). The CLI validates it
+     against `claude`, `openai`, `gemini`, `opencode`, `antigravity`,
+     `claude-api`, `openai-api`, `gemini-api`, `openrouter-api`,
+     `openrouter-native` and rejects anything else.
    - Omit `--llm-model` to use the provider's default model.
+   - For a `-api` / `-native` provider, add `--llm-api-key "<key>"` unless the
+     provider's standard env var is already set on the runner machine. For a
+     local endpoint, add `--llm-base-url "<url>"`.
    - Omit `--team` if the user didn't ask for grouping. The flag is repeatable;
      pass it once per team. Defaults to `$CLAWMEETS_AGENT_TEAMS` (comma-separated)
      if no `--team` flag is given.
@@ -115,8 +171,8 @@ up on the next run.
    When working on new tasks, check this directory for relevant reference material.
    ```
 
-4.5 **Recommend skills** (opt-in — do this after `agent register` succeeds,
-    before the final confirm):
+5. **Recommend skills** (opt-in — do this after `agent register` succeeds,
+   before the final confirm):
    ```bash
    clawmeets skill list
    ```
@@ -140,7 +196,12 @@ up on the next run.
    list to hit a count. The catalog is server-curated, so everything it
    returns is already vetted; ranking here is relevance-only.
 
-5. **Confirm**: "Agent '{name}' registered and linked to {current_user}. Run `/clawmeets:start` to start the runner."
+6. **Confirm**: "Agent '{name}' registered and linked to {current_user}. Run `/clawmeets:start` to start the runner."
+
+   If the user seems to expect the agent to already know something about the
+   job, say plainly that it starts with an empty memory and offer the
+   `onboard-agent` path (a mentor brief and/or its own deep research,
+   distilled into its `learnings/`).
 
 ## Error Handling
 

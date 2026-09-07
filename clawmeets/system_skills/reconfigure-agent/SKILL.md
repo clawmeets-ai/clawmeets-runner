@@ -30,7 +30,7 @@ Settings you can change (pass any subset; an empty string clears a key):
 | `--git-base-branch` | branch new work is cut from |
 | `--knowledge-dir` | proprietary-knowledge directory |
 | `--dwh-dir` | personal data-warehouse root |
-| `--llm-provider` | LLM backend (claude / openai / gemini / opencode / *-api) |
+| `--llm-provider` | LLM backend (claude / openai / gemini / opencode / `antigravity` / *-api) |
 | `--llm-model` | provider-specific model |
 | `--llm-api-key` | BYO key for a `-api` provider |
 | `--llm-base-url` | local-model endpoint — for `openai-api` an OpenAI-compatible URL (ollama `http://localhost:11434/v1`, vLLM, LM Studio); for the `claude` CLI a local Anthropic Messages-API URL (ollama `http://localhost:11434` — no `/v1`, or a gateway) |

@@ -240,6 +240,29 @@ class ClaudeCLI(SubprocessLLMProvider):
             stdin_bytes=prompt.encode("utf-8"),
         )
 
+    @staticmethod
+    def _events(stdout: str) -> list:
+        """Top-level event array from the CLI's --output-format json, or []."""
+        try:
+            data = json.loads(stdout.strip())
+        except json.JSONDecodeError:
+            return []
+        return data if isinstance(data, list) else []
+
+    @classmethod
+    def _result_item(cls, stdout: str) -> Optional[dict]:
+        """The single `type: "result"` event, which carries the turn's verdict.
+
+        Everything the CLI knows about a failure lives here — `is_error`,
+        `api_error_status`, `terminal_reason`, and a human-readable `result`
+        string. Note `subtype` stays `"success"` even on an API error, so it
+        is useless as a discriminator; `is_error` is the honest one.
+        """
+        for item in cls._events(stdout):
+            if isinstance(item, dict) and item.get("type") == "result":
+                return item
+        return None
+
     def _check_rate_limit(
         self,
         prepared: PreparedInvocation,
@@ -247,36 +270,35 @@ class ClaudeCLI(SubprocessLLMProvider):
         stderr: str,
         returncode: int,
     ) -> Optional[LLMRateLimitError]:
-        """Detect Claude's rate-limit signature: returncode=0 + is_error=true + error="rate_limit"."""
-        try:
-            data = json.loads(stdout.strip())
-        except json.JSONDecodeError:
+        """Detect Claude's rate-limit signature: is_error=true plus either
+        `api_error_status == 429` (current CLI) or `error == "rate_limit"`
+        (legacy shape, kept so an older binary still classifies).
+
+        The 429 arm matters: the current CLI reports a hit limit *only* as a
+        status code, with the remedy in `result` ("You've hit your weekly
+        limit · resets …") and the machine-readable reset time in a sibling
+        `rate_limit_event`. Keying solely on the legacy `error` field let all
+        of that fall through to a generic invocation error.
+        """
+        item = self._result_item(stdout)
+        if not (item and item.get("is_error") is True):
             return None
-        if not isinstance(data, list):
+        if not (item.get("api_error_status") == 429 or item.get("error") == "rate_limit"):
             return None
-        for item in data:
-            if not (
-                isinstance(item, dict)
-                and item.get("type") == "result"
-                and item.get("is_error") is True
-                and item.get("error") == "rate_limit"
-            ):
-                continue
-            result_text = item.get("result", "")
-            resets_at = None
-            rate_limit_type = None
-            for entry in data:
-                if isinstance(entry, dict) and entry.get("type") == "rate_limit_event":
-                    info = entry.get("rate_limit_info", {})
-                    resets_at = info.get("resetsAt")
-                    rate_limit_type = info.get("rateLimitType")
-                    break
-            return LLMRateLimitError(
-                message=f"Rate limited: {result_text}",
-                resets_at=resets_at,
-                rate_limit_type=rate_limit_type,
-            )
-        return None
+
+        resets_at = None
+        rate_limit_type = None
+        for entry in self._events(stdout):
+            if isinstance(entry, dict) and entry.get("type") == "rate_limit_event":
+                info = entry.get("rate_limit_info", {})
+                resets_at = info.get("resetsAt")
+                rate_limit_type = info.get("rateLimitType")
+                break
+        return LLMRateLimitError(
+            message=f"Rate limited: {item.get('result', '')}",
+            resets_at=resets_at,
+            rate_limit_type=rate_limit_type,
+        )
 
     def _build_error_detail(
         self,
@@ -285,25 +307,51 @@ class ClaudeCLI(SubprocessLLMProvider):
         stderr: str,
         returncode: int,
     ) -> Optional[str]:
-        """Stderr-primary detail; if the JSON output carries a top-level result
-        `error` field, append it. Returns None when returncode == 0 — Claude
-        does not synthesize invocation errors from successful exits (rate
-        limits use their own signal)."""
+        """Detail built from the result item, falling back to stderr.
+
+        The CLI writes its diagnostics to *stdout* as JSON, not stderr, so a
+        stderr-primary detail is empty for every API failure — which is how
+        "exited with code 1: (no stderr)" reached users' chats. `result` holds
+        the human-readable reason (and, for a rate limit, the remedy);
+        `api_error_status` holds the code, which the text does not always
+        repeat. Returns None when returncode == 0 — Claude does not synthesize
+        invocation errors from successful exits (rate limits use their own
+        signal).
+        """
         if returncode == 0:
             return None
         logger.error(f"[claude-invoke] stdout on error: {stdout[:2000]}...")
-        detail = stderr or "(no stderr)"
-        try:
-            data = json.loads(stdout.strip())
-            if isinstance(data, list):
-                for item in data:
-                    if isinstance(item, dict) and item.get("type") == "result":
-                        if "error" in item:
-                            detail = f"{detail}\nJSON error: {item['error']}"
-                        break
-        except (json.JSONDecodeError, KeyError):
-            pass
-        return detail
+
+        parts: list[str] = []
+        item = self._result_item(stdout)
+        if item:
+            if item.get("result"):
+                parts.append(str(item["result"]))
+            status = item.get("api_error_status")
+            if status is not None:
+                parts.append(f"(HTTP {status})")
+            # `error` is absent on every current-CLI failure; kept so a future
+            # or older binary that does emit it is not silently dropped.
+            # Truthiness, not `in`: a present-but-null key must not render as
+            # the literal "JSON error: None".
+            if item.get("error"):
+                parts.append(f"JSON error: {item['error']}")
+            elif not parts and item.get("terminal_reason"):
+                parts.append(f"terminal_reason: {item['terminal_reason']}")
+        if stderr:
+            parts.append(stderr)
+        return " ".join(parts) if parts else "(no stderr)"
+
+    def _error_status_code(
+        self,
+        prepared: PreparedInvocation,
+        stdout: str,
+        stderr: str,
+        returncode: int,
+    ) -> Optional[int]:
+        item = self._result_item(stdout)
+        status = item.get("api_error_status") if item else None
+        return status if isinstance(status, int) else None
 
     def _parse_result(
         self,

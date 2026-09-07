@@ -32,9 +32,10 @@ agent's token and just refreshes local files / settings).
    - If no `current_user`: tell the user to run `/clawmeets:login`.
 
 2. **Ask the user (each optional — only ask if they haven't already stated a preference):**
-   - **LLM backend** (default `claude`): one of `claude`, `openai`, or
-     `gemini`. Phrase it lightly: *"Which LLM should your assistant use?
-     (claude / openai / gemini, default claude)"*
+   - **LLM backend** (default `claude`): one of `claude`, `openai`,
+     `gemini`, `opencode`, or `antigravity`. Phrase it lightly:
+     *"Which LLM should your assistant use?
+     (claude / openai / gemini / opencode / antigravity, default claude)"*
    - **LLM model** (optional): provider-specific override. Skip for Claude
      (uses Claude Code's default). For OpenAI/Codex, common values are
      `o3`, `o3-mini`, `gpt-5-codex`. For Gemini, common values are

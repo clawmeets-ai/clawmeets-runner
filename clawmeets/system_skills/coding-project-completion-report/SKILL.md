@@ -47,7 +47,20 @@ Route elsewhere only when:
 Publish the report **just before** you emit `project_completed`.
 Sequence:
 
-1. Verify acceptance criteria pass.
+1. Verify acceptance criteria pass, reading them **per milestone out of the
+   plan** — `clawmeets plan show <project> --clean`. Each milestone is a
+   `### M<n>` block inside the single `## Milestones` section and its criteria
+   are the `AC-<m>.<n>` lines inside that block; there is no global criteria
+   section. Emit one row per criterion — `{id, criterion (the plan's own
+   words, quoted), verdict: met | not met | not applicable, evidence: the
+   commit, file or room that satisfies it}` — and put that table directly
+   under the verdict.
+
+   **The coding variant had no named source for "acceptance criteria" at all**,
+   which is how a review ends up graded against the criteria the reviewer
+   remembers rather than the ones the user accepted. The plan is the source.
+   A criterion you cannot mark `met` is a caveat you state in
+   `user-communication` or a reason not to complete yet — never a dropped row.
 2. Gather the diff and write the report (this skill).
 3. Post one short line in `user-communication`: *"Wrap-up done — the
    review is on the project page."*
@@ -145,12 +158,19 @@ You write two artifacts:
    ```json
    {
      "executive": "Migrated session-based auth to JWT; backward-compatible cookie shim for legacy clients.",
-     "summary": [
-       "Replaced session storage with JWT issuance in `auth/login.py`.",
-       "Added shim middleware so cookie-only clients still authenticate.",
-       "Removed `sessions` Redis dependency from prod config."
+     "open_items": [
+       {
+         "item": "Retire the cookie shim before the next major release.",
+         "why": "Two auth paths get carried indefinitely otherwise.",
+         "owner": "you"
+       }
      ],
-     "review": "The change fully satisfies the request: every entry point that issued a session cookie now mints a JWT, and the cookie shim keeps legacy clients working, so nothing is left half-migrated.\n\nThe split between issuance (`login.py`) and the verification middleware is clean and the test coverage tracks the new paths. My one reservation is operational rather than correctness: the shim is meant to be temporary, so this needs a follow-up to retire it — otherwise we carry two auth paths indefinitely.",
+     "summary": [
+       "Logins now mint a JWT instead of a server-side session.",
+       "Existing cookie-only clients keep working, unchanged.",
+       "Prod no longer depends on Redis being up to serve auth."
+     ],
+     "review": "The change fully satisfies the request: every entry point that issued a session cookie now mints a JWT, and the cookie shim keeps legacy clients working, so nothing is left half-migrated.\n\nThe split between issuance (`login.py`) and the verification middleware is clean and the test coverage tracks the new paths. My one reservation is operational rather than correctness: the shim is a deliberate compatibility layer, not a permanent one, so the migration is complete only in the sense that both paths now work.",
      "risk_areas": [
        {"file": "src/auth/login.py", "issue": "Token returned in response body — verify no caller logs the body."},
        {"file": "config/prod.yaml", "issue": "Redis stanza removed; downstream tooling that connected here will fail."}
@@ -173,11 +193,21 @@ You write two artifacts:
    }
    ```
 
+   - `summary` bullets state what is now TRUE, not what you DID. If a
+     bullet's subject is you ("Replaced…", "Added…", "Refactored…"),
+     rewrite it from the user's side of the change.
+   - `open_items` is **optional** — zero or more things that still need
+     a human hand, each `{item, why, owner}`. Rendered directly under
+     `executive`, above the summary bullets, so a user obligation is
+     never buried in prose. Omit the key entirely when there are none;
+     never emit an empty list or an "Open items: none" row. Anything you
+     would have written as "this needs a follow-up" inside `review`
+     belongs here instead.
    - `review` is your **holistic review of the entire change** — 1–3
      tight paragraphs (plain text, blank line between paragraphs) giving
      the coordinator's overall verdict: correctness, completeness vs the
      request, the quality/architecture call, and cross-cutting concerns.
-     Distinct from `summary` (what was done) and from `risk_areas`
+     Distinct from `summary` (what is now true) and from `risk_areas`
      (specific spots to inspect). This is the one place the reader gets
      your judgment of the change as a whole.
    - `unified_diff` is the **raw output of `git diff`** — multi-file,
@@ -228,19 +258,21 @@ in exactly this order:
 
 1. **Verdict** (Recipe A's executive line) — one sentence, displayed
    prominently. The reader could read JUST this and know the outcome.
-2. **Summary bullets** (Recipe A) — 3-5 lines of what was done.
-3. **Reviewer's assessment** (Recipe A) — your `review`: the holistic
+2. **Open items** (Recipe A) — your `open_items`, when non-empty. What
+   still needs a human hand. Skipped entirely when the key is absent.
+3. **Summary bullets** (Recipe A) — 3-5 lines of what is now true.
+4. **Reviewer's assessment** (Recipe A) — your `review`: the holistic
    verdict on the whole change, in prose. Sits above the per-spot detail.
-4. **Risk areas** (Recipe A) — 2-5 places the reviewer should look
+5. **Risk areas** (Recipe A) — 2-5 places the reviewer should look
    first, in a warn-styled callout. Surface here, not inside the diff.
-5. **Metrics doughnut** (Recipe B) — at-a-glance change shape.
-6. **Annotated diff viewer** (Recipe C) — the deep dive, last.
+6. **Metrics doughnut** (Recipe B) — at-a-glance change shape.
+7. **Annotated diff viewer** (Recipe C) — the deep dive, last.
 
 Don't reorder. If risks are load-bearing for the verdict, surface
-them in step 4 — never hide them in chip-only annotations inside
-step 6, which the reader may never reach.
+them in the risk-areas callout — never hide them in chip-only
+annotations inside the diff viewer, which the reader may never reach.
 
-### Recipe A — Header + executive + summary + reviewer's assessment + risk areas
+### Recipe A — Header + executive + open items + summary + reviewer's assessment + risk areas
 
 ```js
 mount.style.font = '14px ' + lib.tokens.fontSans;
@@ -256,6 +288,39 @@ exec.style.padding = '4px 0 4px 16px';
 exec.style.borderLeft = '4px solid ' + lib.tokens.accent;
 exec.textContent = data.executive;
 mount.appendChild(exec);
+
+// Open items: what still needs a human hand. Directly under the verdict so
+// the reader never has to find an obligation buried in prose. Absent key or
+// empty list renders nothing at all — no "none" row.
+if (data.open_items && data.open_items.length) {
+  var oi = document.createElement('div');
+  oi.style.margin = '0 0 20px 0';
+  oi.style.padding = '12px 14px';
+  oi.style.border = '1px solid ' + lib.tokens.accent;
+  oi.style.borderRadius = '6px';
+  var oh = document.createElement('div');
+  oh.style.font = '700 12px ' + lib.tokens.fontSans;
+  oh.style.textTransform = 'uppercase';
+  oh.style.letterSpacing = '0.08em';
+  oh.style.color = lib.tokens.accentDeep;
+  oh.style.marginBottom = '8px';
+  oh.textContent = 'Open items';
+  oi.appendChild(oh);
+  data.open_items.forEach(function (o) {
+    var line = document.createElement('div');
+    line.style.marginTop = '6px';
+    line.style.color = lib.tokens.fg;
+    line.style.lineHeight = '1.6';
+    var txt = lib.esc(o.item);
+    if (o.why) txt += ' <span style="color:' + lib.tokens.muted + '">— '
+      + lib.esc(o.why) + '</span>';
+    if (o.owner) txt += ' <span style="font:600 11px ' + lib.tokens.fontSans
+      + ';color:' + lib.tokens.muted + '">(' + lib.esc(o.owner) + ')</span>';
+    line.innerHTML = txt;
+    oi.appendChild(line);
+  });
+  mount.appendChild(oi);
+}
 
 if (data.summary && data.summary.length) {
   var sumWrap = document.createElement('div');
@@ -485,12 +550,23 @@ The review is the user's polished take-away. Match the voice of a
 trusted senior reviewer:
 
 - Lead with the verdict (`executive`), not the setup.
+- `summary` bullets name what is now TRUE in the user's world, not what
+  you did. "Sessions no longer drop after an hour", not "updated
+  `auth.py`". If the subject of a bullet is you, rewrite it.
+- Anything needing a human hand goes in `open_items`, not into a
+  sentence halfway through `review`. An obligation the reader has to
+  excavate is an obligation that gets missed.
 - The `review` is your overall sign-off on the whole change — give a
   clear, honest verdict (call out weaknesses, not just praise). A few
   sentences, not a wall of text.
 - Comments on lines are short, concrete, actionable — "verify callers
   don't log this" beats "this might be sensitive."
 - Risk-areas section flags 2–5 places to look first, not every change.
+- **The report is read with no chat open.** Never reference a chat
+  message, a milestone, an agent, or a numbered point from one — the
+  reader can see none of it. State the finding; put the pointer in
+  `diff_files` / `annotations` where it is clickable. Never "see
+  annotation 2" — those are anchors, not an index.
 - No emoji, no exclamation marks, no "we ran git diff."
 
 The page IS the deliverable. Don't summarize it in chat afterward.

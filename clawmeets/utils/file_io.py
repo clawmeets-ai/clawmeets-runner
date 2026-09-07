@@ -192,7 +192,10 @@ class FileUtil:
         """Read and parse an NDJSON file (newline-delimited JSON)."""
         result = []
         try:
-            for line in path.read_text(encoding="utf-8").splitlines():
+            # split("\n"), not splitlines() — NDJSON is \n-delimited, and
+            # splitlines() also breaks on U+2028/U+2029/U+0085, which can ride
+            # inside a JSON string and would silently drop the row below.
+            for line in path.read_text(encoding="utf-8").split("\n"):
                 line = line.strip()
                 if line:
                     try:

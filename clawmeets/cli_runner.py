@@ -57,6 +57,7 @@ from clawmeets.llm.claude_cli import ClaudeCLI
 from clawmeets.llm.codex_cli import CodexCLI
 from clawmeets.llm.gemini_cli import GeminiCLI
 from clawmeets.llm.opencode_cli import OpenCodeCLI
+from clawmeets.llm.antigravity_cli import AntigravityCLI
 from clawmeets.models.context import ModelContext
 from clawmeets.models.model_config import VALID_CONFIG_PROVIDERS
 from clawmeets.models.agent import Agent
@@ -257,7 +258,7 @@ def _server_url(server: str) -> str:
     return server.rstrip("/")
 
 
-def _env_identity_headers() -> dict[str, str]:
+def _env_identity_headers(*, as_user: bool = False) -> dict[str, str]:
     """Per-process agent identity injected by the runner, if present.
 
     Mirrors the runner's own httpx client (``Authorization: Bearer`` +
@@ -265,21 +266,48 @@ def _env_identity_headers() -> dict[str, str]:
     authenticates as that agent's owner — unambiguous per process even when
     multiple runners share a host. Empty when not running inside a runner
     (interactive human use), where the saved session applies instead.
+
+    ``as_user`` **drops ``X-Agent-ID`` and keeps the bearer** — the other half
+    of ``clawmeets plan resolve --as-user`` (M1 AC-1.3), which is how a
+    CLI-only owner accepts a plan now that acceptance is a note. Routes that offer the
+    owner's assistant an owner-level door branch on the presence of that one
+    header: with it they resolve an *agent*, without it they run the bearer
+    through ``resolve_user_from_credential``, which accepts the owner's
+    ``{username}-assistant`` token as the owner. Sufficient by inspection —
+    ``project_plans._identity`` branches on exactly one header (``if agent_id:``
+    → agent path, else credential path) and there is no second identity-bearing
+    header to also suppress.
+
+    The key is **dropped**, not sent empty: nothing should depend on a server
+    reading ``"".strip()`` as falsy.
+
+    This widens nothing on its own. A bearer that is not a JWT and not an
+    ``-assistant`` agent's token — a specialist's, for instance — resolves to
+    nobody and gets ``401``.
     """
     token = os.environ.get("CLAWMEETS_AGENT_TOKEN")
     agent_id = os.environ.get("CLAWMEETS_AGENT_ID")
     if token and agent_id:
-        return {"Authorization": f"Bearer {token}", "X-Agent-ID": agent_id}
+        headers = {"Authorization": f"Bearer {token}"}
+        if not as_user:
+            headers["X-Agent-ID"] = agent_id
+        return headers
     return {}
 
 
-def _http(server: str) -> httpx.Client:
+def _http(server: str, *, as_user: bool = False) -> httpx.Client:
     # Default headers carry the per-process agent identity (if any). Commands
     # that set their own Authorization per request override it; the server's
     # resolve_viewer only consults X-Agent-ID as a post-JWT fallback, so the
     # extra default header is harmless on every route.
+    #
+    # `as_user` suppresses the agent header for the whole client rather than
+    # per request, because a per-request header can only OVERRIDE a default,
+    # never remove it.
     return httpx.Client(
-        base_url=_server_url(server), timeout=30, headers=_env_identity_headers()
+        base_url=_server_url(server),
+        timeout=30,
+        headers=_env_identity_headers(as_user=as_user),
     )
 
 
@@ -550,6 +578,10 @@ def _construct_llm_provider(
     if normalized == "opencode":
         OpenCodeCLI.verify_cli()
         return OpenCodeCLI(model=model, agent_env=agent_env, skill_dirs=skill_dirs)
+    if normalized == "antigravity":
+        # Binary is `agy`, NOT `antigravity` — verify_cli's default probes it.
+        AntigravityCLI.verify_cli()
+        return AntigravityCLI(model=model, agent_env=agent_env, skill_dirs=skill_dirs)
     if normalized == "claude":
         ClaudeCLI.verify_cli()
         return ClaudeCLI(
@@ -576,6 +608,7 @@ def _build_initial_local_settings(
     git_base_branch: Optional[str] = None,
     llm_base_url: Optional[str] = None,
     output_mode: Optional[str] = None,
+    knowledge_dir: Optional[str] = None,
 ) -> dict:
     """Build the local_settings block for a freshly generated card.json.
 
@@ -586,6 +619,12 @@ def _build_initial_local_settings(
     ``git_url`` binds this agent to a git repo. It is surfaced to the LLM as
     ``$CLAWMEETS_AGENT_GIT_URL`` and drives the git-workflow skill; ``git_base_branch``
     (optional) overrides the branch new work is cut from (default: repo default).
+
+    ``knowledge_dir`` points at the owner's proprietary-reference files. Stored
+    verbatim (absolute, or relative to the owner's settings.json —
+    ``FileUtil.resolve_local_dir`` resolves it at runner start). Deliberately
+    NOT checked for existence here: the directory may live on the machine that
+    will run the agent, which need not be the machine running this command.
     """
     settings: dict = {}
     if llm_provider:
@@ -608,6 +647,8 @@ def _build_initial_local_settings(
         settings["output_mode"] = output_mode
     if dwh_dir:
         settings["dwh_dir"] = dwh_dir
+    if knowledge_dir:
+        settings["knowledge_dir"] = knowledge_dir
     if git_url:
         settings["git_url"] = git_url
     if git_base_branch:
@@ -639,7 +680,10 @@ def agent_register(
         help="LLM backend for this agent. Bare names shell the Code CLI: "
              "'claude' (default), 'openai', 'gemini', 'opencode' (opencode.ai — "
              "Zen gateway incl. free models; set --llm-model to a provider/model "
-             "slug like 'opencode/deepseek-v4-flash-free'). The '-api' variants "
+             "slug like 'opencode/deepseek-v4-flash-free'), 'antigravity' (Google "
+             "Antigravity, binary `agy`; set --llm-model to a BARE slug like "
+             "'gemini-3.1-pro-high' — the -high/-medium/-low suffix IS the "
+             "reasoning effort). The '-api' variants "
              "run in-process with a BYO key (no binary): 'claude-api', "
              "'openai-api', 'gemini-api', 'openrouter-api' (OpenAI-compatible "
              "gateway — set --llm-model to an OpenRouter slug). 'openrouter-native' "
@@ -681,6 +725,14 @@ def agent_register(
         None, "--dwh-dir",
         help="Personal data-warehouse root for this agent (typically a network shared file system mount, e.g. /mnt/dwh). "
              "Written to card.json local_settings; rendered into the agent prompt.",
+    ),
+    knowledge_dir: Optional[str] = typer.Option(
+        None, "--knowledge-dir", "-k",
+        help="Proprietary-knowledge directory for this agent (the owner's reference "
+             "files). Written to card.json local_settings; the runner passes it to the "
+             "LLM as a read-only extra dir and indexes it into memory/REFERENCES.md. "
+             "Absolute, or relative to the owner's settings.json. Not required to exist "
+             "on this machine — the agent may run elsewhere.",
     ),
     git_url: Optional[str] = typer.Option(
         None, "--git-url", envvar="CLAWMEETS_AGENT_GIT_URL",
@@ -825,6 +877,7 @@ def agent_register(
         initial_local_settings = _build_initial_local_settings(
             llm_provider, llm_model, dwh_dir, llm_api_key, git_url, git_base_branch,
             llm_base_url=llm_base_url, output_mode=llm_output_mode,
+            knowledge_dir=knowledge_dir,
         )
         if initial_local_settings:
             card["local_settings"] = initial_local_settings
@@ -3597,22 +3650,19 @@ def reflection_show(
 
 
 # ---------------------------------------------------------------------------
-# bootstrap (two-phase personalized first-fill)
+# bootstrap (machine-level one-time setup)
 # ---------------------------------------------------------------------------
 #
-# `clawmeets bootstrap` is a one-shot orchestrator that personalizes a freshly
-# installed team from the user's own data:
+# `clawmeets bootstrap` installs machine-level prerequisites. Today that is
+# only `bootstrap browser` (Chromium for the playwright-browser skill).
 #
-#   Phase 1 — gather a profile dump from the user's Gmail + Calendar (or fall
-#             back to a 3-question prompt), DM it to the assistant; the
-#             assistant's reflect skill writes USER.md.
-#   Phase 2 — for each worker agent, do a deep-research pass on the agent's
-#             domain decorated by USER.md, DM it to the agent; the agent's
-#             reflect skill writes learnings/.
-#
-# All transport rides existing rails (DM POST + reflect-trigger marker). The
-# only new piece on the agent side is the Bootstrap mode added to reflect's
-# SKILL.md.
+# It is NOT the agent-personalization path. An earlier design for a two-phase
+# `clawmeets bootstrap` (CLI-driven profile gathering, then a per-agent
+# deep-research DM) was never implemented and has been superseded: an agent
+# now deep-researches its own domain in-chat via the personalize-trigger, and
+# `<!-- clawmeets:reflect-trigger -->` distills that dump — plus any mentor
+# brief posted in the same room — into its memory/learnings/. That flow is
+# owned by the `onboard-agent` / `propose-project` skills, not by this CLI.
 
 def _ensure_fresh_user_token(server_url: str, data_dir: Path, username: str, current_token: str) -> str:
     """Verify the saved JWT still works; silently renew it when expired.
@@ -4037,7 +4087,9 @@ def assistant_register(
         None, "--llm-provider",
         help="LLM backend for the assistant. Bare names shell the Code CLI: "
              "'claude' (default), 'openai', 'gemini', 'opencode' (Zen gateway; "
-             "set --llm-model to a provider/model slug). The '-api' variants run "
+             "set --llm-model to a provider/model slug), 'antigravity' (binary "
+             "`agy`; set --llm-model to a bare slug like 'gemini-3.1-pro-high'). "
+             "The '-api' variants run "
              "in-process with a BYO key: 'claude-api', 'openai-api', 'gemini-api', "
              "'openrouter-api' (OpenAI-compatible gateway — set --llm-model to a slug).",
     ),
@@ -4365,7 +4417,7 @@ def agent_team_register(
         None, "--llm-provider",
         help=(
             "Override LLM provider for every worker registered in this run. "
-            "One of: claude, openai, gemini, opencode (CLI) or claude-api, "
+            "One of: claude, openai, gemini, opencode, antigravity (CLI) or claude-api, "
             "openai-api, gemini-api, openrouter-api (in-process BYO-key). "
             "Wins over per-agent llm_provider in setup.json."
         ),

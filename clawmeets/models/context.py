@@ -36,11 +36,13 @@ from typing import Optional
 
 from clawmeets.sync.changelog import (
     BatchTimeoutPayload,
+    AgentOfflinePayload,
     ChangelogEntry,
     ChangelogEntryType,
     ChatroomClearedPayload,
     DisplayNameChangedPayload,
     ProjectAllowlistUpdatedPayload,
+    ProjectPlanStatePayload,
     ProjectCreatedPayload,
     MessagePayload,
     FilePayload,
@@ -53,7 +55,12 @@ from clawmeets.utils.file_io import FileUtil
 from .project import Project, ProjectState
 from .participant import Participant, ParticipantRole
 from .chatroom import Chatroom, ChatroomState
-from .chat_message import ChatBatchTimeoutEvent, ChatFileEvent, ChatMessage
+from .chat_message import (
+    ChatBatchTimeoutEvent,
+    ChatFileEvent,
+    ChatMessage,
+    ChatAgentOfflineEvent,
+)
 
 from clawmeets.api.action_executor import ActionBlockExecutor
 from clawmeets.api.client import ClawMeetsClient
@@ -494,6 +501,8 @@ class ModelContextChangelogSubscriber(ChangelogSubscriber):
     - PROJECT_REACTIVATED → ProjectState.reactivate()
     - PROJECT_ALLOWLIST_UPDATED → ProjectState.apply_allowlist_update()
     - DISPLAY_NAME_CHANGED → ProjectState.set_thread_title() (writes display_name)
+    - PROJECT_PLAN_STATE → ProjectState.set_plan_state() (the plan lifecycle
+      projection: phase inputs + the open-note count the execution gate reads)
 
     ## Priority
 
@@ -571,6 +580,9 @@ class ModelContextChangelogSubscriber(ChangelogSubscriber):
             case ChangelogEntryType.BATCH_TIMEOUT:
                 await self._handle_batch_timeout(entry)
 
+            case ChangelogEntryType.AGENT_OFFLINE:
+                await self._handle_agent_offline(entry)
+
             case ChangelogEntryType.CHATROOM_CLEARED:
                 await self._handle_chatroom_cleared(entry)
 
@@ -581,6 +593,14 @@ class ModelContextChangelogSubscriber(ChangelogSubscriber):
                 # MF1 site 4 (load-bearing): without this case a changelog
                 # rebuild silently does NOT reproduce the auto-title.
                 await self._handle_display_name_changed(entry)
+
+            case ChangelogEntryType.PROJECT_PLAN_STATE:
+                # Load-bearing on the RUNNER, not on the server: this is the
+                # only channel that carries the plan's lifecycle facts to the
+                # process that builds the execution gate's snapshot and the
+                # coordinator's prompt. Without this case both read defaults
+                # and the gate is inert. §7.4.
+                await self._handle_project_plan_state(entry)
 
             case ChangelogEntryType.BATCH_COMPLETE:
                 pass  # Existing reply-window logic in the chip already covers it
@@ -826,10 +846,42 @@ class ModelContextChangelogSubscriber(ChangelogSubscriber):
             coordinator_id=payload.coordinator_id,
             responded_participants=list(payload.responded_participants),
             timed_out_participants=list(payload.timed_out_participants),
+            offline_participants=list(payload.offline_participants),
             version=entry.version,
             source_version=entry.source_version,
         )
         chatroom.state().append_batch_timeout(event)
+
+    async def _handle_agent_offline(self, entry: ChangelogEntry) -> None:
+        """Materialize an AGENT_OFFLINE entry into the chatroom's CHATS.ndjson.
+
+        Exact mirror of :meth:`_handle_batch_timeout`, including the
+        ``chatroom is None`` guard. This is the whole of the plumbing the new
+        row needs to reach the browser: ``GET .../messages`` returns
+        ``room.get_log_entries()`` raw, so once the row is on disk it surfaces
+        typed through the ``ChatLogEntry`` union with no route change.
+
+        ``source_version`` on the changelog entry already points at the
+        @mention message the offline targets were expected to answer, which is
+        what the per-recipient chip keys off of.
+
+        Args:
+            entry: The AGENT_OFFLINE changelog entry
+        """
+        payload: AgentOfflinePayload = entry.payload  # type: ignore[assignment]
+        chatroom = Chatroom.get(self._project_id, payload.chatroom_name, self._model_ctx)
+        if chatroom is None:
+            return
+        event = ChatAgentOfflineEvent(
+            ts=entry.timestamp,
+            message_id=payload.message_id,
+            coordinator_id=payload.coordinator_id,
+            offline_participants=list(payload.offline_participants),
+            dispatched_participants=list(payload.dispatched_participants),
+            version=entry.version,
+            source_version=entry.source_version,
+        )
+        chatroom.state().append_agent_offline(event)
 
     async def _handle_project_completed(self, entry: ChangelogEntry) -> None:
         """Update project status to completed in meta.json.
@@ -887,6 +939,32 @@ class ModelContextChangelogSubscriber(ChangelogSubscriber):
             )
             return
         project.state().set_thread_title(display_name=payload.display_name)
+
+    async def _handle_project_plan_state(self, entry: ChangelogEntry) -> None:
+        """Apply the plan lifecycle projection into project meta.json (D13).
+
+        Runs identically server-side and on every runner that syncs the entry —
+        and the runner is the point. ``Project.phase`` and
+        ``build_state_snapshot``'s ``blocked_notes`` are both computed from these
+        fields, in the agent process, which has no access to the server-side
+        ``plan.json`` sidecar they project.
+        """
+        payload: ProjectPlanStatePayload = entry.payload  # type: ignore[assignment]
+        project = Project.get(self._project_id, self._model_ctx)
+        if project is None:
+            logger.warning(
+                f"PROJECT_PLAN_STATE: project {self._project_id[:8]} not found; "
+                "skipping (likely a stale entry replayed before the project meta is on disk)"
+            )
+            return
+        project.state().set_plan_state(
+            plan_seeded_at=payload.plan_seeded_at,
+            plan_accepted_at=payload.plan_accepted_at,
+            plan_accepted_revision=payload.plan_accepted_revision,
+            plan_accepted_spec_digest=payload.plan_accepted_spec_digest,
+            plan_open_notes=payload.plan_open_notes,
+            plan_user_reviewed_at=payload.plan_user_reviewed_at,
+        )
 
     async def _handle_chatroom_cleared(self, entry: ChangelogEntry) -> None:
         """Wipe CHATS.ndjson and archive prior contents to .bak sibling.

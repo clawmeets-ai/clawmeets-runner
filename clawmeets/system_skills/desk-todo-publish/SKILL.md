@@ -9,11 +9,16 @@ description: >
   "flag this to me", or "put this on my desk"; (3) you surfaced something
   mid-task that needs the *user's own hand* — an approval, a sign-off, a
   decision only they can make — and want to hand it back with context.
-  Package the task and shell `clawmeets todo publish`. The item appears on
-  the owner's To-do rail, agent-badged, and clicking it opens a guided
-  take-over pre-loaded with your suggested prompt + files. You may retract
-  only an item YOU published. Managing or firing what is already on the
-  plate is the owner's assistant's job — the `desk-todo` skill.
+  Package the task and shell `clawmeets todo publish`, tagging it with the
+  owner's OWN labels via `--label` (e.g. `--label office --label next`) so it
+  lands in the right group on their rail: run `clawmeets todo labels list`
+  first and reuse what is there — none of it is built in, and a label you
+  invent still shows but stays unregistered and counts as a context.
+  The item appears on the owner's To-do rail, agent-badged, and clicking it
+  opens a guided take-over pre-loaded with your suggested prompt + files. You
+  may retract only an item YOU published. Managing or firing what is already on
+  the plate — and renaming, merging, recolouring or deleting the labels
+  themselves — is the owner's assistant's job, the `desk-todo` skill.
 ---
 
 # Desk to-do — hand a task back to the manager
@@ -75,6 +80,19 @@ the take-over the manager opens.
   urgent).
 - `--linked "label::icon"` — a source to open from the take-over (e.g.
   `"Finance briefing::chart"`).
+- `--label <name>` (repeatable) — a GTD context or state the owner files this
+  under, e.g. `--label office --label next`. Write `office` or `@office`; both
+  land as the same label. Use the owner's **existing** vocabulary — run
+  `clawmeets todo labels list` first and reuse what's there rather than
+  inventing a near-duplicate. **That list is the owner's own and none of it is
+  built in** — do not assume `next` / `wait-for` / `someday` exist, and do not
+  assume they are the only states; `labels list` reports each label's kind and
+  is the only source of truth for both. A label you invent still shows on the
+  item, but it stays **unregistered** — dashed outline, no colour, sorted last,
+  in its own group rather than the owner's curated ones — until the owner
+  adopts it, and it is treated as a **context** whatever you meant by it.
+  Publishing never creates a state. At most 8 labels fit on one item; a 9th is
+  refused whole rather than partly applied.
 
 Keep provenance honest — only list steps you actually did and facts you
 actually verified.
@@ -87,6 +105,7 @@ actually verified.
    clawmeets todo publish \
      --text "Approve the Provi restock PO ($6.8k) waiting on your sign-off" \
      --suggest api_sync \
+     --label office --label next \
      --draft-prompt "Review Provi restock PO #4471 ($6,821.40, net-30). If the line items and pricing check out against the last order, approve it and confirm the delivery window with Provi." \
      --context-file ctx.md \
      --due Fri \
@@ -104,10 +123,12 @@ actually verified.
    `Flagged "Approve the Provi PO" to your desk — open it to review and dispatch.`
    Don't restate the whole task; the plate item IS the deliverable.
 
-To see what's already on the plate (e.g. to avoid publishing a duplicate):
+To see what's already on the plate (e.g. to avoid publishing a duplicate), and
+the owner's label vocabulary before you tag anything:
 
 ```bash
 clawmeets todo list
+clawmeets todo labels list
 ```
 
 To retract a to-do you published:
@@ -133,3 +154,11 @@ wider token. Same for the plate-management verbs (`todo update` / `done` /
 `{username}-assistant` (the `desk-todo` skill). If the user asks you to
 mark something done or send a saved draft, say it's their assistant's job
 and stop — don't work around it by publishing a second item about it.
+
+**Labels are the same split.** You may READ the vocabulary —
+`clawmeets todo labels list` works for you and you should run it — but every
+other `labels` verb curates the owner's own list and answers
+`Error 401: Invalid token`. If the user asks you to rename, merge, recolour,
+reorder or delete a label, say it's their assistant's job rather than retrying.
+Applying an existing label with `--label` on your own publish is always yours
+to do.

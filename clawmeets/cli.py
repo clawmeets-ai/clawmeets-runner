@@ -53,6 +53,7 @@ from clawmeets.cli_http_api import app as http_api_app
 from clawmeets.cli_brief import app as brief_app
 from clawmeets.cli_todo import app as todo_app
 from clawmeets.cli_sop import app as sop_app
+from clawmeets.cli_plan import app as plan_app
 from clawmeets.cli_dwh import app as dwh_app
 from clawmeets.cli_knowledge_dir import app as knowledge_dir_app
 from clawmeets.cli_etl import app as etl_app
@@ -132,6 +133,7 @@ app.add_typer(http_api_app, name="http-api")
 app.add_typer(brief_app, name="brief")
 app.add_typer(todo_app, name="todo")
 app.add_typer(sop_app, name="sop")
+app.add_typer(plan_app, name="plan")
 app.add_typer(dwh_app, name="dwh")
 app.add_typer(knowledge_dir_app, name="knowledge-dir")
 app.add_typer(etl_app, name="etl")

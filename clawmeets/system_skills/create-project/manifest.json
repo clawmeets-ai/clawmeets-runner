@@ -1,0 +1,6 @@
+{
+  "audiences": ["assistant", "worker", "coordinator"],
+  "surfaces": ["agent_runtime"],
+  "version": "1.0.0",
+  "description": "Start a multi-agent project from your own DM: slug name + display title, pinned agent roster, one create = one kickoff."
+}

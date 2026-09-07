@@ -25,7 +25,7 @@ Create the current user's personal assistant agent (`{username}-assistant`).
 
 ```bash
 clawmeets assistant register \
-  [--llm-provider <claude|openai|gemini>] \
+  [--llm-provider <claude|openai|gemini|opencode|antigravity>] \
   [--llm-model <model>] \
   [--self-learning-daily-at <HH:MM>] \
   [--reflect-timezone <IANA-tz>] \
@@ -50,7 +50,7 @@ Bulk-register a team of worker agents from a `setup.json` template URL.
 ```bash
 clawmeets agent-team register <url> \
   [--agent <name> [--agent <name> ...]] \
-  [--llm-provider <claude|openai|gemini>] \
+  [--llm-provider <claude|openai|gemini|opencode|antigravity>] \
   [--auto-personalize] \
   [-u <username> -p <password>] \
   [--server <url>] [--data-dir <dir>]

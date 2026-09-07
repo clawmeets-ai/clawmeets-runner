@@ -24,6 +24,7 @@ from .changelog import (
     ChangelogEntryType,
     ChangelogPayload,
     MirroredFromRef,
+    ndjson_safe,
 )
 from .subscriber import ChangelogSubscriber
 from clawmeets.utils.file_io import FileUtil
@@ -185,27 +186,58 @@ class ChangelogRunloop:
             return processed
 
     async def load_state(self) -> None:
-        """Load persisted state (call before use)."""
+        """Load persisted state (call before use).
+
+        Ends by telling every subscriber the state is loaded — **always**, on
+        each of the three exits, including the two that loaded nothing. The
+        callback's contract is *"on-disk state now predates every entry you will
+        see"*, and that is as true of a project with no state file as of one
+        resumed mid-stream; a subscriber seeded on only some of them would be
+        seeded on a rule it could not state. Fired outside the lock, because a
+        subscriber priming itself reads the same project state whose writes go
+        through this runloop.
+        """
         state_path = self._changelog_dir / "runloop_state.json"
         if not state_path.exists():
+            await self._notify_state_loaded()
             return
 
         async with self._lock:
             state = FileUtil.read(state_path, "json", default=None)
             if state is None:
                 logger.warning(f"Failed to load runloop state from {state_path}")
-                return
+            else:
+                self._last_processed_version = state.get("last_processed_version", 0)
 
-            self._last_processed_version = state.get("last_processed_version", 0)
+                # Load pending entries from changelog
+                await self._load_pending_entries()
 
-            # Load pending entries from changelog
-            await self._load_pending_entries()
+                logger.debug(
+                    f"Loaded runloop state for project {self._project_id[:8]}: "
+                    f"last_processed={self._last_processed_version}, "
+                    f"pending={len(self._pending_entries)}"
+                )
 
-            logger.debug(
-                f"Loaded runloop state for project {self._project_id[:8]}: "
-                f"last_processed={self._last_processed_version}, "
-                f"pending={len(self._pending_entries)}"
-            )
+        await self._notify_state_loaded()
+
+    async def _notify_state_loaded(self) -> None:
+        """Fire ``on_state_loaded`` on every subscriber, insertion order.
+
+        Best-effort per subscriber: this hook only lets a subscriber PRIME
+        itself, so one that raises must not stop the runloop from coming up —
+        the cost of a skipped prime is the pre-fix behaviour, the cost of a
+        raise here is a project that never syncs again.
+        """
+        for subscriber in self._subscribers:
+            try:
+                await subscriber.on_state_loaded(
+                    self._project_id,
+                    self._project_name,
+                )
+            except Exception:
+                logger.exception(
+                    f"on_state_loaded failed for project {self._project_id[:8]}"
+                )
 
     async def save_state(self) -> None:
         """Explicitly save state (for graceful shutdown)."""
@@ -332,7 +364,9 @@ class ChangelogRunloop:
         """
         changelog_path = self._changelog_dir / "changelog.ndjson"
         entries = []
-        for line in changelog_path.read_text(encoding="utf-8").splitlines():
+        for line in changelog_path.read_text(encoding="utf-8").split("\n"):
+            if not line.strip():
+                continue
             entry = ChangelogEntry.model_validate_json(line)
             if entry.version <= since_version:
                 continue
@@ -353,8 +387,8 @@ class ChangelogRunloop:
         if not changelog_path.exists():
             return []
         entries: list[ChangelogEntry] = []
-        for line in changelog_path.read_text(encoding="utf-8").splitlines():
-            if not line:
+        for line in changelog_path.read_text(encoding="utf-8").split("\n"):
+            if not line.strip():
                 continue
             entry = ChangelogEntry.model_validate_json(line)
             if entry.source_version == source_version:
@@ -438,7 +472,7 @@ class ChangelogRunloop:
             # Use text format with mode="a" for appending JSON lines
             FileUtil.write(
                 changelog_path,
-                entry.model_dump_json(by_alias=True) + "\n",
+                ndjson_safe(entry.model_dump_json(by_alias=True)) + "\n",
                 "text",
                 mode="a",
             )
@@ -460,7 +494,9 @@ class ChangelogRunloop:
         if not changelog_path.exists():
             return
 
-        for line in changelog_path.read_text(encoding="utf-8").splitlines():
+        for line in changelog_path.read_text(encoding="utf-8").split("\n"):
+            if not line.strip():
+                continue
             entry = ChangelogEntry.model_validate_json(line)
             if entry.version <= self._last_processed_version:
                 continue

@@ -355,6 +355,45 @@ class Participant(ABC):
         """
         pass
 
+    async def on_plan_state_change(
+        self,
+        project_id: str,
+        trigger_version: int,
+    ) -> None:
+        """
+        Called once per sync batch that carried a PROJECT_PLAN_STATE entry AND
+        woke nobody by message.
+
+        The one changelog entry that carries no message and can still have to
+        move a project: the user resolves the last note addressed to them and
+        nothing else will wake the coordinator to act on it. The notifier owns
+        the *"and woke nobody"* half — it is the party that knows what else the
+        batch dispatched — and leaves the judgement *"did the execution gate
+        just open, and am I this project's coordinator"* to the implementation,
+        which is the half that owns the predicates.
+
+        Args:
+            project_id: The project ID
+            trigger_version: Changelog version of the PROJECT_PLAN_STATE entry
+        """
+        pass
+
+    async def on_plan_gate_prime(self, project_id: str) -> None:
+        """
+        Called before this runloop applies its first entry for the project.
+
+        Lets an implementation record the plan gate's value as it stood when the
+        process resumed, so the first ``on_plan_state_change`` after a restart is
+        a real *did-this-entry-open-the-gate* comparison rather than a discarded
+        first observation. Without it a runner that restarts while a project is
+        blocked has nothing to compare the release against, and the release —
+        which on the resolve route carries no message — is silently swallowed.
+
+        Args:
+            project_id: The project ID
+        """
+        pass
+
     # ─────────────────────────────────────────────────────────
     # First User Request Event (Coordinator Only)
     # ─────────────────────────────────────────────────────────

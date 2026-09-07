@@ -54,6 +54,16 @@ from .participant import Participant
 #                 "dm-shaped" (see Project.is_dm_shaped).
 ProjectSurface = Literal["regular", "dm", "frontdesk"]
 
+# The plan lifecycle (§7, D13). **Derived, never stored, and deliberately NOT a
+# fourth ``ProjectStatus`` member** — a ``spec-ing`` *status* would break four
+# shipped call sites: ``messages.py:1081`` and ``tunnel_subscriber.py:598``
+# (a user commenting on their own un-accepted plan would flip it ACTIVE and end
+# the stage — fatal on its own), ``action_validator.py`` (wrong violation, wrong
+# reason) and ``ProjectView.tsx``'s ``statusVariant`` (missing key → undefined
+# badge). Status answers *is this running*; phase answers *what stage of the
+# plan is it in*, and they are different questions.
+ProjectPhase = Literal["spec-ing", "executing", "complete", "failed"]
+
 # Seeded label a fresh DM thread carries until its first exchange auto-titles it.
 # Doubles as the fire-once latch for the auto-title trigger (agent.py) and the
 # defensive ``expected_current`` sentinel on the rename endpoint — the trigger
@@ -211,6 +221,56 @@ class Project(BaseModel):
     # back-compatible for any meta.json predating the key. Rides model_dump() into
     # GET /projects (admin list) and GET /projects/{id} (detail) with no route change.
     report_published_at: Optional[datetime] = None
+    # ISO timestamp of the most recent write to this project's ``PLAN.md`` or its
+    # ``plan.json`` sidecar (D5, §6). Denormalized into meta.json **outside the
+    # changelog**, exactly as ``report_published_at`` is and for the same reason:
+    # the project list can badge "awaiting your acceptance" or sort on plan
+    # recency from the single meta.json read it already performs, with no
+    # per-project fetch of the plan. None on a project whose plan has never been
+    # touched, including every project that predates the feature — a stored
+    # field with a None default needs no migration and no backfill.
+    #
+    # NOT a @computed_field: re-deriving it would mean opening plan.json on every
+    # ``Project`` load, which is the N+1 the field exists to avoid.
+    plan_updated_at: Optional[datetime] = None
+
+    # ---- the plan lifecycle projection (D13, §7.2) --------------------------
+    # Five stored facts that make ``phase`` a pure function of owned fields and
+    # make the execution gate (§7.4) answerable from a runner's own meta.json.
+    #
+    # **They ride the changelog** (``PROJECT_PLAN_STATE``), unlike
+    # ``report_published_at`` / ``plan_updated_at`` above, and that difference is
+    # the whole point: those two are read by the *server's* project list, while
+    # these are read by the *runner* — in ``build_state_snapshot`` and in the
+    # coordinator's steady-state prompt block. A direct meta.json write on the
+    # server reaches no runner, so a gate built on one is inert in production.
+    # The sidecar (``plan.json``, server-side only) stays the source of truth;
+    # these are its projection, published from exactly one place.
+    #
+    # Written by ``init_plan_sidecar`` and by NOTHING else (§3.5, property 3):
+    # a project that predates this feature never gets one, so it reads
+    # ``executing`` and behaves exactly as it does today — no backfill, no scan,
+    # and a plan a human wrote by hand is never called un-specified.
+    plan_seeded_at: Optional[datetime] = None
+    plan_accepted_at: Optional[datetime] = None
+    # 0 is the "never accepted" sentinel and is kept INTERNAL — the wire nulls it
+    # (ruling 6.2, F-1), so nothing serializes ``accepted at revision 0``.
+    plan_accepted_revision: int = 0
+    # ``spec_digest`` as it read at acceptance. Paired with the synced PLAN.md it
+    # answers "did the spec move since acceptance" with no sidecar read.
+    plan_accepted_spec_digest: str = ""
+    # The projection of ``project_plan.open_notes_for_you`` — §3.3's ONE number,
+    # carried to the one process that cannot open the sidecar. Never recounted
+    # anywhere; a second implementation is the drift §3.3 refuses.
+    plan_open_notes: int = 0
+    # The projection of ``ProjectPlan.first_user_review_at``: when the OWNER
+    # first opened a review round on this plan. That is the spec lock's start
+    # line before acceptance, and the coordinator's steady-state prompt states
+    # the constraint off this field. **Monotone** — the publisher never clears
+    # it (``plan_state_spec``), because the one thing a coordinator must never
+    # be told is that the lock has lifted. ``None`` on every project that
+    # predates the field and on every plan the user has not looked at yet.
+    plan_user_reviewed_at: Optional[datetime] = None
 
     # Private runtime state (not serialized)
     _ctx: Optional["ModelContext"] = PrivateAttr(default=None)
@@ -267,6 +327,49 @@ class Project(BaseModel):
         """
         data = FileUtil.read(self.meta_path, "json")
         return ProjectStatus(data["status"])
+
+    @computed_field
+    @property
+    def phase(self) -> ProjectPhase:
+        """§3.5's plan lifecycle — a pure function of this project's own fields.
+
+        ::
+
+            COMPLETED -> "complete";  FAILED -> "failed"
+            surface != "regular" -> "executing"     # LOAD-BEARING THREE TIMES
+            plan_seeded_at and not plan_accepted_at -> "spec-ing"
+            else "executing"
+
+        The ``surface != "regular"`` branch keeps a **DM** out of a phase it has
+        no plan for; keeps a **front-desk** project — where ``plan_accepted_at``
+        is never set, because there is no user in the accepting role (§7.2) —
+        from being stranded in ``spec-ing`` for its entire life; and **is the
+        shape guard the execution gate reads**. A reviewer trimming a
+        redundant-looking branch would delete exactly this one.
+
+        ``spec-ing`` requires **positive evidence of being unstarted**, and that
+        is the migration: derived from *"not accepted"* alone, every project that
+        exists today would flip to ``spec-ing`` on deploy — none has ever had a
+        plan accepted, because the feature did not exist — and every one of them
+        would stop at the gate.
+
+        **Not the wire value on a front-desk row.** ``PlanSummary.phase`` is
+        ``null`` there (ruling 6.1, F-1) because a client must be able to tell
+        *"no acceptance model"* from *"not yet accepted"*; the lifecycle answer
+        here is still ``executing``, which is what the gate needs. Two questions,
+        two answers, one derivation — ``plan_summary_for`` nulls this, it does
+        not recompute it.
+        """
+        status = self.status
+        if status == ProjectStatus.COMPLETED:
+            return "complete"
+        if status == ProjectStatus.FAILED:
+            return "failed"
+        if self.surface != "regular":
+            return "executing"
+        if self.plan_seeded_at is not None and self.plan_accepted_at is None:
+            return "spec-ing"
+        return "executing"
 
     @property
     def data_dir(self) -> Path:
@@ -993,5 +1096,67 @@ class ProjectState:
         if project_dict.get("report_published_at") == ts:
             return False  # already in the desired state; no write
         project_dict["report_published_at"] = ts
+        FileUtil.write(meta_path, project_dict, "json", atomic=True)
+        return True
+
+    def set_plan_state(
+        self,
+        *,
+        plan_seeded_at: Optional[str],
+        plan_accepted_at: Optional[str],
+        plan_accepted_revision: int,
+        plan_accepted_spec_digest: str,
+        plan_open_notes: int,
+        plan_user_reviewed_at: Optional[str] = None,
+    ) -> bool:
+        """Apply the plan lifecycle projection into meta.json (D13, §7.2).
+
+        Fired by ``PROJECT_PLAN_STATE`` replay, so it runs identically on the
+        server (where the entry is minted) and on **every runner that syncs it**
+        — which is the entire reason the entry exists (see
+        ``ProjectPlanStatePayload``). Read-modify-write of the full meta dict,
+        preserving every other key, exactly as :meth:`set_report_published_at`
+        and :meth:`complete` do.
+
+        Applied **unconditionally** (last-write-wins), like
+        :meth:`set_thread_title`: the publisher is the only gate, and a changelog
+        rebuild must deterministically reproduce the last entry. Returns True iff
+        the bytes actually moved, so the caller can skip a needless atomic write.
+        """
+        meta_path = self._project.meta_path
+        project_dict = FileUtil.read(meta_path, "json")
+        incoming = {
+            "plan_seeded_at": plan_seeded_at,
+            "plan_accepted_at": plan_accepted_at,
+            "plan_accepted_revision": plan_accepted_revision,
+            "plan_accepted_spec_digest": plan_accepted_spec_digest,
+            "plan_open_notes": plan_open_notes,
+            "plan_user_reviewed_at": plan_user_reviewed_at,
+        }
+        if all(project_dict.get(k) == v for k, v in incoming.items()):
+            return False
+        project_dict.update(incoming)
+        FileUtil.write(meta_path, project_dict, "json", atomic=True)
+        return True
+
+    def set_plan_updated_at(self, ts: Optional[str]) -> bool:
+        """Denormalize the plan's last-write timestamp into meta.json (D5, §6).
+
+        ``ts`` is an ISO string, or ``None`` to clear. Mirrors
+        :meth:`set_report_published_at` exactly — read-modify-write of the full
+        meta dict, idempotent, written **outside the changelog** because the
+        plan's own bytes are the changelog artifact and this field is a
+        projection of them (the ``report_published_at`` safety argument, §6).
+
+        Called by the plan routes after every mutation, so "the plan moved" is
+        readable from the project list without opening plan.json.
+
+        Returns True iff it wrote.
+        """
+        meta_path = self._project.meta_path
+        project_dict = FileUtil.read(meta_path, "json")
+        if project_dict.get("plan_updated_at") == ts:
+            return False
+        project_dict["plan_updated_at"] = ts
         FileUtil.write(meta_path, project_dict, "json", atomic=True)
         return True

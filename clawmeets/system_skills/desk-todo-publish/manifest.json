@@ -2,5 +2,5 @@
   "audiences": ["worker", "coordinator", "assistant"],
   "surfaces": ["agent_runtime"],
   "version": "1.0.0",
-  "description": "Hand a task back to the owner's My Desk plate when it genuinely needs their own hand (`clawmeets todo publish`)."
+  "description": "Hand a task back to the owner's My Desk plate when it genuinely needs their own hand, labelled with the owner's own vocabulary (`clawmeets todo publish --label`)."
 }

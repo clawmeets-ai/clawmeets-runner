@@ -8,9 +8,10 @@ description: >
   agents-to-reuse, agents-to-create-with-bootstrap-topic) as a normal DM
   reply, await the user's approval, then register any new agents (each
   filed under a sensible team) and create the project with yourself as
-  coordinator. Phase 0 of the new
-  project bootstraps each newly-registered agent via the existing
-  personalize → reflect chain — one milestone workroom per new agent.
+  coordinator. Phase 0 of the new project bootstraps each newly-registered
+  agent by following `onboard-agent`'s bootstrap contract — one milestone
+  workroom per new agent, holding its mentor's brief, its own deep
+  research, and the reflect pass that makes both durable.
   Assistant-only.
 ---
 
@@ -156,6 +157,13 @@ new agent. Each new-agent design has five fields:
   turn in the new project to seed its `learnings/`. Be concrete — name
   the slice of their field that this project actually needs. Vague
   bootstrap topics produce vague dumps.
+- **mentor**: who briefs this agent on the job before it researches.
+  **Default: you**, the assistant — you drafted its role and you hold
+  `USER.md`, so you write the brief inline in its bootstrap room. Name a
+  **peer** agent instead only when one clearly owns the domain (a senior
+  agent briefing a new junior one in the same field); that peer then joins
+  the same bootstrap room and writes the brief there. Either way it costs
+  no extra room.
 - **team**: the TEAMS-sidebar label (`user_teams`) the agent gets filed
   under at registration. **Prefer an existing label** from the Step 2
   candidate pool that fits the agent's role (e.g. file a new tax analyst
@@ -192,6 +200,7 @@ Here's what I'd do for **<user's goal restated in 1 sentence>**.
 - `<new-agent-name>` — <description>  _(team: <team-label>)_
   - Capabilities: <cap1>, <cap2>, <cap3>
   - Bootstrap topic: <what they'll deep-research on turn 1>
+  - Mentor: <me, or `@<peer>` — who briefs them on the job first>
 
 **Milestones**
 1. Bootstrap each new agent (one milestone room per agent, in parallel)
@@ -256,6 +265,7 @@ For every entry in "Register new agents", run:
 clawmeets agent register "<name>" "<description>" \
   --capabilities "<cap1,cap2,cap3,...>" \
   --team "<team-label>" \
+  [--git-url "<repo>"] [--knowledge-dir "<path>"] \
   --as-user "<username>"
 ```
 
@@ -265,6 +275,13 @@ sidebar instead of "(no team)". `--team` is repeatable if an agent
 legitimately spans two existing teams, but default to one. (Skip
 `--llm-provider` / `--llm-model` to inherit the default; the user can
 adjust later from Account Settings.)
+
+Pass `--git-url` whenever the agent's role is engineering-shaped and the
+user has named a repo — an agent registered without it cannot run
+`git-workflow` at all, and fixing that later needs a separate
+`clawmeets agent reconfigure` round-trip. Same for `--knowledge-dir` when
+this agent should read a specific reference folder. Both land in
+`card.json` `local_settings` from this one call.
 
 Wait for each `register` to succeed before moving on. The CLI accepts
 your bearer token via `$CLAWMEETS_AGENT_TOKEN` — already in your env, no
@@ -299,6 +316,11 @@ new agent's `Started …` line is missing, the previous `register` did
 not create the expected agent directory — surface the failure and stop,
 do not proceed to project creation.
 
+Treat that check as a hard gate, not a nicety. A missing runner does not
+produce an error later: the server accepts your Phase 0 `@`-mention, no
+process is listening, and the first symptom is a silent 30-minute
+`BATCH_TIMEOUT` after the project is already on the user's desk.
+
 ### 6c. Build the SOP-in-prose `request` body
 
 This becomes the new project's seed user message — you'll read it on
@@ -315,23 +337,20 @@ TEAM — REUSED FROM ROSTER (already bootstrapped; DO NOT create bootstrap miles
 - @<reuse-agent>: <one-line role in this project>
 
 TEAM — NEWLY REGISTERED (needs Phase 0 bootstrap):
-- @<new-agent>: <one-line role in this project>   [bootstrap topic: <topic>]
-- @<new-agent>: <one-line role in this project>   [bootstrap topic: <topic>]
+- @<new-agent>: <one-line role in this project>   [bootstrap topic: <topic>] [mentor: me | @<peer>]
+- @<new-agent>: <one-line role in this project>   [bootstrap topic: <topic>] [mentor: me | @<peer>]
 
 PHASE 0 — Bootstrap ONLY the agents under "TEAM — NEWLY REGISTERED" above.
 EXACTLY N milestones, where N is the count of NEWLY REGISTERED members.
-For each, create a `milestone-bootstrap-<agent>` workroom. The init_message
-MUST start with `<!-- clawmeets:personalize-trigger -->` followed by ONE
-paragraph framing the agent's role in this project. Tell them: their
-owner's USER.md is already populated, so default to NO clarifying
-questions and deliver the field-knowledge dump in ONE message. Their dump
-topic is the [bootstrap topic: …] noted next to their bullet above.
+Run them as ONE parallel batch — the members are independent of each other.
 
-When the new agent replies with their dump, post a follow-up message in
-the SAME workroom whose body starts with `<!-- clawmeets:reflect-trigger -->`
-followed by the dump text. That triggers their /clawmeets:reflect skill,
-which distills the dump into their learnings/. Mark the milestone done
-after that reflection.
+For each member, follow the BOOTSTRAP CONTRACT in the `onboard-agent`
+skill, with that member's name, [bootstrap topic: …] and [mentor: …].
+It owns the mechanics: one `milestone-bootstrap-<agent>` room holding the
+mentor and the new agent together, the mentor's brief, the
+personalize-trigger deep research, and the single reflect-trigger that
+distills both into the agent's learnings/. The steps INSIDE a room are
+serial; the rooms are not.
 
 DO NOT create bootstrap milestones for agents under "TEAM — REUSED FROM
 ROSTER" — their learnings/ is already populated from prior
@@ -363,6 +382,17 @@ If "TEAM — NEWLY REGISTERED" is empty (every team member is reused), OMIT
 that section entirely AND OMIT the PHASE 0 paragraph entirely. The project
 goes straight to Phase 1+.
 
+**Why the Phase 0 paragraph points at a skill but still spells three
+things out.** The request body is a seed message your future self re-reads
+as coordinator, so replacing prose with a pointer is safe only for what
+that turn can recover by opening the skill. "How to bootstrap an agent" is
+recoverable — `onboard-agent` owns it, and keeping a second copy here
+guarantees drift (the two copies already disagreed: the DM path posts a
+bare personalize trigger, this one posts it with a framing paragraph).
+These three are NOT recoverable from a skill about onboarding one agent,
+so they stay inline, verbatim: **don't bootstrap the reused agents**;
+**exactly N milestones**; **the rooms run as one parallel batch**.
+
 The two TEAM groups + the explicit Phase 0 / Phase 1+ split are
 mandatory. Your future-self (the coordinator instance on its first turn
 in the new project) reads this body to plan milestones. Without the
@@ -374,36 +404,23 @@ serve Phase 1+ milestones with empty learnings/). Neither is fine.
 
 ### 6d. Create the project
 
-```bash
-clawmeets project create "<project-name>" "$CLAWMEETS_AGENT_ID" "<request_body>" \
-  --agent "<existing-agent-name>" \
-  --agent "<new-agent-name>" \
-  --agent "<new-agent-name>" \
-  --agent-pool owned \
-  --post-initial-message
-```
+Follow **`create-project`** for the call itself — it owns the mechanics
+(slug vs `--display-name`, pinning the roster with `--agent-pool owned` +
+`--agent`, one create = one kickoff, and what to do when a create fails).
 
-Notes:
+What that skill needs from this one:
 
 - `$CLAWMEETS_AGENT_ID` is you — the assistant — and you become the
   coordinator of the new project.
-- `--agent-pool owned` defaults the new project's invitable allowlist to
-  every agent the user owns. The `--agent` flags pick the specific team
-  out of that pool.
-- `--post-initial-message` wakes you (as coordinator) inside the new
-  project on the same turn, so Phase 0 kicks off immediately rather than
-  sitting idle until the user types something. It is **on by default**
-  (pass `--no-post-initial-message` only if you deliberately want a quiet
-  create).
-
-**This create call IS the kickoff.** It posts your `<request_body>` into
-the new project's `user-communication` as an `@`-mention to you, which is
-the single event that wakes the coordinator and starts Phase 0. Do **not**
-follow it with a `clawmeets message send … user-communication "Kickoff…"`
-or any second kickoff into that room — a second coordinator-directed
-message triggers an independent second planning pass, and the coordinator
-will mint a duplicate set of Phase-0 workrooms (often under a slightly
-different slug, so they don't dedupe). One create = one kickoff.
+- The `--agent` list is exactly the two TEAM groups from 6c: every agent
+  reused from the roster plus every agent you registered in 6a — plus any
+  peer you named as a **mentor** in Step 3 who isn't already in one of
+  those groups. A mentor has to be invitable into the bootstrap room even
+  if it does no Phase 1 work; leave it out and that room's creation is
+  rejected.
+- Keep `--post-initial-message` on (the default). It is what wakes you as
+  coordinator so **Phase 0** starts on the same turn instead of sitting
+  idle until the user types something.
 
 ### 6e. Confirm in the DM
 

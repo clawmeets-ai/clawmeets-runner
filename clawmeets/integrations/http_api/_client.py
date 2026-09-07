@@ -7,9 +7,19 @@ delete}``. Independent of the warehouse ``sync`` driver in ``_lib.py``.
 
 Design contract (see skills/http-api/SKILL.md):
 
-* **Redirects off by default.** Cookie apps signal auth state via 3xx
-  (``Location: /`` = ok, ``/login`` = fail); auto-following would mask a failed
-  login as a final ``200 OK``. ``--follow`` opts in.
+* **Redirects off by default.** Cookie apps signal auth state via 3xx — a
+  ``302`` or ``303`` carrying ``Location: /`` = ok, ``/login`` = fail;
+  auto-following would mask a failed login as a final ``200 OK``. ``--follow``
+  opts in.
+* **Expectations are declared, never inferred.** A generic client cannot know
+  what success means for an arbitrary endpoint — a wrong password is a perfectly
+  ordinary ``303`` with its own ``Set-Cookie``. ``--expect-location`` /
+  ``--expect-status`` let the caller say what "worked" looks like; an unmet
+  expectation exits 23.
+* **The jar is written only on exit 0.** ``--save-session`` persists cookies
+  only when the command succeeds outright — no unmet expectation, no ``--fail``
+  status, no render error. A failed login therefore cannot overwrite a working
+  session jar with the login page's anonymous cookie.
 * **Session jar is cookies-only.** ``--save-session`` writes ``{"cookies": {…}}``
   at ``0600``; ``--session`` seeds a live ``httpx.Cookies`` jar that httpx
   updates from *every* response — including a 302's own ``Set-Cookie`` — so the
@@ -34,7 +44,8 @@ import re
 import stat
 import sys
 import tempfile
-from urllib.parse import urlencode
+from fnmatch import fnmatchcase
+from urllib.parse import urlencode, urljoin, urlsplit
 
 import httpx
 
@@ -44,11 +55,15 @@ EXIT_USAGE = 2     # bad -H / --query / --data pair, both body flags, bad --outp
 EXIT_SESSION = 6   # session/jar I/O error (unreadable jar, unwritable path)
 EXIT_NETWORK = 7   # network error (DNS, connect, timeout, TLS, bad URL)
 EXIT_HTTP_FAIL = 22  # HTTP status >= 400 AND --fail was passed
+EXIT_EXPECT = 23   # a declared --expect-* did not match (jar NOT written)
 
 # Methods that may carry a request body.
 _BODY_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
 _ENV_RE = re.compile(r"\$(?:\{(\w+)\}|(\w+))")
+
+# One --expect-status token: 3 chars, digits or 'x' wildcards ("200", "2xx").
+_STATUS_TOKEN_RE = re.compile(r"^[1-5x][0-9x]{2}$")
 
 # Hop-by-hop / body-derived headers are never persisted; we keep the jar to
 # cookies only, but this guards the header-expansion path too.
@@ -193,6 +208,91 @@ def _resolve_body(
     return None, {}, None
 
 
+def _parse_status_spec(spec: str) -> tuple[list[str], str | None]:
+    """Split ``"200,3xx"`` into normalized 3-char patterns (digits or ``x``).
+
+    Parsed before the request is sent so a typo costs a usage error rather than
+    a live call whose verdict is meaningless. Returns ``(patterns, error|None)``.
+    """
+    patterns: list[str] = []
+    for raw in spec.split(","):
+        token = raw.strip().lower()
+        if not token:
+            continue
+        if not _STATUS_TOKEN_RE.match(token):
+            return [], (
+                f"bad --expect-status token {raw.strip()!r} "
+                "(want a 3-char code with 'x' wildcards, e.g. '200', '2xx', '200,303')"
+            )
+        patterns.append(token)
+    if not patterns:
+        return [], f"bad --expect-status {spec!r} (no status codes given)"
+    return patterns, None
+
+
+def _match_status(code: int, patterns: list[str]) -> bool:
+    """True if the 3-digit status matches any pattern, ``x`` matching any digit."""
+    text = f"{code:03d}"
+    return any(
+        all(want in ("x", got) for want, got in zip(pattern, text))
+        for pattern in patterns
+    )
+
+
+def _resolve_landing(resp: httpx.Response) -> str:
+    """Where did this request end up? — the absolute-ized ``Location`` if there
+    is one (so ``/x``, ``https://h/x`` and ``../x`` all normalize), else the
+    response's own URL.
+
+    The else-branch is what makes ``--expect-location`` behave identically under
+    ``--follow``, where the final response carries no ``Location`` at all.
+    """
+    location = resp.headers.get("location")
+    if location:
+        return urljoin(str(resp.url), location)
+    return str(resp.url)
+
+
+def _match_location(landing: str, pattern: str) -> bool:
+    """Glob the landing URL. A pattern starting with ``/`` matches the URL *path*
+    (``path?query`` when the pattern itself contains ``?``), so ``'/'`` is exact
+    and ``'/dashboard*'`` is a prefix; anything else matches the whole absolute
+    URL. Substring matching is deliberately not used — ``/`` would match
+    ``/login``. Case-sensitive: URL paths are.
+    """
+    if not pattern.startswith("/"):
+        return fnmatchcase(landing, pattern)
+    parts = urlsplit(landing)
+    target = parts.path or "/"
+    if "?" in pattern and parts.query:
+        target = f"{target}?{parts.query}"
+    return fnmatchcase(target, pattern)
+
+
+def _check_expectations(
+    resp: httpx.Response,
+    expect_location: str,
+    status_patterns: list[str],
+) -> str | None:
+    """Evaluate every declared expectation (AND). ``None`` when all pass, else a
+    one-line reason for stderr, e.g. ``expectation failed: landed at '/login'
+    (want '/')``.
+    """
+    if status_patterns and not _match_status(resp.status_code, status_patterns):
+        return (
+            f"expectation failed: status {resp.status_code} "
+            f"(want {','.join(status_patterns)})"
+        )
+    if expect_location:
+        landing = _resolve_landing(resp)
+        if not _match_location(landing, expect_location):
+            return (
+                f"expectation failed: landed at {landing!r} "
+                f"(want {expect_location!r})"
+            )
+    return None
+
+
 def _render(resp: httpx.Response, output: str) -> tuple[str, str | None]:
     """Render the response per ``--output`` (``body`` | ``json`` | ``full``).
 
@@ -236,12 +336,20 @@ def run(
     output: str,
     timeout: float,
     fail: bool,
+    expect_location: str = "",
+    expect_status: str = "",
 ) -> int:
     """Orchestrate one request. Returns a process exit code (see module top).
 
     Precedence: body-implied headers < explicit ``-H`` (explicit wins). A single
     ``httpx.Cookies`` jar is seeded from ``--session`` and captures ``Set-Cookie``
     across the redirect chain for ``--save-session``.
+
+    Tail ordering matters: expectations are evaluated, the response is printed
+    either way (so the caller can read the login page that came back), and only
+    then is the jar written — never on a non-zero exit. With neither
+    ``expect_*`` passed the behaviour is byte-identical to not having them,
+    except that ``--fail`` no longer poisons the jar on a 4xx.
     """
     method = method.upper()
 
@@ -271,6 +379,13 @@ def run(
     if output not in ("body", "json", "full"):
         print(f"bad --output {output!r} (want body|json|full)", file=sys.stderr)
         return EXIT_USAGE
+
+    status_patterns: list[str] = []
+    if expect_status:
+        status_patterns, err = _parse_status_spec(expect_status)
+        if err:
+            print(err, file=sys.stderr)
+            return EXIT_USAGE
 
     # Implied body headers first, explicit -H on top (explicit wins).
     send_headers = {**body_headers, **headers}
@@ -305,18 +420,28 @@ def run(
         print(f"network error: {exc}", file=sys.stderr)
         return EXIT_NETWORK
 
-    if save_session:
-        err = _save_jar(save_session, live_cookies)
-        if err:
-            print(err, file=sys.stderr)
-            return EXIT_SESSION
+    unmet = _check_expectations(resp, expect_location, status_patterns)
+    if unmet:
+        print(unmet, file=sys.stderr)
 
+    # Print before deciding — a failed login's body is the diagnostic.
     text, err = _render(resp, output)
     if err:
         print(err, file=sys.stderr)
         return EXIT_USAGE
     print(text)
 
-    if fail and resp.status_code >= 400:
-        return EXIT_HTTP_FAIL
+    http_failed = fail and resp.status_code >= 400
+    if unmet or http_failed:
+        # The gate: a request that did not go as declared must not replace a
+        # working jar with the failure page's anonymous cookie.
+        if save_session:
+            print(f"not writing session jar {save_session!r}", file=sys.stderr)
+        return EXIT_EXPECT if unmet else EXIT_HTTP_FAIL
+
+    if save_session:
+        err = _save_jar(save_session, live_cookies)
+        if err:
+            print(err, file=sys.stderr)
+            return EXIT_SESSION
     return EXIT_OK

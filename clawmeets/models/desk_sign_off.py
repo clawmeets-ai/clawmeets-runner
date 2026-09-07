@@ -25,13 +25,14 @@ The quote is the **watermarked** message, not the room's current newest one: a
 card shows what the user actually signed off, even when someone posted to the
 room afterwards.
 
-Skipped rows (the returned list may be shorter than the window — no backfill):
+Skipped rows (the returned list may be shorter than the window):
   * the project was deleted (``Project.get`` raises ``ValueError``), or
   * the caller is not the project owner (viewer-only / no-longer-participates —
     My Desk shows the caller's OWN DMs + projects; shared/viewer projects and
     foreign rows are excluded via ``project.created_by``).
-With no limit there is no short list for a skip to contradict, which is why the
-skip is invisible now in a way it was not under "Last 5".
+A skip never shortens the result: with no limit there is nothing for it to
+contradict, and under a ``limit`` hydration simply continues further down the
+list until the cap is full.
 
 A row whose watermark can't resolve (the ``__dismissed__`` sentinel, a deleted
 message, an empty room) falls back to the room's newest message, and then to a
@@ -162,12 +163,22 @@ async def build_sign_off_feed(
     ctx: "ServerContext",
     owner_user_id: str,
     since: Optional[datetime] = None,
+    limit: Optional[int] = None,
 ) -> SignOffFeed:
     """Hydrate the owner's sign-offs in ``since`` into renderable cards.
 
     Rows come back newest-first and already windowed from ``list_sign_offs``;
-    each is hydrated in order and skipped — never backfilled — when its project
-    is gone or not owned by the caller.
+    each is hydrated in order and skipped when its project is gone or not owned
+    by the caller.
+
+    ``limit`` caps the number of CARDS returned, not rows consumed: hydration
+    stops as soon as ``limit`` cards exist, so a skipped row is backfilled from
+    further down the list rather than shortening the result. It exists to bound
+    the per-row chatroom-log read, which is what makes an UNWINDOWED feed cheap
+    — the "recently done" caller asks for a count instead of a day boundary, and
+    without a cap it would read every log the user has ever cleared.
+    ``limit=None`` keeps the hydrate-everything behavior; ``since`` is unchanged
+    and composes with it.
 
     Quote source: the WATERMARKED message via ``_message_by_id(entries,
     row.last_seen_message_id)``, so the card shows what the user actually signed
@@ -186,6 +197,8 @@ async def build_sign_off_feed(
 
     cards: list[SignOffCard] = []
     for row in window.rows:
+        if limit is not None and len(cards) >= limit:
+            break
         try:
             project = Project.get(row.project_id, model_ctx)
         except ValueError:

@@ -26,6 +26,37 @@ Produce `plan-<task>.html` for ANY of:
 - CI/CD / Dockerfile change with a non-obvious effect
 - Anything where you'd open more than 2 files to write
 
+## The boundary with the project's plan
+
+`PLAN.md` and `plan-<task>.html` are two documents and the split is by
+question, not by size:
+
+| | holds |
+|---|---|
+| `PLAN.md` (the project's plan) | **what is being built and how it is judged** — Goal, Guardrails, and one `### M<n>` block per milestone with its deliverable and its `AC-<m>.<n>` criteria. The user accepts it; it is the contract. |
+| `plan-<task>.html` (this skill) | **how ONE milestone will be implemented** — dependency changes, interface diffs, pseudocode, diagrams. Reviewed by whoever asked for the work. |
+
+So: read `PLAN.md` for the criteria you are designing against, and write the
+design into `plan-<task>.html`. Do **not** put a dependency table, an interface
+diff or pseudocode into `PLAN.md`, and do not restate acceptance criteria in
+`plan-<task>.html` — quote them and point at the milestone.
+
+**You do not write `PLAN.md`, and you do not file plan notes.** Only the
+coordinator and the user write the document, and a plan note connects exactly
+those two — `clawmeets plan note` refuses a specialist in both phases.
+
+If your design work shows the plan is wrong — a milestone in the wrong order, a
+criterion that cannot be met as written — say it in the room that reaches the
+decision, and write out the section as you would have it so the coordinator can
+file your text rather than a paraphrase of it:
+
+- **Before the plan is accepted** — answer in the project's `shared-context` room.
+  The coordinator relays the user's questions there and files your answers back
+  to them as notes.
+- **While the project is executing** — raise it with the coordinator in your
+  workroom. The plan is a contract now; the coordinator files the deviation and
+  the user accepts it.
+
 ## When to skip (trivial path)
 
 Skip the HTML and reply with an inline ` ```diff ` block when ALL hold:

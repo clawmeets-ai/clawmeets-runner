@@ -1,0 +1,6 @@
+{
+  "audiences": ["assistant"],
+  "surfaces": ["agent_runtime"],
+  "version": "1.0.0",
+  "description": "Approve a project plan, or apply/reject a plan note, on the owner's explicit request from their own DM (assistant-only)."
+}

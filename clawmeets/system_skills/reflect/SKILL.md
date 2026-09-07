@@ -49,8 +49,7 @@ code changes reads this file before editing, so it pays back every cycle.
   (a build quirk, a layout convention, a test command, a pitfall), record it
   in `REPO.md`. Keep it tight (≤ ~4 KB) and code-focused.
 - This is **repo knowledge**, distinct from `learnings/` (cross-project field
-  knowledge) and PLAN.md "Learnings" (project-scoped). Don't duplicate across
-  them.
+  knowledge) and a project's plan (project-scoped). Don't duplicate across them.
 - No repo bound ⇒ skip `REPO.md` entirely.
 
 ## Source of truth
@@ -60,23 +59,51 @@ trigger DM is your **canonical** source for this cycle — do not re-fetch
 chat history. You may *peek* at `shared-context/PLAN.md` (or other
 project files quoted in the transcript) when you need context to
 understand what was actually said in chat — that's fine. What you must
-**not** do is promote PLAN.md's "Learnings" section verbatim into your
-durable `$CLAWMEETS_AGENT_DIR/memory/learnings/`. Those two layers are
+**not** do is promote **plan note text** into your durable
+`$CLAWMEETS_AGENT_DIR/memory/learnings/`. Those two layers are
 deliberately separate.
+
+**Note text is the half of this rule with a referent.** There is no
+`## Learnings` section any more — the plan seeds four sections and the
+coordinator writes narrative into the milestone's own chatroom, not into
+the document. What *does* accumulate on a plan is notes: proposals,
+questions and deviations filed by whoever was looking at one section on
+one day (`clawmeets plan list-notes`). A note is an argument about **this**
+project's spec, addressed to a particular person, often already rejected —
+copying one into durable memory files a contested opinion as a standing
+fact.
+
+### When the trigger carries no transcript
+
+Only the nightly scheduler attaches a `== Recent activity ==` block. A
+trigger posted by another agent — an onboarding coordinator right after
+you delivered a field-knowledge dump, say — carries prose instead, and
+that is a supported case, not a malformed one.
+
+**With no `== Recent activity ==` block, your canonical source is the
+room conversation already in your prompt**: the
+`== RECENT CHAT IN THIS ROOM ==` block (the last 10 non-ack messages,
+full bodies, including your own) plus the trigger message itself. The
+trigger will normally tell you what to distill — a mentor's brief posted
+above, your own dump, or both. Distill from those exactly as you would
+from a transcript; everything else in this skill is unchanged. Still
+don't go re-fetch history over HTTP.
 
 ### Why the two layers are separate
 
-PLAN.md "Learnings" is **project-scoped** — the coordinator's in-project
-pivoting log. It lives in `shared-context`, dies with the project, and
-is deliberately framed in project-specific terms (acceptance criteria,
-milestone numbers). Mirroring it into `memory/learnings/` would
-couple your durable memory to per-project framing and create drift
-between two stores that mean different things.
+A plan note is **project-scoped** — one agent's proposal or question
+about one section of one spec. It lives in the project's plan sidecar,
+dies with the project, and is deliberately framed in project-specific
+terms (acceptance criteria, milestone numbers, "as I would write it").
+Mirroring one into `memory/learnings/` would couple your durable memory
+to per-project framing and create drift between two stores that mean
+different things — and a note that was *declined* would still be sitting
+in your memory as though it had been agreed.
 
 Lessons that *genuinely* matter cross-project will surface in chat
 (because someone said them out loud) and you'll pick them up from the
-transcript on their merits — not because the coordinator filed them
-under PLAN.md "Learnings" for in-project pivoting reasons.
+transcript on their merits — not because they happened to be filed as a
+note against a section.
 
 ## Role: are you the user's personal assistant?
 
@@ -124,7 +151,8 @@ the whole cycle — the audit pass tucks its summary under that day's
 
 The trigger message contains a `== Recent activity for <you> (since <iso>) ==`
 block. Treat that as the **canonical** source for this cycle — do not
-re-fetch chat history.
+re-fetch chat history. (No such block? See "When the trigger carries no
+transcript" above — you work from the room conversation in your prompt.)
 
 1. **Read** the existing `learnings/INDEX.md`, `learnings/log.md`, and
    (assistant only) `USER.md`.

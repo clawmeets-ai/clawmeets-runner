@@ -19,6 +19,32 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
+# NDJSON line safety
+# ---------------------------------------------------------------------------
+
+# NDJSON is \n-delimited, but ``str.splitlines()`` (and some external tooling)
+# also breaks on U+2028/U+2029/U+0085. Pydantic's ``model_dump_json`` escapes
+# control chars < 0x20 but emits those three raw inside JSON strings, so a
+# pasted message body carrying one would split a single entry across "lines"
+# and wedge every reader of the changelog. Escaping on write is lossless: a raw
+# separator can only occur inside a JSON string literal, where the \uXXXX form
+# parses back to the identical character.
+#
+# Keyed by ordinal so this source stays free of invisible characters —
+# str.translate accepts a {ordinal: replacement} mapping directly.
+_NDJSON_UNSAFE = {
+    0x2028: "\\u2028",  # LINE SEPARATOR
+    0x2029: "\\u2029",  # PARAGRAPH SEPARATOR
+    0x0085: "\\u0085",  # NEXT LINE
+}
+
+
+def ndjson_safe(line: str) -> str:
+    """Escape separator chars that survive JSON serialization un-escaped."""
+    return line.translate(_NDJSON_UNSAFE)
+
+
+# ---------------------------------------------------------------------------
 # Enums (moved from domain/enums.py to keep sync/ self-contained)
 # ---------------------------------------------------------------------------
 
@@ -29,7 +55,7 @@ class ChangelogEntryType(str, Enum):
     FILE_CREATED = "file_created"    # File created/uploaded
     FILE_UPDATED = "file_updated"    # File modified
     ROOM_CREATED = "room_created"    # Chatroom created
-    ROOM_DELETED = "room_deleted"    # Chatroom deleted (used by project rerun)
+    ROOM_DELETED = "room_deleted"    # Chatroom deleted (FD teardown, DM cleanup)
     PROJECT_COMPLETED = "project_completed"  # Project completed
     PROJECT_REACTIVATED = "project_reactivated"  # Completed/failed task resumed by user message
     BATCH_COMPLETE = "batch_complete"  # All expected agents responded
@@ -38,6 +64,8 @@ class ChangelogEntryType(str, Enum):
     CHATROOM_CLEARED = "chatroom_cleared"    # All messages in a chatroom wiped by user
     PROJECT_ALLOWLIST_UPDATED = "project_allowlist_updated"  # Snapshot of agent_names/agent_teams refreshed
     DISPLAY_NAME_CHANGED = "display_name_changed"  # Project-scoped rename (dm thread auto-title)
+    PROJECT_PLAN_STATE = "project_plan_state"  # Plan lifecycle projection (phase inputs + open-note count) fanned to runners
+    AGENT_OFFLINE = "agent_offline"  # Targets had no live runner at dispatch time — we did not wait, nobody was there
 
 
 class ProjectStatus(str, Enum):
@@ -125,8 +153,8 @@ class RoomCreatedPayload(ChatroomPayload):
 class RoomDeletedPayload(ChatroomPayload):
     """Payload for ROOM_DELETED entries in unified changelog.
 
-    Emitted by the project rerun flow to wipe non-system work rooms from a
-    persistent reusable project. Subscribers must be idempotent: deleting an
+    Emitted when a work room is torn down (Front Desk project deletion, the
+    legacy-DM cleanup scripts). Subscribers must be idempotent: deleting an
     already-absent dir / branch is a no-op. `shared-context` and
     `user-communication` are never deletable through this entry — callers
     are expected to enforce that, and subscribers do the same defensively.
@@ -161,11 +189,59 @@ class BatchCompletePayload(ChatroomPayload):
 
 
 class BatchTimeoutPayload(ChatroomPayload):
-    """Payload for BATCH_TIMEOUT entries in unified changelog."""
+    """Payload for BATCH_TIMEOUT entries in unified changelog.
+
+    ``offline_participants`` is the subset of ``timed_out_participants`` whose
+    runner had no live hub connection **at the moment the timeout fired** — it
+    is re-checked there, never carried forward from dispatch time, because the
+    case it exists for is precisely an agent that WAS live when the batch
+    opened and died mid-work.
+
+    It is defaulted so every ``batch_timeout`` row already on disk still
+    parses, exactly as every other list field on this payload is.
+
+    It is what keeps "ignored you" distinguishable from "was never there" on a
+    row that already timed out. The sibling distinction — "never received the
+    message at all" — is a separate :class:`AgentOfflinePayload` row, not a
+    flavour of this one, because only that case is fixed by resending.
+    """
     message_id: str
     coordinator_id: str
     responded_participants: list[str]
     timed_out_participants: list[str]
+    offline_participants: list[str] = Field(default_factory=list)
+
+
+class AgentOfflinePayload(ChatroomPayload):
+    """Payload for AGENT_OFFLINE entries in unified changelog.
+
+    Sibling of :class:`BatchTimeoutPayload`, deliberately NOT a field on it.
+    The two rows mean different things and have different producers and
+    different clocks: BATCH_TIMEOUT means "we waited ``timeout_seconds`` and
+    nobody came", this means "we did not wait, nobody was there". Fusing them
+    would fire three side effects that are all wrong at second zero — the
+    "did not respond within 30 min" system message, ``CANCEL_LLM`` to an agent
+    that is not there, and a coordinator wake for a batch that never started.
+
+    Both lists carry AGENT IDS, never names: the client indexes recipient
+    status by id, so a name silently misses every lookup.
+
+    ``message_id`` is REQUIRED. It keys the offline state to the ``@mention``
+    that would have opened the batch, exactly as ``batch_timeout`` does. The
+    client's per-recipient index is ``(message_id, agent_id)``; without it an
+    agent addressed twice — once while offline, once after ``clawmeets start``
+    — would read OFFLINE on both rows forever, and the once-per-message
+    explainer would have no grouping key.
+
+    ``dispatched_participants`` is derivable from expects minus offline, but is
+    carried anyway to match the ``batch_timeout`` precedent
+    (``responded_participants`` + ``timed_out_participants``) and keep the row
+    self-describing. It is ``[]`` in the all-offline case.
+    """
+    message_id: str
+    coordinator_id: str
+    offline_participants: list[str]      # Agent ids with no live hub connection at dispatch
+    dispatched_participants: list[str]   # Agent ids the batch actually opened for
 
 
 class ParticipantAddedPayload(ChatroomPayload):
@@ -202,6 +278,51 @@ class ProjectAllowlistUpdatedPayload(BaseModel):
     """
     agent_names: list[str] = Field(default_factory=list)
     agent_teams: list[str] = Field(default_factory=list)
+
+
+class ProjectPlanStatePayload(BaseModel):
+    """Payload for PROJECT_PLAN_STATE entries — the plan's lifecycle projection.
+
+    Project-level entry (no ``chatroom_name``), same scope as
+    ``ProjectCompletedPayload``. It carries the six facts ``Project.phase``, the
+    execution gate (§7.4) and the coordinator's spec-lock line are computed
+    from, so all three are answerable from a runner's own synced ``meta.json``.
+
+    **Why this exists at all, since §7.2 says the fields are "denormalized like
+    ``report_published_at``".** That precedent is a *server-only* field: nothing
+    replays it, and a runner never learns it. The gate and the coordinator's
+    steady-state prompt block both run **on the runner**, off
+    ``Project.get(pid, model_ctx)`` and a sidecar that lives only in the
+    server's ``metadata/`` tree. A direct ``meta.json`` write reaches neither,
+    so a gate built on one is inert in production and green in any test whose
+    server and runner share a context. **The changelog is the one channel that
+    carries server state to a runner**, which is why the projection rides it.
+
+    The sidecar remains the source of truth; this is its projection, written by
+    one publisher (``models/project_plan.publish_plan_state``) and reconciled
+    against its source by test.
+    """
+    project_id: str
+    #: ``init_plan_sidecar`` and nothing else (§3.5 property 3). A pre-feature
+    #: project never gets one, so it reads ``executing`` with no backfill.
+    plan_seeded_at: str | None = None
+    plan_accepted_at: str | None = None
+    plan_accepted_revision: int = 0
+    #: ``spec_digest`` as it read at acceptance. The runner compares the synced
+    #: ``PLAN.md`` against it for §7.3's "the spec moved" line — a pure function
+    #: of a synced file and a stored string, so no sidecar read.
+    plan_accepted_spec_digest: str = ""
+    #: The projection of ``project_plan.open_notes_for_you`` — §3.3's one number
+    #: carried to the one process that cannot open the sidecar.
+    plan_open_notes: int = 0
+    #: The projection of ``ProjectPlan.first_user_review_at`` — when the OWNER
+    #: first opened a review round, which is the spec lock's start line before
+    #: acceptance (``project_plan._spec_is_locked``). Carried for the
+    #: coordinator's steady-state prompt block, which must state the constraint
+    #: BEFORE the model forms the intent rather than after the API refuses it.
+    #: Optional with a ``None`` default, so every entry already on a changelog
+    #: replays unchanged.
+    plan_user_reviewed_at: str | None = None
 
 
 class DisplayNameChangedPayload(BaseModel):
@@ -246,10 +367,12 @@ ChangelogPayload = Union[
     ProjectReactivatedPayload,
     BatchCompletePayload,
     BatchTimeoutPayload,
+    AgentOfflinePayload,
     ParticipantAddedPayload,
     ChatroomClearedPayload,
     ProjectAllowlistUpdatedPayload,
     DisplayNameChangedPayload,
+    ProjectPlanStatePayload,
 ]
 
 
@@ -321,6 +444,7 @@ class ChangelogEntry(BaseModel):
                 "project_reactivated": ProjectReactivatedPayload,
                 "batch_complete": BatchCompletePayload,
                 "batch_timeout": BatchTimeoutPayload,
+                "agent_offline": AgentOfflinePayload,
                 "participant_added": ParticipantAddedPayload,
                 "chatroom_cleared": ChatroomClearedPayload,
                 "project_allowlist_updated": ProjectAllowlistUpdatedPayload,
@@ -348,10 +472,12 @@ class ChangelogEntry(BaseModel):
             ChangelogEntryType.PROJECT_REACTIVATED: ProjectReactivatedPayload,
             ChangelogEntryType.BATCH_COMPLETE: BatchCompletePayload,
             ChangelogEntryType.BATCH_TIMEOUT: BatchTimeoutPayload,
+            ChangelogEntryType.AGENT_OFFLINE: AgentOfflinePayload,
             ChangelogEntryType.PARTICIPANT_ADDED: ParticipantAddedPayload,
             ChangelogEntryType.CHATROOM_CLEARED: ChatroomClearedPayload,
             ChangelogEntryType.PROJECT_ALLOWLIST_UPDATED: ProjectAllowlistUpdatedPayload,
             ChangelogEntryType.DISPLAY_NAME_CHANGED: DisplayNameChangedPayload,
+            ChangelogEntryType.PROJECT_PLAN_STATE: ProjectPlanStatePayload,
         }
         expected = expected_types[self.entry_type]
         if not isinstance(self.payload, expected):
@@ -363,7 +489,7 @@ class ChangelogEntry(BaseModel):
 
     def to_log_line(self) -> str:
         """Serialize to NDJSON line."""
-        return self.model_dump_json()
+        return ndjson_safe(self.model_dump_json())
 
     @classmethod
     def from_log_line(cls, line: str) -> "ChangelogEntry":

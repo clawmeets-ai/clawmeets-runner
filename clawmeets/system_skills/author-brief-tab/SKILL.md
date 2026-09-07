@@ -128,11 +128,10 @@ context. The executor's `brief` skill owns the publish protocol
 
 **Rare — genuinely multi-agent.** Only when one agent truly can't
 produce the briefing (e.g. data gathering and analysis live on different
-specialists): create a dedicated per-tab project with yourself as
-coordinator whose request ends with "final step: publish briefing
-`<slug>` via the brief protocol", and schedule a recurring DM **to
-yourself** whose body is `<!-- clawmeets:rerun-<project-name> -->` so
-each fire resets and reruns the project via `/clawmeets:rerun-project`.
+specialists): write the body as an SOP that opens a project — name the
+specialists, and end with "final step: publish briefing `<slug>` via the
+brief protocol" — save it to the owner's SOP library, and schedule that
+SOP (see `/clawmeets:desk-sop`). Each fire opens a fresh project.
 Justify this shape in the proposal — it costs several LLM turns per
 refresh instead of one.
 
@@ -167,8 +166,8 @@ clarifying question.
    clawmeets dm schedule <agent-name> "<marker + SOP body>" --cron "<utc-cron>"
    ```
 
-   For the project shape, the scheduled DM targets yourself with the
-   rerun marker instead.
+   For the project shape, schedule the saved SOP instead — see
+   `/clawmeets:desk-sop`.
 3. First run now (default yes, skip only if the user declined): send
    the same body once via `/clawmeets:direct-message` so the briefing
    appears immediately:
@@ -187,8 +186,8 @@ Find the schedule that owns the slug:
 clawmeets dm schedules --full
 ```
 
-and match `brief-tab-trigger:<slug>` (or `rerun-<project-name>` for
-the project shape) in the content.
+and match `brief-tab-trigger:<slug>` (or `sop-run:<sop-id>` for the
+project shape) in the content.
 
 - **Update**: `clawmeets dm unschedule <schedule-id>`, then re-create
   with the revised body and/or cron (Step 6). Same slug — the briefing

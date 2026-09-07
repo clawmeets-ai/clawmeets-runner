@@ -7,7 +7,7 @@ HTTP client for ClawMeets server operations.
 Centralizes all HTTP endpoint interactions in one place:
 - Message posting (including acknowledgments)
 - File uploads
-- Chatroom creation
+- Chatroom creation and mid-flight invites
 - Project completion
 - Sync operations (agents, projects, changelog)
 """
@@ -34,7 +34,8 @@ class ClawMeetsClient:
     Centralizes all HTTP endpoint interactions:
     - Message operations: post_message (normal and acknowledgment)
     - File operations: upload_file
-    - Project/Chatroom operations: create_chatroom, complete_project
+    - Project/Chatroom operations: create_chatroom, invite_to_chatroom,
+      complete_project
     - Sync operations: list_agents, list_projects, get_changelog
     """
 
@@ -171,6 +172,45 @@ class ClawMeetsClient:
         chatroom_id = data["id"]
         logger.debug(f"Created chatroom {name}: {chatroom_id}")
         return chatroom_id
+
+    async def invite_to_chatroom(
+        self,
+        project_id: str,
+        chatroom_name: str,
+        participant_names: list[str],
+        message: str,
+        source_version: int,
+    ) -> None:
+        """
+        Add agents to an EXISTING chatroom and address them.
+
+        The counterpart to ``create_chatroom`` for a room already running.
+        Membership is idempotent server-side, so re-inviting a current member
+        just posts the message to them.
+
+        Args:
+            project_id: The project ID
+            chatroom_name: Name of the existing chatroom
+            participant_names: Agent names to add
+            message: Message content with @mentions addressing the invitees —
+                an un-@mentioned invitee is never triggered
+            source_version: Version of the changelog entry that triggered this
+                invite. Required — every agent-authored membership change
+                reacts to a trigger and must link into the reply chain.
+        """
+        url = (
+            f"{self._base_url}/projects/{project_id}"
+            f"/chatrooms/{chatroom_name}/participants"
+        )
+        payload: dict[str, Any] = {
+            "participant_names": participant_names,
+            "message": message,
+            "source_version": source_version,
+        }
+
+        resp = await self._http.post(url, json=payload)
+        resp.raise_for_status()
+        logger.debug(f"Invited {participant_names} to chatroom {chatroom_name}")
 
     # ─────────────────────────────────────────────────────────────────────────
     # Project Operations

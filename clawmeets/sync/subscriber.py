@@ -53,6 +53,34 @@ class ChangelogSubscriber(ABC):
         """
         pass
 
+    async def on_state_loaded(
+        self,
+        project_id: str,
+        project_name: str,
+    ) -> None:
+        """Called once, after persisted state is loaded and BEFORE any entry runs.
+
+        Default no-op. Override to capture the state this runloop is resuming
+        FROM — the only moment at which on-disk project state is guaranteed to
+        predate every entry this process will apply.
+
+        That guarantee is what makes it different from ``on_entry``: a
+        subscriber that needs the value a field held *before* an entry moved it
+        cannot read it in ``on_entry``, because ModelContext (priority 0) has
+        already applied the entry by then. Here it can.
+
+        Fires on every runloop creation, which on a fresh process is every
+        project it touches — ``ChangelogRunloopManager.get_or_create`` calls
+        ``load_state()`` before the first ``sync()``. A long-lived runloop is
+        created once, so this fires once and live observation carries it from
+        there.
+
+        Args:
+            project_id: The project ID
+            project_name: The project name
+        """
+        pass
+
     async def on_sync_complete(
         self,
         project_id: str,

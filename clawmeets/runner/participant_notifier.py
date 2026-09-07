@@ -22,6 +22,7 @@ from ..sync.changelog import (
     ChangelogEntryType,
     MessagePayload,
     FilePayload,
+    ProjectPlanStatePayload,
     RoomCreatedPayload,
 )
 from ..models.chat_message import ChatMessage
@@ -58,6 +59,16 @@ class ParticipantNotifier(ChangelogSubscriber):
             participant: The participant to notify
         """
         self._participant = participant
+        # Per-project batch bookkeeping for the plan-gate resume, both cleared
+        # by `on_sync_complete`. `_plan_state_version` is the version of the
+        # last PROJECT_PLAN_STATE seen in this batch; `_woken_version` is the
+        # version of the last entry in this batch that started a turn for this
+        # participant (an addressed message, a first user request, or one of the
+        # two batch outcomes). Comparing the two — rather than merely asking
+        # whether both happened — is what makes the guard correct in both
+        # directions; see `on_sync_complete`.
+        self._plan_state_version: dict[str, int] = {}
+        self._woken_version: dict[str, int] = {}
 
     async def on_entry(
         self,
@@ -87,6 +98,9 @@ class ParticipantNotifier(ChangelogSubscriber):
 
             case ChangelogEntryType.BATCH_TIMEOUT:
                 await self._notify_batch_timeout(entry, project_id)
+
+            case ChangelogEntryType.PROJECT_PLAN_STATE:
+                await self._notify_plan_state(entry, project_id)
 
     async def _notify_room_created(
         self,
@@ -148,6 +162,7 @@ class ParticipantNotifier(ChangelogSubscriber):
         )
 
         if is_first_user_message:
+            self._woken_version[project_id] = entry.version
             context_files = project.get_context_files()
 
             logger.info(
@@ -165,6 +180,11 @@ class ParticipantNotifier(ChangelogSubscriber):
             )
         else:
             addressed = self._participant.id in payload.expects_response_from
+            if addressed:
+                # Recorded BEFORE the await, not after: `on_message` runs the
+                # turn inline and can take minutes, and the record has to be
+                # visible to `on_sync_complete` even if that turn raises.
+                self._woken_version[project_id] = entry.version
             message = ChatMessage.from_message_payload(payload)
             await self._participant.on_message(
                 project_id=project_id,
@@ -250,6 +270,7 @@ class ParticipantNotifier(ChangelogSubscriber):
         if payload.coordinator_id != self._participant.id:
             return
 
+        self._woken_version[project_id] = entry.version
         await self._participant.on_batch_complete(
             project_id=project_id,
             chatroom_name=payload.chatroom_name,
@@ -270,6 +291,7 @@ class ParticipantNotifier(ChangelogSubscriber):
         if payload.coordinator_id != self._participant.id:
             return
 
+        self._woken_version[project_id] = entry.version
         await self._participant.on_batch_timeout(
             project_id=project_id,
             chatroom_name=payload.chatroom_name,
@@ -277,6 +299,91 @@ class ParticipantNotifier(ChangelogSubscriber):
             responded_participants=payload.responded_participants,
             timed_out_participants=payload.timed_out_participants,
             trigger_version=entry.version,
+        )
+
+    async def _notify_plan_state(
+        self,
+        entry: ChangelogEntry,
+        project_id: str,
+    ) -> None:
+        """Forward ``PROJECT_PLAN_STATE`` to the participant.
+
+        This subscriber is a router: it names the EVENT and lets the
+        participant decide what the event means, exactly as
+        :meth:`_notify_batch_complete` does. Whether this particular entry
+        RELEASED the plan gate — and so whether a stalled coordinator should
+        resume — needs the gate predicates and a memo of the previous value,
+        both of which belong with the participant that owns a ``ModelContext``.
+
+        Until now there was no arm at all: ``ModelContext`` wrote the fields
+        into ``meta.json`` and the project sat still until some unrelated event
+        woke it, which is how a plan whose last blocking note the user had just
+        resolved could stop moving for good.
+
+        **Records; does not dispatch.** The decision is deferred to
+        :meth:`on_sync_complete` because it depends on what ELSE the batch
+        delivers, and this entry — deliberately given the lower version so the
+        turn it wakes reads the post-resolution count — is seen before that is
+        known. Dispatching here fires a second, redundant coordinator turn on
+        every route that publishes the projection and posts a message in one
+        ``append_batch``.
+        """
+        self._extract_payload(entry, ProjectPlanStatePayload)
+        self._plan_state_version[project_id] = entry.version
+
+    async def on_state_loaded(
+        self,
+        project_id: str,
+        project_name: str,
+    ) -> None:
+        """Let the participant record the plan gate as this process resumes it.
+
+        The one read of project state guaranteed to predate every entry this
+        runloop will apply, which is exactly what a *"did this entry open the
+        gate"* comparison needs and what ``on_entry`` structurally cannot give:
+        ModelContext (priority 0) has already applied the entry by the time this
+        subscriber sees it.
+        """
+        await self._participant.on_plan_gate_prime(project_id)
+
+    async def on_sync_complete(
+        self,
+        project_id: str,
+        project_name: str,
+    ) -> None:
+        """Dispatch the plan-gate resume, unless a later entry already woke us.
+
+        **The comparison is on versions, not on presence, and both directions
+        matter.**
+
+        *Suppress when the waking entry came after.* ``submit_review`` puts the
+        projection in the prelude of the same ``append_batch`` as the messages —
+        precisely so the turn those messages start reads the post-resolution
+        note count. That turn is the intended one. Dispatching a resume as well
+        spends a second LLM invocation on the same instruction and gives the
+        milestone workroom two chances to be opened.
+
+        *Do NOT suppress when the message came before.* A user message at a
+        lower version than the projection started its turn against the
+        PRE-resolution count — it is the turn the gate NO_OPs, and it is the
+        stall this resume exists to rescue. Guarding on mere co-membership in a
+        batch would swallow exactly that case.
+
+        Both halves are popped whether or not either is used. A batch that
+        raises mid-way never reaches this method at all, and what carries over
+        to the next one is then the right answer anyway: versions are monotonic,
+        so a comparison across two batches decides the same way it would have
+        within one.
+        """
+        plan_version = self._plan_state_version.pop(project_id, None)
+        woken_version = self._woken_version.pop(project_id, None)
+        if plan_version is None:
+            return
+        if woken_version is not None and woken_version > plan_version:
+            return
+        await self._participant.on_plan_state_change(
+            project_id=project_id,
+            trigger_version=plan_version,
         )
 
     def _extract_payload(self, entry: ChangelogEntry, payload_type: type):

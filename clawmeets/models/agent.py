@@ -25,14 +25,23 @@ from ..api.action_validator import ActionValidator, StateSnapshot
 from ..api.responses import AgentStatus
 from ..llm.base import LLMInvocationError, LLMRateLimitError, LLMTimeoutError
 from . import model_config as _model_config
-from ..llm.prompt_builder import CoordinatorPromptBuilder, create_prompt_builder
+from ..llm.prompt_builder import (
+    BATCH_COMPLETION_PLAN_INSTRUCTION,
+    BATCH_COMPLETION_PLAN_REVIEW_INSTRUCTION,
+    PLAN_GATE_RELEASED_INSTRUCTION,
+    CoordinatorPromptBuilder,
+    create_prompt_builder,
+)
 from ..llm.triggers import derive_role
 from ..runner.invocation_registry import invoke_with_registry as _invoke_with_registry
 from ..sync.changelog import ProjectStatus
 from ..utils.file_io import FileUtil
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from ..api.client import ClawMeetsClient
+    from ..llm.prompt_builder import PlanPromptState
     from .context import ModelContext
     from .chat_message import ChatMessage
     from .project import Project
@@ -42,7 +51,18 @@ logger = logging.getLogger(__name__)
 # Retry configuration for transient LLM CLI failures
 _MAX_RETRIES = 2  # Total attempts: 3 (1 original + 2 retries)
 _INITIAL_RETRY_DELAY = 30  # seconds
-_TRANSIENT_INDICATORS = ("overloaded", "rate_limit", "529", "503", "too many requests")
+_TRANSIENT_INDICATORS = (
+    "overloaded",
+    "rate_limit",
+    "529",
+    "503",
+    "too many requests",
+    # Dropped connections carry no status code, so they can only be caught
+    # here. Both phrasings are real: "Connection closed mid-response" and
+    # "The socket connection was closed unexpectedly".
+    "connection closed",
+    "connection was closed",
+)
 
 # Semantic-validation retry budget (see action_validator + _invoke_validated).
 # Hard integer cap -> at most 1 + _MAX_VALIDATION_RETRIES = 3 model invocations
@@ -53,11 +73,34 @@ _MAX_VALIDATION_RETRIES = 2
 
 
 def _is_transient_error(error: LLMInvocationError) -> bool:
-    """Check if an LLMInvocationError is likely transient (retryable)."""
+    """Check if an LLMInvocationError is likely transient (retryable).
+
+    A timeout is NOT transient. The runner's kill window and the server's
+    ``PendingWork.timeout_seconds`` are the same bound by design (see
+    ``server/batch_timeout.resolve_batch_timeout``), so an invocation that
+    burns its full window dies at the moment the batch expires. Retrying
+    starts a fresh full-length attempt into a batch whose pending_work is
+    already gone: the reply is never credited, the CANCEL_LLM the checker
+    sends lands during the backoff sleep with nothing registered, and the
+    UI has already marked the recipient terminal. Fall through to the
+    terminal path instead — ``_post_error_notification`` posts a non-ack
+    reply, which usually closes the batch before the checker even ticks.
+    """
     if isinstance(error, LLMRateLimitError):
         return False  # Rate limits should not be retried with short backoff
     if isinstance(error, LLMTimeoutError):
-        return True
+        return False
+
+    # Structural signal wins where the provider reported one: >= 500 is the
+    # backend's problem and worth the backoff, any 4xx is ours and will fail
+    # again identically. Same policy as the OpenRouter wire path
+    # (llm/_openai_wire.py). A present-but-terminal status short-circuits
+    # rather than falling through — deferring to the string match would let
+    # a stray "503" in a 400's body resurrect it.
+    status = getattr(error, "status_code", None)
+    if status is not None:
+        return status >= 500
+
     msg = str(error).lower()
     return any(indicator in msg for indicator in _TRANSIENT_INDICATORS)
 
@@ -83,16 +126,16 @@ def _resume_marker_for_dm(chatroom, agent_name: str) -> Optional[str]:
     return None
 
 
-def _schema_allows_create_room(action_schema: dict) -> bool:
-    """True iff ``action_schema`` permits a ``create_room`` action.
+def _schema_allows_agent_invites(action_schema: dict) -> bool:
+    """True iff ``action_schema`` permits an action that names invitees.
 
     Precise discriminator for "does this turn need the agent scans" — only a
-    turn that can emit ``create_room`` needs ``invitable_agents`` /
-    ``resolvable_agents``. Reads the ``oneOf`` variants by structure (not by
-    identity), so it stays correct for the full COORDINATOR schema, the
-    restricted coordinator-DM schema, and WORKER_ACTION_SCHEMA alike — an
-    assistant acting as coordinator is covered, a coordinator on an owned DM
-    (worker schema) correctly skips the scan.
+    turn that can emit ``create_room`` or ``invite_agent`` needs
+    ``invitable_agents`` / ``resolvable_agents``. Reads the ``oneOf`` variants
+    by structure (not by identity), so it stays correct for the full
+    COORDINATOR schema, the restricted coordinator-DM schema, and
+    WORKER_ACTION_SCHEMA alike — an assistant acting as coordinator is covered,
+    a coordinator on an owned DM (worker schema) correctly skips the scan.
     """
     variants = (
         action_schema.get("properties", {})
@@ -101,7 +144,8 @@ def _schema_allows_create_room(action_schema: dict) -> bool:
         .get("oneOf", [])
     )
     return any(
-        v.get("properties", {}).get("type", {}).get("const") == "create_room"
+        v.get("properties", {}).get("type", {}).get("const")
+        in ("create_room", "invite_agent")
         for v in variants
     )
 
@@ -135,19 +179,47 @@ def build_state_snapshot(
     can see, and the validator sees exactly those, so a valid reference cannot
     false-reject; the executor's 4xx handler backstops any TOCTOU race).
 
+    ``existing_rooms`` is **exactly** that read — no seeded member, no widened
+    invariant. It used to carry one: ``plan-review`` while the project was
+    awaiting approval. That room was opened mid-turn by
+    ``clawmeets plan consult`` through the SERVER's context and the runner
+    could not adopt it until the turn released the runloop lock, so the spec
+    contract told a coordinator to open a room and then reply into it in the
+    same turn, and the reply was rejected as nonexistent until the retry budget
+    ran out. Consultation now happens in ``shared-context``, which is in
+    ``project.chatrooms`` before the coordinator's first turn, so the hazard
+    does not arise and the seed that patched it is gone.
+
     Keyed on the single ``project_id`` in scope, it automatically reads the
     correct side of a two-sided Front-Desk tunnel (§1b) — the side whose turn is
     running — with no cross-tunnel read and no extra project fetch.
 
     Agent scans (``invitable_agents`` + ``resolvable_agents``) run ONLY when
-    ``include_agents`` (a turn that can emit ``create_room``). Worker turns and
-    owned-DM turns skip both scans entirely (reviewer M1 refinement).
+    ``include_agents`` (a turn that can emit ``create_room`` or
+    ``invite_agent``). Worker turns and owned-DM turns skip both scans entirely
+    (reviewer M1 refinement).
+
+    Called ONCE per turn, before the retry loop, and never from inside it. The
+    one field the loop may move afterwards — ``invitable_agents`` — is refreshed
+    through :func:`refresh_invitable_agents`, deliberately a separate, narrower
+    function rather than a second call to this one: re-running the whole builder
+    would also re-read ``blocked_notes``, which is non-monotone and whose live
+    value would make the verdict oscillate (see ``StateSnapshot``'s docstring).
+
+    **There used to be a SECOND plan field here**, ``awaiting_plan_approval``,
+    computed by a ``_plan_preapproval_blocked`` that fired for the whole of
+    ``spec-ing``. It is gone, and nothing lost a guarantee: the block a project
+    starts life under is now an ordinary open plan note — the **go-note**,
+    seeded by ``POST /projects`` in the same transaction as ``PLAN.md`` — which
+    the one remaining field already counts. Two gates and two snapshot members
+    collapsed into one of each because they were always the same rule read
+    twice.
     """
     from .project import Project
 
     project = Project.get(project_id, model_ctx)
-    existing_rooms = frozenset(project.chatrooms)
     project_active = project.status == ProjectStatus.ACTIVE
+    existing_rooms = frozenset(project.chatrooms)
 
     if include_agents:
         invitable_agents = frozenset(
@@ -167,7 +239,274 @@ def build_state_snapshot(
         invitable_agents=invitable_agents,
         resolvable_agents=resolvable_agents,
         project_active=project_active,
+        # Same gate as the agent scans above and for the same reason: only a
+        # turn that can emit `create_room` / `invite_agent` has a reader for
+        # this, so a worker turn skips the shared-context lookup entirely.
+        blocked_notes=(
+            _plan_execution_blocked(project) if include_agents else 0
+        ),
     )
+
+
+def refresh_invitable_agents(
+    model_ctx: "ModelContext",
+    project_id: str,
+) -> frozenset[str]:
+    """Re-read ONLY the project's invitable-agent set from local state.
+
+    The monotone half of the once-per-turn snapshot. Deliberately narrow: it
+    re-derives the single field a coordinator can legitimately change *during*
+    its own turn (via ``clawmeets project allowlist``, whose
+    ``PROJECT_ALLOWLIST_UPDATED`` entry replays into the local ``meta.json``)
+    and touches nothing else. Everything the retry loop must see hold still —
+    rooms, project status, the plan gate — stays with the frozen snapshot.
+
+    Mirrors ``build_state_snapshot``'s call exactly, ``exclude_ids`` included
+    (i.e. omitted), so the union it feeds is homogeneous with the set it widens;
+    a differently-scoped scan here would silently add or drop the agent's own
+    short name relative to the frozen half.
+
+    Returns an EMPTY set on any read failure rather than raising. The caller
+    unions the result, so an empty set is a no-op — a project that vanished
+    mid-turn degrades to today's frozen behaviour instead of killing a turn
+    whose real work may already be valid.
+    """
+    from .project import Project
+
+    try:
+        project = Project.get(project_id, model_ctx)
+        return frozenset(Agent.invitable_short_names_for_project(project, model_ctx))
+    except Exception:
+        logger.debug(
+            "invitable refresh failed for project %s; keeping the frozen set",
+            project_id,
+            exc_info=True,
+        )
+        return frozenset()
+
+
+def _plan_execution_blocked(project: "Project") -> int:
+    """§7.4's gate — **the only one** — as the count that motivates it.
+
+    ::
+
+        blocked == surface == "regular" and open_notes_for_you > 0
+
+    **Two conjuncts, where there used to be two functions and six.** The old
+    pair — a pre-approval gate on ``phase == "spec-ing"`` and an execution gate
+    on ``phase == "executing" and open_notes > 0 and shared_context_has_peer``
+    — were the same rule stated twice, and the redesign that removed the Approve
+    button collapsed them. Every conjunct that went, went for a reason worth
+    keeping written down, because each looks like something a reader might
+    restore:
+
+    ``phase == "executing"`` — **deleted, and deleting it is what makes the
+    go-note work at all.** The block a project starts life under is now an
+    ordinary open plan note, seeded by ``POST /projects`` before the coordinator
+    has taken a turn. A gate that only fires once the plan is accepted would be
+    clear for exactly the window the go-note exists to close, and the note would
+    block nothing at the one moment it has to block everything.
+
+    ``shared_context_has_peer`` — **deleted, and its argument went with the
+    button.** ``Q12`` added it because a coordinator refused ``create_room``
+    while consulting an empty ``shared-context`` was a livelock silent on both
+    ends: the room is seeded with ``[coordinator]`` alone, so on a fresh project
+    nothing said why the project had stopped. That cannot arise now. The release
+    condition is *"the user accepts the go-note"*, the note is in the plan tray
+    on the user's own desk with the coordinator's ask in it, and the coordinator
+    is told about it in its prompt. Keeping the clause would make the gate
+    return 0 on every brand-new project — which is every project the go-note is
+    for.
+
+    **The consultation half of that argument survives the deletion, and it is
+    what keeps this a gate rather than a deadlock.** A blocked coordinator still
+    has to be able to reach a specialist, and it can: this rests on
+    ``shared-context`` alone, because no note can reach a specialist in either
+    phase — ``user`` is the only addressee a plan note has. So the room IS the
+    channel,
+    it exists from project creation, and ``clawmeets plan consult`` seats the
+    invitable roster on demand. The mechanism is the load-bearing part:
+    ``ensure_consultation_roster`` appends ``PARTICIPANT_ADDED`` straight through
+    the runloop and never passes through the ``create_room`` action this gate
+    refuses. Were it an action, the one channel a gated coordinator has would be
+    closed by the gate itself.
+
+    Note what this does NOT become: *"the room has a peer in it"*. That was the
+    deleted conjunct, and it is a different claim from *"the room exists and can
+    be populated"*. A reader who collapses the two reintroduces the hole.
+
+    ``phase`` is not read at all any more, so this opens no file the pass has
+    not already opened; it was already a pure function of stored fields, and now
+    it is a shorter one.
+
+    **What did NOT change, and why each of the two survivors is still here:**
+
+    ``surface == "regular"`` — on a **front-desk** project there is no user in
+    the accepting role (§7.2), so the halt's release condition does not exist
+    and the halt would be a deadlock, stopping every front-desk engagement at
+    its first agent proposal. On a **DM** it is inert rather than wrong: a DM
+    has no plan, so the count is zero either way. The conjunct is kept as the
+    explicit shape guard it has always been.
+
+    ``open_notes_for_you > 0`` — explicitly **NOT** ``changed_since_acceptance``.
+    The digest comparison is the tempting reading and it is backwards: it fires
+    on **the user's own accepted edit**, because it does not care who moved the
+    bytes. Gating on it would halt a project *because the user edited it*.
+
+    **The two plan facts are read from ``meta.json``, not from the sidecar,**
+    and that is not an optimisation. This function runs in the **agent process**;
+    ``plan.json`` lives in the server's ``metadata/`` tree and is not synced.
+    They arrive here over ``PROJECT_PLAN_STATE`` (D13). If that entry ever stops
+    being published the gate silently reads zeros and never fires, which is why
+    the projection is reconciled against its source by test rather than trusted.
+    """
+    if project.surface != "regular":
+        return 0
+    return max(project.plan_open_notes, 0)
+
+
+def plan_prompt_state(
+    project: "Project", ctx: "ModelContext"
+) -> "PlanPromptState | None":
+    """§7.3's five steady-state facts, assembled from **synced** state only.
+
+    ``None`` when the project has no plan lifecycle to report — a DM, or any
+    project that was never seeded (which is every project predating the feature,
+    §3.5 property 3). A coordinator on one of those gets exactly the prompt it
+    gets today.
+
+    Every member is a project field or a pure function of one and the synced
+    ``PLAN.md``. That is a constraint, not a coincidence: this runs in the agent
+    process, which cannot open the server-side sidecar, so ``open_notes_for_you``
+    arrives over ``PROJECT_PLAN_STATE`` (D13) and *"the spec moved"* is
+    ``spec_digest(synced body) != plan_accepted_spec_digest`` — the sidecar's own
+    definition, computed from the two halves that are local.
+
+    The title is the project's display label rather than the document's ``# ``
+    heading: it is the name the user sees on the card, and deriving it would put
+    a heading parser in the prompt builder for a string the project already owns.
+    """
+    from ..llm.prompt_builder import PlanPromptState
+    from .chatroom import Chatroom
+    from .plan_markdown import spec_digest
+    from .project_plan import approval_state
+
+    if project.surface != "regular" or project.plan_seeded_at is None:
+        return None
+    # One read of the synced document serves both facts. It used to be opened
+    # only when there was an acceptance digest to compare against — but the
+    # approval text matters most in exactly the case that had no digest, so the
+    # read moved out of the branch rather than being done a second time inside
+    # a new one.
+    try:
+        room = Chatroom.get(project.id, "shared-context", ctx)
+        raw = room.get_file("PLAN.md") if room is not None else None
+    except ValueError:
+        raw = None
+    body = raw.decode("utf-8", errors="replace") if raw is not None else None
+    changed = False
+    if (
+        body is not None
+        and project.plan_accepted_at is not None
+        and project.plan_accepted_spec_digest
+    ):
+        changed = spec_digest(body) != project.plan_accepted_spec_digest
+    return PlanPromptState(
+        title=project.display_name or project.name,
+        phase=project.phase,
+        changed_since_acceptance=changed,
+        open_notes_for_you=project.plan_open_notes,
+        approval=approval_state(body) if body is not None else "",
+        user_has_reviewed=project.plan_user_reviewed_at is not None,
+    )
+
+
+def _is_spec_consultation_batch(project: "Project", chatroom_name: str) -> bool:
+    """M5 AC-5.6 — is this ``BATCH_COMPLETE`` a **spec consultation**?
+
+    ::
+
+        spec_consult == chatroom_name == PLAN_ROOM
+                        and surface == "regular"
+                        and phase == "spec-ing"
+
+    The one predicate behind both halves of the variant — the trailing
+    instruction on the synthetic message and the role-contract block — so the
+    two cannot come apart.
+
+    **Selection is by room and phase, in Python, against the constant.** The
+    room name is compared to
+    :data:`~clawmeets.models.project_plan.PLAN_ROOM` rather than to a string
+    literal, and the model is never handed a room name and asked to test it:
+    a rule the prompt asks the model to evaluate is a rule the model can
+    decline to evaluate.
+
+    **Every conjunct is a decision.**
+
+    ``chatroom_name == PLAN_ROOM`` — the project's one consultation room, where
+    the relay posts and where ``PLAN.md`` itself lives.
+
+    ``surface == "regular"`` — belt and braces, in the shape
+    :func:`_plan_execution_blocked` already uses and for the same reason.
+    :attr:`Project.phase` derives ``executing`` for every non-regular shape, so
+    this is redundant *right now*; it stays because that derivation branch is
+    named load-bearing three times and a reviewer trimming it would delete
+    exactly it.
+
+    ``phase == "spec-ing"`` — **this is what makes the milestone workflow
+    wrong, and it now carries the whole of the room half's old weight.** When
+    the consultation room was ``plan-review``, opened on demand, the room name
+    alone was nearly a proxy for the stage. ``PLAN_ROOM`` is not: it exists on
+    every regular project from creation and hosts ordinary post-acceptance
+    consultation too, where ``create_room`` is no longer refused and ticking a
+    milestone's checkbox is the correct instruction again. Selecting on the
+    room alone was merely imprecise before the merge; it is plainly wrong
+    after it. Do not trim this conjunct.
+
+    A pure function of a project and a room name, so a test states the truth
+    table directly instead of driving a whole batch to observe which prompt
+    came out.
+    """
+    from .project_plan import PLAN_ROOM
+
+    return (
+        chatroom_name == PLAN_ROOM
+        and project.surface == "regular"
+        and project.phase == "spec-ing"
+    )
+
+
+def _participant_names(ids: "Sequence[str]", ctx: "ModelContext") -> list[str]:
+    """M5 AC-5.7 — batch participants as **names**, for a prompt that must group
+    by agent.
+
+    ``BatchCompletePayload.responded_participants`` carries participant **ids**
+    (``PendingWork`` fills them from the resolved ``expects`` of the message
+    that opened the batch), and they were joined raw into the synthetic message
+    the coordinator reads. A coordinator asked to *"group the answers by
+    agent"* was being handed a list of UUIDs — it cannot match one to a name in
+    the room, so it either guesses or ignores the list.
+
+    Resolved through :meth:`Participant.get`, the typed factory
+    :meth:`Chatroom.list_participants` already uses. Deliberately not resolved
+    through the room: an id that has since left the room is still a fact about
+    the batch, and going through the membership list would silently drop it.
+
+    **Falls back to the raw id** for anything unresolvable rather than omitting
+    it. A shorter list is how *"who did NOT answer"* goes missing, and an
+    unresolvable id printed as itself is at least a question the reader can
+    ask; a name that is simply absent is not.
+    """
+    from .participant import Participant
+
+    names: list[str] = []
+    for pid in ids:
+        try:
+            participant = Participant.get(pid, ctx)
+        except Exception:
+            participant = None
+        names.append(getattr(participant, "name", None) or pid)
+    return names
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -585,6 +924,13 @@ class Agent(PersistableParticipant):
             model_ctx: ModelContext for filesystem access (may include cli/knowledge_dirs/client)
         """
         super().__init__(id, model_ctx)
+        # Per-project memo of the EXECUTION gate's last observed value, read
+        # only by :meth:`on_plan_state_change` and seeded by
+        # :meth:`on_plan_gate_prime`. In-memory on purpose: it answers "did THIS
+        # entry release the gate", a question about two adjacent observations,
+        # not durable state — and the prime is what keeps a restart from
+        # counting as the first of them.
+        self._plan_gate_blocked: dict[str, bool] = {}
 
     # ─────────────────────────────────────────────────────────────────────────
     # Role Property (from Participant ABC)
@@ -621,24 +967,35 @@ class Agent(PersistableParticipant):
         )
 
     @classmethod
-    def invitable_short_names_for_project(
+    def invitable_agents_for_project(
         cls,
         project: "Project",
         model_ctx: "ModelContext",
         *,
         exclude_ids: frozenset[str] = frozenset(),
-    ) -> list[str]:
-        """Short-names of the agents a coordinator may invite into ``project``.
+    ) -> list["Agent"]:
+        """**The invitable roster**: the agents a coordinator may put into ``project``.
 
         With an explicit allowlist set (``project.agent_{names,teams}``) →
         the resolved allowlist; with no allowlist → the owner's own crew
-        (matching what AGENTS.md lists under "Your agents"). Used both to
-        surface the invitable list in the coordinator prompt and to tell a
-        coordinator which names are valid when a ``create_room`` invite 404s.
+        (matching what AGENTS.md lists under "Your agents").
 
         The candidate pool is admin-scoped (skips the discoverable filter so
         non-discoverable owned agents are visible); ``resolve_invitable_agents``
         drops anything the project hasn't allowed.
+
+        Returns the ``Agent`` objects rather than their names because two
+        callers want two different projections of one query and a second query
+        would drift from this one. :func:`invitable_short_names_for_project`
+        wants the display names, for the coordinator prompt and for the
+        *"valid agents: …"* hint on a failed invite;
+        :func:`~clawmeets.models.project_plan.ensure_consultation_roster` wants
+        ``id``, ``name`` and ``registered_by``, because it is appending room
+        membership and tagging cross-owner invitees ``external``.
+
+        **This set is also the allowlist**, which is why the roster sync
+        needs no separate allowlist check: everything here has already passed
+        :meth:`Project.matches_invitable`, the one owner of that rule.
         """
         viewer_owner_id = project._invitable_viewer_owner_id(model_ctx)
         candidates = [
@@ -647,15 +1004,32 @@ class Agent(PersistableParticipant):
             if a.id not in exclude_ids
         ]
         if project.enforces_invitable_allowlist:
-            matched = project.resolve_invitable_agents(candidates, model_ctx)
-        else:
-            # No allowlist: the invitable set is the owner's own crew, the
-            # same "Your agents" AGENTS.md shows.
-            matched = [
-                a
-                for a in candidates
-                if viewer_owner_id and a.registered_by == viewer_owner_id
-            ]
+            return project.resolve_invitable_agents(candidates, model_ctx)
+        # No allowlist: the invitable set is the owner's own crew, the
+        # same "Your agents" AGENTS.md shows.
+        return [
+            a
+            for a in candidates
+            if viewer_owner_id and a.registered_by == viewer_owner_id
+        ]
+
+    @classmethod
+    def invitable_short_names_for_project(
+        cls,
+        project: "Project",
+        model_ctx: "ModelContext",
+        *,
+        exclude_ids: frozenset[str] = frozenset(),
+    ) -> list[str]:
+        """:meth:`invitable_agents_for_project`, as the names a human types.
+
+        Used to surface the invitable list in the coordinator prompt and to tell
+        a coordinator which names are valid when a ``create_room`` invite 404s.
+        """
+        viewer_owner_id = project._invitable_viewer_owner_id(model_ctx)
+        matched = cls.invitable_agents_for_project(
+            project, model_ctx, exclude_ids=exclude_ids
+        )
 
         names: list[str] = []
         for other in matched:
@@ -1273,18 +1647,33 @@ class Agent(PersistableParticipant):
         """Invoke → validate → maybe retry, up to ``_MAX_VALIDATION_RETRIES``.
 
         Provably terminating (plan §4): the state snapshot is taken ONCE before
-        the loop (a closed, fixed target), the budget is a hard integer counter,
-        and only a REJECT_RETRY classification re-invokes — NO_OP / PASS never
-        do, so idempotent actions (create-existing-room, re-complete) cannot
-        spin. Never keys on free-form content, so valid-but-non-deterministic
-        prose triggers zero retries.
+        the loop (a closed target), the budget is a hard integer counter, and
+        only a REJECT_RETRY classification re-invokes — NO_OP / PASS never do,
+        so idempotent actions (create-existing-room, re-complete) cannot spin.
+        Never keys on free-form content, so valid-but-non-deterministic prose
+        triggers zero retries.
+
+        **The invitee set is refreshed between attempts, and only ever widened.**
+        A coordinator's remedy for a non-invitable invitee — ``clawmeets project
+        allowlist`` — lands *inside* the turn that discovers the problem, so a
+        set frozen at turn start could never see it: the coordinator widens the
+        roster, is rejected by the stale set, assumes it has the name wrong, and
+        burns the whole budget on spelling variants while the action is dropped.
+        Between attempts the loop therefore re-derives just that one field and
+        UNIONS it in (``StateSnapshot.with_invitable``), then RE-VALIDATES the
+        block it already has. If the widening rescued it, the turn breaks out
+        with no extra invocation at all — the one-shot case (widen the roster and
+        open the room in the same turn) costs zero retries. Nothing else in the
+        snapshot moves, so the target stays closed; it is now monotone rather
+        than motionless, which still forbids oscillation, and termination was
+        always the integer budget's job anyway.
 
         At budget exhaustion the terminal fallback drops the still-offending
         actions, keeps the valid ones, and surfaces a note (identical to today's
         4xx behavior — no regression). Returns the (possibly filtered) block,
         its usage, and the notes to post to user-communication.
         """
-        include_agents = _schema_allows_create_room(action_schema)
+        include_agents = _schema_allows_agent_invites(action_schema)
         snapshot = build_state_snapshot(
             self._model_ctx, project_id, include_agents=include_agents
         )
@@ -1324,6 +1713,19 @@ class Agent(PersistableParticipant):
             result = ActionValidator().validate(block, snapshot)
             if not result.retryable:
                 break
+            # Did the roster widen under us (the coordinator's own allowlist
+            # edit landing mid-turn)? Re-validating the block we already have is
+            # pure and free — the validator does no I/O — so a rescued block
+            # costs zero further invocations.
+            if include_agents:
+                widened = snapshot.with_invitable(
+                    refresh_invitable_agents(self._model_ctx, project_id)
+                )
+                if widened is not snapshot:
+                    snapshot = widened
+                    result = ActionValidator().validate(block, snapshot)
+                    if not result.retryable:
+                        break
             correction = result.feedback()
 
         # ``result.retryable`` is True here only if the budget was exhausted with
@@ -1435,6 +1837,122 @@ class Agent(PersistableParticipant):
             trigger_version=trigger_version,
         )
 
+    async def on_plan_gate_prime(self, project_id: str) -> None:
+        """Seed the gate memo from state that predates every entry to come.
+
+        Fired by the notifier out of ``ChangelogRunloop.load_state`` — the one
+        moment at which the synced ``meta.json`` is guaranteed to hold the value
+        the gate had *before* anything this process will apply. That is a value
+        :meth:`on_plan_state_change` structurally cannot read for itself:
+        ``ModelContext`` runs at priority 0 and has already written the entry by
+        the time the notifier sees it.
+
+        **Without this, the fix has a hole shaped exactly like the bug.** The
+        memo is per-process and the runloop resumes from a *persisted* cursor,
+        so a restart never replays the ``PROJECT_PLAN_STATE`` entries that would
+        re-prime it. Project stalls on an open note → runner restarts → the user
+        resolves the last note through ``POST /plan/notes/{id}/resolve``, which
+        posts no message → the release is recorded as a first observation and
+        swallowed → the project stays stopped with nothing on any surface left
+        to wake it. Priming makes a restart indistinguishable from a live
+        observation.
+
+        Silent on a project this agent does not coordinate, and on one whose
+        ``meta.json`` is not on disk yet: neither has a gate this agent reads.
+        """
+        from .project import Project
+        project = Project.get(project_id, self._model_ctx)
+        if not project or not self.is_coordinator_for(project):
+            return
+        self._plan_gate_blocked[project_id] = bool(
+            _plan_execution_blocked(project)
+        )
+
+    async def on_plan_state_change(
+        self,
+        project_id: str,
+        trigger_version: int,
+    ) -> None:
+        """A ``PROJECT_PLAN_STATE`` batch landed. Resume if it OPENED the gate.
+
+        **The one re-dispatch the runner mints itself, and it is not
+        self-continuation.** The signal is the USER's act — resolving the last
+        note addressed to them — arriving as a changelog entry like any other.
+        What is unusual is only that the entry carries no message, so before
+        this arm existed nothing read it.
+
+        Two holes it closes, and the first is not a race at all:
+
+        * ``POST /plan/notes/{id}/resolve`` publishes the projection and posts
+          nothing. Resolve the last blocking note that way and the project
+          simply never moved again — no stale read required.
+        * A route that publishes the projection AFTER the message that wakes on
+          it leaves that turn reading the pre-resolution count, because the turn
+          holds the runloop lock this entry needs and so cannot re-read it.
+          §7.4's gate then NO_OPs the turn's ``create_room`` and it stops; the
+          entry drains into silence behind it. ``submit_review``'s prelude
+          ordering is the fix for that one, and this is the net under it —
+          including under the next route to get the ordering wrong. The
+          notifier's version comparison is what keeps the net from ALSO firing
+          when the ordering is right and the woken turn is already correct.
+
+        **THIS ARM NOW CARRIES ACCEPTANCE TOO, and that is a merge rather
+        than a widening.** There used to be a second gate and a second wake-up:
+        ``POST /plan/approve`` posted an acceptance marker as the user, and this
+        method was deliberately narrowed to the execution gate so an approval
+        would not fire both. Both of those are gone. Acceptance is the user
+        applying the **go-note**, which is an ordinary open plan note, so it
+        moves this one gate and nothing else — the double-dispatch the old
+        narrowing existed to prevent cannot be constructed any more.
+
+        The two doors that apply it land differently and both are covered:
+        the tray's Accept goes through ``submit_review``, which posts a real
+        message to the coordinator with the projection in the **same batch's
+        prelude**, so the notifier's version comparison sees the woken turn
+        already reading post-acceptance state and this arm stays quiet;
+        ``plan resolve --apply`` posts nothing at all, and this arm is the only
+        thing that starts the work. The old marker's best-effort failure mode —
+        a project whose ``user-communication`` room is missing never getting its
+        wake-up — went with the marker.
+
+        **On the TRANSITION, never on the level.** An entry exists only because
+        a lifecycle field moved (``publish_plan_state`` is idempotent), but
+        plenty of those moves are a note being FILED, which must wake nobody.
+        Resuming on ``blocked == 0`` alone would re-run the coordinator on every
+        unrelated plan edit for the rest of the project's life.
+
+        A project with no memo at all is one whose ``meta.json`` did not exist
+        when :meth:`on_plan_gate_prime` ran — a project created after this
+        process started, which has no stalled turn to rescue.
+        """
+        from .project import Project
+        project = Project.get(project_id, self._model_ctx)
+        if not project or not self.is_coordinator_for(project):
+            return
+
+        # ModelContext (priority 0) applied the batch before the notifier's
+        # `on_sync_complete` ran, so this reads the POST-batch gate; the memo —
+        # primed at load, then carried forward here — supplies the other half.
+        blocked = bool(_plan_execution_blocked(project))
+        was_blocked = self._plan_gate_blocked.get(project_id)
+        self._plan_gate_blocked[project_id] = blocked
+        if was_blocked is not True or blocked:
+            return
+
+        logger.info(
+            f"Agent {self.name} (as coordinator): plan gate released in "
+            f"project {project_id[:8]}, resuming"
+        )
+        await self._process_batch_results(
+            project_id,
+            "user-communication",
+            "",
+            [],
+            timed_out=[],
+            trigger_version=trigger_version,
+            gate_released=True,
+        )
+
     async def on_batch_timeout(
         self,
         project_id: str,
@@ -1526,6 +2044,7 @@ class Agent(PersistableParticipant):
         responded_participants: list[str],
         timed_out: list[str],
         trigger_version: int,
+        gate_released: bool = False,
     ) -> None:
         """Process batch results as coordinator.
 
@@ -1533,6 +2052,12 @@ class Agent(PersistableParticipant):
         - Delegate more work
         - Summarize results
         - Complete project
+
+        ``gate_released`` re-uses this whole path for a turn that is NOT a
+        batch: :meth:`on_plan_state_change`. Everything a coordinator turn
+        needs is identical — same prompt builder, same snapshot, same executor —
+        and only the synthetic incoming message differs, so the alternative was
+        sixty duplicated lines that would drift.
         """
         action_executor = self._model_ctx.action_executor
         if not self._model_ctx.cli or not action_executor:
@@ -1556,17 +2081,40 @@ class Agent(PersistableParticipant):
         # synthetic: "batch complete in <room>; responded X, timed out Y".
         # Recent conversation rides through the prompt's RECENT CHAT block;
         # deliverable files ride through the SYNCED PROJECT FILE MANIFEST.
+        #
+        # AC-5.7 — as NAMES, not ids. Both lists, because "who timed out" is
+        # the half a coordinator acts on and it was equally unreadable.
         status_parts = [f"Batch complete in '{chatroom_name}'"]
         if responded_participants:
-            status_parts.append(f"Responded: {', '.join(responded_participants)}")
+            responded_names = _participant_names(
+                responded_participants, self._model_ctx
+            )
+            status_parts.append(f"Responded: {', '.join(responded_names)}")
         if timed_out:
-            status_parts.append(f"Timed out: {', '.join(timed_out)}")
+            timed_out_names = _participant_names(timed_out, self._model_ctx)
+            status_parts.append(f"Timed out: {', '.join(timed_out_names)}")
         batch_status = ". ".join(status_parts)
-        batch_content = (
-            batch_status
-            + ".\n\nIMPORTANT: Update PLAN.md with your assessment "
-            "(PASS/FAIL per acceptance criterion) BEFORE deciding next steps."
+
+        # M5 AC-5.6 — ONE boolean picks BOTH the trailing instruction and the
+        # role-contract block, so the synthetic message and the contract can
+        # never tell this turn two different stories about what it is.
+        spec_consult = not gate_released and _is_spec_consultation_batch(
+            project, chatroom_name
         )
+
+        # B5 — one constant, rendered identically here and by
+        # ``scripts/dump_sample_prompts.py`` (AC-7.12). Three of them now: the
+        # milestone one, its spec-stage sibling, and the gate-release turn that
+        # is not a batch at all.
+        if gate_released:
+            batch_content = PLAN_GATE_RELEASED_INSTRUCTION
+        else:
+            instruction = (
+                BATCH_COMPLETION_PLAN_REVIEW_INSTRUCTION
+                if spec_consult
+                else BATCH_COMPLETION_PLAN_INSTRUCTION
+            )
+            batch_content = f"{batch_status}.\n\n{instruction}"
 
         chat_history = (
             chatroom.recent_history_for_prompt()
@@ -1585,7 +2133,8 @@ class Agent(PersistableParticipant):
         # flow_context="batch" injects the BATCH COMPLETION WORKFLOW and
         # HANDLING WORKER QUESTIONS AND BLOCKERS blocks into the role
         # contract; otherwise they sit dormant on every user-comm turn
-        # for no benefit.
+        # for no benefit. "spec-consult" (AC-5.6) swaps in the spec-stage
+        # variant, off the same boolean as the instruction above.
         action_schema, dm_is_owned = self._coordinator_dm_action_schema(project)
         prompt = coordinator_builder.build_prompt(
             name=self.name,
@@ -1603,10 +2152,18 @@ class Agent(PersistableParticipant):
             dm_is_owned=dm_is_owned,
             invitable_agents=self._resolve_invitable_agents_for_prompt(project),
             chat_history=chat_history,
-            flow_context="batch",
+            flow_context="spec-consult" if spec_consult else "batch",
+            plan=plan_prompt_state(project, self._model_ctx),
         )
 
-        await self._emit_acknowledgment(project_id, chatroom_name, trigger_version)
+        if not gate_released:
+            # No ack on the gate-release turn: the ack answers a message, and
+            # nobody sent one. Posting "Message received, processing..." into
+            # `user-communication` unprompted reads as the coordinator talking
+            # to itself.
+            await self._emit_acknowledgment(
+                project_id, chatroom_name, trigger_version
+            )
 
         action_block, usage, validation_notes = await self._invoke_validated(
             project_id=project_id,
@@ -1723,6 +2280,10 @@ class Agent(PersistableParticipant):
                 knowledge_dirs=self._model_ctx.knowledge_dirs,
                 dwh_dir=self._model_ctx.dwh_dir,
                 invitable_agents=self._resolve_invitable_agents_for_prompt(project),
+                # §7.3's one branch: `spec-ing` gets the spec contract, anything
+                # else (a pre-feature project, an already-accepted plan) keeps
+                # today's setup contract.
+                plan_phase=project.phase,
             )
 
         action_block, usage, validation_notes = await self._invoke_validated(
@@ -1844,6 +2405,7 @@ class Agent(PersistableParticipant):
             dm_is_owned=dm_is_owned,
             invitable_agents=self._resolve_invitable_agents_for_prompt(project),
             chat_history=chat_history,
+            plan=plan_prompt_state(project, self._model_ctx),
         )
 
         action_block, usage, validation_notes = await self._invoke_validated(

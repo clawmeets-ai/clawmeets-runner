@@ -115,8 +115,34 @@ class WorkTracker:
         return self._pending.get((project_id, chatroom_name))
 
     async def record_response(
-        self, project_id: str, chatroom_name: str, participant_id: str
+        self,
+        project_id: str,
+        chatroom_name: str,
+        participant_id: str,
+        *,
+        admit_if_absent: bool = False,
     ) -> Optional[PendingWork]:
+        """Credit ``participant_id``'s reply against the room's open batch.
+
+        Returns ``None`` when there is no open batch, or when the replier is
+        not one of its ``expected_participants`` — "this reply belongs to no
+        batch of mine" is a meaningful answer and most callers want it.
+
+        ``admit_if_absent`` widens the batch to include a replier it was not
+        waiting for, instead of dropping the reply. That case is real rather
+        than defensive: a batch narrowed to its live members at dispatch can
+        still be open when a narrowed-out agent reconnects (the reconnect
+        backoff floor is 2.0s, ``cli_runner.py:2659``), replays the message
+        from catch-up and answers. Admitting it adds the id to BOTH
+        ``expected_participants`` and — via the append below —
+        ``responded_participants``, so ``is_complete`` is unchanged for the
+        members still outstanding and the late reply reaches the coordinator in
+        ``BATCH_COMPLETE`` instead of vanishing.
+
+        The admit and the credit happen under ONE lock acquisition on purpose:
+        split across two calls, a batch that completed in between would drop
+        the reply anyway.
+        """
         key = (project_id, chatroom_name)
         changed = False
         async with self._lock:
@@ -124,7 +150,13 @@ class WorkTracker:
             if work is None:
                 return None
             if participant_id not in work.expected_participants:
-                return None
+                if not admit_if_absent:
+                    return None
+                work = work.model_copy(update={
+                    "expected_participants":
+                        work.expected_participants + [participant_id],
+                })
+                self._pending[key] = work
             if participant_id not in work.responded_participants:
                 # Use immutable update pattern
                 new_responded = work.responded_participants + [participant_id]
@@ -161,9 +193,16 @@ class WorkTracker:
         When no batch is open for ``(project_id, chatroom_name)`` this synthesizes
         one expecting only ``participant_id`` (coordinator = ``coordinator_id``,
         the room's coordinator), then records the response — so the batch is
-        immediately complete and the caller fires BATCH_COMPLETE as usual. When a
-        batch IS already open, this is exactly ``record_response`` (the reply
-        credits the existing batch).
+        immediately complete and the caller fires BATCH_COMPLETE as usual.
+
+        When a batch IS already open but is not waiting for ``participant_id``,
+        the reply is admitted into it rather than dropped. Both shapes have the
+        same cause — a reply arriving from an agent the room's batch machinery
+        is not expecting — and the room key ``(project_id, chatroom_name)``
+        means the second shape cannot be handled by synthesizing a batch:
+        ``create_pending_work`` would collide. It is reachable whenever a batch
+        was narrowed to its live members at dispatch and a narrowed-out agent
+        reconnects and answers while that batch is still open.
 
         Callers MUST guard ``participant_id != coordinator_id`` before calling —
         synthesizing a batch whose coordinator is the replier would wake the
@@ -185,7 +224,9 @@ class WorkTracker:
                 # A concurrent reply opened a batch between the check and the
                 # create — fall through and record against whatever is now open.
                 pass
-        return await self.record_response(project_id, chatroom_name, participant_id)
+        return await self.record_response(
+            project_id, chatroom_name, participant_id, admit_if_absent=True
+        )
 
     async def remap_expected(
         self, project_id: str, chatroom_name: str, mapping: dict[str, str]
