@@ -421,6 +421,12 @@ What that skill needs from this one:
 - Keep `--post-initial-message` on (the default). It is what wakes you as
   coordinator so **Phase 0** starts on the same turn instead of sitting
   idle until the user types something.
+- Pass `--spawned-from "<the id in your identity block>"`. This ask arrived
+  in a thread, and if your user opened that thread from a to-do on My Desk,
+  the flag is what makes the to-do follow the project instead of dropping
+  back to **New** once the thread goes quiet. If there is no such to-do it
+  does nothing and says nothing, so there is no case where passing it costs
+  you anything. `create-project` has the detail.
 
 ### 6e. Confirm in the DM
 

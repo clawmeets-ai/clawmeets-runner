@@ -337,8 +337,9 @@ class BriefTabSyncPayload(BaseModel):
     invalidates its ``['brief-tabs']`` query so My Desk re-renders with the
     fresh tab.
 
-    Carries only the per-tab cursor; the full payload (data + render code)
-    is fetched separately via ``GET /me/brief/tabs``.
+    Carries only the per-tab cursor, never the document. The metadata
+    strip is refetched via ``GET /me/brief/tabs`` and the briefing's HTML
+    document via ``GET /me/brief/tabs/{slug}``.
     """
     action: str            # "upsert" | "delete"
     slug: str
@@ -397,15 +398,27 @@ class DeskTodoSyncPayload(BaseModel):
     """Payload for DESK_TODO_SYNC messages.
 
     Sent server -> the plate-owning user whenever their desk to-do list
-    changes — a self-capture, a status/draft patch, a reorder, a delete,
-    or an agent team member publishing a to-do via ``PUT /me/desk/todos``.
-    The frontend invalidates its ``['desk-todos']`` query so the My Desk
-    To-do rail re-renders.
+    changes — a self-capture, an archive/draft patch, a reorder, a delete,
+    an agent team member publishing a to-do via ``PUT /me/desk/todos``, a
+    project association being added or removed, or a PROJECT EVENT that moved
+    a row's derived ticket state. The frontend invalidates its
+    ``['desk-todos']`` query so the My Desk To-do rail re-renders.
 
     Carries only the action + affected id; the full list is fetched via
-    ``GET /me/desk/todos``.
+    ``GET /me/desk/todos``. **The three association-era members add no new
+    payload shape on purpose** — the desk ignores the payload and refetches, so
+    a richer envelope would be a second source of truth for the plate with no
+    reader.
+
+    ``id`` semantics differ by action, and the difference is load-bearing:
+
+    * ``associate`` / ``dissociate`` carry the **to-do id** — one row moved.
+    * ``project`` carries **``None``**. One project event (completing,
+      reactivating, deleting) can move several rows at once, and the refetch is
+      whole-plate anyway; naming one row would be a lie about scope.
     """
     action: str            # "add" | "patch" | "reorder" | "delete" | "publish"
+                           #       | "associate" | "dissociate" | "project"
     id: str | None = None
 
 

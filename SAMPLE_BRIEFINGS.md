@@ -4,7 +4,7 @@ Your **My Desk** is your personal dashboard. You fill it **one briefing at a tim
 by telling your assistant, in plain English, what you want to see and how often.
 Your assistant figures out which of your agents can produce each briefing, installs
 anything missing, schedules the refresh, and keeps each briefing current — you never
-name a sync, a file path, a slug, or any render code.
+name a sync, a file path, a slug, or any HTML.
 
 Send each of these as a message in your assistant DM. Add detail or your own preferences
 in plain prose; the assistant will propose the setup and ask before it runs anything.

@@ -79,6 +79,28 @@ MIN_QUOTE_CHARS = 3
 #: the convention parses exactly as it did before and simply has no criteria.
 CRITERION_RE = re.compile(r"\bAC-(\d+)\.(\d+)\b")
 
+#: The two layers a section can be in. **Spec is the default and the absence of
+#: a marker means spec**, which is the single property that makes this change
+#: invisible to every plan already on disk: an unmarked document is locked
+#: exactly as strictly as it was before layers existed.
+SPEC = "spec"
+DETAIL = "detail"
+
+#: ``## Milestones <!-- layer: detail -->`` — a section declares its own layer
+#: on its heading line, and descendants inherit it (:func:`section_layers`).
+#:
+#: **A per-heading marker rather than a ``## Spec`` / ``## Execution`` document
+#: split**, because nesting would let the keeper move the boundary by
+#: restructuring headings, while a marker cannot be moved without moving
+#: :func:`_layer_manifest` and therefore the digest.
+LAYER_RE = re.compile(r"<!--\s*layer:\s*(spec|detail)\s*-->", re.I)
+
+#: ``### M2: Session layer <!-- advances: AC-2.1, AC-2.3 -->`` — which criteria
+#: a section of the detail layer claims to advance. Read by
+#: :func:`parse_coverage`; the ids inside are found with ``CRITERION_RE``, so
+#: "what is a criterion label" keeps exactly one answer.
+ADVANCES_RE = re.compile(r"<!--\s*advances:\s*([^>]*?)\s*-->", re.I)
+
 #: Block-level markers only, stripped off a source line to get the text a
 #: rendered block will actually contain: nested blockquote ``>``, list bullet,
 #: ordered marker, task box. ATX headings are handled by ``HEADING_RE``, which
@@ -107,6 +129,11 @@ class PlanSection(BaseModel):
     id: str
     heading: str
     depth: int
+    #: ``SPEC`` or ``DETAIL``, **resolved** — the section's own
+    #: ``<!-- layer: … -->`` marker if it has one, else the nearest marked
+    #: ancestor's, else ``SPEC``. Additive with a default on a response-only
+    #: model, so no client breaks and no stored document is read differently.
+    layer: str = SPEC
     boxes: tuple[int, int]
     char_start: int
     char_end: int
@@ -118,12 +145,29 @@ class Shorthand(BaseModel):
     ``checked`` is the task-list marker state of the line the shorthand sits on,
     or ``None`` when it is not on a task-list line. Display only, like
     ``PlanSection.boxes``.
+
+    ``quote`` is the line the shorthand was WRITTEN ON, with the comment holding
+    it removed and :func:`quote_from_line` applied — the anchor the note filed
+    from this shorthand carries, so it renders beside the task it is about
+    instead of at the end of the whole milestone.
+
+    **It is not display-only, and it is the one member here that is not.** The
+    other two describe the line; this one is an ADDRESS, and it is the same
+    ``(section, quote)`` pair :class:`PlanCriterion` carries, computed by the
+    same function. That symmetry is the argument for the field: a shorthand and
+    a criterion are both a line of the document a note wants to point at, and
+    there is no reason one of them should know how and the other should not.
+
+    ``""`` when the shorthand was ALONE on its line — extraction deletes that
+    line outright, so there is nothing left to point at and the note settles at
+    the end of its section, which is the honest rung.
     """
 
     section: str
     owner: str
     text: str
     checked: bool | None = None
+    quote: str = ""
 
 
 class PlanCriterion(BaseModel):
@@ -210,6 +254,23 @@ def _fence_spans(text: str) -> list[tuple[int, int]]:
 
 def _outside_fences(pos: int, spans: list[tuple[int, int]]) -> bool:
     return not any(start <= pos < end for start, end in spans)
+
+
+def heading_text(raw: str) -> str:
+    """A heading's text with its HTML comments folded out, whitespace collapsed.
+
+    **The one thing that lets a marker live on a heading line at all.** Slugs
+    come from heading text, so ``## Milestones <!-- layer: detail -->`` would
+    otherwise slug to ``milestones-layer-detail``: every note anchored to the
+    section goes dangling, and marking a section would silently rename it.
+
+    Folding here rather than special-casing ``LAYER_RE`` keeps the rule the one
+    this module already states everywhere else — **a comment is inert** — and it
+    closes a hole that predates layers: shorthand lives inside comments, so a
+    ``{@bob: …}`` written on a heading line changed that section's slug until
+    :func:`extract_shorthand` removed it, and then changed it back.
+    """
+    return re.sub(r"[ \t]+", " ", COMMENT_RE.sub("", raw)).strip()
 
 
 def slugify_heading(text: str, taken: set[str]) -> str:
@@ -312,25 +373,50 @@ def parse_sections(body: str) -> list[PlanSection]:
         )
         taken.add(LEDE_ID)
 
+    # Resolved layer, carried down the heading stack. A section's own marker
+    # wins; otherwise it inherits from the nearest marked ancestor; otherwise
+    # SPEC. **Inheritance is what makes a nested milestone free**: a rule that
+    # only knew depth 2 would mis-file every ``### M2`` edit, because
+    # :func:`split_by_section` reports the most specific section that changed.
+    stack: list[tuple[int, str]] = []
+
     for i, (start, _end, depth, heading) in enumerate(heads):
         stop = len(body)
         for nxt_start, _e, nxt_depth, _h in heads[i + 1 :]:
             if nxt_depth <= depth:
                 stop = nxt_start
                 break
-        slug = slugify_heading(heading, taken)
+        while stack and stack[-1][0] >= depth:
+            stack.pop()
+        own = LAYER_RE.search(heading)
+        layer = own.group(1).lower() if own else (stack[-1][1] if stack else SPEC)
+        stack.append((depth, layer))
+        slug = slugify_heading(heading_text(heading), taken)
         taken.add(slug)
         sections.append(
             PlanSection(
                 id=slug,
-                heading=heading,
+                heading=heading_text(heading),
                 depth=depth,
+                layer=layer,
                 boxes=count_boxes(body[start:stop]),
                 char_start=start,
                 char_end=stop,
             )
         )
     return sections
+
+
+def section_layers(body: str) -> dict[str, str]:
+    """``{slug: "spec" | "detail"}`` for every section, at every depth.
+
+    A thin read over :func:`parse_sections` — the resolution itself happens
+    there, because a section's layer is derived from the same heading walk as
+    its depth and its extent, and deriving it twice is two answers waiting to
+    disagree. Fence-aware for free, which matters: a plan documenting this very
+    convention must not classify itself out of the lock.
+    """
+    return {s.id: s.layer for s in parse_sections(body)}
 
 
 def section_extent(body: str, slug: str) -> tuple[int, int] | None:
@@ -468,8 +554,25 @@ def retitle_section(body: str, slug: str, title: str) -> str:
     match = HEADING_RE.match(head)
     if match is None:
         return body
-    indent, hashes, _text = match.groups()
-    return body[:start] + f"{indent}{hashes} {title.strip()}" + sep + rest + body[end:]
+    indent, hashes, text = match.groups()
+    # **The markers on the heading line survive a retitle**, because they are
+    # grammar and not title: ``<!-- layer: detail -->`` and
+    # ``<!-- advances: … -->`` say what the section IS, while ``title`` says
+    # what it is called. Dropping them would silently unlock a detail section —
+    # or, on a milestone, drop its coverage claim — through an operation whose
+    # whole contract is *"keeping its depth and its body"*.
+    #
+    # A ``title`` that carries its own comment is taken at its word and nothing
+    # is re-appended — otherwise a caller that reads the heading, edits it and
+    # sends it back doubles every marker on it.
+    incoming = title.strip()
+    kept = (
+        ""
+        if COMMENT_RE.search(incoming)
+        else "".join(m.group(0) for m in COMMENT_RE.finditer(text or ""))
+    )
+    head = f"{indent}{hashes} {incoming}"
+    return body[:start] + (f"{head} {kept}" if kept else head) + sep + rest + body[end:]
 
 
 def delete_section(body: str, slug: str) -> str:
@@ -601,13 +704,72 @@ def _line_bounds(text: str, pos: int) -> tuple[int, int]:
     return start, len(text) if end == -1 else end
 
 
+def strip_block_markers(line: str) -> str:
+    """A source line with the markers remark CONSUMES taken off the front.
+
+    Blockquote ``>``, ATX ``#``s, list bullet, ordered ``1.``, task box
+    ``[ ]``/``[x]``. Those never survive into the rendered DOM, so text carrying
+    one cannot be compared against what a reader sees.
+
+    Named rather than left inline in :func:`quote_from_line` because
+    :func:`section_holding_quote` asks the same question of a whole section and
+    a second copy of this list is a second answer to *"what is a marker"*. It
+    does NOT collapse whitespace or apply :func:`quote_from_line`'s length
+    bounds — those are that function's own policy, not part of the grammar.
+    """
+    text = _BLOCKQUOTE_RE.sub("", line)
+    heading = HEADING_RE.match(text)
+    if heading is not None:
+        return heading.group(3) or ""
+    return _TASKBOX_RE.sub("", _BULLET_RE.sub("", text))
+
+
+def _match_view(text: str) -> str:
+    """``text`` reduced to what a quote can be compared against.
+
+    Every line stripped of its block markers, whitespace collapsed across the
+    whole run — the server-side twin of ``planAnchor``'s ``normalizeText``, so a
+    quote that anchors in the browser is a quote this can find.
+    """
+    stripped = " ".join(strip_block_markers(ln) for ln in text.splitlines())
+    return " ".join(stripped.split())
+
+
+def section_holding_quote(body: str, quote: str) -> str:
+    """The slug of the one section whose OWN text contains ``quote``, or ``""``.
+
+    **Own text, not the extent**, and that is what makes the answer unique
+    rather than merely first. :func:`parse_sections` nests: a line inside a
+    child section is also inside its parent's extent, so a containment test over
+    extents matches every ancestor and has to break the tie by depth. Own texts
+    partition the document instead — every character of the body belongs to
+    exactly one of them — so "which section is this line in" has one answer and
+    no tie to break.
+
+    ``""`` on **no match and on more than one**, and the second is not
+    over-caution. A short excerpt genuinely can occur in two sections, and a
+    caller filing a note against a guess would anchor an argument to the wrong
+    passage; the honest degrade is the un-sectioned note the caller already
+    wrote, which the editor still shows — just at the bottom of the page rather
+    than in the body.
+    """
+    needle = _match_view(quote)
+    if not needle:
+        return ""
+    hits = [
+        slug for slug, (own, _full) in _section_texts(body).items()
+        if needle in _match_view(own)
+    ]
+    return hits[0] if len(hits) == 1 else ""
+
+
 def quote_from_line(line: str) -> str:
     """A source line reduced to what a rendered block will actually contain.
 
-    Strips **block-level markers only** — blockquote ``>``, ATX ``#``s, list
-    bullet, ordered ``1.``, task box ``[ ]``/``[x]``. Those are the markers
-    remark consumes, so a quote carrying one can never match the flattened DOM
-    text ``locate`` searches, and the note it anchors is loose forever.
+    Strips **block-level markers only**, via :func:`strip_block_markers` — those
+    are the markers remark consumes, so a quote carrying one can never match the
+    flattened DOM text ``locate`` searches, and the note it anchors is loose
+    forever.
 
     Deliberately leaves **inline** emphasis alone. ``locate``'s ``stripMarkers``
     fallback and :func:`_comparison_view` already normalise ``*``/``_``/`` ` ``
@@ -624,13 +786,7 @@ def quote_from_line(line: str) -> str:
     unanchored note that is today's default, which is the correct failure
     direction — a missing anchor costs a pane entry, a wrong one costs trust.
     """
-    text = _BLOCKQUOTE_RE.sub("", line)
-    heading = HEADING_RE.match(text)
-    if heading is not None:
-        text = heading.group(3) or ""
-    else:
-        text = _TASKBOX_RE.sub("", _BULLET_RE.sub("", text))
-    text = " ".join(text.split())
+    text = " ".join(strip_block_markers(line).split())
     if len(text) < MIN_QUOTE_CHARS or len(text) > PLAN_QUOTE_CHARS:
         return ""
     return text
@@ -668,6 +824,40 @@ def heading_depth(section_text: str) -> int:
     head = heading_line(section_text)
     m = HEADING_RE.match(head) if head else None
     return len(m.group(2)) if m else 0
+
+
+def heading_slug(section_text: str) -> str:
+    """The id the section ``section_text`` opens with WOULD be given, or ``""``.
+
+    Beside :func:`heading_line` and :func:`heading_depth`, and for the third
+    time the same reason: heading shape is grammar. This is the composition
+    those two leave un-said, and it is :func:`parse_sections`' own — the ``#``
+    run off via :func:`strip_block_markers`, then :func:`heading_text` to fold
+    out the inert comment, then :func:`slugify_heading`.
+
+    **All three steps, in that order, because two of them are individually
+    survivable and that is the trap.** Skipping ``heading_text`` slugs
+    ``## Milestones <!-- layer: detail -->`` to ``milestones-layer-detail``,
+    which is the bug that once made marking a section silently rename it.
+    Skipping ``strip_block_markers`` looks harmless — ``#`` folds to ``-`` and
+    :func:`slugify_heading` strips a leading one, so the answer comes out RIGHT
+    by accident on every heading anyone has written. An answer that is only
+    accidentally the same as ``parse_sections``' is exactly the second heading
+    parser this module exists to prevent, so the accident is not relied on.
+
+    ``taken`` is EMPTY, deliberately, so the answer is the slug this heading
+    takes **on its own** and never an ``x-2`` de-duplication against a document
+    it is not in yet. The one caller that needs it — the create test in
+    :func:`add_note` — is asking whether a proposal means to write the section
+    it names, and a proposal is one heading rather than a document.
+
+    ``""`` for text that does not open on a heading, which is the honest answer
+    to *"which section does this create"* from a replacement that creates none.
+    """
+    head = heading_line(section_text)
+    if not head:
+        return ""
+    return slugify_heading(heading_text(strip_block_markers(head)), set())
 
 
 def drops_heading(current: str, replacement: str) -> bool:
@@ -759,6 +949,110 @@ def relevels_heading(current: str, replacement: str) -> bool:
     return bool(incoming) and incoming != depth
 
 
+def _heading_tally(body: str) -> dict[str, int]:
+    """How many headings the document gives each **pre-dedup** slug.
+
+    Keyed on the slug rather than the heading text, because the slug is the
+    thing that collides: ``## Approval`` and ``## approval!`` are two headings
+    and one id, and it is the id every caller addresses a section by.
+    :func:`slugify_heading` is handed an EMPTY ``taken`` on purpose — the
+    de-duplicated ids are what this function exists to detect, so counting them
+    would count each one once and find nothing.
+
+    The ``_lede`` is skipped (``depth == 0``): it has no heading to collide.
+
+    A plain ``dict`` rather than a ``Counter``: this module's import list is
+    pinned to five names by
+    ``test_the_grammar_module_imports_nothing_from_clawmeets_and_does_no_io``,
+    and a tally is not worth the sixth.
+    """
+    tally: dict[str, int] = {}
+    for sec in parse_sections(body):
+        if not sec.depth:
+            continue
+        slug = slugify_heading(sec.heading, set())
+        tally[slug] = tally.get(slug, 0) + 1
+    return tally
+
+
+def duplicated_heading(before: str, after: str) -> str:
+    """The first heading ``after`` duplicates and ``before`` did not, or ``""``.
+
+    **The ``duplicate id`` state, asked as a question a write can be refused
+    for.** Two headings under one slug is a state this module tolerates —
+    :func:`slugify_heading` de-duplicates as ``x`` / ``x-2`` so nothing is ever
+    lost, and ``plan show --sections`` renders a *"duplicate heading"* warning
+    beside it — but it is damage, not a feature, and ``add_note`` already
+    refuses to create it from the note door
+    (``test_the_typo_that_used_to_append_a_second_heading_under_one_slug``:
+    *"the only one of these with real damage"*). The write door never asked.
+
+    The incident that closed it: a coordinator regenerated ``## Milestones``
+    into a file, copied one section too far, and the file ended with the
+    document's own ``## Approval`` block. The splice gave the plan two of them.
+    Ids are assigned in **source order**, so the injected copy took ``approval``
+    and the user's real, accepted section was demoted to ``approval-2`` — and
+    then reported to them, by a spec lock doing its job, as a brand-new section
+    to approve. Worse on an unaccepted plan, where the write simply lands:
+    :func:`section_extent` resolves a slug to the FIRST match, so every reader
+    of ``approval`` — including the coordinator's own go signal — would read the
+    injected copy.
+
+    **Only a duplicate the write INTRODUCES.** A plan that already holds two
+    ``### Notes`` keeps working, and every write to it stays possible; refusing
+    on the state rather than on the transition would make a document that
+    already exists unwritable and offer no way back. Counted per slug, so
+    adding a THIRD copy is caught as surely as the second.
+
+    Returns the offending heading rebuilt at its own depth (``"## Approval"``),
+    because the refusal owes the writer the line — an agent told only *"a
+    duplicate heading"* has to bisect a section it just generated to find which
+    one. Falsy when there is nothing to report, which is what makes it readable
+    as the predicate as well as the message.
+    """
+    def _lines(rows: list[PlanSection]) -> dict[tuple[int, str], int]:
+        """How many times each heading LINE — depth and text together — occurs."""
+        out: dict[tuple[int, str], int] = {}
+        for s in rows:
+            out[(s.depth, s.heading)] = out.get((s.depth, s.heading), 0) + 1
+        return out
+
+    was, now = _heading_tally(before), _heading_tally(after)
+    sections = [s for s in parse_sections(after) if s.depth]
+    seen = _lines([s for s in parse_sections(before) if s.depth])
+    lines = _lines(sections)
+
+    for sec in sections:
+        base = slugify_heading(sec.heading, set())
+        # `was.get`, NOT `was[...]`: a write may introduce BOTH copies at once
+        # — two new sections under one slug, the purest form of the copy-paste
+        # this exists to catch — and that slug is absent from the before-tally.
+        if not (now[base] > 1 and now[base] > was.get(base, 0)):
+            continue
+        # **NAME THE OCCURRENCE THE WRITE ADDED, not the first one under the
+        # slug.** They collide on the id but need not share a line: `## A` and
+        # `## a!` are one slug and two headings, and quoting the one that was
+        # already there sends the writer looking for text they did not send.
+        # Identified by the heading LINE — depth and text together, since
+        # `## A` and `### A` are also one slug and two lines — rather than by
+        # position, because position is exactly what a copied-in section makes
+        # unreliable: the injected copy in the incident landed mid-document,
+        # ahead of the original. When every occurrence is byte-identical there
+        # is nothing to choose between them and the first is named.
+        colliding = [
+            s for s in sections if slugify_heading(s.heading, set()) == base
+        ]
+        added = next(
+            (
+                s for s in colliding
+                if lines[(s.depth, s.heading)] > seen.get((s.depth, s.heading), 0)
+            ),
+            colliding[0],
+        )
+        return f"{'#' * added.depth} {added.heading}"
+    return ""
+
+
 def parse_criteria(body: str) -> list[PlanCriterion]:
     """Every ``AC-<m>.<n>`` in the document, in source order, fence-aware.
 
@@ -816,6 +1110,41 @@ def quote_names_criterion(text: str, ac_id: str) -> bool:
     return any(m.group(0).upper() == wanted for m in CRITERION_RE.finditer(text))
 
 
+def named_criterion(text: str) -> str:
+    """The first ``AC-<m>.<n>`` ``text`` names, or ``""``.
+
+    The other direction of :func:`quote_names_criterion` — that one is handed an
+    id and asks whether a string names it, this one is handed a string and asks
+    which id it names — and both live here for the same reason: where a
+    criterion label starts and ends is grammar, and ``CRITERION_RE`` is the one
+    expression that says so.
+
+    **First, not every.** A note's prose routinely names a second criterion in
+    passing, and its subject is what it opens with; a caller wanting a set can
+    have ``CRITERION_RE`` itself.
+
+    **Case is not folded, and that is the same answer**
+    :func:`quote_names_criterion` **gives about its haystack.** ``CRITERION_RE``
+    is upper-case only, so a lower-case ``ac-2.3`` is not a criterion label
+    anywhere in this module — :func:`parse_criteria` does not report one either,
+    and a note anchored to a label the document cannot contain would find
+    nothing to anchor to. The leniency ``--ac ac-2.3`` enjoys is a NEEDLE being
+    normalised, which is a different act.
+
+    Fence-aware, and that is where it parts company with
+    :func:`quote_names_criterion`. That one reads a QUOTE — an excerpt, which
+    has no fences of its own — while this reads a note's whole comment, which is
+    Markdown a writer may well have put a code sample in. A criterion id inside
+    one is prose about a criterion, exactly as it is everywhere else in this
+    module.
+    """
+    fences = _fence_spans(text)
+    for m in CRITERION_RE.finditer(text):
+        if _outside_fences(m.start(), fences):
+            return m.group(0)
+    return ""
+
+
 def extract_shorthand(body: str) -> tuple[list[Shorthand], str]:
     """Pull every ``{@agent: instruction}`` out of the document's HTML comments.
 
@@ -858,6 +1187,16 @@ def extract_shorthand(body: str) -> tuple[list[Shorthand], str]:
         box = BOX_RE.match(line)
         checked = box.group(1) in ("x", "X") if box else None
         section = _enclosing_section(sections, comment.start())
+        # THE LINE MINUS THE COMMENT, which is exactly what survives this
+        # function — the removal below deletes the comment and nothing else, so
+        # `- [ ] Wire the ingest endpoint <!-- {@backend: …} -->` is still
+        # `- [ ] Wire the ingest endpoint` in the document the note is read
+        # against. Sliced rather than run through `strip_comments` because a
+        # MULTI-LINE comment's opener is all this line holds of it: the stripper
+        # would leave the dangling `<!--` in the quote, and an anchor carrying
+        # one provably cannot be found.
+        after = body[comment.end():line_end] if comment.end() <= line_end else ""
+        quote = quote_from_line(body[line_start:comment.start()] + after)
         for m in matches:
             found.append(
                 Shorthand(
@@ -865,6 +1204,7 @@ def extract_shorthand(body: str) -> tuple[list[Shorthand], str]:
                     owner=m.group(1),
                     text=m.group(2).strip(),
                     checked=checked,
+                    quote=quote,
                 )
             )
 
@@ -971,16 +1311,153 @@ def normalize_spec_text(text: str) -> str:
     return "\n".join(ln for ln in lines if ln)
 
 
+def parse_coverage(body: str) -> dict[str, tuple[str, ...]]:
+    """``{slug: (ac_id, …)}`` — which criteria each section CLAIMS to advance.
+
+    Reads ``<!-- advances: AC-2.1, AC-2.3 -->`` off any section, at any depth,
+    fence-aware. The ids inside are found with ``CRITERION_RE``, so *"what is a
+    criterion label"* keeps the one answer it has had since criteria were first
+    parsed — a second, hand-rolled idea of where a label ends is exactly the
+    ``AC-2.1`` / ``AC-2.10`` boundary bug :func:`quote_names_criterion` exists
+    to name.
+
+    **Occurrences, not validation**, matching :func:`parse_criteria`: a claim on
+    an id that does not exist is a row, not an error. Sections with no marker do
+    not appear. Only sections with at least one claim are keys.
+    """
+    fences = _fence_spans(body)
+    sections = parse_sections(body)
+    out: dict[str, list[str]] = {}
+    for m in ADVANCES_RE.finditer(body):
+        if not _outside_fences(m.start(), fences):
+            continue
+        slug = _enclosing_section(sections, m.start())
+        seen = out.setdefault(slug, [])
+        for ac in CRITERION_RE.finditer(m.group(1)):
+            if ac.group(0) not in seen:
+                seen.append(ac.group(0))
+    return {slug: tuple(ids) for slug, ids in out.items() if ids}
+
+
+def unclaimed_criteria(body: str) -> frozenset[str]:
+    """Criteria DEFINED in the spec layer that no section claims to advance.
+
+    The input to the coverage check that keeps the detail layer honest: if
+    milestones are freely editable, a keeper can quietly drop the work behind a
+    criterion and the user only finds out at the end.
+
+    **Definition is the first occurrence in document order**
+    (:func:`parse_criteria`'s rule), and only a definition inside a ``SPEC``
+    section counts — a criterion the keeper is free to rewrite is not one the
+    keeper can be held to.
+
+    Note what this returns on a plan that carries no ``advances:`` markers at
+    all: *every* criterion, both before and after any write. That is the whole
+    migration story — :func:`~clawmeets.models.project_plan._coverage_regressed`
+    compares two of these sets, so an unmarked plan can never regress.
+    """
+    layers = section_layers(body)
+    defined: list[str] = []
+    for c in parse_criteria(body):
+        if c.id not in defined and layers.get(c.section, SPEC) == SPEC:
+            defined.append(c.id)
+    claimed = {ac for ids in parse_coverage(body).values() for ac in ids}
+    return frozenset(ac for ac in defined if ac not in claimed)
+
+
+def _top_level(sections: list[PlanSection]) -> list[PlanSection]:
+    """The document's top-level sections — ``depth == 2``, with the fallback.
+
+    Shared by :func:`_digest_material` and :func:`_layer_manifest` so the two
+    cannot disagree about what the skeleton IS. ``depth == 2`` is the rule
+    (§3.2) because every document this system writes puts its title at ``#`` and
+    its sections at ``##``; when a document has no ``##`` at all the rule would
+    select nothing and every such document would share a digest, so it falls
+    back to the shallowest depth present. The ``_lede`` is top-level too and
+    leads when there is one.
+    """
+    headed = [s for s in sections if s.id != LEDE_ID]
+    chosen = [s for s in headed if s.depth == 2]
+    if not chosen and headed:
+        shallowest = min(s.depth for s in headed)
+        chosen = [s for s in headed if s.depth == shallowest]
+    return [s for s in sections if s.id == LEDE_ID] + chosen
+
+
+def _layer_manifest(body: str) -> str:
+    """The document's top-level skeleton as a comparison key: one
+    ``<slug>:<layer>`` per section, in document order, newline-joined.
+
+    **THIS IS WHAT MAKES THE MARKER IMMUTABLE, and without it the whole design
+    is a hole.** HTML comments fold out of the digest by design
+    (:func:`normalize_spec_text`), so a keeper could flip ``spec`` to ``detail``
+    in one write that looks inert, and unlock the section on the next one.
+    Hashing the manifest means the flip MOVES the digest and comes back to the
+    user as a proposal — no new enforcement path, the existing lock does it.
+    The transition to layered locking is itself a user decision.
+
+    It also means **adding or removing a top-level section, or retitling one,
+    needs the user's accept even when the section is detail** — the section list
+    is part of what was approved. Deliberate, and the conservative half of a
+    choice: the looser rule (manifest covers only the sections that existed at
+    acceptance) is more code and a second rule to hold in mind.
+
+    Nested sections are absent on purpose. ``### M2``'s layer is inherited, so
+    re-cutting, splitting, merging and renaming milestones inside a detail
+    parent moves nothing here — which is exactly the freedom this change is for.
+    """
+    return "\n".join(f"{s.id}:{s.layer}" for s in _top_level(parse_sections(body)))
+
+
+def _legacy_digest_material(body: str) -> str:
+    """:func:`_digest_material` **as it read before layers existed**, frozen.
+
+    One caller, forever:
+    :func:`~clawmeets.models.project_plan.changed_since_acceptance`'s
+    compatibility arm. Every plan already accepted carries an
+    ``accepted_spec_digest`` computed by this text; left alone, narrowing the
+    digest would make *every accepted plan in the system* announce "the plan
+    changed since approval" on its next load, having changed nothing.
+
+    **Never grow a feature here, and never tidy it.** Its correctness is
+    "identical to a hash computed months ago", so a refactor that reads better
+    and hashes differently is a silent regression across every live project.
+    """
+    sections = parse_sections(body)
+    headed = [s for s in sections if s.id != LEDE_ID]
+    chosen = [s for s in headed if s.depth == 2]
+    if not chosen and headed:
+        shallowest = min(s.depth for s in headed)
+        chosen = [s for s in headed if s.depth == shallowest]
+    chosen = [s for s in sections if s.id == LEDE_ID] + chosen
+
+    text = "\n".join(body[s.char_start : s.char_end] for s in chosen) if chosen else body
+    return normalize_spec_text(text)
+
+
+def legacy_spec_digest(body: str) -> str:
+    """:func:`spec_digest` under the pre-layers formula. See
+    :func:`_legacy_digest_material` — read-time compatibility only."""
+    return hashlib.sha256(_legacy_digest_material(body).encode("utf-8")).hexdigest()
+
+
 def _digest_material(body: str) -> str:
     """The exact text ``spec_digest`` hashes. Split out so tests can read it.
 
-    Top-level sections only, in document order, so **a nested milestone counts
-    exactly once** — its text is already inside its parent's extent.
-    ``depth == 2`` is the rule (§3.2), because every document this system writes
-    puts its title at ``#`` and its sections at ``##``. When a document has no
-    ``##`` at all the rule would hash the empty string and every such document
-    would share a digest, so it falls back to the shallowest depth present; a
-    preamble is top-level too and is included when there is one.
+    Two parts, and the first is the smaller but load-bearing one.
+
+    **The layer manifest** (:func:`_layer_manifest`) leads: the top-level
+    skeleton and each section's layer. It is here so that changing a section's
+    layer, or the set of top-level sections, moves the digest — a marker that
+    was not hashed could be flipped in one inert-looking write, and the section
+    would be unlocked on the next.
+
+    **Then the SPEC-layer top-level sections**, in document order, so a nested
+    milestone counts exactly once — its text is already inside its parent's
+    extent. A ``DETAIL`` section contributes no text at all: that omission IS
+    the narrowing, and it is the whole of the enforcement change. **The lock did
+    not move; what it hashes did.** ``_top_level`` owns the depth rule and its
+    no-``##`` fallback.
 
     Three normalizations, applied before hashing and **never to the bytes on
     disk**:
@@ -999,15 +1476,12 @@ def _digest_material(body: str) -> str:
        out of the middle of a line leaves whitespace behind that nobody typed.
     """
     sections = parse_sections(body)
-    headed = [s for s in sections if s.id != LEDE_ID]
-    chosen = [s for s in headed if s.depth == 2]
-    if not chosen and headed:
-        shallowest = min(s.depth for s in headed)
-        chosen = [s for s in headed if s.depth == shallowest]
-    chosen = [s for s in sections if s.id == LEDE_ID] + chosen
+    chosen = _top_level(sections)
+    manifest = "\n".join(f"{s.id}:{s.layer}" for s in chosen)
+    spec = [s for s in chosen if s.layer == SPEC]
 
-    text = "\n".join(body[s.char_start : s.char_end] for s in chosen) if chosen else body
-    return normalize_spec_text(text)
+    text = "\n".join(body[s.char_start : s.char_end] for s in spec) if chosen else body
+    return manifest + "\n" + normalize_spec_text(text)
 
 
 def spec_digest(body: str) -> str:
@@ -1051,6 +1525,27 @@ def render_diff(base: str, text: str, *, label: str = "") -> str:
     )
 
 
+def _is_anchorable(line: str) -> bool:
+    """Can a reader point at this source line? **Non-blank AND not comment-only.**
+
+    The predicate behind :func:`first_changed_line`'s choice of anchor, named
+    rather than inlined because it is asked in three places there and a rule with
+    three copies has three answers.
+
+    ``strip_comments`` is deliberately the same function
+    :func:`normalize_spec_text` uses to declare a comment inert to the spec
+    digest — the two are the same claim about the same bytes, said to two
+    different readers: a comment changes neither what the plan *says* nor what a
+    reader can *see*.
+
+    An unterminated ``<!--`` is left alone and reads as anchorable. Judging it
+    would mean carrying comment state across lines, and the answer this function
+    exists to give is about one line at a time; a stray opener is rare, and the
+    cost of getting it wrong is one unanchored note rather than a wrong anchor.
+    """
+    return bool(strip_comments(line).strip())
+
+
 def first_changed_line(base: str, text: str) -> str:
     """The line of ``base`` that ``text`` first changes — a proposal's anchor.
 
@@ -1063,29 +1558,95 @@ def first_changed_line(base: str, text: str) -> str:
 
     Three shapes, and the ``insert`` rule is the one that is not obvious:
 
-    * ``replace`` / ``delete`` — the first non-blank base line in the range.
-    * ``insert`` — the last non-blank base line **before** it. An insertion has
+    * ``replace`` / ``delete`` — the first ANCHORABLE base line in the range.
+    * ``insert`` — the last ANCHORABLE base line **before** it. An insertion has
       no base line of its own, and the line it follows is what a reader is
       looking at when they read the proposal. An insertion at the very top
-      falls back to the base's first non-blank line.
-    * no change, or a base with no non-blank line at all (a section create) —
+      falls back to the base's first anchorable line.
+    * no change, or a base with no anchorable line at all (a section create) —
       ``""``. That is honest: there is nothing on screen yet to anchor to.
+
+    **A BLANK-ONLY CHANGE RANGE IS AN INSERTION WEARING A ``replace`` TAG**, and
+    treating it as neither is what put a proposal in the page-bottom pane. A
+    section's captured base runs to the next heading, so it ends on a blank line;
+    a proposal that only APPENDS — every *"add a new acceptance criterion"* note
+    — lines up against that trailing blank, and ``SequenceMatcher`` absorbs it
+    into the change rather than reporting a clean ``insert``. The range then held
+    no non-blank line, the loop fell through, and the function returned ``""``,
+    which :func:`_derive_quote` stores and ``PlanEditor``'s
+    ``!!n.quote && shownIds.has(n.section)`` reads as *"not anchorable, send it
+    to the bottom of the page"*. Measured on ``plan-block-comment-simplify``
+    note ``n-7a43c9``, whose single opcode was ``replace base[15:16] == ['']``.
+
+    So the blank range no longer ENDS the search — it is remembered and the walk
+    continues, because a later opcode naming a real line is still the better
+    anchor. Only the terminal answer changes: where there is no such line, the
+    insertion is anchored the way :func:`insert` already anchors one.
+
+    **ANCHORABLE IS NARROWER THAN NON-BLANK, and it has to be — on EVERY arm,
+    which is a repair rather than a restatement.** The rule below was written
+    for the insertion arm and applied only there; the ``replace``/``delete`` arm
+    kept a plain ``ln.strip()`` and could therefore hand back the very line the
+    rule exists to refuse. It is not a corner: a refused rewrite of a criterion
+    diffs as a ``replace`` over a range that opens on that criterion's
+    ``<!-- evidence: … -->`` line, so the arm most likely to see a comment-only
+    line was the arm not applying the rule. Measured on
+    ``clawmeets-todo-tickets`` note ``n-8d35c3``, whose derived quote was the
+    evidence comment verbatim.
+
+    The rule itself: the quote this produces is searched for in the *rendered*
+    DOM (``planAnchor.locate`` over
+    ``PlanBody``'s flattened blocks), and ``PlanBody`` renders through the
+    ``rehypeHideComments`` plugin, which drops a raw node that is nothing but an
+    HTML comment before it can reach the document. A line that is nothing but an
+    ``<!-- … -->`` comment therefore renders to nothing, and quoting one produces
+    an anchor that provably cannot be found — the note lands in its section's
+    loose pane reading *"Couldn't find this line"*, which is a different wrong
+    answer rather than a fix. In the plan format this system writes, every
+    criterion ends on an ``<!-- evidence: … -->`` line, so that is precisely the
+    line an append follows. ``strip_comments`` is the same predicate
+    :func:`normalize_spec_text` already uses to call a comment inert.
+
+    That plugin is why this paragraph now names a plugin rather than an absence.
+    The rule was originally justified by ``PlanBody`` mounting ``ReactMarkdown``
+    with no ``rehype-raw``, on the reasoning that raw HTML then reached the
+    document not at all — true of react-markdown 8, which spliced an unhandled
+    raw node out of the tree, and false from 9, which converts it to TEXT. The
+    comment lines duly appeared on screen and this rule went from principled to
+    accidentally-still-correct. The plugin restores the premise deliberately, so
+    the two can no longer drift apart unnoticed:
+    ``rehypeHideComments.test.tsx`` asserts it.
+
+    Whatever comes back is still a line of ``base`` **verbatim** — this walks
+    opcodes to LOCATE, never to build.
     """
     base_lines = base.splitlines()
-    non_blank = [ln for ln in base_lines if ln.strip()]
-    if not non_blank:
+    anchorable = [ln for ln in base_lines if _is_anchorable(ln)]
+    if not anchorable:
         return ""
+
+    def preceding(i1: int) -> str:
+        """The line an insertion at ``i1`` follows, or the base's first."""
+        before = [ln for ln in base_lines[:i1] if _is_anchorable(ln)]
+        return before[-1] if before else anchorable[0]
+
+    # Where a blank-only change range was seen, if one was. Not returned from
+    # inside the loop: a real changed line further down is the better anchor and
+    # is still reachable, which is what "keep looking" was always for.
+    inserted_at: int | None = None
 
     matcher = difflib.SequenceMatcher(None, base_lines, text.splitlines())
     for tag, i1, i2, _j1, _j2 in matcher.get_opcodes():
         if tag == "equal":
             continue
         if tag == "insert":
-            before = [ln for ln in base_lines[:i1] if ln.strip()]
-            return before[-1] if before else non_blank[0]
-        changed = [ln for ln in base_lines[i1:i2] if ln.strip()]
+            return preceding(i1)
+        changed = [ln for ln in base_lines[i1:i2] if _is_anchorable(ln)]
         if changed:
             return changed[0]
-        # A run of blank lines was rewritten. Not something a reader can point
-        # at, so keep looking rather than anchoring to whitespace.
-    return ""
+        # A run of blank or comment-only lines was rewritten. Not something a
+        # reader can point at, so keep looking rather than anchoring to
+        # whitespace — but do not forget where it was.
+        if inserted_at is None:
+            inserted_at = i1
+    return preceding(inserted_at) if inserted_at is not None else ""

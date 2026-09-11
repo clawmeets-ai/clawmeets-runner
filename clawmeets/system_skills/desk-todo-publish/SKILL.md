@@ -10,10 +10,10 @@ description: >
   mid-task that needs the *user's own hand* — an approval, a sign-off, a
   decision only they can make — and want to hand it back with context.
   Package the task and shell `clawmeets todo publish`, tagging it with the
-  owner's OWN labels via `--label` (e.g. `--label office --label next`) so it
-  lands in the right group on their rail: run `clawmeets todo labels list`
-  first and reuse what is there — none of it is built in, and a label you
-  invent still shows but stays unregistered and counts as a context.
+  owner's OWN labels via `--label` (e.g. `--label office`) so it lands in the
+  right group on their rail: run `clawmeets todo labels list` first and reuse
+  what is there — none of it is built in, and a label you invent still shows
+  but stays unregistered.
   The item appears on the owner's To-do rail, agent-badged, and clicking it
   opens a guided take-over pre-loaded with your suggested prompt + files. You
   may retract only an item YOU published. Managing or firing what is already on
@@ -80,19 +80,24 @@ the take-over the manager opens.
   urgent).
 - `--linked "label::icon"` — a source to open from the take-over (e.g.
   `"Finance briefing::chart"`).
-- `--label <name>` (repeatable) — a GTD context or state the owner files this
-  under, e.g. `--label office --label next`. Write `office` or `@office`; both
-  land as the same label. Use the owner's **existing** vocabulary — run
-  `clawmeets todo labels list` first and reuse what's there rather than
-  inventing a near-duplicate. **That list is the owner's own and none of it is
-  built in** — do not assume `next` / `wait-for` / `someday` exist, and do not
-  assume they are the only states; `labels list` reports each label's kind and
-  is the only source of truth for both. A label you invent still shows on the
-  item, but it stays **unregistered** — dashed outline, no colour, sorted last,
-  in its own group rather than the owner's curated ones — until the owner
-  adopts it, and it is treated as a **context** whatever you meant by it.
-  Publishing never creates a state. At most 8 labels fit on one item; a 9th is
-  refused whole rather than partly applied.
+- `--label <name>` (repeatable) — a GTD context the owner files this under,
+  e.g. `--label office`. Write `office` or `@office`; both land as the same
+  label. Use the owner's **existing** vocabulary — run `clawmeets todo labels
+  list` first and reuse what's there rather than inventing a near-duplicate.
+  **That list is the owner's own and none of it is built in** — do not assume
+  `office` / `home` / `phone` exist, and do not assume any particular label
+  does. A label you invent still shows on the item, but it stays
+  **unregistered** — dashed outline, no colour, sorted last, in its own group
+  rather than the owner's curated ones — until the owner adopts it. At most 8
+  labels fit on one item; a 9th is refused whole rather than partly applied.
+
+  **A label cannot say the work is running.** Every label is a context; the
+  `state` kind is retired. Whether an item is New / Working / Completed is
+  DERIVED from the projects linked to it and is read-only — nothing you pass
+  here moves it, and there is no label that means "in progress". If you want the
+  item to read Working, link it to the project actually doing the work
+  (`clawmeets todo associate <id> <project_id>`), which is true rather than
+  decorative.
 
 Keep provenance honest — only list steps you actually did and facts you
 actually verified.
@@ -105,7 +110,7 @@ actually verified.
    clawmeets todo publish \
      --text "Approve the Provi restock PO ($6.8k) waiting on your sign-off" \
      --suggest api_sync \
-     --label office --label next \
+     --label office \
      --draft-prompt "Review Provi restock PO #4471 ($6,821.40, net-30). If the line items and pricing check out against the last order, approve it and confirm the delivery window with Provi." \
      --context-file ctx.md \
      --due Fri \

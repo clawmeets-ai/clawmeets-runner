@@ -300,9 +300,9 @@ Your working directory is a sandbox. To share a file with the chatroom:
 # left out: they DO get re-woken via BATCH_COMPLETE, so their promise is real.
 @dataclass(frozen=True)
 class PlanPromptState:
-    """What a coordinator turn is told about its project's plan (§7.3).
+    """What an agent turn is told about its project's plan (§7.3).
 
-    Four facts, assembled by ``models/agent.py`` from the project's **own synced
+    Six facts, assembled by ``models/agent.py`` from the project's **own synced
     fields** — the sidecar lives on the server and the agent process cannot open
     it, which is why every member here is either a project field or a pure
     function of one and the synced ``PLAN.md``.
@@ -337,6 +337,99 @@ class PlanPromptState:
     #: member here, because this dataclass is assembled in the AGENT process and
     #: the sidecar that knows about rounds lives only on the server.
     user_has_reviewed: bool = False
+    #: What the plan forbids OUTRIGHT — ``project_plan.not_authorized_state``
+    #: of the same synced body every other member here is computed from, so it
+    #: costs no extra read.
+    #:
+    #: **It is the only member that is an INSTRUCTION rather than a fact**, and
+    #: it is the only one a WORKER is given too. Every other field describes the
+    #: plan's lifecycle to the agent that keeps the document; this one describes
+    #: a limit to whichever agent might breach it, and the agent that places the
+    #: order or sends the email is almost never the coordinator.
+    #:
+    #: ``""`` is the expected value and renders nothing. See
+    #: :func:`~clawmeets.models.project_plan.not_authorized_state` for why the
+    #: section exists at all rather than being folded into Goal or Acceptance
+    #: Criteria: those two are what the deviation channel watches, and this is
+    #: exactly the class of breach that moves neither.
+    not_authorized: str = ""
+
+
+#: The ``## Not Authorized`` injection. **One constant because the PROHIBITION
+#: is one rule** — a limit the coordinator is told about and the worker is not
+#: is a limit on nobody, since the worker is the one holding the tool.
+#:
+#: The closing sentence is the load-bearing one. An agent breaks these by
+#: SUCCEEDING: sending the questions completes the deliverable, submitting the
+#: order is more of what the Goal asked for. Nothing in its own reasoning flags
+#: the act as a departure, so the instruction has to name that feeling directly
+#: rather than rely on the model noticing a conflict that, from inside the task,
+#: does not exist.
+#:
+#: **``{escalation}`` is the one clause that is NOT one rule, and collapsing it
+#: into one was a real bug.** "Stop" is shared; *"and here is who to tell"* is
+#: not, because the two roles do not stand in the same place. A coordinator is a
+#: participant of ``user-communication`` and can reach the user directly. A
+#: worker is not: on a regular project that room is created with the coordinator
+#: as its only agent participant, so a post is refused with ``403 Agent … is not
+#: a participant``, the failure note the executor tries to file lands in the same
+#: room and 403s too, and the escalation disappears with nothing on any surface
+#: saying it happened — the exact outcome this block's own justification exists
+#: to prevent, since there is no afterwards in which to file it. Worse, the
+#: worker contract's CRITICAL RULES already say *"Do NOT post to
+#: user-communication"*, so a single shared sentence also makes the prompt
+#: contradict itself. The worker's route is the BLOCKED status its reply format
+#: already defines: it reaches the coordinator, who can reach the user.
+_NOT_AUTHORIZED_BLOCK = """== NOT AUTHORIZED — WHAT THE USER'S APPROVAL DOES NOT BUY ==
+{text}
+
+These are not preferences and they are not scope. Each names an act that cannot
+be undone by more work: a message sent, an order placed, a deploy shipped, data
+published or deleted, money spent. So there is no filing it afterwards and no
+correcting it in the next turn — {escalation} Watch for
+this in particular when the act would COMPLETE the work rather than derail it:
+that is how this rule actually gets broken."""
+
+#: The coordinator's route: it IS a participant of ``user-communication``, and
+#: the user is one message away.
+_NOT_AUTHORIZED_ESCALATION_COORDINATOR = """STOP and ask the user in `user-communication`
+BEFORE the act, even when finishing your task appears to require it."""
+
+#: The worker's route. It names the channel the worker actually has and says so
+#: in the vocabulary of the structured reply format further down the same
+#: prompt, so the two do not have to be reconciled by the model. The explicit
+#: *"do not post to `user-communication`"* is not redundant with CRITICAL RULES:
+#: this block renders ~50 lines above that list, and an instruction to stop and
+#: escalate is exactly the moment a model reaches for the user directly.
+_NOT_AUTHORIZED_ESCALATION_WORKER = """STOP BEFORE the act, even when finishing your
+task appears to require it, and report a BLOCKED status whose **Blocker** names
+the act and the line above that forbids it. That reaches the coordinator, who
+is the one who can ask the user. Do NOT post to `user-communication` yourself —
+you are not a participant of that room, so the post is refused and the
+escalation is lost with it."""
+
+
+def _not_authorized_block(text: str, escalation: str) -> str:
+    """The block, or ``""`` when the plan forbids nothing outright.
+
+    ``escalation`` is the role's route out — see
+    :data:`_NOT_AUTHORIZED_ESCALATION_COORDINATOR` /
+    :data:`_NOT_AUTHORIZED_ESCALATION_WORKER`. It is a required argument rather
+    than a defaulted one on purpose: a default would silently give some future
+    third callsite whichever role happened to be written first, and getting it
+    wrong is not visible in the rendered text — it reads perfectly, and only
+    fails at the moment an agent tries to use it.
+
+    **Whitespace counts as nothing**, and the guard lives here rather than at
+    either callsite so the two cannot disagree. ``not_authorized_state`` already
+    strips, but a caller building a :class:`PlanPromptState` by hand does not,
+    and the failure mode is silent: a header with no rules under it, which reads
+    to a model as a prohibition it cannot see and therefore cannot obey.
+    """
+    text = (text or "").strip()
+    if not text:
+        return ""
+    return _NOT_AUTHORIZED_BLOCK.format(text=text, escalation=escalation)
 
 
 # B5 — the ONE batch-completion instruction. It used to be hardcoded in
@@ -397,13 +490,15 @@ BATCH_COMPLETION_PLAN_REVIEW_INSTRUCTION = (
     "settled — a correction, a missing step, a sequencing fix nobody has to "
     "choose between — you WRITE INTO THE PLAN yourself, because you are its "
     "keeper: `clawmeets plan update <project> --section <slug> --body-file "
-    "<f>`. **UNLESS THE USER HAS ALREADY REVIEWED THIS PLAN** — the block "
-    "above says so in as many words when they have. From that point they "
-    "decide what it says: the same text goes as a `plan note` proposal "
-    "instead, EVERY answer becomes one including the settled ones, and a "
-    "`plan update` that moves what the plan says is refused (your text is "
-    "filed for the user automatically and you get the note ids back). A "
-    "checkbox tick and an HTML comment still land either way. "
+    "<f>`. That stays true after the user has reviewed it and right up until "
+    "they ACCEPT it — you keep writing, you do not switch to proposals. What "
+    "changes once they have looked at it is that a write moving what the plan "
+    "SAYS also needs `--why \"<one changelog line: the change and its "
+    "cause>\"`, and the server refuses it without one; that line is what they "
+    "read at their next round in place of a diff. A checkbox tick, an HTML "
+    "comment, and a rewrite of `## Milestones` or any other "
+    "`<!-- layer: detail -->` section need no `--why` — the schedule stays "
+    "yours, only what the plan PROMISES is theirs to accept. "
     "Only what genuinely needs the USER's judgment — a trade-off, a "
     "scope call, two agents who disagree — becomes a note to them "
     "(`clawmeets plan note <project> --section <slug> --to user -m \"...\"`), "
@@ -493,8 +588,11 @@ ever an end of it.
      user --edit-file <f> -m "why"` — and send the batch. A `plan update` that
      moves what the plan SAYS is refused; your text is not lost, it is filed
      for the user automatically and you get back the note ids. Ticking a
-     checkbox and editing an HTML comment are not spec changes and still land
-     silently, so keep reporting progress exactly as before.
+     checkbox, editing an HTML comment, and rewriting `## Milestones` or any
+     other `<!-- layer: detail -->` section are not spec changes and still land
+     silently, so re-plan and keep reporting progress exactly as before — but
+     SAY in user-communication that you re-planned, because nobody will be
+     asked to accept it.
      File them TOGETHER and send ONE batch. Five notes in one batch is one
      message to the user; five batches is five.
      Send on only what actually needs a seat you do not occupy — a domain
@@ -755,6 +853,8 @@ class WorkerPromptBuilder(PromptBuilder):
         self._capabilities = capabilities or []
         self._git_url = git_url
         self._is_dm = False
+        # set per-build; None on a DM and on any project with no seeded plan.
+        self._plan: Optional[PlanPromptState] = None
 
     def _actions(self) -> list[str]:
         return ["reply", "update_file"]
@@ -763,6 +863,27 @@ class WorkerPromptBuilder(PromptBuilder):
         if self._is_dm:
             return self._dm_role_contract()
         return self._worker_role_contract()
+
+    def _not_authorized(self) -> str:
+        """The plan's outright prohibitions, or ``""``.
+
+        **A worker gets this and gets none of the rest of the plan state.** The
+        other five facts are about keeping the document, which is not this
+        agent's job; this one is about not doing something that cannot be
+        undone, which is very much its job — the coordinator delegates the tool,
+        so the coordinator is rarely the agent holding it.
+
+        **The prohibition is the coordinator's; the way out is not.** A worker
+        cannot post to `user-communication` — it is not a participant and the
+        server refuses it — so it escalates the only way it can, by reporting
+        BLOCKED to the coordinator. See
+        :data:`_NOT_AUTHORIZED_ESCALATION_WORKER`.
+        """
+        block = _not_authorized_block(
+            self._plan.not_authorized if self._plan else "",
+            _NOT_AUTHORIZED_ESCALATION_WORKER,
+        )
+        return "\n\n" + block if block else ""
 
     def _worker_role_contract(self) -> str:
         coord = self._coordinator_name
@@ -777,7 +898,7 @@ delegates tasks to you.
 4. REPORT results using the structured reply format below.
 
 Before starting, check PLAN.md in the synced project files for milestone
-goals, guardrails, and acceptance criteria.
+goals and acceptance criteria.{self._not_authorized()}
 
 You do NOT write PLAN.md, and you do NOT file plan notes. A plan note connects
 the user and the coordinator, and nobody else is ever an end of it —
@@ -874,12 +995,20 @@ you directly within your area of expertise.
         is_dm: bool = False,
         dwh_dir: Optional[Path] = None,
         chat_history: list[tuple[str, str]] | None = None,
+        plan: Optional[PlanPromptState] = None,
     ) -> str:
         """Build a worker prompt. ``project_id`` is surfaced in the identity
         header so the LLM can target this exact thread from CLIs that take a
         project id (e.g. ``dm schedule --project <id>``).
+
+        ``plan`` is the same :class:`PlanPromptState` the coordinator is built
+        with, and **only one member of it is read here** — see
+        :meth:`_not_authorized`. Optional and defaulting to ``None`` so a caller
+        with no plan (a DM, an unseeded project) passes nothing and renders
+        nothing.
         """
         self._is_dm = is_dm
+        self._plan = plan
         capabilities_line = ", ".join(self._capabilities) if self._capabilities else ""
         return self._assemble(
             name=name,
@@ -1078,8 +1207,18 @@ written in the roster (not IDs, and do not add suffixes like '-agent')."""
         return steady_state
 
     def _plan_block(self) -> str:
-        """§7.3's steady-state plan block: five facts, plus the obligation the
+        """§7.3's steady-state plan block: six facts, plus the obligation the
         note count exists to drive.
+
+        **``not_authorized`` renders FIRST and is the only clause here a worker
+        also gets.** Everything else in this block is about keeping the
+        document; that one is about not doing something irreversible, and it is
+        the one class of breach the deviation channel cannot see — an agent that
+        ships the deploy has over-satisfied the spec rather than moved it, so
+        there is no criterion for it to notice and nothing for it to file. The
+        prohibition is word-for-word the worker's; only the escalation route
+        differs, because only the coordinator can reach the user directly
+        (:data:`_NOT_AUTHORIZED_ESCALATION_COORDINATOR`).
 
         **The spec-lock clause and the server-side 403 are one change, and
         shipping either alone is worse than shipping neither.** The doctrine
@@ -1128,6 +1267,18 @@ written in the roster (not IDs, and do not add suffixes like '-agent')."""
             f"Phase: {plan.phase}",
             f"`## Approval` currently says: {plan.approval or '(no such section)'}",
         ]
+        # FIRST, ahead of every lifecycle clause below. Those tell the
+        # coordinator how to move the document; this one can stop a turn.
+        forbidden = _not_authorized_block(
+            plan.not_authorized, _NOT_AUTHORIZED_ESCALATION_COORDINATOR
+        )
+        if forbidden:
+            # Blank line on BOTH sides. ``lines`` is joined with a single "\n",
+            # which is right for the one-paragraph clauses below and wrong for a
+            # multi-paragraph block: without this the lifecycle clause that
+            # follows butts straight onto the last sentence and reads as part of
+            # the same instruction.
+            lines.append("\n" + forbidden + "\n")
         if plan.phase != "executing":
             lines.append(
                 "THAT LINE IS THE GO SIGNAL, and nothing else is. Work starts "
@@ -1155,9 +1306,21 @@ written in the roster (not IDs, and do not add suffixes like '-agent')."""
             )
         if plan.phase == "executing":
             lines.append(
-                "The plan is ACCEPTED. It is a contract now.\n"
+                "The plan is ACCEPTED. It is a contract now — but only its "
+                "SPEC LAYER is.\n"
                 "Tick milestone checkboxes freely — a ticked box and an HTML "
                 "comment are not spec changes and nothing gates them.\n"
+                "`## Milestones`, and any other section marked "
+                "`<!-- layer: detail -->`, is still YOURS: re-cut it, split or "
+                "merge milestones, re-sequence, re-assign, change the "
+                "`<!-- evidence: ... -->` on a criterion. None of that is a "
+                "deviation and none of it costs the user a decision. Two "
+                "things you may NOT do there: change a section's `layer:` "
+                "marker, and drop a `<!-- advances: ... -->` claim so that a "
+                "criterion is left unclaimed — both are refused exactly like a "
+                "spec edit. ANNOUNCE a re-plan in user-communication; the user "
+                "will not be asked to accept it, so telling them is the only "
+                "way they learn.\n"
                 "A change to what the plan SAYS is different: it is a DEVIATION, "
                 "the user accepts it, and you file it as a note to them "
                 "(`clawmeets plan note <project> --section <slug> --to user "
@@ -1172,30 +1335,50 @@ written in the roster (not IDs, and do not add suffixes like '-agent')."""
                 "validated with the agents or one you did not."
             )
         if plan.user_has_reviewed and plan.phase != "executing":
-            # The spec lock's pre-acceptance half. `phase != "executing"` is not
-            # a second copy of the server's rule — it only keeps this from
-            # printing beside the ACCEPTED paragraph above, which already says
-            # all of this in the contract's own words.
+            # **THE PRE-ACCEPTANCE HALF, AND ITS VERB IS NOW THE OPPOSITE ONE.**
+            # This paragraph used to say *"the user has reviewed this, so
+            # propose, do not write"* — the spec lock started at the first
+            # review round. It starts at acceptance again
+            # (`project_plan._spec_is_locked`), so the same turn that used to be
+            # refused now lands and owes a receipt instead. Saying the old thing
+            # here would tell a coordinator to file proposals the server no
+            # longer needs and to fear a refusal it will never meet.
+            #
+            # `phase != "executing"` is not a second copy of the server's rule —
+            # it only keeps this from printing beside the ACCEPTED paragraph
+            # above, which says the post-acceptance contract in its own words.
             lines.append(
-                "THE USER HAS REVIEWED THIS PLAN. From here they decide what it "
-                "says — you no longer do, and this is enforced, not advisory.\n"
-                "Fold their feedback in as PROPOSALS, not as writes: "
-                "`clawmeets plan note <project> --section <slug> --to user "
-                "--edit-file <f> -m \"why\"`, then send one batch. EVERY answer "
-                "becomes a proposal, including the ones you are confident "
-                "about and the ones that only tidy up what they said — you are "
-                "not the judge of which of their remarks 'settles' a section.\n"
-                "A `clawmeets plan update` that moves what the plan SAYS is "
-                "REFUSED. Your text is not lost: it is filed for the user "
-                "automatically carrying your proposal, and you get back the "
-                "note ids. Do not retry it smaller — a smaller spec edit is "
-                "still a spec edit.\n"
-                "Ticking a milestone checkbox, editing an HTML comment and "
-                "reflowing text all still land silently and are not gated. "
-                "Keep reporting progress exactly as you did before.\n"
-                "Batch, don't drip: one `plan update`-worth of changes filed as "
-                "one set of notes and sent as one review batch costs the user "
-                "one message, where five separate rounds cost them five."
+                "THE USER HAS REVIEWED THIS PLAN — and until they ACCEPT it, "
+                "you are still its writer. Do not switch to proposals.\n"
+                "Fold every agent's feedback and every remark of theirs "
+                "straight into the document: `clawmeets plan update <project> "
+                "--section <slug> --body-file <f> --why \"...\"`. The user is "
+                "reading the PLAN, not your diffs — before acceptance there is "
+                "no agreed baseline for a diff to be a change *to*, so a "
+                "half-accepted set of hunks leaves the plan in a state nobody "
+                "designed.\n"
+                "`--why` is REQUIRED on any write that moves what the plan "
+                "SAYS, and the server refuses the write without it. It is a "
+                "CHANGELOG LINE — the change and its cause, in one sentence:\n"
+                "  GOOD  \"M2 now owns auth setup, moved out of M3 — backend "
+                "flagged M3's endpoints cannot be built before it\"\n"
+                "  BAD   \"incorporated feedback from all agents\"\n"
+                "The user answers by naming one of those lines. A line they "
+                "cannot name forces them to re-read the whole document to "
+                "object to one thing, which is the cost this whole shape exists "
+                "to avoid. Each write files a receipt carrying the line; they "
+                "read the receipts as one changelog at their next round.\n"
+                "Ticking a checkbox, editing an HTML comment, reflowing text "
+                "and rewriting `## Milestones` or any other "
+                "`<!-- layer: detail -->` section need no `--why` at all — the "
+                "schedule is yours.\n"
+                "Send a `plan note --to user` only for what genuinely needs "
+                "THEIR judgment — a trade-off, a scope call, two agents who "
+                "disagree. Then `clawmeets plan review <project>`, and say in "
+                "`user-communication` what moved and ask for their acceptance.\n"
+                "Batch, don't drip: one round of feedback folded in and sent as "
+                "one review costs the user one message, where five separate "
+                "rounds cost them five."
             )
         if plan.phase == "spec-ing":
             lines.append(_RELAY_PROCEDURE)
@@ -1306,12 +1489,65 @@ STEP 1: UNDERSTAND — read the request and the shared-context files, then read
         the plan ONCE: `clawmeets plan show <project>`. It already exists — the
         server wrote it when the project was created. Do NOT read it again this
         turn; every write prints the plan's new state back to you.
-STEP 2: FILL — write Goal and Guardrails, plus any other spec sections this
-        work needs (the vocabulary is yours — write what the job requires),
-        then ONE `## Milestones` section containing one `### M<n>` block per
-        milestone, each with its Deliverable and its acceptance criteria
-        labelled AC-<m>.<n> INSIDE that block:
+STEP 2: FILL — the document has TWO LAYERS and they are not equally yours.
         `clawmeets plan update <project> --section <slug> --body-file <f>`
+
+        SPEC (the user's — Goal, Not Authorized, Acceptance Criteria, and
+        any other section you leave unmarked): what they are saying yes or no
+        TO.
+        DETAIL (yours — `## Milestones <!-- layer: detail -->` and anything
+        else you mark that way): how the same yes gets delivered. Once the
+        user has reviewed the plan you may still rewrite the detail layer
+        freely, and you may not touch the spec layer. One sentence decides
+        which a section is: IF CHANGING IT WOULD CHANGE THE USER'S ANSWER,
+        IT IS SPEC. Unmarked means spec — mark only what is genuinely yours.
+
+        Write Goal, then `## Not Authorized`. Then ONE
+        `## Acceptance Criteria` section, criteria grouped under `### G<m>`
+        headings and labelled AC-<m>.<n> — `<m>` is the GROUP, not a
+        milestone. Then ONE `## Milestones` section carrying the detail
+        marker, one `### M<n>` block per milestone, each declaring the
+        criteria it advances: `### M2: Session layer <!-- advances: AC-1.1,
+        AC-1.3 -->`. Every criterion must be claimed by some milestone; a
+        later edit that leaves one unclaimed is refused like a spec change.
+
+        EVERY CRITERION IS AN OBSERVABLE OUTCOME, NOT AN ARTIFACT AND NOT A
+        METHOD. One plain sentence saying what must be TRUE for whoever
+        receives the work, checkable by them without being told how it was
+        made — for software that is behaviour, for research it is what the
+        reader can now see and trust. "Produces 6 slides", "a Figma file with
+        12 frames" and "a TSV with 10 rows" are artifacts. "Every
+        recommendation cites a source the reader can open" is a criterion.
+
+        THE ALTITUDE TEST — apply it to every line you write: IF AN ORDINARY
+        CHANGE IN HOW THE WORK GETS DONE WOULD BREAK THE CRITERION, IT IS TOO
+        FINE-GRAINED. A rename or a refactor in code, a different source,
+        sample window or tool in research — neither may cost the user a
+        decision. "The quote goes through `capQuote`" fails; "a note filed
+        from a block quotes that block" passes. "The top 10 hashtags by
+        engagement rate from the Graph API" fails; "a reader can name the
+        formats gaining traction and open posts that show each one" passes.
+
+        `## Not Authorized` IS NOT A SCOPE SECTION AND MOST PLANS SAY
+        "None." — write a line there only for an act that CANNOT BE UNDONE BY
+        MORE WORK: an email sent, an order placed, a deploy shipped, data
+        published or deleted, money spent. "Nothing reaches production without
+        a separate go-ahead from the user" belongs there; "exactly these six
+        items, no more" does not — that restates the Goal, and building a
+        seventh thing is a deviation you would file anyway. Quality bars are
+        criteria. Sequencing YOU chose is milestone ordering and costs the
+        user no decision; sequencing THE USER mandated is a denial and goes in
+        `## Not Authorized` phrased as one ("no deploy before the security
+        review passes"), because the milestone layer is yours to re-cut and
+        would not hold it.
+
+        HOW it will be shown goes in a comment — a test where one exists
+        (`<!-- evidence: tests/test_auth.py::test_restart -->`), otherwise
+        whatever a reader could check it against (`<!-- evidence:
+        deliverables/ig/trends.md — one opened post per format -->`). The
+        comment is inert, so changing the evidence later costs the user no
+        decision.
+
         Write what you are confident in. Do NOT invent what you are not.
         There is exactly ONE Milestones section and it also carries progress.
         Do NOT create a Current Status, Review Log or Learnings section —
@@ -1446,9 +1682,11 @@ A BATCH_COMPLETE just fired in this room. Process it:
            specific feedback AND original context (workers lose access to old
            rooms);
        (c) escalation needed → contact user via user-communication;
-       (d) project complete → walk EVERY milestone's acceptance criteria before
-           you complete; a criterion you cannot mark met is either a caveat you
-           state in user-communication or a reason not to complete yet. When the
+       (d) project complete → walk EVERY acceptance criterion before you
+           complete — per criteria GROUP, naming which milestones claimed each
+           (`<!-- advances: ... -->`), not milestone by milestone; a criterion
+           you cannot mark met is either a caveat you state in
+           user-communication or a reason not to complete yet. When the
            FINAL milestone's deliverable is in hand and criteria pass, your remaining job is to DELIVER, not to keep
            analyzing. If findings are worth presenting (numbers, comparisons,
            recommendations), publish an interactive report that surfaces in the
@@ -1567,15 +1805,27 @@ burns the turn's token budget and the project never starts.
 - If this project's plan is ACCEPTED, the accepted spec sections are the
   requirement — not the original request. Read them first:
   `clawmeets plan show <project> --clean`.
-- Break the request into milestones, each with ONE concrete deliverable and
-  verifiable acceptance criteria.
-- Write acceptance criteria as the MINIMUM the deliverable must provide for the
-  NEXT milestone (or the final user need) to proceed — the "good enough to
-  unblock" bar, NOT a wishlist of every fact related to the topic. Specify the
-  FIGURE or OUTCOME required and accept ANY credible source or reasonable proxy;
-  do NOT pin a single named source per item or demand precision the downstream
-  step won't consume. Over-specified, source-pinned criteria cause endless
-  revisions when one source happens to be unavailable.
+- Write acceptance criteria as OBSERVABLE OUTCOMES, then break the request into
+  milestones that advance them.
+- An acceptance criterion names, in one plain sentence, what must be TRUE for
+  whoever receives the work — behaviour for software, what the reader can see
+  and trust for research — the MINIMUM that must hold for the next milestone (or
+  the final user need) to proceed, the "good enough to unblock" bar, NOT a
+  wishlist and NOT a description of an artifact. "Produces 6 slides" is not a
+  criterion; "every recommendation cites a source the reader can open" is.
+- THE ALTITUDE TEST: if an ordinary change in HOW THE WORK GETS DONE would break
+  the criterion, it is too fine-grained — a rename or a swapped library in code,
+  a different source, sample window or tool in research. Neither may cost the
+  user a decision; both belong to the detail layer or the evidence comment.
+  Specify the OUTCOME required and accept ANY credible source or reasonable
+  proxy; do NOT pin a single named source, an internal name, or precision the
+  downstream step won't consume. Over-specified criteria cause endless revisions
+  when one source happens to be unavailable — and every substitution becomes a
+  change to what the plan says.
+- Scope rules, quality bars and sequencing are GUARDRAILS, not criteria.
+- HOW a criterion will be shown goes in an `<!-- evidence: ... -->` comment
+  beside it, never in the criterion's own sentence. Comments are inert, so the
+  evidence can change without renegotiating the contract.
 - Plan should accomplish EXACTLY what the user asked — no more, no less.
 - If you think additional work would be valuable, propose it to the user
   rather than silently adding milestones.
@@ -1587,15 +1837,20 @@ burns the turn's token budget and the project never starts.
   to specific sub-tasks. This is a DIFFERENT file from the roster — here you
   record who-does-what for THIS project, using names EXACTLY as they appear
   in the roster (do not invent names or add suffixes like '-agent').
-- PLAN.md: concrete milestones + verifiable acceptance criteria + workroom
+- PLAN.md: behavioural acceptance criteria + concrete milestones + workroom
   names. It ALREADY EXISTS — fill it one section at a time with
   `clawmeets plan update <project> --section <slug> --body-file <f>`.
   `update_file PLAN.md` still works, but it replaces the WHOLE document.
-  Write exactly ONE `## Milestones` section, one `### M<n>` block per
-  milestone, each with its Deliverable and its acceptance criteria labelled
-  AC-<m>.<n> INSIDE that block. Do NOT create a Current Status, Review Log or
-  Learnings section — progress is a checkbox in Milestones, and narrative goes
-  to the milestone's own chatroom.
+  Write ONE `## Acceptance Criteria` section — criteria grouped under `### G<m>`
+  headings, labelled AC-<m>.<n>, where `<m>` is the GROUP and not a milestone —
+  and exactly ONE `## Milestones <!-- layer: detail -->` section, one `### M<n>`
+  block per milestone, each declaring what it advances:
+  `### M2: Session layer <!-- advances: AC-1.1, AC-1.3 -->`. Criteria do NOT
+  live inside milestones: the marked section is yours to re-cut freely once the
+  user has reviewed the plan, and anything nested in it would be freed with it.
+  Every criterion must be claimed by some milestone. Do NOT create a Current
+  Status, Review Log or Learnings section — progress is a checkbox in
+  Milestones, and narrative goes to the milestone's own chatroom.
 
 == STEP 4: DELEGATE (first milestone only) ==
 - Create the first workroom, inviting the assigned agent.
@@ -1616,6 +1871,10 @@ handle it.
 - Vague milestones ("do research") or subjective criteria ("high quality").
 - Source-pinned or exhaustive criteria ("median DOM from Redfin Data Center")
   that fail when one source is blocked and aren't needed downstream.
+- Criteria naming the method rather than the result — an internal function,
+  class, selector or file path in code; a named tool, endpoint, metric or
+  sample size in research. Changing how the work is done must never need the
+  user's approval.
 - Multiple milestones in one room.
 - All tasks delegated at once.
 - Scope creep beyond what the user asked for.

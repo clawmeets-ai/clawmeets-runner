@@ -66,24 +66,34 @@ artifact and the user's open page re-renders in place.
 
 ## § The acceptance-criteria trace
 
-**Read the criteria out of the plan, per milestone. Do not restate them
-from memory.**
+**Read the criteria out of the plan, per criteria GROUP. Do not restate
+them from memory.**
 
 ```bash
 clawmeets plan show <project> --clean
 ```
 
-Each milestone lives in one `### M<n>` block inside the single
-`## Milestones` section, and its criteria are the `AC-<m>.<n>` lines
-**inside that block** — there is no global criteria section to read
-instead. Walk them in document order and emit one row per criterion:
+Criteria live in one `## Acceptance Criteria` section, grouped under
+`### G<m>` headings and labelled `AC-<m>.<n>` — `<m>` is the group, not a
+milestone. Which milestone took each on is written on the milestone, as
+`### M2: Session layer <!-- advances: AC-1.1, AC-1.3 -->`. Walk the criteria
+in document order and emit one row each:
 
 | field | value |
 |---|---|
 | `id` | `AC-<m>.<n>`, exactly as the plan writes it |
 | `criterion` | the plan's own words, quoted — not your paraphrase |
+| `claimed by` | the milestone(s) whose `advances:` names it, or `unclaimed` |
 | `verdict` | `met` \| `not met` \| `not applicable` |
 | `evidence` | the deliverable file or the room that satisfies it |
+
+**A criterion is an invariant, so judge the invariant and nothing else.**
+Its `<!-- evidence: … -->` comment records how the team meant to show it;
+that comment is the keeper's and may have changed since. If the invariant
+holds by some other demonstration, the verdict is `met` — a substituted
+test or artifact was never a deviation. `unclaimed` in the third column is
+itself worth a line in the report: it means no milestone ever took the
+criterion on.
 
 **Why quoted rather than restated.** A criterion you retype is a criterion
 you can soften. The plan is the contract the user accepted, and a trace is
@@ -95,9 +105,12 @@ A criterion you cannot mark `met` is either a **caveat you state in
 `user-communication`** or a **reason not to complete yet**. It is never a
 row you quietly drop.
 
-If the plan has no `## Milestones` section — a pre-feature project, or one
-whose coordinator wrote a different shape — say so in one line and fall back
-to the criteria in the delegation messages. Do not invent the section.
+If the plan has no `## Acceptance Criteria` section — a pre-feature project,
+or one whose coordinator wrote a different shape — look for `AC-<m>.<n>`
+lines inside the `### M<n>` blocks, which is where they lived before, and
+leave the `claimed by` column as the enclosing milestone. If there are none
+at all, say so in one line and fall back to the criteria in the delegation
+messages. Do not invent the section.
 
 ## § What the report should contain
 

@@ -33,7 +33,7 @@ question, not by size:
 
 | | holds |
 |---|---|
-| `PLAN.md` (the project's plan) | **what is being built and how it is judged** — Goal, Guardrails, and one `### M<n>` block per milestone with its deliverable and its `AC-<m>.<n>` criteria. The user accepts it; it is the contract. |
+| `PLAN.md` (the project's plan) | **what is being built and how it is judged** — Goal, Acceptance Criteria, what is Not Authorized, and one `### M<n>` block per milestone with its deliverable and its `AC-<m>.<n>` criteria. The user accepts it; it is the contract. |
 | `plan-<task>.html` (this skill) | **how ONE milestone will be implemented** — dependency changes, interface diffs, pseudocode, diagrams. Reviewed by whoever asked for the work. |
 
 So: read `PLAN.md` for the criteria you are designing against, and write the

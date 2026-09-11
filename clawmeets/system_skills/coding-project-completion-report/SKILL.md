@@ -47,14 +47,24 @@ Route elsewhere only when:
 Publish the report **just before** you emit `project_completed`.
 Sequence:
 
-1. Verify acceptance criteria pass, reading them **per milestone out of the
-   plan** — `clawmeets plan show <project> --clean`. Each milestone is a
-   `### M<n>` block inside the single `## Milestones` section and its criteria
-   are the `AC-<m>.<n>` lines inside that block; there is no global criteria
-   section. Emit one row per criterion — `{id, criterion (the plan's own
-   words, quoted), verdict: met | not met | not applicable, evidence: the
-   commit, file or room that satisfies it}` — and put that table directly
-   under the verdict.
+1. Verify acceptance criteria pass, reading them **per criteria GROUP out of
+   the plan** — `clawmeets plan show <project> --clean`. They live in one
+   `## Acceptance Criteria` section, grouped under `### G<m>` headings and
+   labelled `AC-<m>.<n>`, where `<m>` is the group and not a milestone; which
+   milestone took each on is written on the milestone, as
+   `### M2: Session layer <!-- advances: AC-1.1, AC-1.3 -->`. Emit one row per
+   criterion — `{id, criterion (the plan's own words, quoted), claimed by (the
+   milestone(s) whose advances: names it, or `unclaimed`), verdict: met | not
+   met | not applicable, evidence: the commit, file or room that satisfies
+   it}` — and put that table directly under the verdict.
+
+   **Judge the invariant, not the artifact.** A criterion's
+   `<!-- evidence: … -->` comment is the keeper's and may have changed since
+   the plan was accepted; a test that moved or an artifact that was
+   substituted is not a deviation. What the criterion's own sentence promises
+   is the only thing the user signed. On an older plan the criteria sit inside
+   the `### M<n>` blocks instead — read them there and let the enclosing
+   milestone be the `claimed by`.
 
    **The coding variant had no named source for "acceptance criteria" at all**,
    which is how a review ends up graded against the criteria the reviewer

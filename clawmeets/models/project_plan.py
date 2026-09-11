@@ -50,7 +50,7 @@ import json
 import logging
 import re
 import secrets
-from collections.abc import Awaitable, Callable, Iterable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -60,15 +60,23 @@ from pydantic import BaseModel, Field, model_validator
 from clawmeets.models.agent import Agent
 from clawmeets.models.chatroom import Chatroom
 from clawmeets.models.plan_markdown import (
+    SPEC,
     PlanLimitError,
     body_sha,
     drops_heading,
+    duplicated_heading,
     extent_key,
     extract_shorthand,
     first_changed_line,
     heading_line,
+    heading_slug,
+    legacy_spec_digest,
+    named_criterion,
     normalize_spec_text,
+    parse_criteria,
     parse_sections,
+    section_holding_quote,
+    section_layers,
     quote_from_line,
     relevels_heading,
     rename_pair,
@@ -77,6 +85,7 @@ from clawmeets.models.plan_markdown import (
     section_extent,
     spec_digest,
     split_by_section,
+    unclaimed_criteria,
 )
 from clawmeets.sync.changelog import (
     ChangelogEntryType,
@@ -102,7 +111,7 @@ if TYPE_CHECKING:
 #: private ``_*_locked`` helpers below assume it is already held so that
 #: :func:`submit_review` can compose them into one transaction without
 #: re-entering a non-reentrant lock. Precedent: ``models/project_report.py:30``,
-#: ``models/desk_sop.py:41``, ``models/desk_todo.py:38``, ``models/brief_tab.py:35``.
+#: ``models/desk_sop.py:41``, ``models/desk_todo.py:38``, ``models/brief_tab.py:45``.
 _lock = asyncio.Lock()
 
 #: The plan lives in one room, under one name, on every project that has one.
@@ -148,6 +157,17 @@ MAX_HISTORY = 200
 MAX_NOTE_CHARS = 32 * 1024
 MAX_EDIT_CHARS = 32 * 1024
 
+#: A pre-acceptance keeper write's ``--why`` — the changelog line the user
+#: reads instead of a diff (:func:`_file_write_receipt_locked`).
+#:
+#: **Small on purpose, and the smallness is the feature.** The whole value of a
+#: receipt is that the user can answer *"drop the auth move"* by naming one
+#: line; a paragraph is a summary, and a summary is the thing this replaced. It
+#: is also the guarantee that :func:`_finish_locked` cannot raise: capped here,
+#: at input validation, the receipt comment it builds can never breach
+#: ``MAX_NOTE_CHARS`` above the append.
+MAX_WHY_CHARS = 600
+
 #: A note's ``quote`` — the excerpt it is anchored to. **Not a second number**:
 #: it is the browser client's ``PLAN_QUOTE_CHARS``, read from
 #: ``clawmeets/web/frontend/src/components/project/plan/planAnchor.tsx:52``,
@@ -178,7 +198,26 @@ MAX_QUOTE_CHARS = 4000
 #: not.
 NOTE_DEDUPE_SECONDS = 10
 
-NOTE_STATUSES = ("open", "answered", "applied", "rejected", "dismissed")
+#: The note ladder. **ADVISORY, NEVER A VALIDATION SET**, and this is a
+#: commitment rather than an observation:
+#:
+#: * It is never narrowed into a ``Literal``, an ``Enum`` or a pydantic
+#:   validator. :attr:`PlanNote.status` is a plain ``str`` and stays one, so a
+#:   sidecar written by a newer build is readable by an older one — an unknown
+#:   word deserializes, renders as itself, and raises nothing.
+#: * A reader treats **anything that is not ``open`` as terminal** and
+#:   enumerates nothing. Every note-state partition in this module and every
+#:   caller of it tests ``== "open"`` or ``!= "open"``; not one lists the
+#:   terminal words. That is what makes adding a word to this tuple a local
+#:   change rather than an audit of every surface.
+#: * ``folded`` is the sixth, and it answers the question the first five could
+#:   not: a proposal the user chose to *keep alongside* another one on the same
+#:   section. ``applied`` means "its text IS the section"; ``rejected`` means
+#:   "its text is NOT in the document"; ``folded`` means "its text is in the
+#:   section that landed, but the section is not its text". Closing such a note
+#:   ``rejected`` — which is what this module did before ``folded`` existed —
+#:   tells its author their work was dropped when it is sitting in the plan.
+NOTE_STATUSES = ("open", "answered", "applied", "rejected", "dismissed", "folded")
 
 #: **DERIVED, NEVER STORED.** A note has no ``kind`` field: it is a comment,
 #: optionally carrying a diff (``proposal``), optionally carrying a parent
@@ -206,6 +245,30 @@ RESOLVE_ACTIONS = ("apply", "reject", "answered", "dismiss")
 #: by the user (§2.6). A superseded proposal resolves ``rejected`` — never
 #: ``applied``, because its text did not reach the document.
 SUPERSEDED_REASON = "superseded by @{by}'s proposal on the same section"
+
+#: Written by the server onto a note its own author replaced before the user
+#: ever saw it (:func:`_supersede_prior_locked`). **Not** a variant of
+#: ``SUPERSEDED_REASON`` above, and the split is deliberate: that one is
+#: ``submit_review`` telling an agent the user chose someone else's text over
+#: theirs, which is a DECISION about two proposals that both reached the desk.
+#: This one is a filing-time collapse of one author's own drafts, and nobody
+#: decided anything — there was only ever going to be one row.
+REPLACED_UNSENT_REASON = (
+    "replaced by {id} — a newer proposal on the same section from the same "
+    "author, filed before this one was sent"
+)
+
+#: Written by the server on a row the user chose to **fold**, and read by the
+#: agent whose proposal was folded away. The counterpart of
+#: :data:`SUPERSEDED_REASON`, and the two are mutually exclusive on any one row:
+#: *superseded* means the text did NOT reach the document, *folded* means it
+#: DID. Neither sentence may say the other's word — an agent told "superseded"
+#: about text that landed may re-file work that is already in the plan, which is
+#: the failure this reason exists to remove.
+FOLDED_REASON = (
+    "folded into @{by}'s change on the same section "
+    "— your text is in the section that landed"
+)
 
 #: The gate section, and the three strings that live in it.
 #:
@@ -277,6 +340,127 @@ def approval_state(body: str) -> str:
     return rest.strip()
 
 
+#: The section that says what the user's approval does **not** buy, and the
+#: heading it replaces.
+#:
+#: **This is not ``## Guardrails`` renamed for taste.** That heading invited
+#: every constraint anyone could think of and duly got them: across the 151
+#: seeded plans carrying one, the median ran 108 words, the 90th percentile 615
+#: and the longest 5,029 — and not one was ever left empty. Most of that content
+#: had a better home and was sitting there because the heading was open-ended.
+#: A scope boundary (*"exactly these six items, no more"*) restates the Goal, so
+#: building a seventh thing already violates something observable and already
+#: produces a deviation. A quality bar (*"every recommendation cites a source
+#: the reader can open"*) is an acceptance criterion by definition. Sequencing
+#: the keeper chose is milestone content and costs the user no decision when it
+#: changes.
+#:
+#: **What is left is the one class the deviation channel cannot see, and that
+#: asymmetry — not importance, not frequency — is what earns it a heading.** A
+#: deviation fires when the spec MOVES: someone notices Goal or Acceptance
+#: Criteria no longer describe the work and files a note to the user. An agent
+#: that submits the order, sends the email or ships the deploy has not moved the
+#: spec — it has OVER-satisfied it. There is no criterion for it to notice, so
+#: there is nothing for it to file, and by the time anyone could read a note the
+#: act cannot be taken back.
+#:
+#: So the test for a line belonging here is: **violating it cannot be undone by
+#: more work.** Extra code is deletable and extra research is discardable; a
+#: placed order is neither. Expect most plans to say *"None."*
+NOT_AUTHORIZED_SECTION = "not-authorized"
+NOT_AUTHORIZED_HEADING = "## Not Authorized"
+
+#: The pre-2026-09-09 heading, read as a **fallback and never written**. The
+#: plans already on disk carry their denials under it, and a seed template
+#: changing is not a migration — those documents are never rewritten. Reading
+#: only the new slug would mean the rule binds on no project that exists today,
+#: which is exactly the failure the change is meant to fix.
+LEGACY_NOT_AUTHORIZED_SECTION = "guardrails"
+LEGACY_NOT_AUTHORIZED_HEADING = "## Guardrails"
+
+#: Cap on what reaches a prompt. Generous against the new shape — five lines of
+#: denial is around 300 characters, so the cap never fires on a section written
+#: to the hint — and deliberately brutal against the legacy one, where a
+#: 5,029-word section would otherwise displace the turn's actual instructions.
+NOT_AUTHORIZED_MAX_CHARS = 1200
+NOT_AUTHORIZED_MAX_LINES = 12
+
+#: Truncation is **announced, never silent.** A model shown four denials and
+#: told there are more will open the document; one shown four and told nothing
+#: will act as though four is all there are — which is the same failure as not
+#: injecting the section at all, only harder to notice.
+NOT_AUTHORIZED_TRUNCATED = (
+    "... (truncated - read `{heading}` in PLAN.md in full before any outward act)"
+)
+
+#: What an unfilled section says. Either answer means there is nothing to
+#: enforce, so nothing is injected: a prompt carrying the seed's own italic hint
+#: would teach the model to write more hint.
+_NOT_AUTHORIZED_EMPTY = {"none", "none.", "n/a", "na", "-", "\u2014"}
+
+
+def _looks_like_placeholder(text: str) -> bool:
+    """Is this still the seed's italic hint rather than an answer?
+
+    Fully wrapped in underscores, which is how every slot in
+    :data:`SEED_TEMPLATE` marks itself unfilled (``_Not yet approved._`` is the
+    same device). A real denial written entirely in italics would be missed and
+    that is the right trade: the cost is one un-injected line, where the reverse
+    error injects instructional prose into every worker turn on the project.
+    """
+    return text.startswith("_") and text.endswith("_")
+
+
+def _cap_not_authorized(text: str, heading: str) -> str:
+    """Trim to :data:`NOT_AUTHORIZED_MAX_LINES` / ``_MAX_CHARS``, announcing it."""
+    capped = "\n".join(text.splitlines()[:NOT_AUTHORIZED_MAX_LINES])
+    if len(capped) > NOT_AUTHORIZED_MAX_CHARS:
+        capped = capped[:NOT_AUTHORIZED_MAX_CHARS].rstrip()
+    if capped == text:
+        return capped
+    return capped + "\n" + NOT_AUTHORIZED_TRUNCATED.format(heading=heading)
+
+
+def not_authorized_state(body: str) -> str:
+    """What this plan forbids outright, capped and ready to paste into a prompt.
+
+    ``""`` when there is nothing to say, and **nothing to say is the expected
+    answer** — most projects touch nothing irreversible. Three cases collapse to
+    it: no such section, a section still holding the seed's italic hint, and a
+    section that says *"None."* A coordinator that leaves the hint in place has
+    not authorized anything unusual, which is the same state as writing "None"
+    and is treated as such rather than as an omission to complain about.
+
+    **Both slugs are read, new one first.** ``## Not Authorized`` wins where
+    both exist, which is the only case in which someone deliberately wrote under
+    both headings. An empty new section falls through to the legacy one, so a
+    coordinator that added the new heading without moving the content still gets
+    the content enforced.
+
+    Unlike :func:`approval_state` this is not merely informational: it is the
+    only route by which the section reaches a model at all, on either the
+    coordinator or the worker side. It runs in the **agent** process against the
+    synced document, so it must stay a pure function of the bytes — no sidecar,
+    no network.
+    """
+    for slug, heading in (
+        (NOT_AUTHORIZED_SECTION, NOT_AUTHORIZED_HEADING),
+        (LEGACY_NOT_AUTHORIZED_SECTION, LEGACY_NOT_AUTHORIZED_HEADING),
+    ):
+        extent = section_extent(body, slug)
+        if extent is None:
+            continue
+        # Drop the heading line; the caller asked what the section FORBIDS.
+        _, _, rest = body[extent[0]:extent[1]].partition("\n")
+        text = rest.strip()
+        if not text or _looks_like_placeholder(text):
+            continue
+        if text.lower() in _NOT_AUTHORIZED_EMPTY:
+            continue
+        return _cap_not_authorized(text, heading)
+    return ""
+
+
 def _section_prose(body: str, slug: str) -> str:
     """A section's OWN prose: heading dropped, and **stopped at the first
     heading of any depth** that follows.
@@ -319,24 +503,77 @@ def _section_prose(body: str, slug: str) -> str:
 #:
 #: **``## Approval`` is the one section with a rule attached**, and the rule is
 #: not "do not edit it" — it is that the *heading* must survive while a go-note
-#: is open, because that is what the go-note's proposal is located by.
+#: is open, because that is what the go-note's proposal is located by. It is
+#: deliberately left UNMARKED rather than marked ``layer: spec``: spec is the
+#: default, so the marker would add a moving part and say nothing new, and the
+#: heading already carries its own protection.
+#:
+#: **The layered shape** (:func:`plan_markdown.section_layers`): Goal,
+#: Not Authorized and Acceptance Criteria are the user's — unmarked, therefore
+#: spec, therefore locked once the user has looked at the plan. ``## Milestones``
+#: carries ``<!-- layer: detail -->`` and is the keeper's to re-cut freely, and
+#: every ``### M<n>`` inside it inherits that.
+#:
+#: **Criteria are hoisted out of the milestones**, and that hoist is the
+#: precondition for everything else: "milestones are detail, acceptance criteria
+#: are spec" is self-contradictory while the criteria live INSIDE a milestone,
+#: because freeing the milestone frees whatever is nested in it. ``<m>`` in
+#: ``AC-<m>.<n>`` now addresses a criteria GROUP rather than a milestone number,
+#: which cost no parser change — nothing ever read it as a milestone index. A
+#: milestone cites the ids it advances with ``<!-- advances: … -->`` instead of
+#: owning them, and dropping such a claim is refused
+#: (:func:`_coverage_regressed`).
+#:
+#: **``**Deliverable:** `<specific_file.md>`​`` is gone, and its going is the
+#: point rather than a tidy-up.** That one line seeded two biases into every
+#: project this system has ever created: that a plan is about files (a coding
+#: bias, on a template that also has to serve research, design and operations),
+#: and that a criterion names an OUTPUT rather than a behaviour. What a
+#: criterion will be shown by now lives in an ``<!-- evidence: … -->`` comment,
+#: which is inert to the digest and therefore free for the keeper to change
+#: without spending one of the user's decisions.
+#:
+#: **The slot no longer asks for a falsifier, and the reason is what the rule
+#: was always for.** Criteria used to come back unit-test-shaped — naming a
+#: function, a selector, a file path — so any ordinary implementation change
+#: moved what the plan *said* and dragged the user into a decision they should
+#: never have been asked for. The wording chosen to lift them out of that was
+#: "an invariant with a falsifier", and the device ate the intent: every
+#: criterion arrived as ``<assertion>; falsified by <negation>``, unreadable,
+#: usually a restatement, and still pinned to a CSS class. A slot is a pattern
+#: to copy, not a principle to apply, so the slot now carries the property
+#: itself — observable behaviour, at an altitude a rename cannot disturb — and
+#: the counter-case construction is taught nowhere.
 SEED_TEMPLATE = """# {title}
 
 ## Goal
 
-_What is being built and why. Two paragraphs maximum._
+_What outcome this produces and why it is worth producing. Two paragraphs maximum._
 
-## Guardrails
+## Not Authorized
 
-_Constraints, quality bars, scope boundaries._
+_What approving this plan does NOT buy. One line per irreversible outward act
+the agents must not take — sending, publishing, ordering, deploying, deleting,
+spending. The test is that violating it cannot be undone by more work, which
+is why a scope boundary belongs in Goal and a quality bar in Acceptance
+Criteria: those are recoverable. Most plans say "None."_
 
-## Milestones
+## Acceptance Criteria
 
-### M1: <action>
+_Observable outcomes, one plain sentence each — what must be true for whoever
+receives this, not how it gets made. If an ordinary change in method or
+implementation would break one, it is too fine-grained. A quality bar a
+reader can check IS a criterion; a scope boundary belongs in Goal. Grouped;
+`<m>` is the group._
 
-**Deliverable:** `<specific_file.md>`
-**Acceptance criteria:**
-- **AC-1.1** — <testable statement>
+### G1: <the promise this group makes>
+
+- [ ] **AC-1.1** — <who or what> <observable outcome>.
+      <!-- evidence: a test, a file, or whatever a reader could check it against -->
+
+## Milestones <!-- layer: detail -->
+
+### M1: <action>  <!-- advances: AC-1.1 -->
 
 - [ ] **M1** — unassigned
 
@@ -467,6 +704,12 @@ class SectionEdit(BaseModel):
     #: cannot: it is the section's text as the document reads now, so it is
     #: ``""`` on both.
     #:
+    #: **A THIRD READER JOINED THE TWO ACCEPT DOORS**, and it is the one a user
+    #: actually sees: :func:`section_new`. The two above act on the distinction
+    #: and were always right; the LABEL on the note never asked, so sixteen
+    #: proposals to ADD a section were shown reading *"the section is no longer
+    #: in the document"*. Same predicate, same field, one more caller.
+    #:
     #: Still off by default, so a path that has not thought about it gets the
     #: safe answer: an unresolvable slug is a ``409``.
     create: bool = False
@@ -537,6 +780,43 @@ class PlanNote(BaseModel):
 
     id: str
     section: str = ""       # derived slug; ADVISORY. "" = the document as a whole
+    #: **The layer ``section`` was in WHEN THIS NOTE WAS FILED** — stamped once
+    #: by :func:`add_note`, never recomputed, never an input on any route.
+    #:
+    #: It exists so :func:`open_notes_for_you` can stop counting a note about a
+    #: section the keeper was free to rewrite without asking. A note in the
+    #: detail layer is a remark about work the plan already delegated; halting
+    #: the whole project over it spends the owner's attention on a decision the
+    #: document says is not theirs.
+    #:
+    #: **Stamped, not derived, and that is the whole design.** The layer could
+    #: be looked up at count time from ``section_layers(body)``, and must not
+    #: be, for three reasons that compound:
+    #:
+    #: 1. **The counter has no document.** The gate runs in the agent process
+    #:    off ``project.plan_open_notes``, a projection over the wire; that
+    #:    process has ``PLAN.md`` but not the sidecar, and the server-side
+    #:    producers include :func:`plan_summary_for`, which documents at length
+    #:    that it never reads a body. A derived answer drags up to 512 KB of
+    #:    markdown into the one path built to avoid it, per project, per list.
+    #: 2. **A stale anchor has no derivable answer.** Sections get renamed and
+    #:    deleted under notes that outlive them, and a lookup that misses has to
+    #:    invent a layer — defaulting the misses to detail silently releases the
+    #:    gate on live questions. Filing time never faces the question: the
+    #:    section is right there.
+    #: 3. **It would be re-gameable.** A keeper cannot mark a section ``detail``
+    #:    to escape the lock — the manifest is hashed, so the flip comes back as
+    #:    a proposal — but a marker flip applied later must not retroactively
+    #:    un-block notes already filed against the section as spec.
+    #:
+    #: Defaults to ``SPEC`` and every producer other than :func:`add_note`
+    #: leaves it there, which is the conservative direction and is deliberate on
+    #: two of them: :func:`_file_conflict_locked` and the spec-lock filer report
+    #: refusals the caller could not work around, and ``_coverage_regressed``'s
+    #: note is anchored to the milestone it is *about* — the one alarm the
+    #: layered lock added, which a detail-layer exemption would delete. Every
+    #: note already on disk loads without the key and blocks exactly as it did.
+    layer: str = SPEC
     to: str = ""            # agent name, or "user"; "" = addressed to nobody
     by: str = ""
     at: str = ""
@@ -640,6 +920,23 @@ class DraftEntry(BaseModel):
     comment: str = ""       # for ask (the question) and reject (the reason)
     to: str = ""            # derived: the note's author, or the keeper
     at: str = ""
+    #: **The user chose to keep this row's text alongside the winner's.**
+    #: Optional, opt-in, and inert everywhere except one branch of
+    #: ``submit_review``'s superseded loop: absent or ``False`` reproduces the
+    #: pre-fold behaviour character for character, which is what makes the field
+    #: additive rather than a change of meaning.
+    #:
+    #: Set by the client on the row(s) being folded **away**, never on the
+    #: winner, and it carries no status, no author name and no id. The winner's
+    #: identity is entirely server-derived — see ``_close_spec_for_superseded``
+    #: — because the winner is not decided until submit, by
+    #: :func:`_collapse_text_rows` over the whole tray, so any client-side
+    #: snapshot of it is stale by construction.
+    #:
+    #: Honoured only where the loop already acts: an ``accept`` row carrying a
+    #: ``note_id`` that ``_collapse_text_rows`` classified superseded. On every
+    #: other row shape it is read by nobody, so it needs no validation arm.
+    folded: bool = False
 
 
 class PlanReviewDraft(BaseModel):
@@ -762,6 +1059,27 @@ class ProjectPlan(BaseModel):
     #: already exists gets the right answer with no migration. That backfill is
     #: also what makes the fact survive the ``MAX_ROUNDS`` trim in :func:`_save`.
     first_user_review_at: str = ""
+    #: **The plan's ``revision`` at the last review round the OWNER was on the
+    #: receiving end of.** Unlike ``first_user_review_at`` it moves every time,
+    #: because the question it answers is *"has this document changed since YOU
+    #: last looked at it?"* and that has a new answer every round.
+    #:
+    #: It is not :attr:`PlanNote.revision`'s job and cannot be derived from it.
+    #: That field records what a NOTE's author saw; the fact needed here is what
+    #: the READER saw, and the two coincide only for a note the reader wrote.
+    #: Deriving it from the go-note's copy is worse than merely wrong — the
+    #: go-note is anchored to ``## Approval``, the one section the keeper may
+    #: not write while it is open, so its number is frozen at project creation.
+    #:
+    #: Stamped in :func:`submit_review` by :func:`_stamp_owner_seen_locked`,
+    #: **after** the batch has rendered, so the message the owner is reading
+    #: reports the span it closed rather than a span of zero.
+    #:
+    #: Defaults ``0``, and ``0`` means *"never presented"* — the banner and the
+    #: receipt changelog are both omitted on it, so a plan written before this
+    #: field existed renders exactly as it did and the owner's first round is
+    #: not handed a changelog of a draft they have never read.
+    owner_last_seen_revision: int = 0
     created_at: str = ""
     updated_at: str = ""
 
@@ -860,8 +1178,38 @@ def open_notes_for_you(plan: ProjectPlan) -> int:
     reply would narrow its release condition to ``apply``/``reject``/
     ``dismiss`` alone, so a user who replies instead of deciding would jam
     their own project with nothing on any surface saying why.
+
+    **AND ONLY IF THE NOTE IS IN THE SPEC LAYER** (``PlanNote.layer``). A
+    detail-layer section is one the keeper may rewrite with ``plan update`` and
+    no refusal, so a note filed against one is a remark about work the document
+    has already delegated — and stopping the entire project over it asks the
+    owner for a decision the plan says is not theirs to make. The precedent is
+    the write receipt, which is *visible, never blocking*, on the same reasoning:
+    a receipt that counted "would turn every pre-acceptance keeper write into a
+    project-wide stop, and the coordinator would be halted by its own
+    bookkeeping."
+
+    **The honest cost, stated because it is a behaviour change and not only a
+    count change.** A detail-layer note is where a keeper asks *"I want your
+    taste on this before I build it"*, and the halt is what converted that
+    question into an answer. Non-blocking means the keeper asks and then builds
+    anyway. That is what the layer already says — detail is the keeper's — so
+    the completion is upstream, in the keeper deciding rather than asking; but
+    the note is still SENT, still lands in the plan editor's comment list, and
+    still stands in the note history — so nothing is hidden, only un-halted.
+    What it loses is the two surfaces that read this integer: the desk card's
+    *"N for you"* pill and the gate itself.
+
+    The layer is READ OFF THE NOTE and never off the document: this function has
+    no body, by design (it is called from paths that document at length that
+    they never read one), and a note's layer is a fact about when it was filed.
+    See ``PlanNote.layer``.
     """
-    return sum(1 for n in plan.notes if n.status == "open" and n.to == OWNER)
+    return sum(
+        1
+        for n in plan.notes
+        if n.status == "open" and n.to == OWNER and n.layer == SPEC
+    )
 
 
 def section_changed(body: str, note: PlanNote) -> bool:
@@ -916,10 +1264,59 @@ def section_changed(body: str, note: PlanNote) -> bool:
     return current is not None and extent_key(current) != extent_key(note.base_section)
 
 
+def section_new(body: str, note: PlanNote) -> bool:
+    """Does this note PROPOSE the section it names? Then the slug not resolving
+    is the point of the note rather than a problem with it.
+
+    **THE MODEL HAS ALWAYS KNOWN THIS AND THE LABEL NEVER ASKED.** The rule is
+    :func:`resolve_note`'s apply arm verbatim — ``current is None and not
+    note.base_section`` — and :func:`_row_creates` carries the same one for the
+    tray. Both of them go on to CREATE the section and say so at length. The
+    field a reader actually sees, :func:`section_missing`, asked only whether
+    the slug resolved, so every one of those notes was labelled *"the section
+    `x` is no longer in the document"* — reporting a deletion that never
+    happened, on a note whose whole purpose is to write that section. That is
+    not a rare shape: it is what the spec lock files whenever a coordinator's
+    refused write ADDS a section, and there were sixteen such notes on one
+    server when this was written.
+
+    ``PlanNote.base_section`` names the two readers of the create-vs-vanished
+    rule. This is the third, and it is the one that was missing: the predicate
+    now has one home and three callers rather than two callers and a field that
+    guessed.
+
+    **``proposal`` is part of the test, and** :func:`_row_creates` **not asking
+    it is not a disagreement.** That function is handed a row that has already
+    chosen a note to accept, so a note with nothing to apply never reaches it;
+    this one is asked of every note on the plan, including the plain comment
+    that names a section somebody later deleted — which is genuinely dangling
+    and must keep saying so. A refused DELETE is excluded by the same clause and
+    correctly: ``proposes_delete`` against an absent section removes nothing, so
+    it creates nothing either.
+    """
+    if not note.section or not note.proposal or note.base_section:
+        return False
+    return _current_section(body, note.section) is None
+
+
 def section_missing(body: str, note: PlanNote) -> bool:
     """The advisory slug no longer resolves, so the proposal cannot be applied
-    and degrades to a comment with a suggestion attached (§3.3)."""
-    return bool(note.section) and _current_section(body, note.section) is None
+    and degrades to a comment with a suggestion attached (§3.3).
+
+    **A note that PROPOSES the section is not missing it** —
+    :func:`section_new` is that case and answers it, and this must not shadow
+    it for the same reason :func:`section_changed` must not shadow this one:
+    *"there is nothing there any more"* and *"there is nothing there yet"* send
+    a reader to two different places, and only one of them is somewhere to go.
+
+    The narrowing runs everywhere the flag is read, which is the point of doing
+    it here rather than at each surface. ``plan list-notes --dangling`` stops
+    returning notes that are creates, ``plan show-note``'s dangling warning
+    stops firing on them, and ``PlanNoteRow`` prints the sentence that is true.
+    """
+    if not note.section or section_new(body, note):
+        return False
+    return _current_section(body, note.section) is None
 
 
 def _comparison_view(text: str) -> str:
@@ -1430,9 +1827,11 @@ class _PreparedWrite:
     (§4.2) is only true if they share it.
     """
 
-    __slots__ = ("result", "spec", "notes", "moved", "body")
+    __slots__ = ("result", "spec", "notes", "moved", "body", "receipts", "why")
 
-    def __init__(self, result, spec=None, notes=(), moved=(), body=""):
+    def __init__(
+        self, result, spec=None, notes=(), moved=(), body="", receipts=(), why=""
+    ):
         self.result = result
         self.spec = spec
         #: The shorthand notes this write owes the sidecar, built **here** and
@@ -1447,6 +1846,18 @@ class _PreparedWrite:
         #: §5.7 quotes back to a reviewer. On a refusal or a no-op it is the
         #: stored body, which is the same sentence: what the section says now.
         self.body = body
+        #: The sections this write moves the SPEC in, on a plan the user has
+        #: not accepted — the rows :func:`_file_write_receipt_locked` turns
+        #: into receipts. Disjoint from ``result.locked`` by construction and
+        #: never populated alongside it: ``locked`` is the refusal, this is the
+        #: landing. Empty on every write that leaves ``spec_digest`` alone, so
+        #: a checkbox tick carries none.
+        self.receipts = list(receipts)
+        #: The writer's one-line changelog for those receipts. Validated in
+        #: :func:`_prepare_locked` — required and length-capped there — so
+        #: :func:`_finish_locked` can file them without ever raising, which is
+        #: the property its two callers' ordering rests on.
+        self.why = why
 
     @property
     def wrote(self) -> bool:
@@ -1503,38 +1914,54 @@ def _spec_is_locked(project: "Project", plan: ProjectPlan, *, by: str) -> bool:
       U3). Without this conjunct M3 locks every front-desk coordinator out of
       its own document on its second write, and the project's Guardrails forbid
       changing that shape by name.
-    * **``plan.accepted_at or _user_has_reviewed(plan)``** — the start line, and
-      the only conjunct this change touched.
+    * **``plan.accepted_at``** — the start line, and the only conjunct that has
+      ever moved.
 
-    **THE START LINE MOVED, AND HERE IS WHY.** The lock used to require
-    ``phase == "executing" and plan.accepted_at``: it engaged when the user
-    ACCEPTED. That left the whole of ``spec-ing`` ungated, and ``spec-ing`` is
-    where the authority actually leaks — a coordinator that has just been given
-    a round of user feedback decides, section by section, whether that feedback
-    "settles" something, and it decides yes nearly every time because it wrote
-    the summary of the feedback itself. Measured on one real project
+    **THE START LINE IS ACCEPTANCE, AND IT MOVED BACK HERE ON PURPOSE.** It
+    briefly read ``accepted_at or _user_has_reviewed(plan)`` — the lock engaged
+    at the user's FIRST review round rather than at their signature — and that
+    version was answering a real incident. Measured on one real project
     (``chuswine-geo-b2b``): after the user's first review round closed the
     coordinator made 26 direct writes to the document — Goal, Guardrails,
     Sequencing and every milestone — against 0 proposals the user could accept
     or reject. The plan was never accepted, so the lock never fired once.
 
-    So the trigger is now *"the user has looked at this"*, not *"the user has
-    signed this"*. The coordinator drafts freely until the first user-opened
-    review round; from then on what the plan SAYS is the user's, and a keeper
-    write that moves ``spec_digest`` is refused and re-filed as a one-click
-    proposal.
+    **The incident's cause was not the writing.** It was that nothing recorded
+    that a decision had been made: 26 acts of judgement about what the user's
+    feedback "settled", and no surface anywhere naming one of them. Refusing the
+    writes is one way to force that record, and it is the expensive way — it
+    puts the user in the seat of merge arbiter over a document nobody has
+    ratified yet, adjudicating hunk by hunk against a baseline they never
+    agreed to. Rejecting one hunk of five does not return the plan to a good
+    state; it returns it to a state nobody designed. And plan sections are
+    entangled in a way code hunks are not — narrowing M2 silently changes M4's
+    dependencies, and no diff shows that.
 
-    **``accepted_at`` is kept as a disjunct, not replaced.** Acceptance remains
-    sufficient, so a legacy plan that was accepted without ever recording a
-    user-opened round still locks. On any plan that reached acceptance the
-    normal way the user reviewed it first, so the disjunct is usually redundant
-    — which is exactly the property that makes every existing test of the
-    accepted half still describe live behaviour.
+    So the record is reinstated without the refusal. Pre-acceptance a keeper's
+    spec write **lands**, and :func:`_file_write_receipt_locked` files a
+    comment-only receipt naming what moved and why — enforced by the write path
+    (``why`` is required, :func:`_prepare_locked` raises without it) rather than
+    requested by a prompt, because prompt-level trust is precisely what failed
+    on ``chuswine-geo-b2b``. What the user gets back is a coherent document plus
+    a named changelog; what they give up is one-click rejection of a single
+    pre-acceptance hunk, which is stated in the trade-off table in
+    ``COLLABORATION_MODEL.md`` rather than hidden here.
 
-    **``phase == "executing"`` had to go**, and its going is not a narrowing of
-    AC-3.1 but a deliberate widening past it: the whole point is to fire during
-    ``spec-ing``, where that conjunct is false by definition. ``accepted_at``
-    implies ``executing``, so nothing that was locked before is unlocked now.
+    **After acceptance nothing about this function changed**, and that is the
+    line the receipt design must not leak across: there IS a ratified baseline
+    then, drift is the thing being measured, and the diff is the evidence that a
+    change is bounded.
+
+    **``phase == "executing"`` is still gone**, and its going is not a narrowing
+    of AC-3.1: ``accepted_at`` implies ``executing``, so the conjunct was
+    redundant on the only inputs that reach it.
+
+    :func:`_user_has_reviewed` and :attr:`ProjectPlan.first_user_review_at` are
+    KEPT, and they still mark the same moment — they just mark the start of
+    RECORDING rather than the start of refusing (:func:`_owes_receipt`). The
+    validator that recovers the fact from ``rounds`` keeps every legacy plan
+    answering correctly, and the coordinator's prompt reads the same projection
+    it always did.
 
     **What is still legal for the keeper after the lock engages**, because the
     comparison is on ``spec_digest`` and that digest normalizes them away
@@ -1542,11 +1969,80 @@ def _spec_is_locked(project: "Project", plan: ProjectPlan, *, by: str) -> bool:
     ``<!-- … -->`` provenance comments, and reflowing whitespace. Progress
     bookkeeping is untouched, which is what makes moving the start line safe to
     ship without also redesigning how milestones report completion.
+
+    **AND THE WHOLE DETAIL LAYER, WHICH IS THE OTHER HALF OF THE SAME
+    SENTENCE.** ``spec_digest`` no longer hashes the text of a section marked
+    ``<!-- layer: detail -->``, so re-cutting, splitting, merging, reordering
+    and re-assigning milestones all leave the digest where they found it and
+    land silently. **This predicate did not change to make that true** — the
+    material the digest reads did. What this function decides is still only
+    *whose document is it*, never *which part of it*.
+
+    Two acts inside a detail section are still refused, and both are refused by
+    the arm above rather than by anything here: changing a section's ``layer:``
+    marker (the manifest is hashed, so the flip moves the digest) and dropping
+    an ``<!-- advances: … -->`` claim so that a criterion is left unclaimed
+    (:func:`_coverage_regressed`).
     """
     return (
         by == keeper(project)
         and project.surface == "regular"
-        and (bool(plan.accepted_at) or _user_has_reviewed(plan))
+        and bool(plan.accepted_at)
+    )
+
+
+def _owes_receipt(project: "Project", plan: ProjectPlan, *, by: str) -> bool:
+    """Whether this writer's spec move must leave the user a **receipt**.
+
+    Named rather than inlined for the one reason that matters here: **two
+    callers ask it and they must never disagree.** :func:`_prepare_locked` asks
+    it to decide whether a missing ``why`` is a ``400``, and asks it again to
+    decide whether to hand the caller receipt rows. A ``400`` demanding a flag
+    that then goes nowhere, or a receipt filed on a write nobody was asked to
+    justify, are the two shapes a second copy produces.
+
+    **THREE STATES, NOT TWO, AND THE MIDDLE ONE IS THIS PREDICATE.** It is
+    tempting to read this as :func:`_spec_is_locked`'s complement — same author,
+    same surface, other side of ``accepted_at`` — and that reading is wrong in
+    the direction that costs the most. A plan's life has three phases for a
+    keeper's spec write:
+
+    * **drafting**, before the user has opened a single review round: writes
+      land, and owe NOTHING. There is no reader for a receipt — the user has
+      not seen the document, so there is nothing for a changelog to be a
+      changelog *since*, and :func:`_owner_changelog` renders none. Demanding a
+      line here would tax every keystroke of composing a first draft to produce
+      a record nobody will ever read.
+    * **reviewed but unaccepted**: writes land, and owe a receipt. This is the
+      window the ``chuswine-geo-b2b`` incident happened in — 26 direct writes
+      after the user's first round closed, 0 of them recorded anywhere — and it
+      is the only window where a keeper's write changes a document the user has
+      an opinion about but has not signed.
+    * **accepted**: :func:`_spec_is_locked`. Writes are refused and filed as
+      proposals with diffs, because there is finally a ratified baseline for a
+      diff to be a bounded delta against.
+
+    So ``_user_has_reviewed`` is the start line, exactly as it was when it
+    gated the lock. **What changed is the outcome, not the trigger** — the same
+    act that used to be refused now lands and is recorded — which is why that
+    predicate and :attr:`ProjectPlan.first_user_review_at` are kept rather than
+    deleted, backfill validator and all.
+
+    It does **not** ask whether the spec actually moved. That question needs
+    ``cleaned`` and ``body``, which only exist after the splice, and folding it
+    in here would put an I/O-shaped argument on a predicate the prompt layer
+    also wants to read. The caller ands the two together, once.
+
+    ``surface == "regular"`` for the same reason the lock carries it: a
+    front-desk plan is ``executing`` from creation and the coordinator's write
+    IS the acceptance there, so there is no user round for a receipt to be read
+    in and nobody it would be addressed to.
+    """
+    return (
+        by == keeper(project)
+        and project.surface == "regular"
+        and not plan.accepted_at
+        and _user_has_reviewed(plan)
     )
 
 
@@ -1585,7 +2081,7 @@ def _write_refusal(project: "Project", *, by: str) -> str:
 
 
 def _spec_lock_refusal(
-    project: "Project", *, by: str, note_ids: Sequence[str], accepted: bool
+    project: "Project", *, by: str, note_ids: Sequence[str]
 ) -> str:
     """M3's own refusal, with its remedy in it (AC-3.3).
 
@@ -1595,25 +2091,46 @@ def _spec_lock_refusal(
     lands. Names the note ids, because a ``403`` body is a bare string and the
     user's copy of the coordinator's text is the whole point of the refusal.
 
-    **Two reasons behind one flag, because the lock now has two start lines.**
-    The single sentence this used to be said *"it is accepted"*, which is FALSE
-    on every refusal the pre-acceptance trigger produces — and a ``403`` whose
-    stated reason the model can see is untrue is one it argues with rather than
-    obeys. ``accepted`` picks the true half; both halves keep the two properties
-    the original string was built for.
+    **The ``accepted`` flag is gone, and its going is the point.** It existed
+    while the lock had two start lines and one of them was *"the user has
+    reviewed this"*, on which *"it is accepted"* would have been a stated reason
+    the model can see is untrue — and a ``403`` a model can disprove is one it
+    argues with rather than obeys. :func:`_spec_is_locked` now engages on
+    ``accepted_at`` alone, so the unaccepted half of that flag became
+    unreachable: a parameter with one possible value, and a sentence behind it
+    that no caller can ever produce. Pre-acceptance there is no refusal to word
+    — the write lands and files a receipt.
     """
     ids = ", ".join(note_ids) or "a note"
-    why = (
-        "it is accepted, and the user decides what it says"
-        if accepted
-        else "the user has reviewed this plan, and from here they decide what "
-        "it says"
-    )
     return (
-        f"@{by} may not change what this plan says — {why}. Ticking a checkbox "
-        f"or editing an HTML comment still applies. Your text is filed as {ids} "
-        f"for the user to accept in one click; say why in `user-communication`."
+        f"@{by} may not change what this plan says — it is accepted, and the "
+        f"user decides what it says. Ticking a checkbox or editing an HTML "
+        f"comment still applies. Your text is filed as {ids} for the user to "
+        f"accept in one click; say why in `user-communication`."
     )
+
+
+def _coverage_regressed(before: str, after: str) -> bool:
+    """Would this write leave a criterion unclaimed that WAS claimed before?
+
+    **The one thing that makes "milestones are implementation detail" safe
+    rather than merely convenient.** If the keeper may re-cut milestones without
+    asking, it may also delete the milestone that carried the work behind
+    ``AC-2.1`` — and the user finds out at completion, which is the moment this
+    whole design exists to stop being the moment things surface.
+
+    So re-cutting, splitting, merging, reordering and re-owning milestones stay
+    free, and exactly one milestone edit is not: one that drops coverage. That
+    is a spec change, because it changes what the user said yes to.
+
+    **A REGRESSION test, not a validity test, and the distinction is the entire
+    migration story.** It never asks *"is every criterion claimed?"* — a plan
+    that carries no ``<!-- advances: … -->`` markers has the identical unclaimed
+    set before and after every write, so this cannot fire on any document that
+    exists today. Nothing has to be backfilled and no plan has to adopt the
+    convention to keep working.
+    """
+    return bool(unclaimed_criteria(after) - unclaimed_criteria(before))
 
 
 def _prepare_locked(
@@ -1623,6 +2140,7 @@ def _prepare_locked(
     edits: Sequence[SectionEdit],
     *,
     by: str,
+    why: str = "",
 ) -> _PreparedWrite:
     """§4.1 steps 1–6, plus step 7's shorthand extraction. **Appends nothing.**
 
@@ -1636,6 +2154,14 @@ def _prepare_locked(
     means *the section moved under you, re-read and decide*. ``locked`` means
     *the plan is accepted and this changes what it says, so it is the user's
     call now*. Neither is ever populated alongside the other.
+
+    ``why`` is the keeper's changelog line for a **pre-acceptance** spec move.
+    It is validated here — required, and capped at ``MAX_WHY_CHARS`` — because
+    this is the last point at which refusing is free: below the append the
+    write has already been broadcast to every participant, and a cap tripped
+    there would leave the document written and the caller told nothing was.
+    A write that moves no spec never sees it, so ticking a checkbox needs no
+    flag.
     """
     if not may_write(project, by):
         raise PlanForbiddenError(_write_refusal(project, by=by))
@@ -1804,6 +2330,56 @@ def _prepare_locked(
                     f"Keep one, and leave its text as it stands."
                 )
 
+    # **AND NO WRITE PUTS TWO HEADINGS UNDER ONE SLUG**, which is the general
+    # form of the arm directly above — asked of every section, at every phase,
+    # rather than of the go-note's own while that note happens to be open.
+    #
+    # The two guards on each edit ask about its FIRST line: does it carry a
+    # heading (`drops_heading`), and is that heading at the section's own level
+    # (`relevels_heading`). Nothing looks at the rest of the text, and a
+    # replacement may legitimately carry further headings — re-cutting `### M1`
+    # into M1 + M2 is how a milestone list grows, and is pinned by
+    # `test_the_keeper_rewrites_a_detail_section_after_the_users_round_and_files_nothing`.
+    # So the question is not whether a replacement adds a heading. It is
+    # whether the heading it adds is one the plan ALREADY HAS.
+    #
+    # The incident: a coordinator regenerated `## Milestones` into a file,
+    # copied one section too far, and the file ended with the document's own
+    # `## Approval` block. Ids are assigned in source order, so the injected
+    # copy took `approval` and the user's real, accepted section was demoted to
+    # `approval-2` — then reported to them as a brand-new section to approve, by
+    # a spec lock doing exactly its job. The user read a note saying their
+    # keeper "could not change `approval-2`" about a slug nobody had ever typed.
+    #
+    # **This is not a new rule; it is an existing one reaching its second
+    # door.** `add_note` already refuses to create the `duplicate id` state
+    # (`_refuse_unknown_section`, and
+    # `test_the_typo_that_used_to_append_a_second_heading_under_one_slug` calls
+    # it *"the only one of these with real damage"*). A surface refusing what
+    # its sibling accepts is the shape of a bug, and this was the open half.
+    #
+    # **Asked of the SPLICED document, and of the transition rather than the
+    # state.** Of the document, because the duplicate is only visible once the
+    # text is in place — no single edit names the section it collides with. Of
+    # the transition, because a plan that already holds two `### Notes` must
+    # stay writable; refusing on the state would leave a document that exists
+    # with no way to edit it and no way back.
+    #
+    # Refused, not silently repaired, for the reason the two guards above give:
+    # a `400` can name the heading it saw, and a rename chosen by the server
+    # would make the stored document disagree with the text its author sent.
+    dup = duplicated_heading(body, spliced)
+    if dup:
+        raise PlanInputError(
+            f"this write gives the plan a second {dup!r} heading. Two headings "
+            f"slug to one id, so the copy that comes FIRST in the document takes "
+            f"it and the other is renamed — every note, every quote and every "
+            f"later edit addressed to that section then lands on whichever came "
+            f"first. If you meant to rewrite that section, edit it by its own "
+            f"slug; if you copied more text than you meant to, send only the "
+            f"section you are writing."
+        )
+
     if spliced == body:
         # §4.1 step 6 — an idempotent retry, and the reason a review of only
         # rejects, asks and dismissals costs nothing and needed no code: those
@@ -1818,8 +2394,9 @@ def _prepare_locked(
     changes = split_by_section(body, cleaned)
     moved = [slug for slug, _b, _a in changes]
 
-    if _spec_is_locked(project, plan, by=by) and spec_digest(cleaned) != spec_digest(
-        body
+    if _spec_is_locked(project, plan, by=by) and (
+        spec_digest(cleaned) != spec_digest(body)
+        or _coverage_regressed(body, cleaned)
     ):
         # **AC-3.1 — splice first, compare after, and compare ``cleaned``.**
         #
@@ -1835,6 +2412,15 @@ def _prepare_locked(
         # actually reaches disk: a ``{@user: …}`` shorthand is a note, not a
         # change to what the plan says, and hashing it would refuse a write whose
         # only "spec move" the extractor was about to remove.
+        #
+        # **THE SECOND ARM IS NOT A SECOND LOCK.** ``spec_digest`` no longer
+        # hashes the detail layer, which is what buys the keeper its freedom —
+        # and that freedom has exactly one way to be abused, which
+        # :func:`_coverage_regressed` closes: a milestone edit that drops the
+        # work behind a criterion. Same refusal, same rows, same filed note,
+        # because it is the same kind of act — it changes what the user said yes
+        # to. Both arms ask their question of ``cleaned`` against ``body``, both
+        # sides computed here in one call, so neither needs a migration.
         #
         # **Appends nothing and files nothing.** This function's contract is that
         # ``plan`` is not mutated, so a caller that abandons the write leaves the
@@ -1855,15 +2441,72 @@ def _prepare_locked(
             body=body,
         )
 
+    # **THE SAME QUESTION, ASKED ON THE OTHER SIDE OF ACCEPTANCE, WITH THE
+    # OPPOSITE OUTCOME.** The arm above refuses a keeper's spec move on an
+    # ACCEPTED plan and files a proposal. This one lets the identical move LAND
+    # on an unaccepted one and files a receipt — a comment naming what moved and
+    # why — because before acceptance there is no ratified baseline for a diff
+    # to be a bounded delta against, and hunk-by-hunk adjudication of a draft
+    # nobody agreed to leaves the plan in a state nobody designed.
+    #
+    # **It re-uses the arm above's predicate exactly, and deliberately so.** The
+    # digest test is the same expression on the same two values, and
+    # `_owes_receipt` is `_spec_is_locked`'s complement on the other three
+    # conjuncts, so no write can fall between them and none can satisfy both.
+    # `_coverage_regressed` rides along for the same reason it does up there: a
+    # milestone edit that drops the work behind a criterion changes what the
+    # user is being asked to say yes to, and it is the one detail-layer edit
+    # that owes them a line.
+    #
+    # **Filtered HERE, through the same `_rows_worth_showing` the refusal path
+    # uses**, and here rather than in the filer because that filter reads its
+    # layers out of the STORED body — the document as it stands before this
+    # write — and this is the last frame in which the stored body exists. Pass
+    # the post-write text and a keeper could suppress its own receipt by marking
+    # the section `<!-- layer: detail -->` in the very write being recorded.
+    receipts: list[StaleSection] = []
+    if _owes_receipt(project, plan, by=by) and (
+        spec_digest(cleaned) != spec_digest(body)
+        or _coverage_regressed(body, cleaned)
+    ):
+        if not why.strip():
+            raise PlanInputError(
+                "this write changes what the plan SAYS, and the user has not "
+                "accepted it yet — so it lands, and it owes them a line saying "
+                "what moved and why. Pass --why (`why` on a review batch), "
+                "and make it a CHANGELOG LINE "
+                "naming the change and its cause (\"M2 now owns auth setup, "
+                "moved out of M3 — backend flagged M3's endpoints cannot be "
+                "built before it\"), not a summary (\"incorporated feedback\"): "
+                "they answer you by naming one of these lines. Ticking a "
+                "checkbox, editing an HTML comment and re-cutting `## "
+                "Milestones` still need no --why."
+            )
+        if len(why) > MAX_WHY_CHARS:
+            raise PlanInputError(
+                f"--why is {len(why)} chars, limit is {MAX_WHY_CHARS}. It is one "
+                f"changelog line, not the rationale — the rationale goes in "
+                f"`user-communication`, where the user can answer it."
+            )
+        receipts = _rows_worth_showing(
+            [
+                StaleSection(section=slug, base=before, current=before, text=after)
+                for slug, before, after in _pair_renamed_rows(body, cleaned, changes)
+            ],
+            body,
+        )
+
     return _PreparedWrite(
         WriteResult(ok=True, revision=plan.revision, sections=moved, sha=body_sha(cleaned)),
         spec=_file_spec(project, ctx, cleaned, by, created=False),
         notes=[
-            PlanNote(id="", section=s.section, to=s.owner, by=by, comment=s.text)
+            PlanNote(id="", section=s.section, quote=s.quote, to=s.owner, by=by, comment=s.text)
             for s in shorthands
         ],
         moved=moved,
         body=cleaned,
+        receipts=receipts,
+        why=why,
     )
 
 
@@ -1883,8 +2526,18 @@ def _finish_locked(
     function only mutates the in-memory ``plan``, ``_save`` is the module's only
     writer, and it runs after the append on both paths — so an append that
     raises persists nothing either way.
+
+    **The receipts are filed HERE and not in :func:`_apply_locked`**, and the
+    reason is the second caller. :func:`submit_review` reaches the append
+    through ``_prepare_locked`` + this function directly, never through
+    ``_apply_locked``; filing there would mean a keeper write carried inside a
+    review batch moved the spec and left no line. One filer, both doors.
     """
     prepared.result.note_ids += _add_notes_locked(plan, prepared.notes)
+    if prepared.receipts:
+        prepared.result.note_ids += _file_write_receipt_locked(
+            plan, prepared.receipts, by=by, why=prepared.why
+        )
     if project.surface == "frontdesk" and by == keeper(project):
         # §7.2 U3 — the coordinator is the sole acceptor on a front-desk plan,
         # so its write IS the acceptance. One extra call site, not a second
@@ -1903,6 +2556,7 @@ async def _apply_locked(
     *,
     by: str,
     verb: str = "write",
+    why: str = "",
 ) -> _PreparedWrite:
     """§4.1, steps 1–7. **The entire concurrency mechanism**, prepared and
     committed in one go — the shape every caller but :func:`submit_review` wants.
@@ -1919,7 +2573,7 @@ async def _apply_locked(
     Callers that want only the verdict take ``.result``, which is the same
     object they used to be handed.
     """
-    prepared = _prepare_locked(project, ctx, plan, edits, by=by)
+    prepared = _prepare_locked(project, ctx, plan, edits, by=by, why=why)
     if prepared.result.locked:
         # **M3 AC-3.3, filed here and not in each caller, because it is
         # unconditional.** Staleness has a ``file_conflict`` flag — it is a
@@ -1936,7 +2590,7 @@ async def _apply_locked(
         # loses the write AND shows the user a traceback. :func:`apply_edits`
         # raises on the way out, once the sidecar is saved.
         prepared.result.note_ids += _file_spec_lock_locked(
-            project, plan, prepared.result.locked, by=by
+            project, plan, prepared.result.locked, by=by, body=prepared.body
         )
         _note(
             plan, by, "refused",
@@ -2049,6 +2703,80 @@ def _validate_notes_locked(plan: ProjectPlan, notes: Sequence[PlanNote]) -> None
             check_note_text(field, text)
 
 
+def _supersede_prior_locked(plan: ProjectPlan, note: PlanNote) -> None:
+    """**One author gets one unsent proposal per section.** Close the earlier
+    ones as ``dismissed``, naming the note that replaced them. Lock held; the
+    incoming ``note`` must already carry its id and must NOT yet be in
+    ``plan.notes``.
+
+    **Why it is here and not in** :func:`add_note`. ``add_note``'s
+    :func:`_recent_twin` net catches the *identical* re-file and returns the
+    existing id. This is its sibling for the *changed* re-file, and it has to
+    sit one level down because the door that produced the incident does not go
+    through ``add_note`` at all: :func:`_file_spec_lock_locked` files the
+    server's own deviation note directly onto :func:`_add_notes_locked` when a
+    write is refused, and so do :func:`_file_conflict_locked` and
+    :func:`absorb_plan_upload`. On ``clawmeets-plan-fold-status`` that left the
+    user four rows on ``## Milestones`` where one was meant, two of them
+    server-written delete-rows the coordinator never chose to file, and the
+    coordinator hand-wrote *"apply this and dismiss the other three"* because
+    it had no way to reconcile them itself.
+
+    **It is not a hole in** :func:`_refuse_unsent_self_close`, and the
+    ``note_was_sent`` clause is the whole reason. That guard exists because a
+    keeper that files a question and then closes it before the batch goes out
+    has decided it on the user's behalf — the ``chuswine-geo-b2b`` sequence its
+    docstring records. Nothing is decided here: the close is atomic with filing
+    a REPLACEMENT on the same section addressed to the same person, so what
+    reaches the desk is the same question in its current wording, never
+    silence. A bare ``resolve --dismiss`` on your own unsent note stays a 403,
+    because that one really does end with nothing on the desk.
+
+    **Proposals only.** Comments and questions stack legitimately on one
+    section — §4.4's *"a note with no proposal never collides"* — and two of
+    them are two things to say, not one restated. Two unsent PROPOSALS on one
+    section are already unrepresentable: a proposal is the section's whole
+    replacement text, the document can hold one, and the skill's own remedy for
+    the collision was to file a third note superseding both by hand. This does
+    that in the one place every filing door passes through, so the coordinator
+    never has to notice.
+
+    ``bool(proposal) or proposes_delete`` is the desk's ``has_proposal``
+    (``routes/project_plans.py``) minus its ``status == "open"`` clause on the
+    delete arm, which is redundant here — the loop only looks at open notes.
+
+    The go-note is exempt (``bootstrap``): it closes on ``apply`` and on
+    nothing else (:func:`_refuse_go_note_close`), and it is unique per plan
+    anyway, so nothing can legitimately replace it.
+    """
+    if not (note.proposal or note.proposes_delete):
+        return
+    if not note.section or note.bootstrap:
+        return
+    for prior in plan.notes:
+        if prior.id == note.id or prior.status != "open" or prior.bootstrap:
+            continue
+        if prior.by != note.by or prior.to != note.to:
+            continue
+        if prior.section != note.section:
+            continue
+        if not (prior.proposal or prior.proposes_delete):
+            continue
+        if note_was_sent(plan, prior):
+            # The user has seen it. From here only they may close it, which is
+            # exactly what `_refuse_unsent_self_close` leaves open and what
+            # this must not take away: two rows on the desk is a worse outcome
+            # than one, but a row vanishing from under the reader is worse than
+            # both.
+            continue
+        _close_note(
+            prior,
+            status="dismissed",
+            by=note.by,
+            reason=REPLACED_UNSENT_REASON.format(id=note.id),
+        )
+
+
 def _add_notes_locked(plan: ProjectPlan, notes: Sequence[PlanNote]) -> list[str]:
     """Validate the whole sequence, **then** stamp ids and timestamps and file.
 
@@ -2057,12 +2785,55 @@ def _add_notes_locked(plan: ProjectPlan, notes: Sequence[PlanNote]) -> list[str]
     by which *"the first shorthand was filed and then lost"* happens on a caller
     that then abandons the plan; validating first makes that partial state
     unreachable rather than merely harmless. Lock held.
+
+    **THE QUOTE IS DERIVED HERE, not in each caller, and that placement is the
+    whole repair.** :func:`add_note` — the public door — has derived one since
+    the anchor work landed, but it is not the door most notes come through:
+    :func:`_file_spec_lock_locked`, :func:`_file_conflict_locked` and
+    :func:`absorb_plan_upload` all build a :class:`PlanNote` by hand and hand it
+    straight to this function, and every one of them omitted ``quote``. So the
+    notes the SERVER files about a refused write — the ones a user is most
+    likely to be reading, because they arrive unasked — were exactly the notes
+    that could never render beside the text they are refusing. On
+    ``clawmeets-todo-tickets`` that was both open notes on the plan.
+
+    Fixing it at the call sites would have been four places to remember and a
+    fifth to forget. Here it is structural: this is the one function every
+    filing door already passes through, which is the argument
+    :func:`_supersede_prior_locked` makes at length for living at this level.
+
+    ``add_note``'s own derivation stays where it is and is not made redundant by
+    this one: :func:`_recent_twin` keys on ``quote``, so the quote must exist
+    BEFORE the dedupe scan, which is upstream of here. A note that arrives
+    carrying a quote is untouched by the guard below — including every note that
+    came through that door.
+
+    **``base_section`` is the whole input**, so no document read is needed and
+    none is taken; this function has never held a body and does not start now. A
+    caller that captured no base derives no quote and its note settles at the
+    end of its section, which is the middle rung of :func:`_derive_quote`'s
+    ladder and the correct fall.
     """
     _validate_notes_locked(plan, notes)
     ids: list[str] = []
     for note in notes:
+        if note.section and not note.quote:
+            note.quote = _derive_quote(note.base_section, note.proposal)
         note.id = _gen_id("n", (n.id for n in plan.notes))
         note.at = note.at or _now()
+        # BEFORE THE APPEND, and that ordering is load-bearing twice over. The
+        # id is stamped, so the reason can name the note that replaced them;
+        # `plan.notes` still holds only PRIOR notes, so the incoming one cannot
+        # supersede itself. A batch carrying two rows on one section collapses
+        # the same way — the first is appended by the time the second is
+        # processed — which is the answer a per-note rule has to give.
+        #
+        # The open-note budget above is counted before any of this, so a
+        # sequence that would fit only AFTER superseding is still refused. That
+        # is the conservative direction and it costs nothing real: superseding
+        # is what stops repeated re-files from accumulating toward the cap in
+        # the first place.
+        _supersede_prior_locked(plan, note)
         plan.notes.append(note)
         ids.append(note.id)
     return ids
@@ -2128,6 +2899,60 @@ def _reply_addressee(parent: PlanNote, by: str) -> str:
     return parent.to if parent.by == by else parent.by
 
 
+def _reply_closes_parent(
+    project: "Project", plan: ProjectPlan, parent: PlanNote, *, by: str
+) -> bool:
+    """Does a reply to ``parent``, filed by ``by``, close it ``answered``?
+
+    **The rule AC-5.9 states, with one home instead of two.** It lived inside
+    :func:`submit_review`'s ``ask`` arm, which is the OWNER's door — the tray is
+    owner-only — so the half of AC-5.9 that runs the other way never ran at all.
+    :func:`open_notes_for_you` has documented that half since it was written
+    (*"the coordinator answers the user's note … closing it is −0"*), and
+    :func:`add_note`, the door the coordinator actually uses, left the parent
+    open on the stated grounds that *"the plan editor draws only OPEN notes"*.
+
+    The consequence was one-sided and the user saw it: every note the user wrote
+    was answered and stayed open, so it kept a ``Dismiss`` button and kept
+    asking the person who had already been answered to close their own question.
+    The cost the old comment was avoiding — the question leaving the screen when
+    it closes — is paid where it belongs, on the reply: ``PlanNoteRow``'s
+    *"Answering your question"* line now carries the parent's own first line, so
+    the answer still reads as an answer with the question gone.
+
+    ``answered`` is the ladder's own word for *the addressee has replied*, so
+    every clause below is that sentence made checkable:
+
+    * **an already-closed parent stays as it closed.** A reply to a note someone
+      resolved underneath you must not overwrite ``applied`` with ``answered``:
+      the second is a weaker fact and it would erase which decision was made.
+    * **never the go-note.** :func:`_refuse_go_note_close` carries the argument
+      at length — every way of closing it releases the execution gate and only
+      ``apply`` means yes, so typing *"what about the auth milestone?"* must not
+      start the work being questioned. The outgoing reply is filed either way;
+      only the parent's status differs.
+    * **only someone the note is addressed to**, which is :func:`resolve_note`'s
+      own report guard verbatim. Under the two-party rule the addressee is the
+      user or the keeper, so in practice this admits exactly the two ends of the
+      thread and refuses nothing anybody can reach.
+    * **not your own unsent proposal to the user**, which is
+      :func:`_refuse_unsent_self_close` — the same authority leak, arriving
+      through the reply door instead of the ``--dismiss`` one.
+
+    It **returns a bool where those two RAISE**, and that is the difference that
+    matters: filing a reply is always legal. A shape that may not close the
+    parent still files the note and simply leaves the parent open, because the
+    caller asked to say something and not to resolve anything.
+    """
+    if parent.status != "open" or parent.bootstrap:
+        return False
+    if parent.to and parent.to != by and not may_write(project, by):
+        return False
+    if by != OWNER and parent.by == by and parent.to == OWNER:
+        return note_was_sent(plan, parent)
+    return True
+
+
 def _capture_base(body: str, section: str) -> str:
     """The section as it stands **right now**, captured at file time so a note
     has something honest to compare against later.
@@ -2155,16 +2980,173 @@ def _capture_base(body: str, section: str) -> str:
     return _current_section(body, section) or ""
 
 
-def _derive_quote(base: str, proposal: str) -> str:
+def _derive_section(body: str, quote: str) -> str:
+    """The section a QUOTED note belongs to when its author named none.
+
+    The other direction of :func:`_derive_quote`, and the pair is what makes the
+    editor's placement a ladder rather than a cliff — see that function for the
+    three rungs.
+
+    **A quote is what makes this legal.** ``--section ''`` on its own is a
+    deliberate choice with its own meaning — *"about the document as a
+    whole"* — and nothing here may overrule it. But an author who supplied an
+    EXCERPT has already said the note is about a particular passage; a passage
+    lives in a section, and refusing to look up which one is not respect for
+    their choice, it is a shrug. So this fires on ``quote and not section`` and
+    on nothing else, which leaves the whole-document note exactly as sayable as
+    it was.
+
+    Reachable from the terminal, where ``--quote`` and ``--section`` are
+    independent options and nothing pairs them; the browser composer always
+    sends both, because ``planAnchor`` takes them off one selection.
+
+    ``""`` when the excerpt is in no section or in two;
+    :func:`section_holding_quote` carries why an ambiguous match must not be
+    guessed at.
+    """
+    return section_holding_quote(body, quote) if quote else ""
+
+
+def _salvage_section(body: str, section: str, quote: str) -> str:
+    """A section slug that does not resolve, replaced by the one the note's own
+    EXCERPT lives in — or handed back untouched when there is nothing to go on.
+
+    **Nothing in this system checks that a section slug is real**, at either
+    door, and a slug is the one address a caller types by hand. ``plan note
+    --section m2`` when the document says ``m2-api-and-ingest`` is accepted,
+    filed, stamped SPEC — so it blocks execution — and dropped at the bottom of
+    the page under a sentence about a section that was never deleted.
+
+    It is also the answer to a race nobody has reported yet and everybody can
+    reach: a slug is derived from heading TEXT, so retitling a section re-slugs
+    it. Select a block in the browser, have somebody retitle the section
+    underneath you, and the note you send names a slug that stopped existing
+    between the selection and the Save. The quote still resolves, because the
+    passage did not move — only its address did.
+
+    **The quote is what makes the lookup legal**, and it is the same bargain
+    :func:`section_holding_quote` is written for: an author who supplied an
+    excerpt has already said which passage they mean, so reading the section off
+    it is a lookup rather than an override. With no excerpt there is nothing to
+    look anything up FROM, and the slug stands as typed for
+    :func:`_refuse_unknown_section` to answer.
+
+    Returns ``section`` UNCHANGED on every path that is not a salvage —
+    including a resolvable slug, which is the overwhelmingly common one and is
+    answered by the first test without a scan. Nothing here ever overrules a
+    slug that works.
+    """
+    if not section or not quote or _current_section(body, section) is not None:
+        return section
+    return section_holding_quote(body, quote) or section
+
+
+def _refuse_unknown_section(body: str, section: str, proposal: str) -> None:
+    """Refuse a note whose typed section is neither in the document nor being
+    written by the note itself. **400, and the only one of these that had teeth.**
+
+    A typo'd slug on a plain comment costs a misplaced note. A typo'd slug with
+    a proposal corrupts the document, and does it without a ``--force``: the CLI
+    reads the section's text to fill ``base_section``, gets nothing back for a
+    slug that does not resolve, and sends ``""`` — which the model reads as
+    *"this proposal CREATES a section"* (:func:`_row_creates`,
+    :func:`resolve_note`'s apply arm). One ``resolve --apply`` later the document
+    holds a SECOND ``## M2 — API and ingest``, one slug over two headings, which
+    is the ``duplicate id`` state ``plan show --sections`` warns about and
+    nothing repairs.
+
+    **Narrow, because proposing a section that does not exist yet is legal and
+    is how half this system works** — the spec lock files a restore of a deleted
+    section that way, and so does the upload absorber. The test that separates a
+    create from a typo is the proposal's OWN first heading: a replacement whose
+    heading slugs to the section the note names means to write that section, and
+    one whose heading slugs to anything else (or that has no heading at all)
+    named a section it cannot be talking about. Neither filer reaches here in any
+    case — both build their notes by hand for :func:`_add_notes_locked` — so this
+    guard sits on exactly the door a human or an agent types a slug at.
+
+    Asked only of a slug the caller TYPED, which is :func:`add_note`'s gate
+    rather than this function's and is argued there: what the exemption lets
+    through is a comment on a section that is gone, which writes nothing.
+
+    **NAMES THE THING, NOT THE FLAG** (AC-1.5), like the ``PlanInputError`` above
+    it: this refusal reaches the browser composer too, which has no
+    ``--section`` and never will.
+    """
+    if not section or _current_section(body, section) is not None:
+        return
+    if proposal and heading_slug(proposal) == section:
+        return
+    raise PlanInputError(
+        f"There is no section {section!r} in this plan. Name one the document "
+        f"has, quote the passage you mean, or write a proposal whose own "
+        f"heading creates it."
+    )
+
+
+def _criterion_quote(base: str, comment: str) -> str:
+    """The line of ``base`` defining the criterion this note's PROSE names.
+
+    **The address was typed — into the message body instead of into ``--ac``.**
+    ``plan note --ac AC-2.3`` resolves to exactly the ``(section, quote)`` pair a
+    note wants and is documented in the plan skill in three places; agents still
+    open with *"AC-1.3: ``--as-user`` is specified as suppressing…"* and pass
+    ``--section m1-…`` alone. On one server that was 24 notes — the largest
+    single class of sectioned-but-unanchored note there is — and after two
+    rounds of documentation changes it is not a documentation problem. The
+    author knew which line they meant and wrote it down; this reads what they
+    wrote.
+
+    **Scoped to ``base``, which IS the section the note names**, and the scope is
+    the guard rather than a detail of it. An id in prose is as often a
+    cross-reference — *"this conflicts with AC-2.3"* on a note about a different
+    milestone — as it is an anchor, and a cross-reference must not move the
+    note. A criterion defined elsewhere is simply not in this text, so it finds
+    nothing and the note keeps the anchor it would have had.
+
+    **Exactly one occurrence, or nothing.** ``parse_criteria`` reports
+    occurrences rather than definitions, so an id both defined and referred back
+    to inside one section yields two rows and no answer. First-in-document-order
+    would be the definition and would usually be right; *usually* is the wrong
+    standard for an anchor, and the fall is one rung to the section heading
+    rather than to the bottom of the page.
+
+    Fence-aware on both sides — ``named_criterion`` over the comment,
+    ``parse_criteria`` over the base — so a note quoting a code sample of a
+    criterion anchors to nothing, like every other scanner in this system.
+    """
+    wanted = named_criterion(comment)
+    if not wanted:
+        return ""
+    hits = [c for c in parse_criteria(base) if c.id.upper() == wanted]
+    return hits[0].quote if len(hits) == 1 else ""
+
+
+def _derive_quote(base: str, proposal: str, *, comment: str = "") -> str:
     """The quote a sectioned note gets when its author supplied none.
 
-    **The whole of why CLI-filed notes land at the bottom of the page.** The
-    editor draws a note inline, against the line it argues about, only when the
-    note carries a quote AND a section that still resolves
-    (``PlanEditor.tsx:775``: ``!!n.quote && shownIds.has(n.section)``).
-    Everything else falls to the page-bottom pane. ``--quote`` is optional and
-    no worked example in the ``plan`` skill passes one, so *every* note filed
-    from a terminal was unanchored by construction — not by anybody's
+    **The whole of why CLI-filed notes land at the bottom of the page.**
+
+    THE PLACEMENT LADDER, which this function and :func:`_derive_section` exist
+    to climb. Where a note is drawn is decided by what it can name, in three
+    rungs, and the fall between them is one rung at a time:
+
+    * **section + quote** — inline in the body, under the block holding that
+      line. The answer everybody wants.
+    * **section, no quote** — at the END OF THAT SECTION, in ``PlanBody``'s
+      loose pane, labelled with why it could not be placed more precisely. The
+      note is still next to the text it argues about.
+    * **neither** — the page-bottom ``NOTES`` list. Correct, and the only
+      correct answer: a note that names no part of the document has no part of
+      the document to sit beside.
+
+    Derivation is how a note that LOOKS like the bottom rung is recognised as a
+    higher one. It never invents an anchor to climb a rung it has not earned:
+    every function here returns ``""`` rather than a guess, which is a fall of
+    exactly one rung and never a wrong placement.
+
+    ``--quote`` is optional and no worked example in the ``plan`` skill passes
+    one, so *every* note filed from a terminal was unanchored by construction — not by anybody's
     carelessness. The browser composer was always fine, because
     ``planAnchor.tsx`` takes the quote off the user's selection; that asymmetry
     is what made this read like an agent-behaviour problem when it was a
@@ -2175,14 +3157,27 @@ def _derive_quote(base: str, proposal: str) -> str:
     * **A proposal** anchors to :func:`first_changed_line` — the base line it
       actually changes, which is the line its reader wants to be looking at.
     * **Anything else** — a comment, a question, a deviation — anchors to the
-      section's own heading. That is the honest answer to *"which line is this
-      about"* from an author who named none: the note renders under the heading
-      of the section it names, instead of at the bottom of the document.
+      criterion its own prose names (:func:`_criterion_quote`), and failing that
+      to the section's own heading. That is the honest answer to *"which line is
+      this about"* from an author who named none: the note renders under the
+      line it is arguing about if it said which, under the heading of the
+      section it names if it did not, and at the bottom of the document in
+      neither case.
+
+    The criterion arm is BELOW the proposal arm and not merged with it, because
+    where the two disagree the proposal is right: a rewrite of ``AC-2.3`` that
+    changes the line under it should anchor to the line it changes, and
+    ``first_changed_line`` is the finer answer. Prose is consulted only where
+    there is no diff to read.
 
     ``""`` for the ``_lede`` (no heading to point at) and ``""`` for a section
     that does not resolve — :func:`_capture_base` already returns ``""`` there,
     and both cases have their own answer in :func:`section_missing`, which an
-    invented anchor would shadow.
+    invented anchor would shadow. Those two are no longer the same outcome as
+    each other, which is the ladder earning its keep: the ``_lede`` note names a
+    section that resolves, so it settles at the END of the preamble; the note
+    whose section is gone names nothing that resolves and goes to the bottom of
+    the page, still carrying ``section_missing``'s sentence.
 
     The result is cut from the stored body, which the server has already
     decoded, so it can never be the lone surrogate :func:`check_note_text`
@@ -2190,8 +3185,9 @@ def _derive_quote(base: str, proposal: str) -> str:
     """
     if not base:
         return ""
-    line = first_changed_line(base, proposal) if proposal else heading_line(base)
-    return quote_from_line(line)
+    if proposal:
+        return quote_from_line(first_changed_line(base, proposal))
+    return _criterion_quote(base, comment) or quote_from_line(heading_line(base))
 
 
 def _recent_twin(
@@ -2396,7 +3392,10 @@ async def create_plan(
         note_ids = _add_notes_locked(
             plan,
             [
-                PlanNote(id="", section=s.section, to=s.owner, by=by, comment=s.text)
+                PlanNote(
+                    id="", section=s.section, quote=s.quote,
+                    to=s.owner, by=by, comment=s.text,
+                )
                 for s in shorthands
             ],
         )
@@ -2418,6 +3417,7 @@ async def apply_edits(
     ctx: "ModelContext",
     runloop: "ChangelogRunloop",
     file_conflict: bool = False,
+    why: str = "",
 ) -> WriteResult:
     """**The one funnel.** Every byte that reaches PLAN.md comes through here.
 
@@ -2429,14 +3429,25 @@ async def apply_edits(
     Does **not** bump ``revision`` on a regular project: that happens once, in
     :func:`submit_review`'s transaction (§2.5).
 
+    ``why`` is the keeper's one-line changelog for a write that moves the spec
+    on a plan the user has NOT accepted. Such a write lands — the lock starts at
+    acceptance — and files a receipt carrying this line
+    (:func:`_file_write_receipt_locked`). It is **required** on exactly those
+    writes and ignored on every other, and the requirement is enforced in
+    :func:`_prepare_locked` rather than requested by a prompt, because
+    prompt-level trust is what failed on ``chuswine-geo-b2b``.
+
     Raises :class:`PlanConflictError` (409) on a stale write and
     :class:`PlanSpecLockedError` (403) on one M3 refused — **both after the
     save**, because both refusals have already filed the notes that are their
-    only remedy.
+    only remedy — and :class:`PlanInputError` (400), before anything is written,
+    on a pre-acceptance spec move with no ``why``.
     """
     async with _lock:
         plan = _load(project, ctx)
-        result = (await _apply_locked(project, ctx, runloop, plan, edits, by=by)).result
+        result = (
+            await _apply_locked(project, ctx, runloop, plan, edits, by=by, why=why)
+        ).result
         if result.stale and file_conflict:
             # ``+=``, not ``=``. On this path ``note_ids`` is empty, but the
             # spec-lock path above already filled it, and an assignment here
@@ -2453,7 +3464,6 @@ async def apply_edits(
                     project,
                     by=by,
                     note_ids=result.note_ids,
-                    accepted=bool(plan.accepted_at),
                 ),
                 note_ids=result.note_ids,
                 revision=result.revision,
@@ -2523,7 +3533,7 @@ async def absorb_plan_upload(
         # arithmetic happened to be right, with nothing enforcing it.
         may_apply = may_write(project, by)
         shorthand_notes = [
-            PlanNote(id="", section=s.section, to=s.owner, by=by, comment=s.text)
+            PlanNote(id="", section=s.section, quote=s.quote, to=s.owner, by=by, comment=s.text)
             for s in shorthands
         ]
         proposal_notes = [] if may_apply else [
@@ -2818,13 +3828,46 @@ async def add_note(
     (:func:`_derive_quote`), so it renders against a line instead of at the
     bottom of the page. Same rule as the base it is cut from: a default for an
     omitted field, never an override, and never backfilled onto a stored note.
+    A note whose prose opens on ``AC-2.3`` and passes no ``--ac`` is anchored to
+    that criterion's line, provided the criterion is in the section the note
+    names (:func:`_criterion_quote`).
 
-    **What it does NOT do is close the parent.** ``submit_review`` does
-    (AC-5.9) and this door deliberately does not: the plan editor draws only
-    OPEN notes, so closing the question on reply erases the top of the exchange
-    from the screen and leaves the answer standing alone — the thing anchoring
-    the reply exists to prevent. The parent closes when the thread is done, via
-    :func:`resolve_note`.
+    **A SECTION SLUG IS CHECKED, WHICH IT NEVER WAS.** In order: a slug that
+    does not resolve is repaired from the note's own quote where the excerpt
+    names one section and one only (:func:`_salvage_section`), and a slug the
+    CALLER TYPED that still does not resolve is a **400**
+    (:func:`_refuse_unknown_section`) unless the note's proposal is the thing
+    that creates it. The refusal exists because the same typo carrying an
+    ``--edit-file`` used to append a SECOND heading under the same slug on a
+    single ``resolve --apply``: the CLI fills ``base_section`` by reading the
+    section it cannot find, sends ``""``, and ``""`` is how this model spells
+    *"create"*. An INHERITED slug — the one ``reply_to`` fills in above — is
+    never refused: answering a note about a section somebody has since deleted
+    is a conversation that has to stay possible, and it is only ever a comment,
+    because the ``proposal and not section`` refusal at the top of this function
+    means a reply carrying a proposal arrives with its slug typed out.
+
+    **A reply CLOSES the parent** ``answered`` (AC-5.9), in the same save that
+    files it, under :func:`_reply_closes_parent` — the same predicate
+    ``submit_review``'s ``ask`` row asks.
+
+    **This reverses what stood here, and the reversal is the point.** The old
+    rule was that ``submit_review`` closed and this door deliberately did not,
+    *"because the plan editor draws only OPEN notes, so closing the question on
+    reply erases the top of the exchange from the screen"*, with the parent left
+    to close *"when the thread is done, via* :func:`resolve_note` *"*. Nothing
+    ever did that. And because the tray is OWNER-ONLY, the door that closed was
+    the user's and the door that did not was the coordinator's — so the
+    asymmetry ran in exactly one direction: a user's note, once answered, stayed
+    open and kept asking the user to dismiss their own answered question.
+    :func:`open_notes_for_you` has spelled out the coordinator half of AC-5.9
+    since it was written; this makes that paragraph true.
+
+    The cost the old rule was avoiding is real and is paid rather than
+    reinstated: ``PlanNoteRow``'s *"Answering your question"* line carries the
+    parent's own first line, so a closed question is still legible from the
+    answer. The parent is resolved off the UNFILTERED note list precisely so it
+    survives being closed.
     """
     if not comment and not proposal:
         raise PlanInputError("A note needs a comment or a proposal")
@@ -2862,6 +3905,13 @@ async def add_note(
         # THE ADDRESSEE CHECK MOVED IN HERE WITH IT, and had to: it must run on
         # the EFFECTIVE addressee. A copy left above the lock would give the
         # two-party rule two homes, and a rule with two homes has two answers.
+        # WHAT THE CALLER TYPED, kept because the refusal below turns on it.
+        # The reply derivation immediately after this can fill `section` in from
+        # a parent whose own section has since been deleted, and answering a
+        # note about a section somebody removed is exactly the conversation that
+        # must stay possible. A slug a caller SUPPLIED is theirs to get wrong; a
+        # slug the system supplied on their behalf is not.
+        typed_section = section
         parent = _reply_parent(plan, reply_to)
         if parent is not None:
             section = section or parent.section
@@ -2893,8 +3943,20 @@ async def add_note(
             if not note_addressee_allowed(project, by=by, to=addressee):
                 raise PlanInputError(_note_refusal(project, by=by, to=addressee))
 
-        # ---- the base, and the quote derived from it ----------------------
-        # BOTH COMPUTED ONCE, ABOVE THE LOOP, and the order matters.
+        # ---- the section checked, then the base, then the quote ------------
+        # THE ORDER IS THE ONLY ONE THAT WORKS, and each step feeds the next:
+        # the section is settled first (derived, then salvaged, then checked),
+        # because it decides which text the base is captured from, and the base
+        # is what the quote is cut out of. Deriving the quote first would cut it
+        # from a section this call had not settled on yet.
+        #
+        # THE TWO DERIVATIONS NEVER BOTH FIRE — each is gated on the other
+        # being present — so a note carrying neither is left carrying neither.
+        # That is not a failure to derive: it is the bottom rung of
+        # `_derive_quote`'s ladder, and a note about the document as a whole
+        # belongs to no section by definition.
+        #
+        # ALL COMPUTED ONCE, ABOVE THE LOOP, and the order matters there too.
         # `_capture_base` used to be called inside the per-addressee loop,
         # where it returned the same value on every pass; it moves out because
         # `_derive_quote` needs it too and neither may be computed per
@@ -2905,21 +3967,76 @@ async def add_note(
         #
         # AN EXPLICIT QUOTE ALWAYS WINS, exactly as an explicit `base_section`
         # does: derivation is the default for an omitted field and never an
-        # override. `--section ''` is untouched and still means "about the
-        # document as a whole" — `_capture_base` returns "" for it, so nothing
-        # is derived and a deliberately unanchored note stays sayable.
+        # override. `--section ''` WITH NO QUOTE is untouched and still means
+        # "about the document as a whole" — `_capture_base` returns "" for it,
+        # so nothing is derived and a deliberately unanchored note stays
+        # sayable. `--section ''` WITH a quote is a different sentence and is
+        # read as one: the excerpt already names a passage, so the section it
+        # lives in is looked up rather than treated as a refusal to name one.
         #
         # NOT RETROACTIVE, for `_capture_base`'s reason: an anchor asserts what
         # its author was looking at, and inventing one for a note filed before
         # this existed asserts something false about a person.
         #
+        # The quote step is gated on `section`, not on `base` alone.
+        # `_capture_base` already returns "" without one, but a caller may
+        # supply `base_section` explicitly with no section — and a quote CUT
+        # FROM a section nobody named is a claim about a passage nobody can look
+        # up. Note which direction that argues: it refuses to invent an excerpt
+        # for an unnamed section, and says nothing against reading the section
+        # off an excerpt the author supplied, which is the line below.
+        section = section or _derive_section(body, quote)
         # Gated on `section`, not on `base` alone. `_capture_base` already
         # returns "" without one, but a caller may supply `base_section`
         # explicitly with no section — and a quote on a sectionless note is a
         # claim about a passage nobody can look up.
+        #
+        # SALVAGE, THEN REFUSE, THEN CAPTURE, THEN DERIVE, and each step feeds
+        # the next.
+        # The salvage may CHANGE which section this note lands on, so it runs
+        # above the base capture (which reads that section's text), above the
+        # layer resolution below (which is keyed on the slug), and above the
+        # refusal, which must not fire on a slug that was just repaired.
+        #
+        # The salvage is asked of the EFFECTIVE section and the refusal only of
+        # a TYPED one, and the asymmetry is deliberate: repairing an address is
+        # always worth doing, and being told you got one wrong is only useful if
+        # you wrote it.
+        #
+        # THE EXEMPTION COSTS NOTHING, and it is worth saying why rather than
+        # trusting it. What it lets through is a note on a section the system
+        # named, which is only ever a REPLY inheriting a parent whose section has
+        # since been deleted — and a reply like that can never carry a proposal,
+        # because `proposal and not section` is refused above the lock, so the
+        # CLI resolves the parent's section itself and it arrives TYPED. A
+        # comment is all that reaches here unchecked, and a comment on a section
+        # that is gone writes nothing and corrupts nothing. The damaging shape —
+        # a proposal against an absent section, which `resolve_note` reads as a
+        # create and appends under whatever heading it opens with — always
+        # carries a typed slug and is always checked.
+        section = _salvage_section(body, section, quote)
+        if typed_section:
+            _refuse_unknown_section(body, section, proposal)
         base = base_section or _capture_base(body, section)
         if section and not quote:
-            quote = _derive_quote(base, proposal)
+            quote = _derive_quote(base, proposal, comment=comment)
+
+        # ---- the layer, resolved ONCE, off the same read ------------------
+        # Free here and nowhere else. `body` is already in hand for the base,
+        # and the section named above is the one this note actually lands on —
+        # `reply_to` has already filled it in — so the lookup is a dict get over
+        # a walk that is happening anyway.
+        #
+        # BELOW the reply derivation on purpose: a reply inherits its parent's
+        # section, and stamping before that would classify the note by a section
+        # it does not have. Resolved against the CURRENT document, which is the
+        # one its author is looking at; `PlanNote.layer` carries why this is
+        # stamped rather than looked up when it is counted.
+        #
+        # AN UNKNOWN SLUG STAMPS `SPEC`, and so does `--section ''`. Both are
+        # the blocking direction, and both are right for the same reason: a note
+        # nobody can place is not a note the plan has delegated.
+        layer = section_layers(body).get(section, SPEC) if section else SPEC
 
         # ---- the double-submit net, PER ADDRESSEE --------------------------
         # It runs BELOW the two-party loop above, deliberately: a refused
@@ -2979,6 +4096,7 @@ async def add_note(
                     quote=quote,
                     reply_to=reply_to,
                     revision=plan.revision,
+                    layer=layer,
                 )
             )
 
@@ -2990,6 +4108,30 @@ async def add_note(
             for slot, nid in zip(slots, filed):
                 ids[slot] = nid
             _note(plan, by, "note", section=section, detail=",".join(filed))
+            # **AC-5.9's OTHER HALF, and the reason it is here rather than in a
+            # second copy of the rule.** BELOW the append, because a reply that
+            # trips the open-note cap must close nothing —
+            # `_add_notes_locked` validates and raises before anything is
+            # filed, so an over-cap request leaves the parent exactly as it
+            # was. Above `_save`, so the close and the note it answers persist
+            # in one write or neither.
+            #
+            # INSIDE `if fresh`, with the activity row and the save. A fully
+            # deduped request wrote nothing and must close nothing: the
+            # identical reply that WAS filed already closed this parent, and
+            # re-closing would restamp `resolved_at` on a thread nothing
+            # happened to.
+            #
+            # `_auto_close_rounds` follows for `resolve_note`'s reason — a
+            # round closes once every note in it is non-open, and this is now a
+            # path that can make that true. Without it the coordinator's answer
+            # would close the note and leave the round it arrived in open
+            # forever, which is the bookkeeping half of the same asymmetry.
+            if parent is not None and _reply_closes_parent(project, plan, parent, by=by):
+                _close_note(parent, status="answered", by=by)
+                _note(plan, by, "resolve", section=parent.section,
+                      detail=f"{parent.id} answered")
+                _auto_close_rounds(plan)
             _save(project, ctx, plan)
         return ids
 
@@ -3070,6 +4212,69 @@ def _pair_renamed_rows(
     ]
 
 
+def _rows_worth_showing(
+    rows: Sequence[StaleSection], body: str
+) -> list[StaleSection]:
+    """Which of a write's per-section rows are **worth putting in front of the
+    user** — the ones whose change the plan's own rules call a spec change.
+
+    **ONE HOME, TWO CALLERS, AND THAT IS WHY IT IS A FUNCTION.** Both outcomes a
+    keeper's spec move can have need this exact answer:
+    :func:`_file_spec_lock_locked` asks it to decide which sections become
+    proposals on an accepted plan, and :func:`_prepare_locked`'s receipt arm
+    asks it to decide which become receipts on an unaccepted one. A second copy
+    would be a second answer, and this filter has already drifted from its
+    caller once — see below.
+
+    **The decision to refuse is NOT taken here, and must not be.** That belongs
+    to :func:`_prepare_locked`, which asks it of the UNFILTERED document;
+    filtering there could let a write the lock means to refuse fall through and
+    land. What is filtered here is only which sections are shown.
+
+    The two halves came apart because they ask different questions. The lock's
+    test is ``spec_digest(cleaned) != spec_digest(body)`` — normalized, and about
+    the DOCUMENT. The rows come from :func:`split_by_section`, which is a raw
+    byte comparison per section. So one section genuinely moving the spec
+    dragged every other byte-changed section into a ``to=user`` note with it,
+    including sections normalization folds away completely: an owner was handed
+    a diff whose entire content was ``- [ ]`` becoming ``- [x]`` and asked to
+    accept it — on the same document whose prompt promises that ticking a box is
+    not a spec change. :func:`normalize_spec_text` IS the digest's own key, so
+    this asks the lock's question rather than a second copy of it.
+
+    **AND THE SAME DEFECT REACHED THROUGH A SECOND DOOR.** Normalization was the
+    first filter; the layer is the second, and it exists for the identical
+    reason. A write that legitimately moves the spec in one section — or drops a
+    criterion's claim — also carries every milestone byte the keeper touched in
+    the same call, and those rows are, by construction, sections the lock does
+    not protect. Showing them would hand the user re-cut milestones to decide on
+    a document whose whole promise is that re-cutting milestones is not their
+    decision.
+
+    ``body`` is the **stored** document — what the plan said BEFORE this write —
+    on both call paths, and that is load-bearing rather than incidental: reading
+    the layers out of the incoming text would let a keeper suppress its own note
+    by marking the section ``<!-- layer: detail -->`` in the very write being
+    filtered.
+
+    **AND IF THAT WOULD LEAVE NOTHING, EVERYTHING STAYS.** The refusal path's
+    contract is that the coordinator's text lands somewhere recoverable and
+    :func:`_spec_lock_refusal` names the ids it filed; zero notes is the dead end
+    AC-3.3 exists to prevent. It should be unreachable — a moved digest means
+    some section's normalized text moved — but the fallback costs one comparison
+    and removes the need to prove that. The receipt path inherits the same
+    guarantee for the same reason: a spec move the user is never told about is
+    the failure the receipt exists to end.
+    """
+    layers = section_layers(body) if body else {}
+    kept = [s for s in rows if layers.get(s.section, SPEC) == SPEC]
+    kept = [
+        s for s in kept
+        if normalize_spec_text(s.base) != normalize_spec_text(s.text)
+    ]
+    return kept or list(rows)
+
+
 def _row_deletes(s: StaleSection) -> bool:
     """**A row with a real base and no text is a DELETE, not an absence**, and
     the rule has ONE HOME because two surfaces read it and they came apart.
@@ -3091,8 +4296,39 @@ def _row_deletes(s: StaleSection) -> bool:
     return bool(s.base) and not s.text
 
 
+def _row_adds_section(s: StaleSection) -> bool:
+    """**A row with text and no base ADDS a section; it does not change one.**
+
+    The mirror of :func:`_row_deletes`, added for the same reason and after the
+    same kind of report: :func:`_spec_lock_comment` opened *"could not change
+    ``X``"* on every row, so a refused ADD named a section the document does not
+    have and told the user the keeper had failed to change it. A user read that
+    as the keeper disputing what the plan already said.
+
+    The rows that reach here with an empty base are not rare and are not
+    mistakes: :func:`~clawmeets.models.plan_markdown.split_by_section` reports
+    ``base == ""`` for every slug absent before the write and present after —
+    an explicit create, the create half of a **retitle**, and a heading that
+    appeared inside another section's replacement.
+
+    ``s.text`` is required rather than assumed so the two predicates stay
+    disjoint: a row with neither base nor text is the ABSENCE
+    :func:`_spec_lock_comment`'s third arm already speaks for, and must not
+    acquire a second sentence claiming something is being added.
+
+    **Not** :func:`_row_creates`, which asks the same question of a tray
+    ``DraftEntry`` and answers it from the NOTE's ``base_section`` because a
+    row's own base cannot tell a create from a section deleted underneath it.
+    Here there is no note yet — this row is what one is about to be filed FROM —
+    and ``StaleSection.base`` is the write's own before-text, so the collision
+    that function exists to break cannot arise. Two names, because they read
+    different fields of different objects.
+    """
+    return bool(s.text) and not s.base
+
+
 def _spec_lock_comment(
-    *, by: str, section: str, text: str, deletes: bool, accepted: bool
+    *, by: str, section: str, text: str, deletes: bool, creates: bool = False
 ) -> str:
     """What the refused write is, said to the user who has to decide it.
 
@@ -3105,6 +4341,16 @@ def _spec_lock_comment(
     nothing to accept, and the fix after THAT gave a refused delete its
     ``Accept`` back without revisiting the sentence. Two commits, two half-truths,
     one destroyed section. The flag is now the input, so the pair cannot drift.
+
+    **A FOURTH ARM, because "could not change" was false on an ADD.** A row
+    with text and no base is a section the document does not have yet
+    (:func:`_row_adds_section`), and the sentence named it as something the
+    keeper had failed to *change* — so a user was handed a note about
+    ``approval-2``, a slug nobody typed, reading as though the keeper disputed
+    what their plan already said. The verb now follows the row. The predicate is
+    passed in for the reason the paragraph above gives about ``deletes``: a
+    sentence that re-derives a fact its own caller already settled is a second
+    answer waiting to disagree with the first.
 
     **THREE ARMS, because an empty ``text`` is two different facts.** With a real
     ``base`` it is a DELETE — a proposal whose replacement text happens to be
@@ -3124,16 +4370,19 @@ def _spec_lock_comment(
     :func:`~clawmeets.models.plan_markdown.relevels_heading` refuse it at input
     validation, which is where the incident above actually began.
 
-    ``accepted`` splits the lede for the same reason
-    :func:`_spec_lock_refusal` splits its own: the lock now also engages on an
-    UNACCEPTED plan the user has reviewed once, and this sentence is read by the
-    user on their desk. *"The plan is accepted"* on a plan they have not
-    accepted is the note contradicting the Accept button sitting next to it.
+    **The ``accepted`` split is gone with the lock's second start line.** It
+    was added when the lock also engaged on an UNACCEPTED plan the user had
+    reviewed once — *"the plan is accepted"* on a plan they had not accepted is
+    the note contradicting the Accept button beside it. The lock reads
+    ``accepted_at`` alone again, so this sentence is only ever read on an
+    accepted plan, and a flag with one reachable value is a flag that only
+    invites a caller to pass the wrong one.
     """
-    state = "the plan is accepted" if accepted else "you have reviewed this plan"
-    lede = f"@{by} could not change `{section}` — {state}"
+    verb = "add the section" if creates else "change"
+    lede = f"@{by} could not {verb} `{section}` — the plan is accepted"
     if text:
-        return f"{lede} and this moves what it says. Accept this to make the change."
+        moves = "this adds to what it says" if creates else "this moves what it says"
+        return f"{lede} and {moves}. Accept this to make the change."
     if deletes:
         return (
             f"{lede}, and this write REMOVES the section. Accept it and "
@@ -3155,6 +4404,7 @@ def _file_spec_lock_locked(
     locked: Sequence[StaleSection],
     *,
     by: str,
+    body: str = "",
 ) -> list[str]:
     """M3 AC-3.3/AC-3.4 — one **deviation** note per section a refused
     executing-phase keeper write would have moved, ``to=user``, carrying the
@@ -3194,34 +4444,7 @@ def _file_spec_lock_locked(
     exactly the drift derivation was chosen to absorb, and it cost this function
     no code.
     """
-    # **ONLY THE SECTIONS THAT ACTUALLY MOVE THE SPEC, AND THE ASYMMETRY IS THE
-    # POINT.** The refusal upstream is decided on the UNFILTERED list — that
-    # decision belongs to :func:`_prepare_locked`, and filtering there could let
-    # a write the lock means to refuse fall through and land. What is filtered
-    # here is only which sections get put in front of the user as a note.
-    #
-    # The two halves came apart because they ask different questions. The lock's
-    # test is `spec_digest(cleaned) != spec_digest(body)` — normalized, and about
-    # the DOCUMENT. The rows come from :func:`split_by_section`, which is a raw
-    # byte comparison per section. So one section genuinely moving the spec
-    # dragged every other byte-changed section into a `to=user` note with it,
-    # including sections normalization folds away completely: an owner was handed
-    # a diff whose entire content was `- [ ]` becoming `- [x]` and asked to accept
-    # it — on the same document whose prompt promises that ticking a box is not a
-    # spec change. :func:`normalize_spec_text` IS the digest's own key, so this
-    # asks the lock's question rather than a second copy of it.
-    #
-    # **AND IF THAT WOULD LEAVE NOTHING, EVERYTHING STAYS.** This function's
-    # contract is that a refusal files the coordinator's text somewhere it can be
-    # recovered, and :func:`_spec_lock_refusal` names the ids it filed; zero notes
-    # is the dead end AC-3.3 exists to prevent. It should be unreachable — a moved
-    # digest means some section's normalized text moved — but the fallback costs
-    # one comparison and removes the need to prove that.
-    moved = [
-        s for s in locked
-        if normalize_spec_text(s.base) != normalize_spec_text(s.text)
-    ]
-    locked = moved or locked
+    locked = _rows_worth_showing(locked, body)
 
     return _add_notes_locked(
         plan,
@@ -3242,7 +4465,10 @@ def _file_spec_lock_locked(
                         # sentence that describes the button now cannot answer
                         # differently. See `_row_deletes`.
                         deletes=_row_deletes(s),
-                        accepted=bool(plan.accepted_at),
+                        # SAME RULE, SAME PLACE, for the reason the `deletes`
+                        # comment above gives: the sentence never re-derives a
+                        # fact the note's own fields already settle.
+                        creates=_row_adds_section(s),
                     )
                 ),
                 proposal=s.text,
@@ -3253,6 +4479,99 @@ def _file_spec_lock_locked(
             for s in locked
         ],
     )
+
+
+#: A receipt's ``resolution``, and **the discriminator** — the one field that
+#: separates a receipt from every other closed note on the plan.
+#:
+#: It is a string in ``resolution`` and not a ``kind`` field for the reason
+#: :class:`PlanNote` states in its own words: *"THERE IS NO ``kind`` FIELD, AND
+#: ITS ABSENCE IS THE POINT."* Every word a surface prints for a note is
+#: computed from the note's existing fields, and a receipt is nothing more
+#: exotic than a comment the system filed and closed in the same breath. A
+#: fifth :data:`NOTE_KINDS` member would be a second place to keep that rule.
+RECEIPT_RESOLUTION = "recorded — a keeper write before acceptance, nothing pending"
+
+#: A receipt's comment. ``{why}`` is the keeper's changelog line verbatim, so
+#: the user can quote it back; the section is named first because that is what
+#: they scan for when they want to object to exactly one thing.
+RECEIPT_COMMENT = "Rewrote `{section}` — {why}"
+
+
+def _is_write_receipt(note: PlanNote) -> bool:
+    """Is this note a pre-acceptance write receipt?
+
+    Named because two surfaces ask it — the render that coalesces receipts into
+    the owner's changelog, and every test that asserts a receipt never reaches
+    the desk as a decision — and asking it by hand is how the ``resolution``
+    string acquires a second, subtly different spelling.
+    """
+    return note.resolution == RECEIPT_RESOLUTION
+
+
+def _file_write_receipt_locked(
+    plan: ProjectPlan,
+    moved: Sequence[StaleSection],
+    *,
+    by: str,
+    why: str,
+) -> list[str]:
+    """One **receipt** per section a landed pre-acceptance keeper write moved —
+    ``to=user``, comment-only, filed already closed.
+
+    The pre-acceptance sibling of :func:`_file_spec_lock_locked`: same rows,
+    same filter (:func:`_rows_worth_showing`, applied by the caller against the
+    stored body), opposite outcome. That one REQUESTS a change the server
+    refused to make; this one RECORDS one the server already made.
+
+    **Three properties, each load-bearing.**
+
+    * **``proposal`` stays empty.** :func:`note_kind` therefore returns
+      ``"note"``, ``has_proposal`` is false so no ``Accept`` appears,
+      :func:`_changed_warning` returns ``""`` on its first guard, and
+      :func:`render_batch_message` renders no diff. That is the entire
+      implementation of *"a comment, not a diff"*, and it costs no new field.
+      ``base_section`` is left empty for the same reason — a base with no
+      proposal is half of a diff nobody will ever render.
+    * **Filed already closed** (``status="applied"``, ``resolved_by=by``).
+      Nothing is pending on it, so it must never reach
+      :func:`open_notes_for_you` — which counts ``status == "open"`` — and can
+      therefore never hold §7.4's execution gate. A receipt that blocked would
+      turn every keeper write into a stop.
+    * **Not superseded and not superseding.**
+      :func:`_supersede_prior_locked` returns immediately on a note with no
+      proposal, so ten receipts on one section stay ten lines of changelog
+      rather than collapsing to the last one. Collapsing is right for
+      proposals, where the document can hold one replacement text; it is wrong
+      for history, where each line is a separate thing the user may object to.
+
+    **Cannot raise, and that is a contract its caller depends on.**
+    :func:`_finish_locked` calls it below the append, where a raise would leave
+    the document written and broadcast while the caller was told nothing was.
+    It is safe because the two caps :func:`_validate_notes_locked` enforces
+    cannot be reached: ``why`` is capped at :data:`MAX_WHY_CHARS` at input
+    validation, well under ``MAX_NOTE_CHARS``, and a closed note spends none of
+    the ``MAX_OPEN_NOTES`` budget.
+
+    Runs with ``_lock`` held, so :func:`_add_notes_locked` and never
+    ``add_note`` — the third caller of that door, not a new one.
+    """
+    notes = [
+        PlanNote(
+            id="",
+            section=s.section,
+            to=OWNER,
+            by=by,
+            comment=RECEIPT_COMMENT.format(section=s.section, why=why),
+            status="applied",
+            resolved_by=by,
+            resolved_at=_now(),
+            resolution=RECEIPT_RESOLUTION,
+            revision=plan.revision,
+        )
+        for s in moved
+    ]
+    return _add_notes_locked(plan, notes)
 
 
 async def file_conflict_note(
@@ -3609,6 +4928,55 @@ def _refuse_go_note_close(note: PlanNote, verb: str) -> None:
         )
 
 
+def _refuse_unapprovable_go_note_accept(
+    note: PlanNote, edit: SectionEdit | None
+) -> None:
+    """**Accepting the go-note releases the execution gate, so the accept has to
+    actually write the approval.**
+
+    The sibling of :func:`_refuse_go_note_close`, and the same argument one step
+    further in. That guard covers the closes that obviously are not approval —
+    ``reject``, ``dismiss``, a supersede, a fold. This one covers the close that
+    LOOKS like approval and is not: the accept arm closes the note ``applied``
+    and stamps ``accepted_at`` off THE ROW BEING SUBMITTED rather than off its
+    text landing, so an accept that leaves ``## Approval`` alone comes out with
+    the gate released, the coordinator dispatched, and the document still
+    reading *"_Not yet approved._"* — a sidecar that says the user approved a
+    plan they did not.
+
+    **ASKED OF THE DERIVED WRITE, WHICH IS WHY IT STILL EXISTS.** It used to ask
+    the row's shape — *does this row name a section?* — which was the same
+    question while a section-less accept wrote nothing. :func:`_edit_for_row`
+    now answers such a row from its note, so the go-note's canonical
+    ``{"kind": "accept", "note_id": ...}`` writes ``## Approval`` and walks
+    straight through here. That repair did NOT make this guard redundant, and
+    keeping it is not defensiveness about a state that cannot happen: the row
+    shape it used to test never covered ``{"kind": "accept", "note_id": <go>,
+    "section": "goal", ...}``, which named A section, passed, wrote ``goal``,
+    and stamped the plan accepted with the approval untouched. One rule over the
+    write catches that, the empty derivation, and anything later that stops
+    producing one — where the old row-shaped rule caught exactly one of the
+    three.
+
+    No shipped client loses anything, and one gains. The browser's ``acceptRow``
+    copies ``note.section`` onto the row, so its Accept has always carried
+    ``approval``; the CLI approves through ``plan resolve --apply``, which is
+    not this door at all.
+    """
+    if not note.bootstrap:
+        return
+    if edit is not None and edit.section == note.section:
+        return
+    raise PlanConflictError(
+        f"This accept does not write `{note.section}`, so the plan would be "
+        "marked approved with the approval section unchanged — and accepting "
+        "the go-note is what releases the execution gate. Send the accept with "
+        "no section so the note's own proposal is applied, or stage the row "
+        "with the approval section and text, so the document says what the "
+        "gate says."
+    )
+
+
 def _stamp_user_review_locked(plan: ProjectPlan, *, by: str) -> None:
     """Latch :attr:`ProjectPlan.first_user_review_at` — the spec lock's start
     line before acceptance. **Idempotent, and it never moves once set.**
@@ -3625,6 +4993,32 @@ def _stamp_user_review_locked(plan: ProjectPlan, *, by: str) -> None:
     if by != OWNER or plan.first_user_review_at:
         return
     plan.first_user_review_at = _now()
+
+
+def _stamp_owner_seen_locked(
+    plan: ProjectPlan, *, by: str, addressees: Iterable[str]
+) -> None:
+    """Latch :attr:`ProjectPlan.owner_last_seen_revision` — *"the owner has now
+    seen the document at this revision"*. **It moves every round**, unlike its
+    two neighbours, because the question it answers has a new answer each time.
+
+    **Two arms, one fact.** The owner has seen this revision if a batch was
+    addressed TO them, or if the batch was theirs — a review the owner submits
+    is a review they wrote against the document in front of them. Stamping only
+    the first arm would leave the banner claiming the plan moved since a round
+    the owner themselves closed.
+
+    **Called BELOW the render**, and the ordering is the whole of its
+    correctness: the batch the owner is about to read reports the span *from*
+    this value, so stamping first would collapse every banner to
+    ``revision N → N`` and silently delete the signal. Same argument as
+    :func:`_stamp_acceptance_locked`'s placement, reached from the other side —
+    that one must be stamped before the projection reads it, this one after the
+    message reads it.
+    """
+    if by != OWNER and OWNER not in addressees:
+        return
+    plan.owner_last_seen_revision = plan.revision
 
 
 def _stamp_acceptance_locked(plan: ProjectPlan, *, body: str, by: str) -> None:
@@ -3968,6 +5362,168 @@ def _changed_warning(
     )
 
 
+class BatchDecision(BaseModel):
+    """What **this submit** decided about ONE note, for ONE addressee.
+
+    A model rather than a tuple so a renderer cannot mistake ``kind`` for
+    ``reason`` positionally, and so a later field lands here rather than
+    widening every call site.
+
+    ``kind`` is the DECISION, not the row's kind: the two agree on ``accept``,
+    ``reject``, ``ask`` and ``dismiss``, and diverge on the one case the row
+    alone cannot answer — an ``accept`` that ``_collapse_text_rows`` classified
+    superseded decided ``fold`` or ``superseded``, never ``accept``. Deriving it
+    from ``row.kind`` alone would print *"accepted"* to an author whose text is
+    not the section, which is the exact lie this whole change exists to remove.
+    """
+
+    kind: str          # accept|fold|superseded|reject|ask|dismiss
+    reason: str = ""
+
+
+#: The sentence per decision, and the ``{reason}`` half is appended **only** when
+#: the row carries one — because two kinds structurally never do and the line
+#: must not print a dangling dash:
+#:
+#: * ``accept`` — the decisions loop passes no reason at all, so it is
+#:   decision-only and this module does not invent one for it.
+#: * a BROWSER ``dismiss`` — the tray's dismiss row sets no comment, so it prints
+#:   a bare decision. Honest but thin; inventing a reason here would be the
+#:   renderer making up a fact the user never typed.
+#:
+#: ``fold`` and ``superseded`` map to the EMPTY string on purpose: their reasons
+#: (:data:`FOLDED_REASON`, :data:`SUPERSEDED_REASON`) already name their own verb
+#: and are whole sentences, so a prefix would say the word twice.
+DECISION_TEXT: dict[str, str] = {
+    "accept": "accepted",
+    "reject": "rejected",
+    "ask": "replied",
+    "dismiss": "dismissed",
+    "fold": "",
+    "superseded": "",
+}
+DECISION_LINE = "**Decided this round:** {text}"
+DECISION_WITH_REASON = "{text} — {reason}"
+
+
+def _decision_of(row: DraftEntry, *, whole_sentence: str = "") -> BatchDecision:
+    """The decision one submitted ROW made, built **from the row**.
+
+    From the row and never from the note, because of the ordering this
+    transaction depends on: rendering is step 2 and the closes are step 3, so at
+    render time the note is still ``open``, its ``resolution`` is still empty,
+    and the ``accept`` arm has not yet moved ``proposal`` into ``applied_text``.
+    A line derived from note state would print *"open"* for every decision in
+    the batch. See :func:`submit_review`'s step 3 for why hoisting the closes
+    above the render is not the fix.
+
+    ``whole_sentence`` is the caller's answer for the two cases the row cannot
+    answer alone — a superseded row, folded or not — and it is the SAME string
+    the close writes to ``note.resolution``, computed once by
+    :func:`_close_spec_for_superseded` and passed here, so the message and the
+    stored record can never word the same fact differently.
+    """
+    if whole_sentence:
+        return BatchDecision(
+            kind="fold" if row.folded else "superseded", reason=whole_sentence
+        )
+    return BatchDecision(kind=row.kind, reason=row.comment)
+
+
+def _decision_line(decision: BatchDecision | None) -> str:
+    """One rendered decision line, or ``""`` when there is nothing to say.
+
+    **``""`` is the byte-identity contract.** The caller appends nothing for an
+    empty string, so a render with no decisions passed is character-for-character
+    what it was before this existed. That is the single most load-bearing
+    default in this change: the quote and diff tests that render a note directly
+    pass no decisions, and neither does ``plan review --dry-run`` — which is not
+    a stub, because ``cli_plan.review`` POSTs only ``note_ids`` and never
+    ``entries``, so a CLI review batch carries zero decisions by construction and
+    the dry run's *"the preview IS the message"* assertion stays true
+    permanently rather than accidentally.
+    """
+    if decision is None:
+        return ""
+    text = DECISION_TEXT.get(decision.kind, decision.kind)
+    if not text:
+        text = decision.reason
+    elif decision.reason:
+        text = DECISION_WITH_REASON.format(text=text, reason=decision.reason)
+    return DECISION_LINE.format(text=text) if text else ""
+
+
+#: How many receipt lines the owner's changelog block shows before it stops
+#: listing and starts counting. High enough that an ordinary round of feedback
+#: fits whole; low enough that a runaway keeper cannot bury the notes under it.
+MAX_CHANGELOG_LINES = 15
+
+
+def _owner_changelog(
+    addressee: str,
+    all_notes: Sequence[PlanNote],
+    *,
+    revision: int,
+    last_seen: int,
+) -> list[str]:
+    """The owner's *"here is what moved since you last read this"* block.
+
+    **THE OTHER HALF OF LETTING THE KEEPER WRITE.** Before acceptance a keeper's
+    spec change lands instead of arriving as a proposal, which buys the user a
+    document that is coherent every time they open it and costs them the diff
+    they used to accept hunk by hunk. This block is what they get instead: the
+    span the document moved over, and a named line per change. Without it the
+    trade is not a trade — it is the ``chuswine-geo-b2b`` failure with better
+    manners, 26 silent writes and nothing on any surface naming one.
+
+    So the lines are **named changes, not a summary**, and that is a property of
+    the ``--why`` the write path requires rather than of this render: the user
+    answers by quoting one line back, and a line they cannot name is a line that
+    forces them to re-read the whole document to object to one thing.
+
+    Receipts are selected by ``revision >= last_seen`` rather than by timestamp
+    because ``plan.revision`` only moves inside :func:`submit_review` — so every
+    receipt filed between two rounds carries the revision that round opened at,
+    and the comparison is exact rather than approximately-ordered. They are
+    identified by :func:`_is_write_receipt`, which reads ``resolution``: there is
+    no ``kind`` field to read and there is deliberately not going to be one.
+
+    Returns ``[]`` — not a heading with nothing under it — for every case that
+    is not *the owner, on a document they have seen before, that has since
+    moved*. An empty section a reader learns to skip is worse than no section.
+    """
+    if addressee != OWNER or not last_seen or last_seen == revision:
+        return []
+    receipts = [
+        n for n in all_notes
+        if _is_write_receipt(n) and n.revision >= last_seen
+    ]
+    if not receipts:
+        return []
+    lines = [
+        "",
+        f"**This plan moved — revision {last_seen} → {revision} — since your "
+        f"last review round.** These changes landed directly, so read the "
+        f"document end to end rather than diffing it: plan sections are "
+        f"entangled by design, and narrowing one milestone changes what the "
+        f"next one depends on.",
+        "",
+        "**What moved, and why**",
+    ]
+    for note in receipts[:MAX_CHANGELOG_LINES]:
+        lines.append(f"- {note.comment}")
+    if len(receipts) > MAX_CHANGELOG_LINES:
+        lines.append(
+            f"- _…and {len(receipts) - MAX_CHANGELOG_LINES} more — "
+            f"`clawmeets plan list-notes <project>` lists them all._"
+        )
+    lines.append(
+        "Accept the plan if it reads right, or reply naming the line you want "
+        "changed."
+    )
+    return lines
+
+
 def render_batch_message(
     addressee: str,
     notes: Sequence[PlanNote],
@@ -3979,8 +5535,10 @@ def render_batch_message(
     keeper_name: str = "",
     round_no: int = 0,
     revision: int = 0,
+    last_seen: int = 0,
     all_notes: Sequence[PlanNote] = (),
     history: Sequence[PlanHistoryEntry] = (),
+    decisions: Mapping[tuple[str, str], BatchDecision] | None = None,
 ) -> str:
     """§5.7's message — **the whole point of the feature**, and the bar it is
     held to is AC-5.3: *the addressee can act without opening anything else.*
@@ -3997,6 +5555,46 @@ def render_batch_message(
     applied**; the section is shown **as it stands now**, with the reviewer told
     when that differs from what the author saw; and the **thread comes with the
     note**, so an addressee joining round 2 need not reconstruct round 1.
+
+    ``decisions`` is what THIS submit decided, and it is keyed by
+    **(ADDRESSEE, NOTE ID)** — never by note id alone. Three reasons from this
+    module, and the third is the one with teeth:
+
+    1. ``submit_review``'s ``by_addressee`` is filled by TWO loops — the
+       decisions loop and the plain-send loop over ``note_ids`` — and this
+       function is handed the merged list. One message can therefore carry a
+       decided note beside a freshly-sent undecided one.
+    2. The same note can reach two addressees in one batch (the ``seen`` set is
+       itself keyed on the pair), so a note-keyed map has no room for the case.
+    3. Dismissing your OWN note tells nobody, and that skip is an ADDRESSING
+       decision: it ``continue``s before the row reaches ``by_addressee``. A
+       note-keyed map would still hold that dismissal and would attach it to the
+       same note arriving by the SEND path — telling the user *"dismissed"*
+       about a note they were merely shown. The pair key drops it, because the
+       addressee it was skipped for is never a key.
+
+    ``last_seen`` is the revision this addressee last had this document put in
+    front of them (:attr:`ProjectPlan.owner_last_seen_revision`), and it drives
+    **the owner's changelog block** — the banner naming the span the plan moved
+    over, plus the receipts filed inside it. That block is what makes
+    *"re-read the document"* a reasonable instruction rather than an unbounded
+    one: the user is told which sections moved and why before they open it.
+
+    Rendered for the OWNER alone, and only once they have seen the plan before
+    (``last_seen`` truthy and different from ``revision``). A specialist reviews
+    against the current text and has no baseline of their own, and an owner's
+    FIRST round has nothing to be a changelog *since* — handing them the draft's
+    whole construction history at the moment they are asked to read the draft is
+    noise, not evidence.
+
+    Left at their defaults, ``last_seen`` and ``decisions`` both make the render
+    byte-identical to what it was before either parameter existed — see
+    :func:`_decision_line`.
+    **Placement is deliberate:** the decision sits immediately under the note it
+    decided and above the evidence, so an addressee reading top-down learns the
+    outcome before the diff. And it reaches whoever the ROW addresses, which is
+    not necessarily the note's author — a ``to``-overridden reject reaches the
+    person the user named, and the line goes with it.
     """
     headings = _section_headings(body)
     replies_by_parent: dict[str, list[PlanNote]] = {}
@@ -4010,6 +5608,7 @@ def render_batch_message(
     lines = [head, "", f"Plan review — round {round_no or 1} — **{title}** (project `{ref}`)"]
     if batch_comment:
         lines.append(batch_comment)
+    lines += _owner_changelog(addressee, all_notes, revision=revision, last_seen=last_seen)
 
     total = len(notes)
     for i, note in enumerate(notes, 1):
@@ -4024,6 +5623,10 @@ def render_batch_message(
         )
         for row in (note.comment or "_(no comment — the proposal is the note)_").split("\n"):
             lines.append(f"> {row}")
+
+        decided = _decision_line((decisions or {}).get((addressee, note.id)))
+        if decided:
+            lines += ["", decided]
 
         if note.quote:
             lines += ["", "**Quoted excerpt**"]
@@ -4407,22 +6010,216 @@ def _row_creates(plan: ProjectPlan, row: DraftEntry) -> bool:
     return not _find_note(plan, row.note_id).base_section
 
 
-def _collapse_text_rows(entries: Sequence[DraftEntry]) -> tuple[list[DraftEntry], list[DraftEntry]]:
+def _edit_for_row(
+    plan: ProjectPlan, body: str, row: DraftEntry
+) -> SectionEdit | None:
+    """**The one answer to "what does this row write", or ``None`` for nothing.**
+
+    Both questions in this transaction are downstream of it: what
+    :func:`apply_edits` splices, and — through :func:`_collapse_text_rows` —
+    which rows are competing to splice the same section. They were two
+    predicates before, and the pair is what let a row be superseded for a
+    section it was never going to write.
+
+    **A ROW THAT NAMES ITS SECTION IS TAKEN AT ITS WORD.** ``section``, ``text``
+    and ``base`` are what the user staged against text they were looking at, and
+    ``base`` is §4.4's whole staleness contract. Nothing here second-guesses it;
+    only ``create`` is derived, for the reason :func:`_row_creates` gives.
+
+    **AN ``accept`` THAT NAMES NO SECTION IS ANSWERED FROM ITS NOTE**, which is
+    where the answer has always been. ``{"kind": "accept", "note_id": ...}`` is
+    the canonical accept body — the shape ``can_decide`` advertises and the one
+    ``DraftEntry`` permits, since ``section`` is optional — and it used to write
+    no bytes at all while the accept arm closed the note ``applied`` with
+    ``applied_text`` set. The note then claimed to be in a document it was not
+    in, on every surface at once: the tray drew its diff out of ``applied_text``
+    beside a section that still read the old way, its author was told
+    *"accepted"* and stopped waiting, and ``revision`` never moved, so
+    ``plan show --versions`` had nothing for the user to find the loss by. The
+    text was unrecoverable by then — an accept empties ``proposal`` into
+    ``applied_text``, and :func:`resolve_note` refuses ``--apply`` on a note
+    that carries no proposal.
+
+    So the three fields come off the NOTE, exactly as :func:`resolve_note`'s
+    apply arm has always taken them, and the two doors onto one decision stop
+    disagreeing about what that decision writes.
+
+    **``base`` IS THE NOTE'S, EXCEPT WHEN THERE ISN'T ONE.** ``base_section`` is
+    the section's bytes captured when the note was FILED, so handing it to
+    :func:`_splice` makes the staleness question here identical to
+    :func:`section_changed`'s — down to the ``409`` and the
+    :class:`StaleSection` payload ``PlanCollide`` already knows how to re-base.
+    The ``or`` carries ``section_changed``'s own exemption rather than a second
+    opinion about it: ``""`` means *nothing was captured* — a note filed before
+    :func:`_capture_base` widened, which is deliberately never backfilled — and
+    comparing an empty base against real text would refuse every one of those
+    notes forever. The current extent is what *"there is nothing to compare"*
+    looks like written as a base, and it is what ``resolve_note`` passes on
+    every apply.
+
+    ``None`` is still a real answer, for the rows that genuinely write nothing:
+    a row kind that is not a write, an accept on a note that only asked a
+    question, and an accept on a note naming no section. A
+    :attr:`PlanNote.proposes_delete` note IS a write — its empty text is the
+    delete — which is why the test below is ``proposal or proposes_delete`` and
+    not the string alone.
+
+    **The one thing that got louder.** A call that used to ``200`` and write
+    nothing can now ``409`` when the section moved or vanished under the note.
+    That is the correct refusal and the one ``resolve --apply`` has always
+    given; it is a refusal appearing on a route that never refused, because the
+    route never did anything.
+    """
+    if row.section:
+        return SectionEdit(
+            section=row.section,
+            text=row.text,
+            base=row.base,
+            # **AND THE ROW'S OWN BASE IS NOT THE INPUT.** See `_row_creates`: an
+            # accept whose section has vanished carries `base == ""` whether it is
+            # a restore or a conflict, so the flag is derived from the NOTE, which
+            # knows which. It is consulted by `_splice` only when the slug fails to
+            # resolve, so it is inert on every row whose section is still there.
+            create=_row_creates(plan, row),
+        )
+    if row.kind != "accept" or not row.note_id:
+        return None
+    note = _find_note(plan, row.note_id)
+    if not note.section or not (note.proposal or note.proposes_delete):
+        return None
+    return SectionEdit(
+        section=note.section,
+        text=note.proposal,
+        base=note.base_section or (_current_section(body, note.section) or ""),
+        # The same rule the row-carried branch uses and the same one
+        # `resolve_note` computes as `creating`: an empty capture means there was
+        # nothing there when this was written, which is a create.
+        create=_row_creates(plan, row),
+    )
+
+
+def _collapse_text_rows(
+    plan: ProjectPlan, body: str, entries: Sequence[DraftEntry]
+) -> tuple[list[DraftEntry], list[DraftEntry]]:
     """§2.6, one layer down: ``apply_edits`` splices one replacement per section,
     so **at most one row per section may carry text**.
 
     The later row wins — that is the rule the user set. Returns
     ``(applied, superseded)``; nothing is dropped silently, because every
     superseded row's note resolves ``rejected`` with a written reason.
+
+    **ONLY THE ROWS THAT WRITE ARE RACED, and the question is put to
+    :func:`_edit_for_row` rather than answered here.** That is the same
+    function the splice reads, so what competes to write a section and what
+    actually writes it cannot drift apart — and they had. This keyed on the raw
+    ``row.section``, which an ``accept`` staged by ``note_id`` alone leaves
+    empty: every such row landed in one bucket under ``""``, so a batch that
+    decided two of them closed all but the last ``rejected``, carrying
+    :data:`SUPERSEDED_REASON` — *"superseded by @X's proposal on the same
+    section"*, said about rows that name no section and propose no text, and
+    said to the author of a decision the user had actually made.
+
+    ``test_d14_the_tray_re_signs_too_and_a_batch_stamps_exactly_once`` is that
+    batch, in this repo's own suite: two proposals, two different sections, one
+    submit, and the first of them silently thrown away.
+
+    This function's contract is *a superseded row lost a race to write a
+    section*. It can only hold if the race is run over what is written, which
+    is why the predicate moved rather than merely growing an exception.
     """
     text_rows = [e for e in entries if e.kind in ("edit", "accept")]
+    writes = {id(e): _edit_for_row(plan, body, e) for e in text_rows}
     last_per_section: dict[str, DraftEntry] = {}
     for entry in text_rows:
-        last_per_section[entry.section] = entry
-    winners = set(id(e) for e in last_per_section.values())
+        edit = writes[id(entry)]
+        if edit is not None:
+            last_per_section[edit.section] = entry
+    losers = {
+        id(e) for e in text_rows if writes[id(e)] is not None
+    } - {id(e) for e in last_per_section.values()}
     return (
-        [e for e in text_rows if id(e) in winners],
-        [e for e in text_rows if id(e) not in winners],
+        [e for e in text_rows if id(e) not in losers],
+        [e for e in text_rows if id(e) in losers],
+    )
+
+
+def _winner_note_for(
+    plan: ProjectPlan,
+    body: str,
+    row: DraftEntry,
+    applied_rows: Sequence[DraftEntry],
+) -> PlanNote | None:
+    """The note behind the row that WON ``row``'s section, or ``None``.
+
+    **Not a guess, and not taken from the wire.** It is the exact inverse of
+    :func:`_collapse_text_rows`' own keying: that function builds
+    ``last_per_section[...]``, one winner per distinct section, so for any
+    superseded row writing section ``S`` there is exactly one applied row
+    writing ``S``. The lookup is total and single-valued by construction, which
+    is why the fold field carries no winner identity — there is nothing for the
+    client to tell the server that the server does not already know, and a
+    client-side snapshot of the winner would be stale by construction anyway.
+
+    **THROUGH :func:`_edit_for_row`, BECAUSE THAT IS THE SECTION THAT WAS
+    RACED.** ``row.section`` is empty on an accept staged by ``note_id`` alone,
+    and matching on the raw field would look for a winner under ``""`` — a key
+    the collapse never used — and name whichever unrelated row happened to
+    carry it, or nobody. The inverse of a keying has to invert the same key.
+
+    ``None`` is a real answer, not a failure: the winner may be the user's own
+    ``edit`` row, which carries no ``note_id``. :func:`_close_spec_for_superseded`
+    is what turns that into a name.
+    """
+    target = _edit_for_row(plan, body, row)
+    if target is None:
+        return None
+    winner = next(
+        (
+            r for r in applied_rows
+            if (edit := _edit_for_row(plan, body, r)) is not None
+            and edit.section == target.section
+        ),
+        None,
+    )
+    return (
+        _find_note(plan, winner.note_id)
+        if winner is not None and winner.note_id
+        else None
+    )
+
+
+def _close_spec_for_superseded(
+    row: DraftEntry, winner_note: PlanNote | None, *, by: str
+) -> tuple[str, str]:
+    """``(status, reason)`` for ONE row in the superseded set.
+
+    ``folded`` is honoured only on a row the loop already acts on — an
+    ``accept`` carrying a ``note_id`` — so the flag is inert on every other row
+    shape and needs no validation arm of its own. An absent or false flag returns
+    exactly ``("rejected", SUPERSEDED_REASON.format(...))``, which is this
+    module's behaviour before the field existed, character for character. That
+    identity is the whole proof the field is additive.
+
+    **THE WINNING AUTHOR, and why it is never empty on a fold.** The reason names
+    the winner, and a name is what makes the sentence say anything at all — with
+    it empty the surface can only say *"folded"* with no object. ``winner_note``
+    is ``None`` when the winner is the user's own ``edit`` row, and
+    :attr:`PlanNote.by` carries no non-empty guarantee of its own, so the author
+    resolves through **two** fallbacks — ``(winner_note.by if winner_note else "")
+    or by`` — landing on the submitter, who is never empty. Drop the second
+    ``or`` and the guarantee becomes a hope.
+
+    The ``rejected`` arm keeps its ONE fallback deliberately: changing it would
+    change a sentence this project is not here to change.
+    """
+    if row.folded:
+        return (
+            "folded",
+            FOLDED_REASON.format(by=(winner_note.by if winner_note else "") or by),
+        )
+    return (
+        "rejected",
+        SUPERSEDED_REASON.format(by=(winner_note.by if winner_note else by)),
     )
 
 
@@ -4437,6 +6234,7 @@ async def submit_review(
     room: str = "",
     resend: bool = False,
     batch_comment: str = "",
+    why: str = "",
     render: MessageRenderer | None = None,
     post: OwnerPoster | None = None,
 ) -> PlanReviewRound:
@@ -4473,6 +6271,16 @@ async def submit_review(
     leaves ``revision`` unchanged (§4.1 step 6, no code); and a coordinator's
     checkbox tick — which arrives through :func:`apply_edits`, not here — appends
     a ``FILE_UPDATED`` and leaves ``revision`` unchanged (§2.5).
+
+    ``why`` is :func:`apply_edits`'s parameter, taken here for the same write and
+    forwarded unchanged: an ``edit`` row from the keeper on a reviewed-but-
+    unaccepted plan moves the spec through step 1 exactly as a ``PUT …/plan``
+    would, so it owes the user the same changelog line and files the same
+    receipt. It is **not** ``batch_comment`` — that is the sentence above the
+    notes in the rendered message, addressed to whoever the batch is sent to;
+    this is the line filed on the document, addressed to the owner. Ignored on
+    every batch that does not reach the receipt arm, which is every batch the
+    tray and the CLI send today.
     """
     async with _lock:
         plan = _load(project, ctx)
@@ -4515,36 +6323,55 @@ async def submit_review(
         comment = batch_comment or draft.batch_comment
         room_name = room or draft.room
 
-        applied_rows, superseded_rows = _collapse_text_rows(rows)
-        # **A row that names no section is not a section write.** An ``accept``
-        # staged by ``note_id`` alone carries no ``section``/``text``/``base`` —
-        # it is a decision, and the bytes it would write are none. It used to
-        # become ``SectionEdit(section="", text="", base="")`` and reach the
-        # splice, where an unresolvable slug was coerced to ``""`` and the whole
-        # thing happened to no-op. That coercion is exactly what let a proposal
-        # against a DELETED section read as a create, so it is gone — and the
-        # rows that relied on it are filtered here instead, where the fact is
-        # actually known. ``_collapse_text_rows`` still sees every row, so what
-        # is staged, superseded and resolved is unchanged.
+        # **THE DOCUMENT, READ ONCE AND ABOVE EVERYTHING THAT ASKS ABOUT IT.**
+        # `_edit_for_row` needs it to answer an `accept` staged by `note_id`
+        # alone — the note's `base_section` is the staleness input, and the
+        # section's CURRENT extent is the fallback for a note filed before that
+        # capture existed. `_prepare_locked` re-reads the same bytes under the
+        # same lock, so the collapse races the rows over exactly the body the
+        # splice will check them against.
+        body = _read_body(project, ctx)
+        applied_rows, superseded_rows = _collapse_text_rows(plan, body, rows)
+        # **WHAT EACH ROW WRITES IS ASKED ONCE, OF ONE FUNCTION.**
+        # `_collapse_text_rows` just raced these rows over the very sections
+        # `_edit_for_row` names, so the set that reaches the splice and the set
+        # that competed to reach it cannot disagree — which they did while this
+        # was a second, hand-written predicate here.
+        #
+        # `None` is *this row writes nothing*, and it is a real answer for two
+        # shapes: accepting a note that only asked a question, and any row kind
+        # that is not a write. Both are still staged, decided and resolved
+        # below; they simply splice no bytes.
         edits = [
-            SectionEdit(
-                section=r.section,
-                text=r.text,
-                base=r.base,
-                # **AND THE ROW'S OWN BASE IS NOT THE INPUT.** See
-                # `_row_creates`: an accept whose section has vanished carries
-                # `base == ""` whether it is a restore or a conflict, so the
-                # flag is derived from the NOTE, which knows which. It is
-                # consulted by `_splice` only when the slug fails to resolve, so
-                # it is inert on every row whose section is still there.
-                create=_row_creates(plan, r),
-            )
-            for r in applied_rows
-            if r.section
+            edit for edit in (_edit_for_row(plan, body, r) for r in applied_rows)
+            if edit is not None
         ]
 
+        # AND THE ONE CLOSE `_refuse_go_note_close` PERMITS STILL HAS TO EARN
+        # IT: an `accept` that does not write the approval is not an approval,
+        # however much the sidecar it stamps says otherwise. **Asked of the
+        # derived write, and therefore only reachable from here** — the row's
+        # own shape stopped being the answer the moment a section-less accept
+        # started writing its note's proposal. Above `_prepare_locked` so the
+        # raise still costs the batch nothing: no bytes, no message, no note
+        # closed, and not even the spec lock's file-and-save.
+        for row in applied_rows:
+            if row.kind == "accept" and row.note_id:
+                _refuse_unapprovable_go_note_accept(
+                    _find_note(plan, row.note_id), _edit_for_row(plan, body, row)
+                )
+
         # ---- 1. the write, COMPUTED but not yet appended ------------------
-        prepared = _prepare_locked(project, ctx, plan, edits, by=by)
+        # **``why`` reaches the funnel from HERE too — the second half of
+        # `_finish_locked`'s "one filer, both doors".** That docstring's promise
+        # is that a keeper spec move carried inside a review batch files a
+        # receipt rather than vanishing; a call that dropped `why` on the floor
+        # could never keep it, because `_prepare_locked` refuses such a write
+        # before it reaches the filer. Without this argument the refusal names
+        # a flag this door does not accept, so the batch is unrecoverable AND
+        # files nothing — strictly worse than the spec lock's refusal below,
+        # which at least lands the coordinator's text as a note.
+        prepared = _prepare_locked(project, ctx, plan, edits, by=by, why=why)
         result = prepared.result
         if result.locked:
             # **M3, and deliberately asymmetric with the staleness branch below.**
@@ -4557,7 +6384,9 @@ async def submit_review(
             # NOT evaporate is the coordinator's text, which lands on the user's
             # desk as a deviation they can accept in one click. That is the whole
             # of AC-3.3, and a refusal that dropped it would be a dead end.
-            ids = _file_spec_lock_locked(project, plan, result.locked, by=by)
+            ids = _file_spec_lock_locked(
+                project, plan, result.locked, by=by, body=prepared.body
+            )
             _note(
                 plan, by, "refused",
                 detail=",".join(s.section for s in result.locked),
@@ -4565,7 +6394,7 @@ async def submit_review(
             _save(project, ctx, plan)
             raise PlanSpecLockedError(
                 _spec_lock_refusal(
-                    project, by=by, note_ids=ids, accepted=bool(plan.accepted_at)
+                    project, by=by, note_ids=ids
                 ),
                 note_ids=ids,
                 revision=result.revision,
@@ -4603,6 +6432,19 @@ async def submit_review(
         decisions = [r for r in rows if r.kind in ("accept", "reject", "ask", "dismiss")]
         by_addressee: dict[str, list[PlanNote]] = {}
         seen: set[tuple[str, str]] = set()
+        # **What this submit decided, told to whoever it decided it AT.** Built
+        # here, in the addressing loop, because the key is the pair — see
+        # `render_batch_message` for the three reasons a note-keyed map is
+        # wrong, and `_decision_of` for why it is built from the ROW and not
+        # from the note it is about.
+        #
+        # The superseded set is already in hand (`_collapse_text_rows` ran well
+        # above), so the two rows this loop cannot classify on its own — an
+        # `accept` that lost its section, folded or not — are classified without
+        # a lookahead, by the same function step 3 closes them with. One string,
+        # written once, sent and stored.
+        decided: dict[tuple[str, str], BatchDecision] = {}
+        superseded_ids = {id(r) for r in superseded_rows}
 
         def _address(addressee: str, note: PlanNote) -> None:
             if not addressee or (addressee, note.id) in seen:
@@ -4631,7 +6473,17 @@ async def submit_review(
                     and by == OWNER
                 ):
                     continue
-                _address(row.to or note.by or keeper(project), note)
+                addressee = row.to or note.by or keeper(project)
+                whole = ""
+                if id(row) in superseded_ids:
+                    _status, whole = _close_spec_for_superseded(
+                        row, _winner_note_for(plan, body, row, applied_rows), by=by
+                    )
+                if addressee:
+                    decided[(addressee, note.id)] = _decision_of(
+                        row, whole_sentence=whole
+                    )
+                _address(addressee, note)
         for nid in note_ids:
             note = _find_note(plan, nid)
             _address(note.to or keeper(project), note)
@@ -4692,8 +6544,22 @@ async def submit_review(
                 keeper_name=keeper(project),
                 round_no=len(plan.rounds) + 1,
                 revision=plan.revision + (1 if prepared.wrote and project.surface == "regular" else 0),
+                # READ HERE, STAMPED LATER. This is the revision the owner saw
+                # at their PREVIOUS round, and the banner's whole content is the
+                # span between it and the one above;
+                # `_stamp_owner_seen_locked` moves it forward only after every
+                # message has rendered.
+                last_seen=plan.owner_last_seen_revision,
                 all_notes=plan.notes,
                 history=plan.history,
+                # Bound HERE, after the decisions loop filled it, and passed as
+                # a keyword on the partial rather than through
+                # `MessageRenderer` — which is unchanged, and that is the point.
+                # The two callers that render without a decision keep working BY
+                # OMISSION rather than by edit: an injected renderer and
+                # `plan review --dry-run` both call `render_batch_message`
+                # directly and neither has a decision to pass.
+                decisions=decided,
             )
         # Two senders, because these are two different acts. An OWNER's review
         # is a message FROM THE USER and goes out through the ordinary
@@ -4785,6 +6651,14 @@ async def submit_review(
                 base_section=_capture_base(prepared.body, parent.section),
                 quote=parent.quote,
                 reply_to=parent.id,
+                # INHERITED FROM THE PARENT, not re-resolved off `prepared.body`.
+                # This row takes the parent's `section` unconditionally, so the
+                # two fields must agree, and the parent is the one that already
+                # answered the question at the moment it could still be asked.
+                # Re-resolving would also make a reply's blocking-ness depend on
+                # a marker flip that landed between the question and the answer —
+                # the retroactive case `PlanNote.layer` exists to rule out.
+                layer=parent.layer,
             )
         _validate_notes_locked(plan, prepared.notes + list(ask_notes.values()))
 
@@ -4878,7 +6752,23 @@ async def submit_review(
                 # The outgoing question is filed either way: a reply to the
                 # go-note is a real message to the coordinator and must reach
                 # it. Only the parent's status differs.
-                if not note.bootstrap:
+                #
+                # **THE GO-NOTE TEST MOVED INTO `_reply_closes_parent` AND TOOK
+                # THE REST OF THE RULE WITH IT.** This arm was `not
+                # note.bootstrap` and was the ONLY place AC-5.9 was implemented
+                # — and this arm is reachable by the owner alone, because the
+                # tray is owner-only. So the half of AC-5.9 that runs when the
+                # COORDINATOR answers never ran: `add_note` left the parent
+                # open, and every note the user wrote stayed open after it had
+                # been answered. Both doors ask the predicate now, which is the
+                # same one-home argument `_reply_addressee` makes for the
+                # addressee three fields over.
+                #
+                # Nothing about the owner's path changes shape: `may_write` is
+                # true for the owner, so only the go-note and an
+                # already-resolved parent are withheld here, and the second was
+                # never something a live row could reach.
+                if _reply_closes_parent(project, plan, note, by=by):
                     _close_note(note, status="answered", by=by)
                 # The note object is the one validated above the append, not a
                 # new one built to match it.
@@ -4888,20 +6778,34 @@ async def submit_review(
             if row.kind != "accept" or not row.note_id:
                 continue
             note = _find_note(plan, row.note_id)
-            winner = next(
-                (r for r in applied_rows if r.section == row.section), None
+            status, reason = _close_spec_for_superseded(
+                row, _winner_note_for(plan, body, row, applied_rows), by=by
             )
-            winner_note = (
-                _find_note(plan, winner.note_id)
-                if winner is not None and winner.note_id
-                else None
-            )
-            _close_note(
-                note,
-                status="rejected",
-                by=by,
-                reason=SUPERSEDED_REASON.format(by=(winner_note.by if winner_note else by)),
-            )
+            # **EVERY way of closing the go-note releases the execution gate,
+            # and only `apply` means the user said yes** — that is
+            # `_refuse_go_note_close`'s entire argument. This loop is the one
+            # closing path in the module that calls `_close_note` directly: the
+            # ownership pass above guards `reject`/`dismiss` rows and
+            # `resolve_note` guards its own, so the guard belongs to THE LOOP,
+            # not to either of its two branches.
+            #
+            # It was briefly on the `folded` branch alone, and the branch it
+            # skipped was reachable by simply not setting the flag: stage an
+            # accept on the go-note, stage any later row on `## Approval` behind
+            # it, and `_collapse_text_rows` hands the go-note's row here as a
+            # loser. It closed `rejected` with `SUPERSEDED_REASON`, and because
+            # the acceptance stamp keys off the row being submitted rather than
+            # its text landing, the plan came out marked ACCEPTED with
+            # `## Approval` still reading whatever the winning row wrote. Gate
+            # open, plan unapproved, document self-contradicting.
+            #
+            # The verb tracks the act so the refusal names what was attempted;
+            # the sentence it builds is identical in shape either way.
+            #
+            # The raise unwinds the whole submit before step 4's append: no
+            # bytes written, no message sent, no note closed, tray untouched.
+            _refuse_go_note_close(note, "fold" if row.folded else "supersede")
+            _close_note(note, status=status, by=by, reason=reason)
 
         # ---- 4. ONE act ----------------------------------------------------
         # The PROJECT_PLAN_STATE, the FILE_UPDATED and every message share one
@@ -4957,6 +6861,13 @@ async def submit_review(
         # that must not rewrite the document. Same ordering, same reason, same
         # bug class as the acceptance marker and the note count.
         _stamp_user_review_locked(plan, by=by)
+
+        # **AND WHAT THE OWNER HAS NOW SEEN.** Beside the stamp above because
+        # both record something about a round that is closing, but on a
+        # different clock: that one latches once and never moves, this one moves
+        # every round. Below the render for the reason its docstring gives — the
+        # messages just built report the span FROM the old value.
+        _stamp_owner_seen_locked(plan, by=by, addressees=by_addressee)
 
         prelude = [prepared.spec] if prepared.wrote else []
         state_spec = plan_state_spec(project, plan)
@@ -5278,5 +7189,35 @@ def changed_since_acceptance(body: str, plan: ProjectPlan) -> bool:
 
     Never reaches the execution gate: §7.4 decision 1 is explicit that the gate's
     trigger is :func:`open_notes_for_you` and **explicitly not** this.
+
+    **THE LEGACY ARM IS THE WHOLE MIGRATION, AND THERE IS NO OTHER HALF.**
+    Narrowing what :func:`spec_digest` hashes necessarily changed the number it
+    returns, and every plan already accepted stores an
+    ``accepted_spec_digest`` computed under the old formula. Left alone, every
+    accepted plan in the system would announce *"the plan changed since
+    approval"* on its next load, having changed nothing — and a warning that
+    fires on every project at once is a warning nobody reads again.
+
+    Fixed at **read time**, not by a backfill: a plan whose stored stamp matches
+    the old formula over the current body has not moved, and says so. No
+    migration script, no stored-state rewrite, nothing to run. The next
+    acceptance re-stamps with the new formula (``submit_review``'s
+    ``plan.accepted_spec_digest = spec_digest(body)``) and the arm goes
+    vestigial for that plan.
+
+    **It cannot hide a real change.** It only ever makes the answer *more*
+    forgiving, and only when nothing spec-relevant moved under the old rules
+    either — the old formula hashed a superset of the new one's material, so
+    matching it means every section the new formula reads is also untouched.
+
+    The lock path needs no equivalent and gets none: :func:`_prepare_locked`
+    compares ``spec_digest(cleaned)`` against ``spec_digest(body)``, both sides
+    new formula, both computed in the same call. Same for ``approve
+    --expect-spec``, which is a handshake inside one session.
     """
-    return bool(plan.accepted_at) and spec_digest(body) != plan.accepted_spec_digest
+    if not plan.accepted_at:
+        return False
+    return (
+        spec_digest(body) != plan.accepted_spec_digest
+        and legacy_spec_digest(body) != plan.accepted_spec_digest
+    )

@@ -33,7 +33,7 @@ accepted plan says.
 
 | You are | You may | You may not |
 |---|---|---|
-| the project's **coordinator** (its keeper) | write any section **until the user's first review round** — after that, propose; send review batches; close a note addressed to you (`--answered` / `--dismiss`); relay the user's questions in `shared-context` | **accept** the plan, **apply** or **reject** a note — including notes you wrote yourself. **Change what the plan SAYS once the user has reviewed it** — that is a proposal now (below). **Close your own note to the user before it has been sent** — the user has not seen it, so there is nothing to report. And you may not write `## Approval` while the approval note is open: that section is the user's |
+| the project's **coordinator** (its keeper) | write any section **until the user accepts the plan** — after their first review round each spec change also needs `--why` (below); send review batches; close a note addressed to you (`--answered` / `--dismiss`); relay the user's questions in `shared-context` | **accept** the plan, **apply** or **reject** a note — including notes you wrote yourself. **Change what an ACCEPTED plan says** — that is a proposal (below). **Close your own note to the user before it has been sent** — the user has not seen it, so there is nothing to report. And you may not write `## Approval` while the approval note is open: that section is the user's |
 | the **owner** (the human, from the UI or their own terminal) | everything the coordinator may, **and every decision**: accept, apply, reject | — |
 | **any other agent** | read the plan; answer in `shared-context` (before acceptance) or in your workroom (after) — and when a consult asks you to sign an acceptance criterion, answer **per criterion**, not per plan | write the file (`plan update` is a **403**), send a batch (`plan review` is a **403**), and **file a plan note at all** (`plan note` is a **400**, in both phases) |
 
@@ -43,43 +43,64 @@ owner accepts it, and the owner's write is what lands. A refusal here means
 *use the other channel*, not *try again* — and each one names the channel in
 its own error text.
 
-### The line moves once: the user's first review round
+### Two lines, and they do different things
 
-**You draft freely until the user has looked at the plan. After that they
-decide what it says, and you propose.** Not *after they accept* — after they
-first review. Acceptance is a later, separate line and this one does not lift
-when it arrives.
+**You write the plan until the user ACCEPTS it. You do not propose it.** Before
+acceptance nothing has been ratified, so a diff is not a change *to* anything
+the user agreed — and rejecting one hunk of five leaves the plan in a state
+nobody designed. Plan sections are entangled: narrow M2 and you change what M4
+depends on, and no diff view shows that. So the user reads the document.
 
-That is enforced, not advisory. Once the user has opened a review round, a
-`plan update` that moves what the plan **says** is a **403**; your text is not
-lost, it is filed for the user automatically as a note carrying your proposal
-and you get back the note ids. Do not retry it smaller — a smaller spec edit is
-still a spec edit.
+The first line is **the user's first review round**, and it starts a
+*record*, not a refusal. From there every `plan update` that moves what the plan
+**says** must carry a changelog line:
 
-What still lands silently, with no note and no friction, because the lock
+```bash
+clawmeets plan update <project> --section m2 --body-file ./m2.md \
+  --why "M2 now owns auth setup, moved out of M3 — backend flagged that M3's endpoints can't be built before it"
+```
+
+That is enforced: without `--why` the write is a **400** and nothing lands. The
+line is filed as a **receipt** — a comment on the user's plan, no diff, already
+closed — and their next review round opens with every receipt since they last
+read the document, under a banner naming the span it moved over.
+
+**Write a changelog line, not a summary.** The user answers by quoting one of
+your lines back at you. *"M2 now owns auth setup, moved out of M3 — backend
+flagged the ordering"* is answerable. *"Incorporated feedback from all agents"*
+is not: it hands them nothing to object to and pushes them into a full re-read
+to find the one thing they disliked. That is the exact cost this shape exists to
+remove, so a lazy `--why` gives back everything it bought.
+
+The second line is **acceptance**, and it reverses the rule. From there a
+`plan update` that moves the spec is a **403**; your text is not lost, it is
+filed for the user as a note carrying your proposal and you get back the note
+ids. Do not retry it smaller — a smaller spec edit is still a spec edit. The
+diff is right *there* because there is finally a ratified baseline for it to be
+a bounded delta against.
+
+What needs no `--why` and is never refused, in either phase, because the rule
 compares what the document *says* and not its bytes:
 
 - ticking and unticking milestone checkboxes as work completes;
 - editing `<!-- … -->` provenance comments;
-- reflowing a table, reindenting a list, rewrapping a paragraph.
+- reflowing a table, reindenting a list, rewrapping a paragraph;
+- rewriting `## Milestones` or any other `<!-- layer: detail -->` section.
 
-So **keep reporting progress exactly as you did before.** The document is not
-frozen; only its meaning is.
+So **keep reporting progress exactly as you did before.** The schedule is yours.
 
-**Batch, don't drip.** One `plan update`-worth of changes filed as one set of
-notes and sent as one `plan review` costs the user one message and a few
-clicks. The same changes dripped out over five rounds cost them five messages.
-The volume of proposals is the price of the guarantee; the number of
-interruptions is yours to control.
+**Batch, don't drip.** One round of feedback folded into the document and sent
+as one `plan review` costs the user one message and one read. The same changes
+dripped out over five rounds cost them five.
 
-**Why the line is here and not at acceptance.** On one real project the
-coordinator made 26 direct writes to the plan after the user's first review
-round closed — Goal, Guardrails, Sequencing and every milestone — against zero
-proposals the user could accept or reject. The plan was never accepted, so the
-old accept-time lock never engaged once. Every one of those writes was the
-coordinator deciding, section by section, that the user's feedback "settled"
-something. You are not the judge of that: you wrote the summary of their
-feedback yourself.
+**Why the receipt exists.** On one real project the coordinator made 26 direct
+writes to the plan after the user's first review round closed — Goal,
+Guardrails, Sequencing and every milestone — against zero records the user could
+see. The plan was never accepted, so the accept-time refusal never engaged once.
+The failure was not that it wrote. It was that 26 acts of judgement about what
+the user's feedback "settled" left no trace. You are still not the judge of
+that — but now you do not have to be, because you say what you did and they
+answer it.
 
 ## The subcommands
 
@@ -173,22 +194,38 @@ clawmeets plan note <project> --ac AC-2.3 --to user \
 # either party, replying. `--reply-to` is the whole of it: the server reads the
 # parent and fills in ITS section, ITS quote and the other end of the thread as
 # `--to`, so the answer is drawn directly under the question it answers.
-clawmeets plan note <project> --reply-to n-abc123 -m "It does — see the guardrail."
+clawmeets plan note <project> --reply-to n-abc123 -m 'It does — see `## Not Authorized`.'
 
 # replying WITH the change, which is the form the user can accept in one click.
 # `--section` is not needed: with `--reply-to` it is read off the parent.
 clawmeets plan note <project> --reply-to n-abc123 \
-    -m "Applied — the guardrail now says so explicitly." \
+    -m 'Applied — `## Not Authorized` now says so explicitly.' \
     --edit-file ./new-goal.md
 ```
 
-**A note that names a section is drawn against a LINE, not dumped at the
-bottom of the page.** You do not have to do anything for that: pass `--section`
-(or `--ac`) and the server derives the excerpt. A proposal anchors to the base
-line it changes; anything else anchors to the section's heading. Pass `--quote`
-yourself when you want a specific line and an explicit one always wins. The one
-way to file a note against no line at all is to name no section, which is how
-you say *"about the document as a whole"*.
+**A note is drawn as close to what it names as it can be**, and there are three
+places, not two. Name a section (or `--ac`) and the server derives the excerpt,
+so the note lands **against the line** — a proposal anchors to the base line it
+changes, a note whose message opens on `AC-2.3` anchors to that criterion
+provided the criterion is in the section you named, anything else to the
+section's heading. Where no line can be derived it falls exactly one step, to
+the **end of that section**, still beside the text it argues about. Only a note
+that names nothing the document still contains reaches the **"Notes" list at the
+bottom of the page**.
+
+You do not have to do anything for any of that. Pass `--quote` yourself when you
+want a specific line; an explicit one always wins. And `--quote` alone is
+enough — with no `--section` the server looks the excerpt up and files the note
+in whichever section holds it, so the two flags do not have to be remembered
+together. The one way to file a note against no part of the document at all is
+to pass neither, which is how you say *"about the document as a whole"*.
+
+**The slug you pass must be one the document has.** A `--section` that does not
+resolve is refused — `clawmeets plan show <project> --sections` prints the
+slugs — unless your `--edit-file` opens on a heading that would create exactly
+that section, which is the legitimate way to propose a new one. If your note
+carries a `--quote` the server will look the section up from it first, so a
+section that was retitled out from under you costs you nothing.
 
 `clawmeets plan list-notes <project> --ac AC-2.3` reads back every note filed
 against one criterion — the argument's whole history in one command, without
@@ -210,9 +247,12 @@ there is no parent to read, so it carries no section and no quote and lands in
 the "Notes" list at the bottom of the page instead of under the line being
 argued about, and with no `--to` derived from the parent it is *recorded and
 never sent*, so the person who asked never hears it. `--reply-to` does all of
-that from the one flag. The parent stays open, deliberately — the exchange
-reads as a chain — and you close it with `plan resolve --answered` when the
-thread is actually finished, not when you first speak.
+that from the one flag — **including closing the parent**, which lands on
+`answered` in the same write. That is the whole of the second act, so there is
+no `plan resolve --answered` to run afterwards and nothing left open on the
+asker's screen for them to dismiss. The go-note is the one exception: replying
+to it leaves it open, because closing it releases the execution gate and only
+accepting it means yes.
 
 **Answer with the change, not just about it.** When your answer changes the
 plan, file it as a proposal (`--edit-file`) rather than prose. A proposal
@@ -264,16 +304,30 @@ note cannot clobber anything.
 
 ## Recording that work went off-contract
 
+**Anchor it to the criterion it broke, not to the milestone that was building
+it.** `--ac AC-<m>.<n>` fills in both the section and the quote for you, and
+because criteria live in the unmarked `## Acceptance Criteria` section it lands
+in the spec layer — which is the layer the execution gate and the editor's red
+comment box read. A departure anchored to `milestones` is filed into the layer
+you were free to rewrite anyway, so it records but does not hold.
+
 ```bash
 # A REPORT. The work already diverged; there is nothing here to accept.
-clawmeets plan note <project> --section deliverables --to user \
-    -m "Shipped 4 slides. The plan says 6 — the last two needed pricing we do not have."
+clawmeets plan note <project> --ac AC-1.2 --to user \
+    -m "Two of the six recommendations rest on pricing we could not source, so they cite no opener-able source. AC-1.2 is not met and cannot be met from public data."
 
 # AN ASK. You want the contract moved, so the new section text rides along.
-clawmeets plan note <project> --section m3 --to user \
-    -m "M3 gains a criterion: useLogout owns its navigation, or logout lands on \"Project not found\". Why, below." \
-    --edit-file ./m3.md
+clawmeets plan note <project> --ac AC-3.2 --to user \
+    -m "AC-3.2 needs a clause: useLogout owns its navigation, or logout lands on \"Project not found\". Why, below." \
+    --edit-file ./ac-3.md
 ```
+
+**"Shipped 4 slides, the plan says 6" is NOT a deviation and must not be filed
+as one.** Slide count was never the promise — a criterion states a behaviour,
+so the only thing that can deviate from it is a behaviour that does not hold.
+The example above is a real one: a criterion the work cannot satisfy. If you
+find yourself filing a note about a count, a filename or a format, check what
+the criterion actually says before you spend the user's attention on it.
 
 **A deviation has two shapes and only one of them is prose.** If your note asks
 the user to change what the plan *says*, it is a proposal and it carries
@@ -296,8 +350,8 @@ no flag could honestly have said otherwise.
 A deviation makes the parting **recordable and visible**. Nothing here makes one
 **detected** — no checker compares work to plan, and pretending otherwise would
 be worse than the gap. File one when you know; it shows on the owner's card with
-the clause it departed from (`--section` is the locator), and they either move
-the contract or hold the line. **Moving it is one click only if the replacement
+the clause it departed from (`--ac`, or `--section` if what moved is not a
+criterion), and they either move the contract or hold the line. **Moving it is one click only if the replacement
 text rode along.**
 
 **The coordinator files it, not the agent that hit the problem.** A deviation is
@@ -315,6 +369,12 @@ clawmeets plan update <project> --section scratch --delete
 
 **One section at a time. There is no whole-body form and there is no retry.**
 
+The body you send is that section and nothing after it, heading line included.
+Regenerating a section into a file and copying one heading too far is refused
+with a `400` naming the heading you duplicated — two headings slug to one id,
+and the copy that comes first in the document takes it, so every later note,
+quote and edit addressed to that section would land on the wrong one.
+
 A write carries the section's current text as its precondition. If somebody
 changed that section since you read it, the write is refused, **nothing is
 written**, and a conflict note is filed carrying your text so it is not lost.
@@ -325,11 +385,13 @@ decide, write once.
 Two writers on two *different* sections never collide, in either order. That is
 the whole reason the unit is a section.
 
-**And if the user has reviewed this plan, most of what you would write here is
-a `plan note` instead.** A `plan update` still lands a checkbox tick, an HTML
-comment or a reflow; anything that moves what the plan SAYS comes back as a
-**403** with your text already filed for the user. See *"The line moves once"*
-at the top.
+**Once the user has reviewed this plan, a spec change here also needs
+`--why "<one changelog line>"`** — a `400` without it, and the line becomes the
+receipt they read at their next round. **Once they have ACCEPTED it**, the same
+write is a `403` and your text comes back filed as a proposal instead. A
+checkbox tick, an HTML comment, a reflow and a `## Milestones` re-cut need
+neither, in either phase. See *"Two lines, and they do different things"* at the
+top.
 
 ## Closing a note out: `plan resolve`
 
@@ -365,13 +427,39 @@ and the owner and by nobody else. A note filed *before* the two-party rule and
 addressed to a specialist stays closable by that specialist, which is the point
 of not gating a report.
 
-**A reply from the user's review tray closes the note it replies to** — the
-parent lands on `answered` in the same transaction that files the outgoing
-question. **`plan note --reply-to` does not**, and the difference is deliberate
-rather than an oversight: the plan editor draws only OPEN notes, so closing the
-question the moment you answer it would take the question off the user's screen
-and leave your answer standing there alone. Your reply leaves the parent open
-so the two read as a chain; close it with `--answered` when the thread is done.
+**A reply closes the note it replies to, from either door** — the user's review
+tray and `plan note --reply-to` both land the parent on `answered` in the same
+write that files the outgoing question. `answered` is the ladder's own word for
+*the addressee has replied*, and that is exactly what a reply is, so there is
+no `--answered` to run afterwards.
+
+The two doors used to disagree, and because the tray is the user's alone the
+disagreement ran one way: the user's reply closed the coordinator's question,
+while the coordinator's reply left the user's question open forever with a
+`Dismiss` button on it. The reason given was that the plan editor draws only
+OPEN notes, so closing a question takes it off screen and leaves the answer
+standing alone — real, and now paid for on the answer instead: the reply's
+*"Answering your question"* line carries the parent's own first line, so the
+exchange still reads with the question closed.
+
+**Two notes do not close on reply.** The go-note, because closing it releases
+the execution gate and accepting it is the only act that means yes; and a
+proposal of your own to the user that has never been sent, because the user has
+not seen it yet and closing it would decide it on their behalf.
+
+**A user's note is a REQUEST TO YOU, and you close it when you have dealt with
+it — replying is not the only way to deal with something.** A reply closes it
+for free, so most of the time there is nothing extra to do. But when the right
+response is an ACT rather than an answer — you re-cut the milestone they
+questioned, or you file a fresh proposal that does what they asked — the reply
+never happens and the note sits open. Close it yourself: `plan resolve <id>
+--answered` when you did the thing, `--dismiss` when you decided not to and the
+reason belongs elsewhere. You are the addressee, so both are already yours.
+
+**Do not leave it for the user to dismiss.** An open note addressed to you
+badges nobody and blocks nothing — but it is still on their plan editor with a
+control on it, and asking the person who made the request to also file the
+paperwork closing it is the whole of what made this channel feel like a chore.
 
 If the section changed since the proposal was written, `--apply` is refused and
 prints both texts. That is a second, explicit look, not an error.
@@ -432,15 +520,32 @@ still the whole milestone. Per-criterion anchoring stays right for a **comment**
 It is wrong for a proposal, and reliably so: any milestone with two contested
 criteria produces the collision above every time.
 
-**There is no take-back, so the check belongs BEFORE `plan note`, not after.**
-You cannot withdraw a duplicate once you have filed it: closing your own unsent
-proposal to the user is a **403** (`may not close <id> — you wrote it, it is
-addressed to the user, and it has not been sent yet`), because the user has
-never seen it and disposing of it decides it on their behalf. `clawmeets plan
-review <project> --dry-run` will show you two rows on one section, but by then
-your only moves are to send both and say plainly in the batch message which one
-to accept, or to file a third note that supersedes them on purpose. Both cost
-the user a round they did not need. Sort by section first.
+**Re-filing on a section REPLACES your own unsent proposal on it.** File a
+second proposal on the same section, addressed to the same person, before the
+batch goes out and the first is closed for you — `dismissed`, with a reason
+naming the note that replaced it. You do not clear it, ask the user to clear
+it, or mention it in the batch message. It applies to every door: a `plan note
+--edit-file`, and equally the deviation note the server files on your behalf
+when `plan update` is refused on an accepted plan, which is the case you cannot
+avoid by being careful.
+
+So the last write wins and that is the whole rule. **Send the section as it
+should read now**, not as a delta against what you filed ten minutes ago — the
+row that survives is the one the user applies, and applying an older one after
+it would undo part of the newer.
+
+**What is still not a take-back**, and the distinction is worth holding: closing
+your own unsent proposal with `plan resolve --dismiss` remains a **403** (`may
+not close <id> — you wrote it, it is addressed to the user, and it has not been
+sent yet`). That ends with nothing on the user's desk — a question you raised
+and disposed of behind them. Replacing ends with the same question in its
+current wording. If you want a filed proposal gone and have nothing to put in
+its place, send it and let the user decide.
+
+**Once it HAS been sent, it is theirs.** A note that went out in a batch is
+never superseded by a later one; both stand until the user closes them. That is
+the round you save by re-filing before you send, and the reason `clawmeets plan
+review <project> --dry-run` is worth reading first.
 
 ## Reaching a specialist: `plan consult`
 
@@ -490,7 +595,7 @@ by topic.** Under each name you `@`-mention, put:
 **Why the executor and not the roster.** A criterion is a promise somebody has
 to keep. Asking everyone *"any comments on the draft?"* collects opinions about
 a document; asking one named agent *"can you keep this promise, and how will
-you prove it?"* collects a commitment. Only the second is falsifiable before
+you prove it?"* collects a commitment. Only the second is checkable before
 the work starts, and only the second is a signature you can point at later.
 
 **Question 3 is not a formality.** A criterion whose demonstration nobody can
@@ -516,18 +621,40 @@ into the document with `plan update` — you are the keeper — and only what ne
 the *user's* judgment (a trade-off, a scope call, two agents who disagree)
 becomes a note. For the signatures specifically:
 
-**This split applies to the FIRST draft and to nothing after it.** It is the
-rule for the round you run *before* the user has seen anything, when there is
-no decision of theirs to route around. Once the user has opened a review round
-the split is gone: **every** answer becomes a proposal — including the ones you
-are confident about, including the ones that only make a criterion testable.
-The table below reads `plan update` in the first row for the first draft only;
-after the user's first review that same fold is a `plan note` carrying the
-same text, and the server will refuse the `plan update` if you try it anyway.
+**The split survives the user's first review round; what changes is the
+paperwork.** Before they have seen anything, a settled answer goes into the
+document silently. After their first round it still goes into the document —
+you are the keeper right up to acceptance — but the write carries
+`--why "<changelog line>"`, and they read that line rather than a diff. Only
+after ACCEPTANCE does the split go away for the spec layer: from there **every**
+answer that changes what a criterion promises is a proposal, including the ones
+you are confident about.
+
+**The evidence is the exception, and it is the row that used to generate most
+of the traffic.** This table's first row once said to fold the demonstration
+*into* the criterion. That welded the evidence into the contract text, so every
+later substitution of a test or an artifact became a change to what the plan
+*says* and therefore a deviation the user had to accept. Keep the two apart and
+the problem disappears with no ceremony: the **behaviour** is the criterion's
+sentence and is theirs; the **evidence** is a `<!-- evidence: … -->` comment
+beside it and is yours, in both phases, because comments never move the digest.
+
+```markdown
+- [ ] **AC-2.1** — A registered user with valid credentials receives a session
+      that survives a server restart.
+      <!-- evidence: tests/test_auth_session.py::test_survives_restart -->
+- [ ] **AC-3.1** — A reader can name the formats gaining traction and open
+      posts that show each one.
+      <!-- evidence: deliverables/ig/trends.md — two live post links per format -->
+```
+
+A test is the evidence where one exists. Where none can, the evidence is
+whatever the user could check the claim against — a file, a link, a sample
+someone can open. What it must never be is a restatement of the criterion.
 
 | what came back | what you do with it |
 |---|---|
-| yes + a demonstration | fold the demonstration **into** the criterion with `plan update`. Not a user decision — it is the criterion becoming testable. *(After the user's first review: the same fold, filed as a `plan note` proposal — grouped **one note per section**, never one per criterion; see "One proposal per section per batch".)* |
+| yes + a demonstration | fold the demonstration into the criterion's `<!-- evidence: … -->` comment, **never into the criterion's own sentence**. A comment is inert to the spec digest, so this lands with `plan update` in every phase — before the user's first review, after it, and after acceptance — and needs no `--why`, no note and no decision from them. |
 | no | a note to the user, anchored to it: `plan note <project> --ac AC-x.y --to user -m "…"`. Carry the specialist's own words and the alternative it proposed; the scope call is the user's. |
 | not mine, or no answer at all | a note to the user. A milestone with no executor is a roster gap and must not reach acceptance unstated. |
 
@@ -572,8 +699,10 @@ plan is not un-decided; it is CHANGED, by filing a note the user applies — and
 that apply re-signs the acceptance, so the record follows the document rather
 than freezing at the moment of the first yes. If the user wants to stop work
 while something is renegotiated, file a note addressed to them: an open note to
-the user is what the execution gate counts, so filing one holds the project
-without touching the acceptance at all.
+the user **on a spec-layer section** is what the execution gate counts, so
+filing one holds the project without touching the acceptance at all. Anchor it
+to what is actually being renegotiated — a note on a `<!-- layer: detail -->`
+section does not hold anything, for the reason in *The two layers* below.
 
 ### If you are the coordinator: read the section, not the chat
 
@@ -602,7 +731,7 @@ explain is one you will narrate as though it succeeded.
 `plan update` that changes `## Approval`'s text is refused, and so is one that
 removes its heading — the acceptance is a diff, and a diff needs its heading to
 land on. Every other section is yours to rewrite as freely as ever, including
-the seed template's Goal and Guardrails; `## Approval` is the one exception,
+the seed template's Goal and Not Authorized; `## Approval` is the one exception,
 and only until the plan is accepted.
 
 Point the user at the note and **stop**. You do not have to stay in the turn to
@@ -635,10 +764,135 @@ document now says. It is why there is no revoke to miss: `## Approval` stays
 true, and the *"the plan changed since approval"* warning means the one thing it
 can still mean, that the document moved **without** them.
 
+## The two layers
+
+**A section is SPEC if changing it would change what the user said yes or no
+to. It is DETAIL if it only changes how the same yes gets delivered.** That one
+sentence decides every case, and it is deliberately not about software — it
+works the same for a research plan, a design brief or an operations rollout.
+
+| layer | holds | marker | may the keeper edit it after the user's first review? |
+|---|---|---|---|
+| **Intent** | Goal, Not Authorized, Acceptance Criteria | none (spec is the default) | no — refused, filed as a proposal |
+| **Approach** | the shape of the answer, *only where the user chose the shape* — a named architecture, a named report format, a named method | none | no |
+| **Execution** | milestones, sequencing, ownership, evidence | `<!-- layer: detail -->` on the heading | yes, freely |
+
+**Approach is the layer people get wrong in both directions.** If the user said
+"deliver it as a board memo, not a deck", that is spec — they chose it. If they
+said "figure out the right structure", it is detail and it is yours. The test is
+*did the user decide this*, not *is this important*.
+
+`## Milestones <!-- layer: detail -->` is the marked section in the seed
+template, and every `### M<n>` inside it inherits the marker. Unmarked means
+spec, so a plan that carries no markers is locked exactly as strictly as it was
+before layers existed.
+
+**Two edits inside a detail section are still refused.** Changing a section's
+`layer:` marker — because otherwise you could unlock any section with one write
+that looks inert. And dropping an `<!-- advances: … -->` claim so that a
+criterion ends up claimed by nobody — because that is how a re-cut quietly
+deletes the work behind a promise. Re-cutting, splitting, merging, reordering
+and re-assigning milestones are all free.
+
+**You lose nothing except the user's automatic sight of a re-plan.** Nobody will
+be asked to accept your new schedule, so **say in `user-communication` that you
+re-planned and why.** The plan's version history records it either way; the
+announcement is what makes it visible in time to matter.
+
+**A note anchored to a detail section does not stop the project.** The execution
+gate counts open notes to the user in the **spec** layer only, and the plan
+editor's comment box goes red on the same test. The note is still filed, still
+sent, still on their screen and still answerable — it just does not halt every
+agent on the project while it waits.
+
+That is the layer being consistent with itself rather than a loophole: you did
+not need permission to make that edit, so asking for it should not be able to
+stop the work. **The completion is upstream — decide it, do it, and say so.** If
+you genuinely want the user's taste on something inside your own layer, ask in
+`user-communication`, where a question costs them a reply instead of costing the
+project a stop.
+
+**And the corollary, which is the one that bites:** if the thing you are
+departing from is a criterion, anchor the note to the criterion — `plan note
+--ac AC-2.3` fills in the section and the quote for you — and not to the
+milestone that happened to be building it. `## Acceptance Criteria` is unmarked
+and therefore spec, so a departure filed that way lands where it will be seen
+and where it will hold. A real objection anchored to `milestones` is silent.
+
+## `## Not Authorized` — the fourth question
+
+Goal says **why**. Acceptance Criteria say **what desired behaviour looks
+like**. Milestones say **who does what**. `## Not Authorized` says **what the
+user's yes did not buy** — and it is a claim about authority, not about
+behaviour, which is why it is neither of the other two.
+
+**One test decides whether a line belongs there: violating it cannot be undone
+by more work.** An email sent, an order placed, a deploy shipped, data published
+or deleted, money spent. Extra code is deletable and extra research is
+discardable, so scope creep is not this; a quality bar is a criterion; the
+sequencing you chose is milestone ordering. Sequencing the *user* mandated is a
+denial and goes here phrased as one — *"no deploy before the security review
+passes"* — because the milestone layer is yours to re-cut and would not hold it.
+
+**Why it is a section and not a criterion.** The deviation channel fires when
+the spec MOVES: someone notices Goal or Acceptance Criteria no longer describe
+the work, and files a note to the user. An agent that submits the order has not
+moved the spec — it has **over-satisfied** it. Sending the questions completes
+the deliverable; placing the order is more of what the Goal asked for. No
+criterion changed, so there is nothing to notice and nothing to file, and by
+the time a note could be read the act cannot be taken back. That asymmetry is
+the whole justification for the heading — not importance, and not frequency.
+
+**Unlike every other section, this one is injected verbatim into every agent's
+prompt** — the coordinator's and each worker's — capped at a few lines. Write
+it short. Most plans should say *"None."*, and a plan that says "None" has not
+skipped anything.
+
+**Legacy plans carry this under `## Guardrails`.** That heading is read as a
+fallback and never written, so a plan created before the rename keeps working
+without being rewritten. If you inherit one, expect it to be full of scope
+rules and quality bars that now have better homes.
+
 ## Two conventions this system teaches and does not enforce
 
-**Acceptance criteria live inside their milestone**, as `AC-<m>.<n>`, in exactly
-one place. There is no global criteria section.
+**Acceptance criteria live in ONE `## Acceptance Criteria` section**, grouped
+under `### G<m>` headings and labelled `AC-<m>.<n>` — where `<m>` is the
+**group**, not a milestone. Milestones cite the ids they advance
+(`### M2: Session layer <!-- advances: AC-1.1, AC-1.3 -->`) rather than owning
+them.
+
+**They used to live inside their milestone, and the move is what makes the
+layers mean anything.** "Milestones are detail, criteria are spec" is
+self-contradictory while the criteria are nested in a milestone, because
+freeing the milestone frees whatever is inside it.
+
+**A criterion is an observable outcome, not an artifact and not a method.** One
+plain sentence saying what must be TRUE for whoever receives the work, checkable
+by them without being told how it was made. For software that is behaviour; for
+research or analysis it is what the reader can now see and trust; for design,
+what someone looking at it can tell. *"Produces 6 slides"* and *"a TSV with 10
+rows"* are artifacts; *"every recommendation cites a source the reader can
+open"* is a criterion.
+
+**The altitude test is the whole rule.** If an ordinary change in **how the work
+gets done** would break the criterion, it is too fine-grained. That is what this
+section is protecting: a criterion pinned to the method turns every routine
+decision into a change to what the plan *says*, and therefore into a review the
+user has to sit through. What counts as "how" depends on the work — a rename or
+a refactor in code, a different source, sample window or tool in research, a
+different layout or file in design. None of them may cost the user a decision.
+
+| too fine-grained | right altitude |
+|---|---|
+| the block's quote goes through `capQuote` | a note filed from a block quotes that block |
+| the pending highlight does not render as `.plan-mark` | a draft comment is visibly distinct from one already filed |
+| the top 10 hashtags by engagement rate from the Graph API | a reader can name the formats gaining traction and open posts that show each one |
+| a 200-account sample scraped weekly | every trend is backed by more than one account, so no single viral post carries one |
+
+A quality bar a reader can check IS a criterion. A scope rule (*"nothing
+outside this directory changes"*, *"public posts only, last 90 days"*) restates
+the Goal and belongs there — breaking it already moves something observable, so
+it already produces a deviation.
 
 **The format is now PARSED — and still not validated.** This paragraph used to
 say there was no parser, and that is no longer true: `plan show --sections`
@@ -649,7 +903,8 @@ simply has no criteria. What you lose by ignoring it is the address: an argument
 about one criterion has to point at the whole milestone instead, which is a note
 the user has to cold-read a section to place. Keep the convention. The
 completion report also walks criteria per milestone and reads them out of the
-plan rather than restating them.
+plan rather than restating them — per criteria group, naming which milestones
+claimed each.
 
 **One plan per project.** Not per to-do, not per milestone, and never on a DM —
 a DM has no `shared-context` room to hang one on.

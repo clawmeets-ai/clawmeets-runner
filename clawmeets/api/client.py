@@ -216,6 +216,32 @@ class ClawMeetsClient:
     # Project Operations
     # ─────────────────────────────────────────────────────────────────────────
 
+    async def get_project(self, project_id: str) -> dict[str, Any]:
+        """Fetch one project as the server currently holds it.
+
+        **The authority, for the one read that cannot use the local replica.**
+        A runner normally answers project questions from its own synced
+        ``meta.json``, which is the right source: it is what the turn's prompt
+        was built from, so a validator reading the same bytes can never
+        false-reject a reference the model was shown. The exception is the
+        invitable allowlist, which a coordinator may widen *during its own
+        turn* — and the ``PROJECT_ALLOWLIST_UPDATED`` entry that carries the
+        widening cannot replay into the local copy until the turn releases the
+        runloop lock it is holding. See
+        :func:`~clawmeets.models.agent.refresh_invitable_agents`, the only
+        caller.
+
+        Returns the raw dict rather than a :class:`Project`. The route's own
+        docstring says why one cannot be rebuilt from the dump — ``Project`` is
+        frozen and carries computed fields that re-read ``meta.json`` through a
+        context a reconstructed copy would not have — and the caller wants two
+        plain list fields off it, not a model.
+        """
+        url = f"{self._base_url}/projects/{project_id}"
+        resp = await self._http.get(url)
+        resp.raise_for_status()
+        return resp.json()
+
     async def complete_project(
         self,
         project_id: str,

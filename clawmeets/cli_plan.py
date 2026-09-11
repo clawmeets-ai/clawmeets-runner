@@ -52,6 +52,7 @@ import typer
 from clawmeets.cli_runner import DEFAULT_SERVER, _http, _resolve_project_ref
 from clawmeets.models.plan_markdown import (
     append_to_section,
+    heading_slug,
     parse_sections,
     quote_names_criterion,
     retitle_section,
@@ -354,6 +355,12 @@ def _show_note(index: dict, note_id: str, diff: bool) -> None:
         typer.echo(f"\nQuoted excerpt:\n> " + "\n> ".join(note["quote"].splitlines()))
     if note.get("section_changed"):
         typer.echo("\n⚠ this section changed since the note was written")
+    # TWO SENTENCES, NEVER BOTH — the server guarantees at most one of these is
+    # set, because "the slug does not resolve" means either that the section was
+    # DELETED under an old note or that this note is what would CREATE it, and
+    # only the first is a warning.
+    if note.get("section_new"):
+        typer.echo(f"\nthis proposes a new section `{note['section']}`")
     if note.get("section_missing"):
         typer.echo("\n⚠ this section no longer exists (dangling)")
     if diff:
@@ -454,6 +461,12 @@ def update(
     append: bool = typer.Option(False, "--append", help="Append to the section instead of replacing it."),
     title: str = typer.Option("", "--title", help="Rewrite the heading text. Re-slugs the section."),
     delete: bool = typer.Option(False, "--delete", help="Remove the section."),
+    why: str = typer.Option(
+        "", "--why",
+        help="One CHANGELOG LINE: what this changes and whose feedback caused "
+             "it. Required when the write moves what the plan SAYS and the user "
+             "has not accepted it yet.",
+    ),
     server: str = typer.Option(DEFAULT_SERVER, "--server", "-s"),
     token: Optional[str] = typer.Option(None, "--token", "-t"),
     json_out: bool = typer.Option(False, "--json"),
@@ -468,6 +481,24 @@ def update(
     just read. On ``409`` it prints what the section says now beside what you
     wrote and stops — a refusal is information, and the conflict note it filed
     is how it gets resolved (§4.3).
+
+    **``--why`` is the changelog line, and it is required on exactly one kind of
+    write**: one that moves what the plan SAYS, on a plan the user has not
+    accepted. That write LANDS — before acceptance the keeper writes the
+    document, it does not propose it — and files a comment-only receipt carrying
+    this line, which is what the user reads at review time in place of a diff.
+    A ``400`` names it if you left it out.
+
+    Write it as a change and its cause, not as a summary. The user answers by
+    quoting one of these lines back at you, so *"M2 now owns auth setup, moved
+    out of M3 — backend flagged M3's endpoints cannot be built before it"* is
+    answerable and *"incorporated feedback from all agents"* is not: it hands
+    them nothing to object to and pushes them into a full re-read to find the
+    one thing they disliked.
+
+    After the user accepts, the flag stops applying: a spec edit is refused and
+    filed as a proposal with a diff, because from there a ratified baseline
+    exists for the diff to be a bounded delta against.
     """
     supplied = _read(text, body_file, what="text")
     if delete and (supplied is not None or append or title):
@@ -507,7 +538,12 @@ def update(
         edit: dict[str, Any] = {"section": section, "text": new_text, "base": base}
         if create:
             edit["create"] = True
-        resp = client.put(_url(pid), json={"edits": [edit]}, headers=headers)
+        payload: dict[str, Any] = {"edits": [edit]}
+        if why:
+            # Sent ONLY when given, like `create` above: a route parameter that
+            # every call carries as `""` is one no reader can tell was defaulted.
+            payload["why"] = why
+        resp = client.put(_url(pid), json=payload, headers=headers)
         if resp.status_code == 403:
             # **Print the server's own refusal; do not compose one here.**
             #
@@ -544,6 +580,15 @@ def update(
             f"Wrote {', '.join(result.get('sections') or [section])} — "
             f"revision {result.get('revision')}"
         )
+        # The receipt ids, named for the same reason the spec lock's refusal
+        # names the notes it filed: a note the user will read, that this command
+        # created without being asked to, is not a thing to leave silent.
+        ids = result.get("note_ids") or []
+        if ids:
+            typer.echo(
+                f"Filed {', '.join(ids)} — the user reads this line at their "
+                f"next review round."
+            )
 
 
 def _new_section_text(
@@ -601,12 +646,20 @@ def note(
         None, "--edit-file",
         help="The proposal: the section's REPLACEMENT TEXT. Requires --section. Never a diff.",
     ),
-    quote: str = typer.Option("", "--quote", help="The excerpt this is about."),
+    quote: str = typer.Option(
+        "", "--quote",
+        help="The excerpt this is about. Enough on its own — with no --section "
+             "the server files the note in whichever section holds it.",
+    ),
     ac: str = typer.Option(
         "", "--ac",
         help="Anchor to an acceptance criterion, e.g. AC-2.3. Fills in --section and --quote.",
     ),
-    reply_to: str = typer.Option("", "--reply-to", help="Parent note id — makes this a thread reply."),
+    reply_to: str = typer.Option(
+        "", "--reply-to",
+        help="Parent note id. Inherits its section, quote and the other end of "
+             "the thread as --to, and CLOSES it `answered`.",
+    ),
     as_user: bool = typer.Option(
         False,
         "--as-user",
@@ -743,7 +796,35 @@ def note(
                         f"is no section for --edit-file to replace; pass --section."
                     )
                 payload["section"] = section
-            payload["base_section"] = _section_text(index.get("body", ""), section) or ""
+            # **THE ONE PLACE A TYPO BECAME A CORRUPTED DOCUMENT**, and the
+            # line below is how. `_section_text` answers `None` for a slug that
+            # does not resolve; sending `""` for it tells the server *this
+            # proposal CREATES a section*, and one `resolve --apply` later the
+            # document holds a SECOND heading under the same slug — the
+            # `duplicate id` state `plan show --sections` warns about, reached
+            # with no `--force` and nothing to repair it.
+            #
+            # A PRE-FLIGHT ON AN INDEX THIS CALL ALREADY HOLDS, in the shape
+            # `--reply-to` uses eight lines up: no second request, and the
+            # remedy names the command that prints the slugs, which the model's
+            # own refusal deliberately cannot (it reaches a browser composer
+            # that has no flags). `add_note` refuses this too and is the
+            # backstop for every other door — a comment-only note takes no index
+            # read, so its typo is caught there and not here.
+            #
+            # `heading_slug` is the SAME create test the server applies, called
+            # rather than restated: a proposal whose own heading slugs to the
+            # section it names means to write that section, and proposing a
+            # section that does not exist yet is legal.
+            current = _section_text(index.get("body", ""), section)
+            if current is None and heading_slug(proposal) != section:
+                raise _fail(
+                    f"there is no section `{section}` in this plan, and "
+                    f"--edit-file does not open on a heading that would create "
+                    f"it. `clawmeets plan show {project} --sections` prints the "
+                    f"slugs."
+                )
+            payload["base_section"] = current or ""
         result = _ok(client.post(_url(pid, "/notes"), json=payload, headers=headers))
 
     if json_out:
@@ -1306,6 +1387,11 @@ def _dry_run(
             keeper_name=index.get("keeper", ""),
             round_no=round_no,
             revision=index.get("revision", 1),
+            # The dry run's whole promise is that it renders what the server
+            # renders, and the owner's changelog block is part of that message.
+            # Omitting this would preview a message missing the one section the
+            # owner reads first.
+            last_seen=index.get("owner_last_seen_revision", 0),
             all_notes=notes,
             history=history,
         ))

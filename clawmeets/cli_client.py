@@ -45,6 +45,39 @@ file_app = typer.Typer(help="File commands",    no_args_is_help=True)
 # project create / list / get / complete / delete
 # ---------------------------------------------------------------------------
 
+# Set by POST /projects when --spawned-from linked to-dos, or when it tried and
+# could not. Literal strings, not an import: this module is MIT and ships in the
+# runner wheel, which does not carry `clawmeets/server/`. A test asserts these
+# two copies equal the server's constants rather than leaving them to drift.
+_MIRRORED_HEADER = "X-Desk-Todo-Mirrored"
+_MIRROR_ERROR_HEADER = "X-Desk-Todo-Mirror-Error"
+
+
+def _echo_mirror_note(resp) -> None:
+    """Say on STDERR what --spawned-from did, when it did anything.
+
+    Silence is the common case and is deliberate: a create from a context no
+    to-do points at emits neither header, so this prints nothing at all. An
+    agent shelling this reads stderr in its tool output, so a miss lands in
+    what it reports to its user rather than in a log nobody opens.
+    """
+    mirrored = resp.headers.get(_MIRRORED_HEADER)
+    if mirrored:
+        # "1 of your to-dos" is correct English, so there is no plural branch
+        # to get wrong.
+        typer.echo(
+            f"linked this project to {mirrored} of your to-dos on My Desk",
+            err=True,
+        )
+    reason = resp.headers.get(_MIRROR_ERROR_HEADER)
+    if reason:
+        typer.echo(
+            f"could not link this project to your to-dos ({reason}) — "
+            "the project was created",
+            err=True,
+        )
+
+
 @proj_app.command("create")
 def project_create(
     name: str = typer.Argument(
@@ -81,8 +114,23 @@ def project_create(
         help="Post the request as the opening user-communication message to wake the "
              "coordinator (default: on). Use --no-post-initial-message to create quietly.",
     ),
+    spawned_from: Optional[str] = typer.Option(
+        None, "--spawned-from",
+        help="The id of the context you are creating this project FROM (your own "
+             "project/thread id, or the {name}-{id} slug of your synced project "
+             "directory). If one of your owner's to-dos points at that context, it "
+             "gains this project too, so it keeps reading Working against the work "
+             "that continued. Omit it and nothing happens.",
+    ),
 ):
-    """Create a new project."""
+    """Create a new project.
+
+    ``--spawned-from`` is the whole of the to-do mirroring surface. You pass the
+    CONTEXT you are running in; you never name a to-do, and you never learn
+    which to-dos exist — the server holds both ends. If the flag is omitted, or
+    resolves to nothing, or your owner has no to-do pointing at it, the create
+    is exactly what it was before and says nothing extra.
+    """
     headers = {}
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -103,8 +151,16 @@ def project_create(
             payload["agent_teams"] = team
         if agent:
             payload["agent_names"] = agent
+        if spawned_from:
+            payload["spawned_from"] = spawned_from
         resp = client.post("/projects", json=payload, headers=headers)
+        # STDOUT STAYS BYTE-IDENTICAL. The mirror reports itself on stderr and
+        # nowhere else, so anything piping `project create` into `jq` keeps
+        # working — the same discipline the deprecated `todo done` alias
+        # follows. Exit code is untouched too: the create succeeded, and that is
+        # what the caller asked for.
         _print_json(_ok(resp))
+        _echo_mirror_note(resp)
 
 
 @proj_app.command("list")

@@ -248,33 +248,84 @@ def build_state_snapshot(
     )
 
 
-def refresh_invitable_agents(
+async def refresh_invitable_agents(
     model_ctx: "ModelContext",
     project_id: str,
 ) -> frozenset[str]:
-    """Re-read ONLY the project's invitable-agent set from local state.
+    """Re-read ONLY the project's invitable-agent set, from the SERVER.
 
     The monotone half of the once-per-turn snapshot. Deliberately narrow: it
     re-derives the single field a coordinator can legitimately change *during*
-    its own turn (via ``clawmeets project allowlist``, whose
-    ``PROJECT_ALLOWLIST_UPDATED`` entry replays into the local ``meta.json``)
-    and touches nothing else. Everything the retry loop must see hold still —
-    rooms, project status, the plan gate — stays with the frozen snapshot.
+    its own turn (via ``clawmeets project allowlist``) and touches nothing
+    else. Everything the retry loop must see hold still — rooms, project
+    status, the plan gate — stays with the frozen snapshot.
 
-    Mirrors ``build_state_snapshot``'s call exactly, ``exclude_ids`` included
-    (i.e. omitted), so the union it feeds is homogeneous with the set it widens;
-    a differently-scoped scan here would silently add or drop the agent's own
-    short name relative to the frozen half.
+    **AND IT ASKS THE SERVER, WHICH IS THE WHOLE REPAIR.** This used to re-read
+    ``Project.get`` — the runner's own synced ``meta.json`` — on the stated
+    assumption that the coordinator's ``PROJECT_ALLOWLIST_UPDATED`` entry
+    "replays into the local ``meta.json``". It does, but **not until the turn
+    releases the runloop lock it is itself holding**, so the widening arrived
+    strictly after the turn that made it had already given up. The one case
+    this function exists to serve was the one case it could not serve.
 
-    Returns an EMPTY set on any read failure rather than raising. The caller
-    unions the result, so an empty set is a no-op — a project that vanished
-    mid-turn degrades to today's frozen behaviour instead of killing a turn
-    whose real work may already be valid.
+    Measured on the incident that changed it: the allowlist entry landed
+    server-side at 03:16:40, the retry prompt written at 03:22:24 still listed
+    the old roster, both ``create_room`` actions were dropped at 03:24:06, and
+    the runner's local ``meta.json`` was finally written at 03:24:10 — four
+    seconds after the drop. The coordinator had run exactly the command the
+    retry feedback told it to run.
+
+    **Only the two allowlist fields are taken from the server**, overlaid onto
+    the locally-loaded project with ``model_copy``. Reconstructing a
+    :class:`~clawmeets.models.project.Project` from the response would lose the
+    ctx binding its computed properties read through; replacing more than these
+    two fields would quietly un-freeze parts of the snapshot the retry loop
+    depends on holding still.
+
+    **Reading NEWER state here cannot false-reject.** The caller unions through
+    ``StateSnapshot.with_invitable``, so a fresher set can only turn REJECT into
+    PASS. That is why this one field may leave the local replica while the rest
+    of ``build_state_snapshot`` must not: the stale-local-snapshot invariant
+    protects against rejecting a reference the model was shown, and a union
+    never does that.
+
+    Mirrors ``build_state_snapshot``'s projection exactly, ``exclude_ids``
+    included (i.e. omitted), so the union it feeds is homogeneous with the set
+    it widens; a differently-scoped scan here would silently add or drop the
+    agent's own short name relative to the frozen half.
+
+    Returns an EMPTY set on any failure rather than raising. The caller unions
+    the result, so an empty set is a no-op: the turn degrades to the frozen
+    behaviour instead of dying for a widening that may not even exist. The
+    server call has its OWN handler inside that one, so a network edge — which
+    the local-only version did not have — costs the widening and not the local
+    answer as well.
     """
     from .project import Project
 
     try:
         project = Project.get(project_id, model_ctx)
+        # **THE SERVER READ FAILS SOFT, ON ITS OWN.** Nested rather than folded
+        # into the outer handler so an unreachable server costs only the
+        # widening: the local projection below is still a real answer — the one
+        # this function gave before it learned to ask — and throwing it away
+        # with the network error would degrade BELOW the behaviour this is
+        # replacing.
+        client = getattr(model_ctx, "client", None)
+        if client is not None:
+            try:
+                fresh = await client.get_project(project_id)
+                project = project.model_copy(update={
+                    "agent_names": list(fresh.get("agent_names") or []),
+                    "agent_teams": list(fresh.get("agent_teams") or []),
+                })
+            except Exception:
+                logger.debug(
+                    "invitable refresh could not reach the server for project "
+                    "%s; falling back to the local snapshot",
+                    project_id,
+                    exc_info=True,
+                )
         return frozenset(Agent.invitable_short_names_for_project(project, model_ctx))
     except Exception:
         logger.debug(
@@ -368,7 +419,7 @@ def _plan_execution_blocked(project: "Project") -> int:
 def plan_prompt_state(
     project: "Project", ctx: "ModelContext"
 ) -> "PlanPromptState | None":
-    """§7.3's five steady-state facts, assembled from **synced** state only.
+    """§7.3's six steady-state facts, assembled from **synced** state only.
 
     ``None`` when the project has no plan lifecycle to report — a DM, or any
     project that was never seeded (which is every project predating the feature,
@@ -388,8 +439,8 @@ def plan_prompt_state(
     """
     from ..llm.prompt_builder import PlanPromptState
     from .chatroom import Chatroom
-    from .plan_markdown import spec_digest
-    from .project_plan import approval_state
+    from .plan_markdown import legacy_spec_digest, spec_digest
+    from .project_plan import approval_state, not_authorized_state
 
     if project.surface != "regular" or project.plan_seeded_at is None:
         return None
@@ -410,7 +461,20 @@ def plan_prompt_state(
         and project.plan_accepted_at is not None
         and project.plan_accepted_spec_digest
     ):
-        changed = spec_digest(body) != project.plan_accepted_spec_digest
+        # **THE LEGACY ARM, AND IT HAS TO BE HERE TOO.** This is the runner's
+        # copy of ``project_plan.changed_since_acceptance`` — same definition,
+        # computed from the two halves that are local, because the prompt is
+        # assembled in a process that cannot open the sidecar. Narrowing what
+        # ``spec_digest`` hashes changed the number, so a stamp taken under the
+        # old formula must still be recognised; without this arm every plan
+        # accepted before the change would tell its coordinator, every turn,
+        # that the user's spec had moved. Deliberately duplicated rather than
+        # imported: the two answers must agree, and they agree by both naming
+        # ``legacy_spec_digest``.
+        changed = (
+            spec_digest(body) != project.plan_accepted_spec_digest
+            and legacy_spec_digest(body) != project.plan_accepted_spec_digest
+        )
     return PlanPromptState(
         title=project.display_name or project.name,
         phase=project.phase,
@@ -418,6 +482,13 @@ def plan_prompt_state(
         open_notes_for_you=project.plan_open_notes,
         approval=approval_state(body) if body is not None else "",
         user_has_reviewed=project.plan_user_reviewed_at is not None,
+        # Sixth fact, off the SAME read as ``approval`` — which is why the read
+        # moving out of its branch (above) had to happen first. ``""`` whenever
+        # the document is unreachable, which is the same answer as "the plan
+        # forbids nothing" and renders nothing either way; a worker whose
+        # `shared-context` is not synced is no worse off than before this
+        # existed, and is never told a prohibition that is not there.
+        not_authorized=not_authorized_state(body) if body is not None else "",
     )
 
 
@@ -1429,6 +1500,11 @@ class Agent(PersistableParticipant):
             dwh_dir=self._model_ctx.dwh_dir,
             is_dm=is_dm,
             chat_history=chat_history,
+            # Only ``not_authorized`` is read on this side. It is here rather
+            # than only on the coordinator because the agent that sends the
+            # email or places the order is the one that was handed the tool,
+            # and that is a worker on every project that has any.
+            plan=plan_prompt_state(project, self._model_ctx),
         )
 
         # Execute using ClaudeCLI with retry for transient failures
@@ -1719,7 +1795,7 @@ class Agent(PersistableParticipant):
             # costs zero further invocations.
             if include_agents:
                 widened = snapshot.with_invitable(
-                    refresh_invitable_agents(self._model_ctx, project_id)
+                    await refresh_invitable_agents(self._model_ctx, project_id)
                 )
                 if widened is not snapshot:
                     snapshot = widened

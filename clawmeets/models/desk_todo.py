@@ -35,8 +35,9 @@ import shutil
 import unicodedata
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from clawmeets.utils.file_io import FileUtil
 
@@ -161,7 +162,19 @@ class LabelError(ValueError):
 
     @classmethod
     def invalid_kind(cls) -> "LabelError":
-        return cls("labels.invalid_kind", "kind must be 'context' or 'state'")
+        # THE CODE STRING IS FROZEN. It is published in the to-do data contract
+        # and the browser branches on it at ``utils/labelErrors.ts`` to write
+        # its own copy; changing it here is a silent wire break. Only the
+        # SENTENCE moves, and it moves because reciting a one-member enum
+        # ("kind must be 'context'") answers a question nobody asked. What the
+        # caller actually did was ask for a state, and what they need to hear is
+        # that states are not a label any more — the lifecycle they want is
+        # derived on ``state`` and cannot be set by hand.
+        return cls(
+            "labels.invalid_kind",
+            "every label is a context now — the 'state' kind is retired, and "
+            "whether the work is running is derived on the to-do's `state`",
+        )
 
     @classmethod
     def kind_immutable(cls, slug: str, stored: str, wanted: str) -> "LabelError":
@@ -431,9 +444,27 @@ class DeskTodo(BaseModel):
     owner_user_id: str
     text: str
     origin: str = "self"  # "self" | "agent"
-    status: str = "open"  # "open" | "done"
+    # The owner filed it away. A DISPOSAL, never a lifecycle state — nothing
+    # project-driven writes it and nothing reads it as "the work finished".
+    # A bool rather than a renamed two-value string on purpose: a string is
+    # what lets a third value get added later and re-invent lifecycle state,
+    # which is the exact confusion this field exists to end.
+    archived: bool = False
     created_at: str
     updated_at: str
+
+    # Ids of the projects and DM threads this to-do spawned. ONE id space, so a
+    # DM-thread id and a regular project id are indistinguishable here — which
+    # is required, because the desk's **command** button spawns a DM thread and
+    # that is the feature's most common creation path.
+    #
+    # A REFERENCE, not a foreign key: an id whose project was deleted stays in
+    # the list, is legal, and simply stops contributing to the derived state.
+    # This module stores the ids and knows NOTHING about projects — exactly as
+    # it stores label slugs and knows nothing about the registry. The
+    # derivation lives in the third module, ``models/desk_todo_link.py``, which
+    # imports this one and is never imported by it.
+    project_ids: list[str] = Field(default_factory=list)
 
     # self-capture
     source: DeskTodoSource | None = None
@@ -473,6 +504,45 @@ class DeskTodo(BaseModel):
 
     # set when the manager saves a draft in the take-over
     drafted: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def _archived_read_shim(cls, data: Any) -> Any:
+        """Read a plate written in the old ``status: "open" | "done"`` shape.
+
+        NOT compat-nostalgia, and not optional. Every plate on disk today
+        carries ``status``; without this line every to-do the owner ever filed
+        away springs back onto their open plate on first load, which is exactly
+        what AC-4.3 forbids::
+
+            legacy `status` present AND `archived` absent -> archived = (status == "done")
+            `archived` present                           -> it wins, always
+            neither                                      -> False (the field default)
+
+        ``status`` is deliberately NOT redeclared as a field, so pydantic's
+        default ``extra="ignore"`` drops it once this validator has read it, and
+        the owner's next ORDINARY save — a rename, a label edit, an archive
+        toggle — persists the new shape as a side effect of a write they asked
+        for. There is no rewrite pass, no bulk write over anyone's plate, and no
+        schema-version bump: the plate is one JSON document per owner and
+        ``_save`` already rewrites the whole array, so the re-shape costs
+        nothing and touches exactly the one owner who wrote.
+
+        The shim is also what makes the change loadable in both directions
+        during a rollout: a row already carrying ``archived`` is untouched here.
+
+        NAMING TRAP, adjacent and unrelated: ``done_steps`` is the agent's
+        groundwork list ("what's already been done") and has nothing whatever to
+        do with archiving. It is not read or written here.
+        """
+        if not isinstance(data, dict):
+            return data
+        if "archived" in data:
+            return data
+        if "status" in data:
+            data = dict(data)
+            data["archived"] = data.get("status") == "done"
+        return data
 
 
 def gen_id() -> str:
@@ -768,7 +838,6 @@ async def add_todo(
             owner_user_id=owner_user_id,
             text=text,
             origin="self",
-            status="open",
             created_at=now,
             updated_at=now,
             source=source,
@@ -815,7 +884,6 @@ async def publish_agent_todo(
             owner_user_id=owner_user_id,
             text=text,
             origin="agent",
-            status="open",
             created_at=now,
             updated_at=now,
             due=due,
@@ -933,7 +1001,7 @@ async def patch_todo(
     owner_user_id: str,
     todo_id: str,
     *,
-    status: str | None = None,
+    archived: bool | None = None,
     text: str | None = None,
     due: str | None = None,
     draft_prompt: str | None = None,
@@ -993,10 +1061,17 @@ async def patch_todo(
                 break
         if target is None:
             return None
-        if status is not None:
-            if status not in ("open", "done"):
-                raise ValueError("status must be 'open' or 'done'")
-            target.status = status
+        if archived is not None:
+            # THE ONE WRITER (AC-1.6). This assignment is the single place in
+            # the product that records "the owner filed this away". Its three
+            # callers are the desk checkbox, the CLI archive/unarchive verbs,
+            # and the trigger's --consume option. Nothing project-driven writes
+            # it and nothing reads it as "the work finished".
+            #
+            # A bool has no value to validate, so the old
+            # `status must be 'open' or 'done'` branch is gone outright. None
+            # still means "untouched", exactly as it did for `status`.
+            target.archived = archived
         if text is not None:
             text = text.strip()
             if text:
@@ -1034,6 +1109,66 @@ async def patch_todo(
             # uses; the reconcile has no delete branch of its own to get wrong.
             sweep_orphan_todo_files(data_dir, owner_user_id)
         return target
+
+
+async def associate_todo(
+    data_dir: Path, owner_user_id: str, todo_id: str, project_id: str
+) -> DeskTodo | None:
+    """Add one project (or DM-thread) id to a to-do. Returns the updated to-do,
+    or None if the to-do is gone.
+
+    IDEMPOTENT: associating a project the to-do already carries is a no-op that
+    still returns the to-do, not a 409. That matches ``add_labels`` /
+    ``remove_labels`` and it matches them for the same reason — the owner's
+    assistant retries commands, and a rule that succeeds on the first run and
+    fails on the second is the worst kind of rule to hand an agent.
+
+    Stores the id VERBATIM. It does not resolve the project, does not validate
+    it, and does not check who owns it: this module knows nothing about
+    projects. Authorization is the ROUTE's job and lives there, because the
+    visibility predicate it needs (``server/routes/_batch.py``) is not shipped
+    in the runner wheel while this module is.
+    """
+    project_id = (project_id or "").strip()
+    if not project_id:
+        raise ValueError("project_id cannot be empty")
+    async with _lock:
+        todos = _load(data_dir, owner_user_id)
+        for t in todos:
+            if t.id == todo_id:
+                if project_id not in t.project_ids:
+                    t.project_ids.append(project_id)
+                    t.updated_at = _now()
+                    _save(data_dir, owner_user_id, todos)
+                return t
+        return None
+
+
+async def dissociate_todo(
+    data_dir: Path, owner_user_id: str, todo_id: str, project_id: str
+) -> DeskTodo | None:
+    """Remove one project id from a to-do. Returns the updated to-do, or None
+    if the to-do is gone.
+
+    Idempotent in the other direction: removing an id the to-do does not carry
+    is a no-op that still returns the to-do.
+
+    This is also the owner's ONLY way to clear a DANGLING id — one whose
+    project has been deleted — which is why the route above it takes no
+    ownership check on the way out. A deleted project resolves to nothing, so
+    an ownership check would make exactly the rows that most need removing the
+    ones that cannot be removed.
+    """
+    async with _lock:
+        todos = _load(data_dir, owner_user_id)
+        for t in todos:
+            if t.id == todo_id:
+                if project_id in t.project_ids:
+                    t.project_ids = [p for p in t.project_ids if p != project_id]
+                    t.updated_at = _now()
+                    _save(data_dir, owner_user_id, todos)
+                return t
+        return None
 
 
 async def reorder_todos(

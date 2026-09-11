@@ -23,6 +23,31 @@ The seed is a **first-write materialization only** and is never re-asserted. An
 implementation that re-adds missing defaults on read is wrong, and it is wrong
 in the way that silently resurrects ``home`` every time the owner deletes it.
 
+**THE ``state`` KIND IS RETIRED, AND IT IS RETIRED BY READING, NOT BY WRITING.**
+Lifecycle now lives on ``DeskTodo.state``, derived from the projects linked to
+an item (``models/desk_todo_link.py``); a label can no longer mean "the work is
+running". ``KINDS`` is down to one member and nothing new can be stored as a
+state — but owners have ``kind: "state"`` rows on disk today, and **not one byte
+of them is destroyed**. The row keeps its slug, its name, its colour and its
+position, and every to-do carrying it keeps carrying it. It simply stops
+carrying lifecycle meaning, and it reads as a context.
+
+That retirement is a projection applied on the READ path and nowhere else, which
+is the whole reason ``_rows_raw`` and ``_rows`` are two functions:
+
+  * ``_rows_raw``  — today's parse, verbatim. The STORED kind. Every WRITE
+    starts here (``_rows_for_write``, ``auto_register``), so a read-modify-write
+    round-trips a legacy row's ``kind`` unchanged.
+  * ``_rows``      — raw, plus the coercion. What ``list_labels`` answers.
+
+Coercing inside the write path instead would persist ``kind: "context"`` over a
+row the owner stored as ``state`` — a silent rewrite of their data on the next
+unrelated recolour — and it would blind the kind guards in ``create_label`` and
+``merge_label``, which read the stored kind and are what keep a legacy row from
+being shadowed or folded into a context. There is **no migration pass, no
+schema-version bump and no bulk write**; a registry holding a state row is
+byte-identical after any number of reads.
+
 **A WRITE NEVER STARTS FROM AN UNREADABLE FILE.** Every verb here is a
 read-modify-write of the whole array, so "the file exists and will not parse"
 must not be allowed to look like "the registry is empty" — it once did, and one
@@ -60,15 +85,40 @@ LABELS_DIR = "desk-labels"
 # sequence @designer authored, so "earliest free" also means "most likely to be
 # visually distinct from what is already on screen".
 PALETTE = ("blue", "green", "indigo", "teal", "amber", "pink", "slate", "plum")
-KINDS = ("context", "state")
+
+# The kind vocabulary, down to ONE member. Collapsing the tuple is the entire
+# enforcement of the retirement on the write side: ``_validate_kind`` already
+# refuses anything outside it with ``labels.invalid_kind``, so no new code path
+# and no new error code are needed. The CODE STRING does not change — it is
+# published in the to-do data contract and the browser maps it at
+# ``utils/labelErrors.ts``; only the sentence changes, to say the axis is gone
+# rather than to recite an enum that now has one member.
+KINDS = ("context",)
+
+# What a stored row may say that ``KINDS`` no longer accepts. This is a READ
+# vocabulary, never a write one: rows carrying it are shown as ``context`` by
+# ``_rows`` and are left exactly as they are on disk by ``_rows_raw``. Naming it
+# is what keeps the coercion a deliberate one-value projection rather than an
+# "anything unknown becomes a context" rule, which would quietly repair a
+# corrupt row and hide a real bug.
+RETIRED_KINDS = ("state",)
 
 MAX_REGISTRY_ROWS = 64
 MAX_NAME_LEN = 48
 SCHEMA_VERSION = 1
 
-# The owner's starting vocabulary. Six rows, ALL deletable — there is no
-# ``locked`` field and no guard anywhere in this module protecting a state.
-# Both axes are a helpful start, not a fixture.
+# The owner's starting vocabulary. Three rows, ALL deletable — there is no
+# ``locked`` field and no guard anywhere in this module protecting a row. A
+# helpful start, not a fixture.
+#
+# It was six: ``next`` / ``wait-for`` / ``someday`` seeded the state axis, and
+# they are gone with it — a new owner is not handed three labels whose whole
+# purpose was to say what ``state`` now derives. THIS IS NOT A MIGRATION AND IT
+# TOUCHES NOBODY'S REGISTRY. The seed is a first-write materialization, so it
+# only ever decides what an owner who has never written a registry sees; an
+# owner who already has those three rows keeps all six, position and colour
+# intact, and ``list_labels`` shows them as contexts. Nothing re-asserts and
+# nothing removes.
 # The seed's timestamps are a FIXED constant, not the clock. Two reasons, and
 # the first is the one that bit: the seed is materialized in memory on every
 # read of an unwritten registry, so minting `now()` there made two consecutive
@@ -84,9 +134,6 @@ SEED: tuple[dict[str, str], ...] = (
     {"slug": "office", "name": "office", "kind": "context", "color": "blue"},
     {"slug": "home", "name": "home", "kind": "context", "color": "green"},
     {"slug": "phone", "name": "phone", "kind": "context", "color": "teal"},
-    {"slug": "next", "name": "Next", "kind": "state", "color": "indigo"},
-    {"slug": "wait-for", "name": "Wait For", "kind": "state", "color": "amber"},
-    {"slug": "someday", "name": "Some Day", "kind": "state", "color": "slate"},
 )
 
 # INNER lock. ``desk_todo.plate_lock`` is OUTER and the order is never reversed
@@ -100,10 +147,14 @@ _UNSET: object = object()
 def _display_name(raw: str) -> str:
     """A display name with its leading sigils stripped.
 
-    The `@` (contexts) and `!` (states) are chrome the renderer prepends from
-    ``kind``, never data — storing one makes the same character sometimes data
-    and sometimes decoration, and would give a state an `@` it must never have.
-    Mirrors the mock's `raw.replace(/^[@!]+/, '')`.
+    The `@` is chrome the renderer prepends, never data — storing one makes the
+    same character sometimes data and sometimes decoration. Mirrors the mock's
+    `raw.replace(/^[@!]+/, '')`.
+
+    `!` is still stripped even though the axis it marked is retired, and it
+    keeps being stripped: owners and assistants will go on typing `!next` at a
+    label that has been on the plate for a year, and the alternative is a label
+    literally named `!next` sitting beside the real one.
     """
     return raw.strip().lstrip("@!").strip()
 
@@ -204,13 +255,18 @@ def _seed_rows() -> list[DeskLabel]:
     ]
 
 
-def _rows(document: dict | None) -> list[DeskLabel]:
+def _rows_raw(document: dict | None) -> list[DeskLabel]:
     """Parse rows one at a time inside try/except, mirroring ``_load`` in
     ``desk_todo.py``: a corrupt, truncated or hand-edited row is skipped, never
     raised.
 
     ``None`` (no file) materializes the seed in memory. A document that exists
     but parses to nothing yields ZERO rows — never the seed as a repair.
+
+    THE STORED KIND, UNPROJECTED. This is what every WRITE starts from, so a
+    read-modify-write puts a legacy ``kind: "state"`` row back exactly as it
+    found it. Readers want ``_rows`` instead; the difference is the retirement
+    and it is explained at the top of this module.
     """
     if document is None:
         return _seed_rows()
@@ -226,6 +282,40 @@ def _rows(document: dict | None) -> list[DeskLabel]:
         except Exception:
             continue
     return out
+
+
+def _visible(row: DeskLabel) -> DeskLabel:
+    """The row as a READER is shown it — the projection applied to ONE row.
+
+    The mutation verbs return through this while saving the raw row, so that a
+    kind the GET would never show cannot come back on a PATCH / DELETE / merge
+    response either. Without it the wire contradicts itself: the same legacy row
+    reads ``"context"`` on the list and ``"state"`` on the response to a
+    recolour, and a client that caches what it just wrote ends up holding a
+    value the server refuses to accept back.
+    """
+    return row.model_copy(update={"kind": "context"}) if row.kind in RETIRED_KINDS else row
+
+
+def visible_kind(row: DeskLabel) -> str:
+    """The kind a READER is told, which is ``"context"`` for a retired state.
+
+    One value in, one value out, and the only input it rewrites is a member of
+    ``RETIRED_KINDS`` — a row carrying anything else is returned untouched so a
+    genuinely corrupt kind stays visible as itself instead of being laundered.
+    """
+    return "context" if row.kind in RETIRED_KINDS else row.kind
+
+
+def _rows(document: dict | None) -> list[DeskLabel]:
+    """``_rows_raw`` with the retirement projected onto it — the READ path.
+
+    A stored ``kind: "state"`` row is answered as a context. Nothing else about
+    it moves: same slug, same name, same colour, same position in the array, and
+    the copy is made with ``model_copy`` so the projection cannot leak back into
+    a row a caller might later hand to ``_save``.
+    """
+    return [_visible(row) for row in _rows_raw(document)]
 
 
 def _rows_for_write(data_dir: Path, owner_user_id: str) -> list[DeskLabel]:
@@ -246,12 +336,19 @@ def _rows_for_write(data_dir: Path, owner_user_id: str) -> list[DeskLabel]:
     otherwise destroy the file with no UI in front of them.
 
     ``auto_register`` deliberately does NOT come through here: it skips instead
-    of raising, because the to-do write has already succeeded.
+    of raising, because the to-do write has already succeeded. It parses through
+    ``_rows_raw`` directly, for the same reason this does.
+
+    ``_rows_raw``, NOT ``_rows``: every verb downstream of this is a
+    read-modify-write of the whole array, so a row that arrived here with the
+    retirement already projected onto it would be ``_save``d as a context and
+    the owner's stored ``state`` would be gone — destroyed by a recolour they
+    asked for on a different row. The stored kind goes out and comes back.
     """
     registry = _read(data_dir, owner_user_id)
     if not registry.readable:
         raise LabelError.registry_unreadable()
-    return _rows(registry.document)
+    return _rows_raw(registry.document)
 
 
 def _save(data_dir: Path, owner_user_id: str, rows: list[DeskLabel]) -> None:
@@ -272,7 +369,13 @@ def _find(rows: list[DeskLabel], slug: str) -> DeskLabel | None:
 def _validate_kind(kind: object) -> str:
     """The strict wire enum. A forgiving parser lives at the CLI boundary; the
     wire stays strict, because the inverse is how a third kind value gets stored
-    by accident — and the kind is immutable once it lands."""
+    by accident — and the kind is immutable once it lands.
+
+    ``KINDS`` now holds one member, so this is also the whole of the retirement
+    on the write side: ``kind: "state"`` arrives here and leaves as
+    ``labels.invalid_kind``, with no new branch and no new code. Stored state
+    rows are unaffected — they never come through here.
+    """
     if not isinstance(kind, str) or kind not in KINDS:
         raise LabelError.invalid_kind()
     return kind
@@ -325,6 +428,13 @@ def list_labels(data_dir: Path, owner_user_id: str) -> list[DeskLabel]:
     and it stays empty forever: the seed is a first-write materialization, never
     re-asserted.
 
+    THE ONE PROJECTION: a stored ``kind: "state"`` row is answered as a context
+    (``_rows``). That is the whole of the state axis's retirement — nothing is
+    deleted, nothing is rewritten, and the next read of the same untouched file
+    returns the same thing. A caller that needs to know what is actually on disk
+    wants ``_rows_raw``, and the only callers that need it are the ones that
+    write.
+
     Never raises on content, so "the client has no registry" narrows to a
     genuine transport or auth failure. Never returns per-label counts — the
     client already holds the plate and can count locally; coupling the two
@@ -364,8 +474,17 @@ async def create_label(
     sentence even on a full registry, and it is about THIS slug.
 
     The collision is ONE symmetric condition with one code, either direction;
-    the sentence is generated from the OTHER row's kind. ``kind="state"`` is an
-    ordinary create — there is no reserved-kind error.
+    the sentence is generated from the OTHER row's kind.
+
+    ``kind="state"`` is no longer creatable and fails check 1 with
+    ``labels.invalid_kind``. The collision check still reads the STORED kind, so
+    creating ``next`` as a context while a legacy ``next`` state row sits in the
+    registry is ``labels.kind_conflict`` — *"'next' is a state, not a context"*.
+    That refusal is what keeps the legacy row from being shadowed by a second
+    row with the same slug, and it is the reason this check must not be moved
+    onto the projected kind: under the projection the two would look identical
+    and the create would fall through to ``labels.duplicate``, which is a
+    different sentence about a different situation.
 
     ``color`` omitted or null -> ``default_color(rows)``. An explicit null is
     treated as omitted: the owner cannot deliberately create a colourless label
@@ -417,14 +536,26 @@ async def patch_label(
     ``kind`` is accepted only as an echo, and this is the unusual rule a lazy
     implementation gets wrong in one of two ways (both have a test):
 
-      * absent             -> normal, the overwhelming majority
-      * present, == stored -> accepted, no-op. A manage sheet that PATCHes the
-                              whole row back must not 400.
-      * present, != stored -> labels.kind_immutable (400), naming
-                              delete-and-re-add as the repair.
+      * absent              -> normal, the overwhelming majority
+      * present, == VISIBLE -> accepted, no-op. A manage sheet that PATCHes the
+                               whole row back must not 400 — including a row we
+                               showed as a context while it is stored as a
+                               retired state.
+      * present, != visible -> labels.kind_immutable (400), naming
+                               delete-and-re-add as the repair.
+      * present, "state"    -> labels.invalid_kind (400) before any of the
+                               above: the axis is retired and nothing can ask
+                               for it, so the refusal is about the vocabulary
+                               rather than about this row.
 
     Silently ignoring a CHANGED kind would let the sheet believe it promoted a
     label when it hadn't — the worse of the two failures.
+
+    With ``KINDS`` down to one member the middle case is no longer reachable
+    from the wire: every accepted value equals every visible kind. The guard
+    stays because the rule it encodes — a label's kind is not editable — is
+    still true, and a second kind arriving later must land on it rather than on
+    a gap where it used to be.
 
     ``color`` is three-way: absent untouched, null clears, token sets.
     ``name`` absent leaves it; null or blank resets it to the slug rather than
@@ -443,7 +574,20 @@ async def patch_label(
             raise LabelError.unknown_slug(slug)
         if kind is not _UNSET:
             wanted = _validate_kind(kind)
-            if wanted != row.kind:
+            # Compared against the VISIBLE kind, not the stored one. For every
+            # row but a retired state the two are the same string and this is
+            # the guard exactly as it was. For a retired state they differ, and
+            # comparing against the stored kind would 400 a manage sheet that
+            # echoed back the ``"context"`` WE told it on the read — the precise
+            # failure the echo rule exists to prevent, and it would answer with
+            # ``kind_immutable``'s sentence, which tells the owner to delete the
+            # label. Instructing someone to delete a row to get out of an error
+            # our own projection caused is the one outcome forbidden outright.
+            #
+            # This costs no safety: ``patch_label`` never assigns ``row.kind``
+            # under any input, so the stored kind is not reachable from here in
+            # either version. The guard refuses; it does not protect a write.
+            if wanted != visible_kind(row):
                 raise LabelError.kind_immutable(row.slug, row.kind, wanted)
         if name is not _UNSET:
             cleaned = _display_name(name) if isinstance(name, str) else ""
@@ -452,7 +596,8 @@ async def patch_label(
             row.color = color if isinstance(color, str) else None
         row.updated_at = _now()
         _save(data_dir, owner_user_id, rows)
-        return row
+        # The STORED row was saved; the PROJECTED one is returned. See _visible.
+        return _visible(row)
 
 
 async def reorder_labels(
@@ -464,6 +609,13 @@ async def reorder_labels(
     not an error, exactly like ``reorder_todos``, so a partial list (say, only
     the contexts) never drops the rest. Position is the ordering, so this verb
     IS the ordering write.
+
+    Returns through ``_visible``, for exactly the reason ``patch_label`` /
+    ``delete_label`` / ``merge_label`` do: this is a MUTATION RESPONSE, and a
+    kind the GET would never show must not come back on one. Without it
+    ``clawmeets todo labels reorder`` prints ``"kind": "state"`` for a legacy
+    row that ``labels list`` reports as ``"context"`` — two answers about one
+    row, one of which the server will refuse if it is ever sent back.
     """
     async with _registry_lock:
         rows = _rows_for_write(data_dir, owner_user_id)
@@ -478,8 +630,9 @@ async def reorder_labels(
         for row in rows:
             if row.slug not in seen:
                 ordered.append(row)
+        # The STORED rows were saved; the PROJECTED ones are returned.
         _save(data_dir, owner_user_id, ordered)
-        return ordered
+        return [_visible(row) for row in ordered]
 
 
 async def delete_label(
@@ -491,9 +644,10 @@ async def delete_label(
     GUARANTEE, and it is in both SKILL.md files: deleting a label never deletes
     a to-do. An item whose only label is deleted becomes unlabelled.
 
-    A state deletes exactly like a context — no guard, no confirmation, no
-    special case — and deleting the LAST state is a legitimate configuration the
-    server does nothing to resist.
+    A legacy state row deletes exactly like a context — no guard, no
+    confirmation, no special case. The retirement changes nothing here: the
+    owner has always been able to delete any row, and it is THEIR delete. What
+    the retirement does not do is delete one for them.
 
     Ordering, and it is the whole reason this is not two calls::
 
@@ -521,7 +675,7 @@ async def delete_label(
                 desk_todo.save_plate(data_dir, owner_user_id, todos)
 
             _save(data_dir, owner_user_id, [r for r in rows if r.slug != slug])
-            return row, detached
+            return _visible(row), detached
 
 
 async def merge_label(
@@ -541,11 +695,18 @@ async def merge_label(
         3. target missing -> labels.unknown_merge_target (404)
         4. kinds differ   -> labels.kind_mismatch        (400)
 
-    Same-kind only, symmetric. context->context is the typo repair;
-    state->state is the same repair on the other axis and MUST keep working — a
-    guard written as "refuse if either side is a state" passes the cross-kind
-    test and breaks ``waiting`` -> ``wait-for``. state->context is refused too,
-    for a rule the assistant can say out loud rather than look up.
+    Same-kind only, symmetric, and it reads the STORED kind — deliberately, and
+    this is the guard that does the most work after the retirement. context ->
+    context is the typo repair and is the overwhelming case. Two legacy state
+    rows still merge into each other, which is the same repair on the axis that
+    used to exist and must keep working.
+
+    A legacy state merged into a context is REFUSED, and refusing is the safe
+    direction rather than the tidy one: merge is the verb that rewrites the
+    plate and then removes the source row, so letting it run across the
+    projection is how an owner's stored ``state`` row gets deleted by a command
+    they issued about two labels that looked alike on screen. Nothing is lost by
+    refusing; the row and its to-dos stay exactly where they are.
 
     There is NO ``state_conflicts`` in the return: after the same-kind rule it
     is structurally always zero, and a field that always reads 0 is worse than
@@ -582,7 +743,7 @@ async def merge_label(
                 desk_todo.save_plate(data_dir, owner_user_id, todos)
 
             _save(data_dir, owner_user_id, [r for r in rows if r.slug != slug])
-            return source, target, moved
+            return _visible(source), _visible(target), moved
 
 
 def _rewrite_plate(todos: list[DeskTodo], rewrite) -> int:
@@ -610,10 +771,12 @@ async def auto_register(
     fill the owner's group list.
 
     An auto-created row is ALWAYS ``kind="context"`` with ``color=None``: the
-    server never invents an axis and never picks a colour. That is also the line
-    keeping the state axis from drifting, and it matters more now that
-    ``kind="state"`` is reachable at all — at-most-one-state means every stray
-    state is a mutually-exclusive choice the owner never made.
+    server never invents an axis and never picks a colour. That was already the
+    only kind this function could produce, and with ``KINDS`` down to one member
+    it is now the only kind anything can produce — so the paragraph that used to
+    stand here, arguing this line was what kept the state axis from drifting and
+    at-most-one-state intact, is describing an axis that no longer carries
+    meaning. The behaviour is unchanged; only the reason to care is gone.
 
     Best-effort by contract: a full registry simply leaves the slug
     unregistered. It NEVER raises into the caller — the to-do write has already
@@ -641,7 +804,13 @@ async def auto_register(
             registry = _read(data_dir, owner_user_id)
             if not registry.readable:
                 return []
-            rows = _rows(registry.document)
+            # ``_rows_raw`` because this function ``_save``s — see the note in
+            # ``_rows_for_write``. This is the OTHER write path, and it is the
+            # easier one to miss: it does not go through ``_rows_for_write`` at
+            # all, so repointing only that one would have left every ordinary
+            # label edit on any to-do rewriting the owner's stored states to
+            # contexts as a side effect.
+            rows = _rows_raw(registry.document)
             held = {r.slug for r in rows}
             created: list[str] = []
             now = _now()

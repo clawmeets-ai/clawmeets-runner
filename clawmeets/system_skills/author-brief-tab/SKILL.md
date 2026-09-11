@@ -124,7 +124,7 @@ Output: <the rows/fields the briefing should show, and any sort order>.
 It fires verbatim every time and the executor sees only its DM — so
 the body must carry everything; never rely on this conversation for
 context. The executor's `brief` skill owns the publish protocol
-(render code, styling, upload); your SOP only says what data to show.
+(the HTML document, styling, upload); your SOP only says what data to show.
 
 **Rare — genuinely multi-agent.** Only when one agent truly can't
 produce the briefing (e.g. data gathering and analysis live on different
