@@ -10,7 +10,7 @@ description: >
   filed under a sensible team) and create the project with yourself as
   coordinator. Phase 0 of the new project bootstraps each newly-registered
   agent by following `onboard-agent`'s bootstrap contract — one milestone
-  workroom per new agent, holding its mentor's brief, its own deep
+  workroom per new agent, holding its mentors' briefs, its own deep
   research, and the reflect pass that makes both durable.
   Assistant-only.
 ---
@@ -157,13 +157,18 @@ new agent. Each new-agent design has five fields:
   turn in the new project to seed its `learnings/`. Be concrete — name
   the slice of their field that this project actually needs. Vague
   bootstrap topics produce vague dumps.
-- **mentor**: who briefs this agent on the job before it researches.
-  **Default: you**, the assistant — you drafted its role and you hold
-  `USER.md`, so you write the brief inline in its bootstrap room. Name a
-  **peer** agent instead only when one clearly owns the domain (a senior
-  agent briefing a new junior one in the same field); that peer then joins
-  the same bootstrap room and writes the brief there. Either way it costs
-  no extra room.
+- **mentors**: a **list** of who briefs this agent on the job before it
+  researches. **Default: `[you]`**, the assistant — you drafted its role
+  and you hold `USER.md`, so you write the brief inline in its bootstrap
+  room. Add or substitute a **peer** agent when one clearly owns the domain
+  (a senior agent briefing a new junior one in the same field); that peer
+  joins the same bootstrap room and writes its brief there. You and peers
+  **compose** — you can write inline and mention peers in the same message.
+  Either way it costs no extra room: N mentors are `@`-mentioned together in
+  one message and the batch completes when all have replied. **Cap at 3,
+  prefer 1** — each extra mentor is a serial reply the bootstrap waits on,
+  and adjacent domains overlap more than they add. Reach for 2 only when the
+  role genuinely straddles two owners.
 - **team**: the TEAMS-sidebar label (`user_teams`) the agent gets filed
   under at registration. **Prefer an existing label** from the Step 2
   candidate pool that fits the agent's role (e.g. file a new tax analyst
@@ -200,7 +205,7 @@ Here's what I'd do for **<user's goal restated in 1 sentence>**.
 - `<new-agent-name>` — <description>  _(team: <team-label>)_
   - Capabilities: <cap1>, <cap2>, <cap3>
   - Bootstrap topic: <what they'll deep-research on turn 1>
-  - Mentor: <me, or `@<peer>` — who briefs them on the job first>
+  - Mentors: <me, and/or `@<peer>` — who briefs them on the job first; 1–3>
 
 **Milestones**
 1. Bootstrap each new agent (one milestone room per agent, in parallel)
@@ -337,17 +342,17 @@ TEAM — REUSED FROM ROSTER (already bootstrapped; DO NOT create bootstrap miles
 - @<reuse-agent>: <one-line role in this project>
 
 TEAM — NEWLY REGISTERED (needs Phase 0 bootstrap):
-- @<new-agent>: <one-line role in this project>   [bootstrap topic: <topic>] [mentor: me | @<peer>]
-- @<new-agent>: <one-line role in this project>   [bootstrap topic: <topic>] [mentor: me | @<peer>]
+- @<new-agent>: <one-line role in this project>   [bootstrap topic: <topic>] [mentors: me, @<peer>, …]
+- @<new-agent>: <one-line role in this project>   [bootstrap topic: <topic>] [mentors: me, @<peer>, …]
 
 PHASE 0 — Bootstrap ONLY the agents under "TEAM — NEWLY REGISTERED" above.
 EXACTLY N milestones, where N is the count of NEWLY REGISTERED members.
 Run them as ONE parallel batch — the members are independent of each other.
 
 For each member, follow the BOOTSTRAP CONTRACT in the `onboard-agent`
-skill, with that member's name, [bootstrap topic: …] and [mentor: …].
-It owns the mechanics: one `milestone-bootstrap-<agent>` room holding the
-mentor and the new agent together, the mentor's brief, the
+skill, with that member's name, [bootstrap topic: …] and [mentors: …].
+It owns the mechanics: one `milestone-bootstrap-<agent>` room holding every
+mentor and the new agent together, each mentor's brief, the
 personalize-trigger deep research, and the single reflect-trigger that
 distills both into the agent's learnings/. The steps INSIDE a room are
 serial; the rooms are not.
@@ -413,11 +418,11 @@ What that skill needs from this one:
 - `$CLAWMEETS_AGENT_ID` is you — the assistant — and you become the
   coordinator of the new project.
 - The `--agent` list is exactly the two TEAM groups from 6c: every agent
-  reused from the roster plus every agent you registered in 6a — plus any
-  peer you named as a **mentor** in Step 3 who isn't already in one of
-  those groups. A mentor has to be invitable into the bootstrap room even
-  if it does no Phase 1 work; leave it out and that room's creation is
-  rejected.
+  reused from the roster plus every agent you registered in 6a — plus
+  **every** peer you named on a **mentors** list in Step 3 who isn't already
+  in one of those groups. A mentor has to be invitable into the bootstrap
+  room even if it does no Phase 1 work; leave one out and that room's
+  creation is rejected.
 - Keep `--post-initial-message` on (the default). It is what wakes you as
   coordinator so **Phase 0** starts on the same turn instead of sitting
   idle until the user types something.

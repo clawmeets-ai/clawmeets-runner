@@ -25,7 +25,8 @@ Subcommands:
   create    Store a new SOP.
   update    Partially edit one.
   delete    Remove one.
-  trigger   Fill the blanks from --set pairs and DM the result to its agent.
+  trigger   Fill the blanks from --set pairs and dispatch the result — DM'd to
+            its agent, or handed straight back when that agent is us.
 """
 from __future__ import annotations
 
@@ -37,7 +38,11 @@ from pathlib import Path
 import httpx
 import typer
 
-from clawmeets.cli_runner import resolve_dm_recipient, send_dm_as_owner
+from clawmeets.cli_runner import (
+    resolve_dm_recipient,
+    resolve_self_name,
+    send_dm_as_owner,
+)
 from clawmeets.models.sop_template import fill, parse_blanks, unknown_labels
 
 app = typer.Typer(
@@ -87,6 +92,12 @@ def _owner_token() -> str:
 
 def _echo(payload) -> None:
     typer.echo(json.dumps(payload, indent=2, ensure_ascii=False))
+
+
+def _self_name(client: httpx.Client, headers: dict[str, str]) -> str | None:
+    """Our own full registry name — the fallback recipient, and the test for
+    whether a dispatch would be addressed back at this process."""
+    return resolve_self_name(client, _owner_token(), headers["X-Agent-ID"])
 
 
 def _find(client: httpx.Client, headers: dict[str, str], sop_id: str) -> dict:
@@ -151,10 +162,27 @@ def _recipient_view(
     """Who this SOP dispatches to, and whether they still resolve.
 
     Answers "who will this go to?" before anything is sent, so the assistant can
-    say so in the same breath as asking for the blanks."""
+    say so in the same breath as asking for the blanks.
+
+    An UNADDRESSED SOP is not a dead end: a null recipient means the owner's own
+    assistant, which is what ``utils/sopRecipient.ts`` already resolves it to in
+    the browser, and on this path is simply us — the library 401s for anyone
+    else. ``source`` says which of the two it was, so the assistant can name the
+    recipient without having to reason about why it is unset; ``is_self`` says
+    the dispatch will execute in place rather than open a thread."""
+    self_name = _self_name(client, headers)
     name = (sop.get("agent_name") or "").strip()
     if not name:
-        return None
+        if self_name is None:
+            return None
+        return {
+            "id": None,
+            "name": self_name,
+            "resolved_name": self_name,
+            "live": True,
+            "source": "assistant-default",
+            "is_self": True,
+        }
     resolved = resolve_dm_recipient(
         client, _owner_token(), name, agent_id=headers["X-Agent-ID"]
     )
@@ -163,6 +191,8 @@ def _recipient_view(
         "name": name,
         "resolved_name": resolved,
         "live": resolved is not None,
+        "source": "stored",
+        "is_self": resolved is not None and resolved == self_name,
     }
 
 
@@ -206,7 +236,6 @@ def create(
         exists=True, file_okay=True, dir_okay=False, readable=True,
         help="Read the template from a file instead (easier for multi-line bodies).",
     ),
-    desc: str = typer.Option("", "--desc", help="Optional one-line description."),
     agent: str = typer.Option(
         "", "--agent",
         help="Default recipient (short or full agent name); resolved server-side.",
@@ -221,8 +250,6 @@ def create(
     """
     resolved_body = _read_body(body, body_file, required=True)
     payload: dict = {"title": title, "body": resolved_body}
-    if desc:
-        payload["desc"] = desc
     if agent:
         payload["agent_name"] = agent
     client, headers = _client()
@@ -234,7 +261,6 @@ def create(
 def update(
     sop_id: str = typer.Argument(..., help="Id of the SOP to edit."),
     title: str = typer.Option("", "--title", help="New card title."),
-    desc: str = typer.Option("", "--desc", help="New description."),
     body: str = typer.Option("", "--body", help="New template body."),
     body_file: Path = typer.Option(
         None, "--body-file",
@@ -262,8 +288,6 @@ def update(
     payload: dict = {}
     if title:
         payload["title"] = title
-    if desc:
-        payload["desc"] = desc
     if resolved_body is not None:
         payload["body"] = resolved_body
     if agent:
@@ -273,8 +297,8 @@ def update(
         payload["agent_name"] = None
     if not payload:
         typer.echo(
-            "Error: nothing to update — pass at least one of --title / --desc / "
-            "--body / --body-file / --agent / --clear-agent.",
+            "Error: nothing to update — pass at least one of --title / --body / "
+            "--body-file / --agent / --clear-agent.",
             err=True,
         )
         raise typer.Exit(1)
@@ -311,7 +335,7 @@ def trigger(
         help="Send with unanswered blanks left as literal {{…}} text.",
     ),
 ) -> None:
-    """Fill the template from ``--set`` pairs and DM the result to the SOP's agent.
+    """Fill the template from ``--set`` pairs and dispatch it to the SOP's agent.
 
     This verb does NOT ask for values — it cannot. It is one process invocation,
     and the calling agent's turn ends the moment it asks the user something. The
@@ -319,11 +343,23 @@ def trigger(
     and stops, and the user's reply brings it back to run this. See
     ``skills/desk-sop/SKILL.md`` §4.
 
+    Two outcomes, distinguished by ``reason`` in the printed payload:
+
+    - ``{"sent": true, …}`` — the recipient is someone else, so the filled body
+      was posted to them in the owner's voice on a fresh thread.
+    - ``{"sent": false, "reason": "self_recipient", "content": …}`` — the
+      recipient resolved to the caller. DMing ourselves would round-trip through
+      the message bus to wake the process already running this command, so the
+      body comes back instead for the current turn to carry out.
+
+    An SOP with no stored recipient and no ``--to`` addresses the owner's own
+    assistant, which on this assistant-only path is the caller — the same
+    fallback ``utils/sopRecipient.ts`` applies in the browser.
+
     Exits 1 — not a no-op — on an unknown ``--set`` label (typo protection: a
     silently dropped value would send a half-filled template), on a missing
-    value (unless ``--allow-unfilled``), and on no resolvable recipient with no
-    ``--to``. An SOP is addressed by construction, so an unaddressable one is a
-    library problem to report, not a send to guess at.
+    value (unless ``--allow-unfilled``), and on a named recipient that does not
+    resolve to exactly one agent.
     """
     values = _parse_set(set_)
 
@@ -366,12 +402,17 @@ def trigger(
                     err=True,
                 )
 
-        ref = to.strip() or (sop.get("agent_name") or "").strip()
+        # An unaddressed SOP resolves to us, matching what the browser already
+        # does with a null recipient (``utils/sopRecipient.ts``). This group is
+        # assistant-only, so "the owner's assistant" and "the caller" are the
+        # same identity and no username lookup is needed.
+        self_name = _self_name(client, headers)
+        ref = to.strip() or (sop.get("agent_name") or "").strip() or (self_name or "")
         if not ref:
             typer.echo(
-                "Error: this SOP has no recipient. Pass --to <agent> to say who "
-                "should get it, or set one with `clawmeets sop update "
-                f"{sop_id} --agent <agent>`.",
+                "Error: this SOP has no recipient and the roster could not be "
+                "read to fall back to you. Retry, or name one explicitly with "
+                f"--to <agent> / `clawmeets sop update {sop_id} --agent <agent>`.",
                 err=True,
             )
             raise typer.Exit(1)
@@ -385,11 +426,29 @@ def trigger(
             )
             raise typer.Exit(1)
 
+        is_self = self_name is not None and recipient == self_name
+
         if dry_run:
             _echo({
                 "sent": False,
                 "reason": "dry_run",
                 "to": recipient,
+                "is_self": is_self,
+                "content": text,
+                "unfilled": missing,
+            })
+            return
+
+        # We are the recipient. DMing ourselves would post the filled body in
+        # the owner's voice, mint a thread, and wake the process already running
+        # this command — a full round trip through the message bus to reach
+        # ourselves. Hand the body back instead and let this turn carry it out.
+        if is_self:
+            _echo({
+                "sent": False,
+                "reason": "self_recipient",
+                "to": recipient,
+                "is_self": True,
                 "content": text,
                 "unfilled": missing,
             })

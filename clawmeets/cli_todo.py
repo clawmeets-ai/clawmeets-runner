@@ -463,7 +463,7 @@ def list_todos(
     ),
     state: list[str] = typer.Option(
         None, "--state",
-        help="Only to-dos in this ticket state: new | working | completed "
+        help="Only to-dos in this state: new | working | failed | completed "
              "(repeatable, OR'd together).",
     ),
     archived: bool = typer.Option(
@@ -849,12 +849,13 @@ def trigger(
     retried — the message is already out.
 
     Note what firing this does NOT do: it does not associate the thread it opens
-    with the to-do, so the item's ticket state does not move to Working. A DM
-    thread never completes — no user path, no browser control, and an agent in
-    the owner's DM runs on an action set that cannot emit ``project_completed``
-    — so a to-do linked only that way would read Working for as long as it
-    existed. Archiving IS the disposal for a triggered item, which is why it is
-    the default.
+    with the to-do, so the item's ticket state does not move to Working — and
+    that stays deliberate even though a DM thread CAN now reach Done. The
+    owner's only route to it is pressing **Done** on that thread's card on their
+    desk (the agent side still cannot emit ``project_completed`` from a DM), so
+    a to-do linked only to a fired thread would read Working until the owner
+    happened to clear an unrelated-looking card. Archiving IS the disposal for a
+    triggered item, which is why it is the default.
     """
     if consume in _CONSUME_ALIASES:
         typer.echo(

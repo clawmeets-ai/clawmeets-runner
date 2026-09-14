@@ -16,10 +16,16 @@ one-file-per-artifact brief-tab registry — every user's plate is a single
 ordered JSON document. Reorder is then a plain array rewrite under one
 lock, and agent-publish is a prepend.
 
+A brand-new owner does not open an empty plate: ``SEED`` below is the
+onboarding item every account starts with, materialized in memory on the first
+read and written to disk by the first mutation. It is never re-asserted
+afterwards — see the comment on the constant.
+
 Storage::
 
     {data_dir}/desk-todos/
       <owner_user_id>.json     # ordered list[DeskTodo], newest capture first
+                               # ABSENT => the SEED, not an empty plate
 
 Mutations are broadcast to the owner via ``DESK_TODO_SYNC`` (see
 ``server/routes/desk_todos.py``) so the desk refetches ``GET /me/desk/todos``.
@@ -79,6 +85,68 @@ MAX_ATTACHMENT_NAME_LEN = 200
 # UI.
 MAX_LABELS_PER_TODO = 8
 MAX_SLUG_LEN = 32
+
+# ---------------------------------------------------------------------------
+# The starter plate
+# ---------------------------------------------------------------------------
+#
+# What a brand-new owner finds on the plate. Ordinary to-dos — editable,
+# archivable, deletable, no ``locked`` field and no guard anywhere in this
+# module protecting one. A helpful start, not a fixture.
+#
+# THE SEED IS A FIRST-WRITE MATERIALIZATION AND IS NEVER RE-ASSERTED. It decides
+# only what an owner who has never written a plate sees; the moment anything is
+# written — a capture, an archive toggle, a label edit, an agent publish — the
+# file is authoritative forever after. An implementation that re-adds missing
+# rows on read is wrong, and it is wrong in the way that silently resurrects the
+# onboarding item every time the owner ticks it off. Mirrors
+# ``models/desk_sop.py`` and ``models/desk_label.py``, which carry the long-form
+# version of this argument; all three make the same promise and must keep
+# making it.
+#
+# The decision is made on ``path.exists()`` and on nothing else, because
+# ``FileUtil.read`` answers the same ``None`` for a missing file and for a
+# JSONDecodeError: deciding "seed?" on the parsed value would re-seed a CORRUPT
+# plate, which is the one case where the owner's rows are still on disk and most
+# need not to be written over.
+#
+# ``origin`` is ``"self"``, not ``"agent"``: no agent published this, and an
+# agent-origin row with a null ``by_agent_name`` would be a claim about
+# provenance that nothing backs. ``drafted`` IS true, because the row genuinely
+# arrives carrying a ready prompt — that is the field the plate reads to show a
+# preview of it and the toast reads to say "edit it, then command" rather than
+# telling the owner to write a draft that is already there.
+#
+# The recipient pair is left null on purpose. A null recipient already resolves
+# to ``{username}-assistant`` (``utils/todoDraft.ts``), which is exactly who
+# this item is addressed to — and naming it here instead would bake one user's
+# assistant name into a constant. It also has to be null for a further reason
+# specific to this item: at account creation the assistant agent does not exist
+# yet (it is registered later, from the user's own machine), so there is no id
+# to store.
+SEED_TIMESTAMP = "1970-01-01T00:00:00+00:00"
+
+SEED: tuple[dict[str, object], ...] = (
+    {
+        "id": "t-seed-personalize-assistant",
+        # Phrased for the OWNER reading their own plate: the row names the
+        # thing that needs doing, not the party doing it. Clicking it loads
+        # ``draft_prompt`` into the composer already addressed to
+        # ``{username}-assistant``, which is where the second person belongs.
+        "text": "Personalize & bootstrap assistant",
+        "origin": "self",
+        "drafted": True,
+        # A POINTER, not a copy. The SOP body lives once, in
+        # ``desk_sop.SEED``, and it carries typed blanks only the SOP surfaces
+        # know how to fill — so this names it by the exact title that seed
+        # ships and lets the assistant read it out of the library.
+        "draft_prompt": (
+            "Please personalize yourself using my “SYSTEM:Personalize "
+            "assistant” SOP — read it out of my SOP library, ask me "
+            "for whatever blanks it carries, then run it end to end."
+        ),
+    },
+)
 
 # Distinguishes "key absent from a PATCH body" (leave the stored value
 # untouched) from an explicit JSON ``null`` (clear the field). Used only by
@@ -557,8 +625,42 @@ def _path(data_dir: Path, owner_user_id: str) -> Path:
     return Path(data_dir) / TODOS_DIR / f"{owner_user_id}.json"
 
 
+def _seed_rows(owner_user_id: str) -> list[DeskTodo]:
+    """The starter plate, materialized in memory for one owner.
+
+    The timestamps are the fixed epoch constant rather than the clock. The seed
+    is materialized on every read of an unwritten plate, so minting ``now()``
+    here would make two consecutive GETs return different ``created_at`` values
+    for the same row — churn a client can legitimately notice, in a field
+    nothing needs. It is also simply more truthful: the owner did not capture
+    this. Rows keep the constant when the first write materializes them to
+    disk; anything captured or published afterwards is stamped with the real
+    clock and, being prepended, sorts ahead of them.
+    """
+    return [
+        DeskTodo(
+            owner_user_id=owner_user_id,
+            created_at=SEED_TIMESTAMP,
+            updated_at=SEED_TIMESTAMP,
+            **row,
+        )
+        for row in SEED
+    ]
+
+
 def _load(data_dir: Path, owner_user_id: str) -> list[DeskTodo]:
-    raw = FileUtil.read(_path(data_dir, owner_user_id), "json")
+    """Every read and every write starts here, so "missing" vs "empty" vs
+    "unreadable" is decided in exactly one place.
+
+    NO FILE -> the SEED, in memory. A file that exists but holds no usable rows
+    -> ZERO rows, never the seed as a repair: an owner who cleared their last
+    to-do gets an empty plate and keeps it, and a corrupt document is not
+    written over with starter content.
+    """
+    path = _path(data_dir, owner_user_id)
+    if not path.exists():
+        return _seed_rows(owner_user_id)
+    raw = FileUtil.read(path, "json")
     if not isinstance(raw, list):
         return []
     out: list[DeskTodo] = []

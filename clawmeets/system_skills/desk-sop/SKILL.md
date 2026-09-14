@@ -52,11 +52,17 @@ An SOP body carries typed blanks. This is the whole syntax:
 | `{{Deadline\|date}}` | date, with standard quick-picks |
 | `{{Deadline\|date:Today,Friday}}` | date, custom quick-picks |
 | `{{Approver\|agent}}` | an agent name |
+| `{{Mentors\|agents}}` | one or more agent names |
 
 Notes that matter when you author or fill one:
 
 - Every kind also accepts a typed-in custom value. A `select` set is a
   shortcut, never a cage — an off-list value sends, with a warning.
+- `agents` is the multi-pick kind: its answer is ONE comma-separated
+  string (`--set Mentors="assistant, backend"`), so ask for a list and
+  send it as a list. Left unanswered in the browser it offers the owner's
+  own assistant as the default; on this path there is no default, so ask
+  — and when the user shrugs, their assistant is the right answer.
 - An unknown kind degrades to `text`.
 - The kind splits at its FIRST colon, so `{{Aspect|select:9:16,1:1}}`
   keeps its colons.
@@ -76,7 +82,6 @@ your sandbox with `Write` first, so newlines and quotes survive the shell:
 ```bash
 clawmeets sop create \
   --title "Weekly restock review" \
-  --desc "Every Monday morning" \
   --body-file sop.md \
   --agent api-sync
 ```
@@ -120,7 +125,9 @@ something. So firing an SOP with blanks is always two turns.
      --set "Inventory=Chelsea" \
      --set "Par threshold=6"
    ```
-   Then report where it went, in one line.
+   Read `reason` in what it prints — see § After it fires. `sent: true`
+   means report where it went in one line; `reason: "self_recipient"`
+   means **you** are the recipient and the work is yours to do now.
 5. **If `blanks` is empty**, step 3 is skipped — fire immediately.
 6. If you had to *interpret* a value — a date the user said as "next
    Friday", a `select` value they paraphrased — run `--dry-run` first and
@@ -128,10 +135,16 @@ something. So firing an SOP with blanks is always two turns.
    confirmation round trip; it's a stored SOP, they know what it says.
 
 Mention the recipient when you ask, so "who is this going to?" is
-answered before anything is sent:
+answered before anything is sent. `show`'s `recipient` already tells you
+who and how it was decided — `source: "stored"` when the library entry
+names them, `source: "assistant-default"` when it does not and the job
+therefore falls to you. Say which, briefly; don't reason it out loud:
 
 > Running your weekly restock review — it goes to @api-sync. Which
 > inventory, Chelsea or Warehouse? And what par threshold (default 6)?
+
+> Running your register-new-agent SOP — unassigned, so I'll run it
+> myself. What's the name, industry and expertise?
 
 ### What the failures mean
 
@@ -142,7 +155,7 @@ something is actually wrong:
 |---|---|---|
 | `--set names blanks this SOP does not have` | you misspelled a label | re-read `show`'s `blanks`, re-run |
 | `no value given for: X` | you skipped step 3 for `X` | ask the user for `X` and stop |
-| `this SOP has no recipient` | the library entry is unaddressed | ask who should get it, then `--to <agent>` |
+| `this SOP has no recipient and the roster could not be read` | an unaddressed SOP could not even fall back to you — the roster call failed | retry; if it persists, name one with `--to <agent>` |
 | `does not match exactly one agent` | the recipient left, or a short name is ambiguous | confirm the agent with the user |
 | `401` | you are not the owner's assistant | say the library is browser-only for you |
 
@@ -152,6 +165,10 @@ a way around step 3 — using it to dodge asking sends the recipient a
 half-written request.
 
 ## § After it fires
+
+`trigger` has two outcomes. Read `reason`, not the exit code — both are 0.
+
+### `sent: true` — it went to someone else
 
 The message opens a **fresh DM thread** with the recipient, so each run
 is its own conversation and the reply lands on the owner's desk feed as a
@@ -165,6 +182,32 @@ Reply one line, naming the recipient:
 
 Don't paste the filled prompt back; the user wrote the template and just
 supplied the values.
+
+### `reason: "self_recipient"` — it came back to you
+
+The recipient resolved to you, so nothing was sent and no thread was
+minted. DMing yourself would post the filled body in the owner's voice
+and wake the process already running the command — a lap through the
+message bus to arrive where you started.
+
+**`content` is now your instruction. Carry it out in this turn**, exactly
+as if the owner had just typed it, then report what you did. Long jobs
+still belong in a project: create one and say so, rather than holding the
+whole thing inside this reply.
+
+This is the normal path for the `SYSTEM:` SOPs, which ship unassigned
+because only the owner's assistant can do them.
+
+Two things not to trip over:
+
+- **No thread dedupe here.** The `sent: true` path reuses a thread for an
+  identical re-fire; this path has no thread, so firing the same SOP
+  twice does the work twice. If the user asks twice, check whether they
+  meant to.
+- **The desk rail behaves differently, correctly.** Clicking run in the
+  browser always opens a thread, because there is no turn in flight to
+  execute in. Same SOP, same recipient, different surface — not a bug,
+  and not worth narrating to the user.
 
 ## § Scheduling one — put it on a cadence
 

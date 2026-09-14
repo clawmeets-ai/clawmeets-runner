@@ -15,6 +15,7 @@ pipe, kind after, config after the colon::
     {{Deadline|date}}                    date quick-picks
     {{Deadline|date:Today,Friday}}       custom quick-picks
     {{Approver|agent}}                   pick from the agent roster
+    {{Mentors|agents}}                   pick SEVERAL from the roster
 
 Every kind also accepts a typed-in custom value, so a set is a shortcut, never a
 cage. Unknown kinds fall back to text.
@@ -39,11 +40,24 @@ from typing import Literal
 
 from pydantic import BaseModel
 
-PhKind = Literal["text", "number", "select", "date", "agent"]
+PhKind = Literal["text", "number", "select", "date", "agent", "agents"]
 
 # Kinds, in the order placeholders.ts declares PH_TAGS. Anything else degrades
 # to "text".
-KINDS: tuple[str, ...] = ("text", "number", "select", "date", "agent")
+KINDS: tuple[str, ...] = ("text", "number", "select", "date", "agent", "agents")
+
+# The multi-pick kinds. An ``agents`` value is a comma-separated list of names
+# in one string — the blank stays one question with one answer, so ``fill`` and
+# ``--set Mentors="a, b"`` need no list-awareness anywhere. The browser splits
+# on the same separator to draw its ticks (``splitMulti`` in placeholders.ts);
+# nothing downstream of the substitution parses it, because what a body says
+# around the blank ("brief every mentor listed") is what reads it.
+MULTI_KINDS: tuple[str, ...] = ("agents",)
+
+# Offered values come from the live roster, not from the body. Shared by the
+# single- and multi-pick roster kinds: an explicit ``agent:a,b`` config still
+# overrides, and the UI resolves the empty case at fill time.
+ROSTER_KINDS: tuple[str, ...] = ("agent", "agents")
 
 DATE_DEFAULTS: list[str] = ["Today", "Tomorrow", "End of week", "Next Monday"]
 
@@ -58,8 +72,8 @@ class SopBlank(BaseModel):
 
     label: str
     kind: PhKind
-    # Offered values. Empty for text/number, AND for a bare ``agent`` blank:
-    # that roster is resolved at fill time, not parse time.
+    # Offered values. Empty for text/number, AND for a bare ``agent`` /
+    # ``agents`` blank: that roster is resolved at fill time, not parse time.
     options: list[str] = []
     # Pre-offered default, for text/number only.
     default: str = ""
@@ -85,7 +99,7 @@ def _make_blank(label: str, spec: str | None, raw: str) -> SopBlank:
 
     options: list[str] = []
     default = ""
-    if kind in ("select", "agent"):
+    if kind == "select" or kind in ROSTER_KINDS:
         options = _split_list(cfg)
     elif kind == "date":
         custom = _split_list(cfg)

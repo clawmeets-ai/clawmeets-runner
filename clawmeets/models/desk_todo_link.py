@@ -48,10 +48,14 @@ logger = logging.getLogger("clawmeets.models.desk_todo_link")
 # The derived ticket state, as lowercase slugs. Slugs and not display strings:
 # the UI owns the words "Working" and "Completed", and the terminal and the
 # browser must agree on the value rather than on the copy (AC-4.2).
-TICKET_STATES: tuple[str, ...] = ("new", "working", "completed")
+TICKET_STATES: tuple[str, ...] = ("new", "working", "failed", "completed")
 
 STATE_NEW = "new"
 STATE_WORKING = "working"
+# Reached only when NOTHING is contributing and at least one association
+# resolved to a FAILED project — see :func:`derive_plate`. A to-do with one
+# failed project and one still running is WORKING, not failed.
+STATE_FAILED = "failed"
 STATE_COMPLETED = "completed"
 
 # The two refusal sentences for the association surface, written ONCE here so a
@@ -173,20 +177,37 @@ def derive_plate(
 
     Returns ``{todo_id: (state, association_count)}``.
 
-    **The rule is three branches with NO precedence order**, over the
-    CONTRIBUTING associations only::
+    **The rule is four branches**, over the CONTRIBUTING associations first
+    and the resolved ones only as a tie-break::
 
-        every contributing association COMPLETED  -> "completed"
-        any contributing association not complete -> "working"
-        no contributing associations at all       -> "new"
+        every contributing association COMPLETED    -> "completed"
+        any contributing association not complete   -> "working"
+        no contributing associations, but at least
+          one association resolved to FAILED        -> "failed"
+        no contributing associations at all         -> "new"
 
-    Non-contributing, and identical in effect to a dangling id: a project that
-    did not resolve (deleted), and a project whose status is **FAILED**. That
-    is the reference-not-a-foreign-key property the whole design rests on, and
-    it is what makes AC-1.8 true — a to-do whose only project failed reads New,
-    not Working forever with no way out. One completed project is enough when
-    it is the only one; the rule is "every contributing association is
-    complete", never "more than one".
+    Non-contributing for the Working/Done arithmetic: a project that did not
+    resolve (deleted), and a project whose status is **FAILED**. That is the
+    reference-not-a-foreign-key property the whole design rests on, and it is
+    what keeps AC-1.8 true — a failed project never pins a to-do to Working
+    forever with no way out. One completed project is enough when it is the
+    only one; the rule is "every contributing association is complete", never
+    "more than one".
+
+    **FAILED is non-contributing but no longer INVISIBLE.** It used to be
+    identical in effect to a dangling id, so a to-do whose only project failed
+    read "new" — indistinguishable on the plate from one that was never
+    started, which told the owner nothing happened when in fact something
+    happened and broke. The failed branch sits BELOW both contributing
+    branches and ABOVE the New fallback, which is what makes the ordering
+    readable as a sentence: a to-do with one failed project AND one running
+    project is still Working, because there is live work to look at and the
+    failure is not the headline. Only a to-do with nothing left running and at
+    least one real failure reads Failed.
+
+    A dangling id can never read "failed". It is absent from ``statuses``
+    entirely, so it cannot enter the resolved list, and the "never started"
+    and "broke" readings stay distinct in both directions.
 
     Exactly one value comes back per to-do, which is what AC-1.5 is tested
     against. (There is no server-side at-most-one-state rule in the product
@@ -224,15 +245,26 @@ def derive_plate(
 
     out: dict[str, tuple[str, int]] = {}
     for todo in todos:
-        contributing = [
+        # Everything that still RESOLVES. Absent from `statuses` == deleted,
+        # unreadable, or dangling — and it stays absent here, which is what
+        # keeps a dangling id out of the failed branch below.
+        resolved = [
             statuses[pid]
             for pid in todo.project_ids
-            # Absent from `statuses` == deleted, unreadable, or dangling.
             if statuses.get(pid) is not None
-            and statuses[pid] is not ProjectStatus.FAILED
         ]
+        # FAILED resolves but does not CONTRIBUTE: it is excluded from the
+        # Working/Done arithmetic so a broken project cannot pin the row to
+        # Working forever.
+        contributing = [s for s in resolved if s is not ProjectStatus.FAILED]
         if not contributing:
-            state = STATE_NEW
+            # Nothing live and nothing finished. Distinguish "broke" from
+            # "never started" — the two used to collapse into New together.
+            state = (
+                STATE_FAILED
+                if any(s is ProjectStatus.FAILED for s in resolved)
+                else STATE_NEW
+            )
         elif all(s is ProjectStatus.COMPLETED for s in contributing):
             state = STATE_COMPLETED
         else:

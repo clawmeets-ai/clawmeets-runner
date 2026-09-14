@@ -4,8 +4,9 @@ description: >
   Register a new agent AND get its memory populated, in one short project you
   coordinate. Use in your user's own DM when they ask you to add an agent and
   you want it to start with knowledge rather than a blank `learnings/`. Two
-  optional halves — a mentor agent dumps what it already knows about the job,
-  and the new agent deep-researches its own domain — then ONE reflect pass
+  optional halves — one or more mentor agents dump what they already know
+  about the job, and the new agent deep-researches its own domain — then ONE
+  reflect pass
   distills whichever ran into the new agent's durable memory. Both halves are
   optional; with both off this is just `register-agent`. Assistant-only.
 ---
@@ -19,8 +20,8 @@ you coordinate, so the agent's first real turn is spent *learning the job*.
 
 Two things can fill its memory, and **each is independently optional**:
 
-- **a mentor's knowledge dump** — what an agent already on this team knows
-  about the user's domain, house conventions, and traps;
+- **one or more mentors' knowledge dumps** — what the agents already on this
+  team know about the user's domain, house conventions, and traps;
 - **the new agent's own deep research** — the slice of its field a
   practitioner serving *this* user needs on day one.
 
@@ -60,15 +61,24 @@ Ask the user only what you can't infer, in one line each. Defaults:
 
 | Switch | Default | Turn it OFF when |
 |---|---|---|
-| **Mentor brief** | ON, with **you** as the mentor | The user says no mentor, or you genuinely hold nothing about this domain that the agent won't research better itself |
+| **Mentor brief** | ON, with the mentor list = **[you]** | The user says no mentor, or you genuinely hold nothing about this domain that the agent won't research better itself |
 | **Deep research** | ON | The user says skip it, or an agent being *re-*onboarded already covers the ground in its `learnings/` |
 
-**Who the mentor is.** Default is you — the assistant. You just drafted this
-agent's description and capabilities and you hold `USER.md`, so you are usually
-the best-informed party. Route to a **peer** agent only when the user names one
-or when a peer clearly owns the domain (a senior backend agent briefing a new
-junior one). The difference is mechanical, not structural: as mentor you write
-the brief yourself in the room; a peer mentor is `@`-mentioned and writes it.
+**Who the mentors are.** This is a **list**, defaulting to `[you]` — the
+assistant. You just drafted this agent's description and capabilities and you
+hold `USER.md`, so you are usually the best-informed party. Add or substitute a
+**peer** agent when the user names one or when a peer clearly owns the domain (a
+senior backend agent briefing a new junior one). The difference is mechanical,
+not structural: as mentor you write your brief yourself in the room; a peer
+mentor is `@`-mentioned and writes its own. The two **compose** — you can write
+inline *and* mention a peer in the same opening message, which is the cheapest
+way to cover a role that straddles two domains.
+
+**Cap the list at 3, and prefer 1.** Every peer mentor is one more serial reply
+the batch waits on before turn 2 can start, and briefs from adjacent domains
+overlap more than they add. Two earns its keep when the role genuinely straddles
+two owners (a data agent needing both the warehouse conventions and the
+compliance rules); past three you are paying latency for redundancy.
 
 **If both switches are OFF**, do not create a project. Register and start the
 agent from the DM (Step 3 minus the project), tell the user it's up with an
@@ -85,7 +95,8 @@ clawmeets project create "onboard-<name>" "$CLAWMEETS_AGENT_ID" "$(cat /tmp/onbo
   --display-name "Onboarding: <name>" \
   --agent-pool owned \
   --agent "<planned-agent-name>" \
-  --agent "<mentor-name>"          # omit when you are the mentor
+  --agent "<peer-mentor-name>"     # repeat once per PEER mentor;
+                                   # omit entirely when you are the only mentor
 ```
 
 Follow **`create-project`** for the call's mechanics (slug vs `--display-name`,
@@ -140,41 +151,58 @@ milestone is delivered to nobody, and the symptom is not an error but a silent
 *This section is the shared unit. This skill runs it once, for the agent being
 onboarded. `propose-project` runs it once per newly-registered member during
 its Phase 0. It is written to be read standalone: it takes `agent_name`,
-`bootstrap_topic`, `mentor`, and the two switches from Step 2 — nothing else.*
+`bootstrap_topic`, `mentors`, and the two switches from Step 2 — nothing else.*
 
-**One room. Mentor and new agent both in it. Serial by `@`-mention.**
+**One room. Every mentor and the new agent all in it. Serial by `@`-mention.**
 
 ```
 create_room  milestone-bootstrap-<agent_name>
-participants: you (coordinator) + <mentor, if a peer> + <agent_name>
+participants: you (coordinator) + <every peer mentor> + <agent_name>
 ```
 
 The room is the transport. Every agent's prompt carries a
 `== RECENT CHAT IN THIS ROOM ==` block — the last 10 non-ack messages, **whole
-bodies, no truncation, own messages included** — so the new agent reads the
+bodies, no truncation, own messages included** — so the new agent reads every
 mentor's dump simply by being in the room when it was posted. Room files sync
-to every participant too, so anything the mentor writes to
-`onboarding-<agent_name>.md` is readable by the new agent directly. Nothing has
-to be copied, re-inlined, or re-posted.
+to every participant too, so anything a mentor writes to
+`onboarding-<agent_name>-from-<mentor_name>.md` is readable by the new agent
+directly. Nothing has to be copied, re-inlined, or re-posted.
 
 Only `@`-mentioned participants are expected to reply (the server resolves
 mentions to `expects_response_from`; an un-mentioned participant reads and
 stays silent). That is what makes three turns in one room serial.
 
-### Turn 1 — the mentor's knowledge dump *(skip if the switch is OFF)*
+### Turn 1 — the mentors' knowledge dump *(skip if the switch is OFF)*
 
-**If a peer is the mentor**, this is the room's opening message, `@`-mentioning
-the mentor and nobody else. Ask for what a practitioner already on this team
+**If the list holds peer mentors**, this is the room's opening message,
+`@`-mentioning **every** peer mentor on it — and nobody else. One message, N
+mentions: the server resolves them all into `expects_response_from` and fires
+`BATCH_COMPLETE` at you only once *every* one has replied, so N mentors still
+cost you **one** turn, not N. Ask for what a practitioner already on this team
 knows that the new agent cannot look up: the user's domain and business, house
 conventions, who owns what, the traps, the things that have already gone wrong.
-Tell them to post it as their reply **and** save it to
-`onboarding-<agent_name>.md` in this room.
 
-**If you are the mentor** (the default), there is no separate turn: write the
-brief yourself as the room's opening message, save the same file, and put the
-turn-2 trigger in that same message.
+**When you mention more than one, give each a distinct slice in that same
+message** — `@data-eng: the warehouse conventions and the ETL traps;
+@compliance: the retention rules` — because two mentors asked the same open
+question write substantially the same brief twice. Tell each to post it as their
+reply **and** save it to `onboarding-<agent_name>-from-<mentor_name>.md` in this
+room.
 
-Either way you end this turn holding the brief, and the file is the artifact
+**The per-mentor filename is load-bearing, not cosmetic.** The path keys off the
+*new agent's* name, so a single shared name means the second mentor's write
+silently clobbers the first and that brief survives only as chat text. The new
+agent reads it either way — the room-history block carries whole bodies — but
+the saved artifact your user opens later would be missing a brief, with nothing
+to indicate one ever existed.
+
+**If you are on the list** (the default), there is no separate turn for your own
+brief: write it yourself as the room's opening message and save your own
+per-mentor file. If you are the *only* mentor, put the turn-2 trigger in that
+same message. If peers are on the list too, your brief and their `@`-mentions
+ride in that one opening message, and turn 2 waits on their replies.
+
+Either way you end this turn holding every brief, and the files are the artifact
 your user can read later.
 
 **Do not create a knowledge pack.** `knowledge_packs/` is the user's curated
@@ -190,13 +218,13 @@ Message `@<agent_name>`, body starting with the marker on its own line:
 ```
 
 Then, in prose: one paragraph framing its role and why this user registered it;
-a pointer to the mentor's brief above in this room (name what it covers — don't
-just say "see above"); the bootstrap topic, **sharpened by the brief** if there
-is one; and the standing instruction that `USER.md` is already populated, so it
+a pointer to the mentor briefs above in this room (name what each one covers —
+don't just say "see above"); the bootstrap topic, **sharpened by those briefs**
+if there are any; and the standing instruction that `USER.md` is already populated, so it
 should skip clarifying questions and deliver the dump in ONE message.
 
 The topic is what makes or breaks this turn. "Your field" produces a generic
-primer. Name the slice this user actually needs, in the vocabulary the mentor
+primer. Name the slice this user actually needs, in the vocabulary the mentors
 just used.
 
 *(With the mentor switch OFF, this is the room's opening message and there is
@@ -213,19 +241,20 @@ Message `@<agent_name>`, body starting with:
 
 Then one short paragraph: state that **no `== Recent activity ==` transcript is
 attached and the room conversation in their prompt is the source for this
-cycle** — the mentor's brief and their own dump — and to distill both into
+cycle** — every mentor brief and their own dump — and to distill all of it into
 `learnings/`.
 
-**One reflect pass covers both halves**, because both are messages in this
-room. Two triggers would not have helped anyway: reflect is idempotent per day,
+**One reflect pass covers both halves, and any number of mentors**, because all
+of it is messages in this room. Two triggers would not have helped anyway: reflect is idempotent per day,
 so a second one on the same date replies "Already reflected for today" and
 skips both its passes.
 
 Two things to respect:
 
 - **Post it as the immediate next message after the dump.** The history window
-  is 10 messages; this room holds 3–5, so you have room to spare — but don't
-  spend it on chatter between the dump and the trigger.
+  is 10 messages; this room holds 3–5, and still only 7 with the full three
+  mentors (opening + 3 briefs + trigger + dump + trigger), so you have room to
+  spare — but don't spend it on chatter between the dump and the trigger.
 - **Skip this turn entirely only if both switches were OFF** — in which case
   you never created the room.
 
@@ -258,10 +287,10 @@ you, and that is the turn in which you open the first workroom.
 One short message to your user:
 
 > `<name>` is registered, running, and onboarded. It now holds
-> `<one line: what the mentor covered / what it researched>` in its own memory.
-> The brief is saved at `onboarding-<name>.md` in the onboarding project — say
-> the word and I'll turn it into a knowledge pack you can install on your other
-> agents.
+> `<one line: what the mentors covered / what it researched>` in its own memory.
+> The brief is saved at `onboarding-<name>-from-<mentor>.md` in the onboarding
+> project (one file per mentor) — say the word and I'll turn it into a knowledge
+> pack you can install on your other agents.
 
 Offer the pack; never create one unasked.
 

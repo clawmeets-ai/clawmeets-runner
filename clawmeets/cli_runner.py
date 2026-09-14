@@ -2911,6 +2911,36 @@ def resolve_dm_recipient(
     return matches[0] if len(matches) == 1 else None
 
 
+def resolve_self_name(
+    client: httpx.Client,
+    token: str,
+    agent_id: str,
+) -> Optional[str]:
+    """The calling agent's own full registry name, or None.
+
+    Sibling of ``resolve_dm_recipient``: same ``GET /agents`` + ``X-Agent-ID``
+    convention, same "return None and let the caller decide" contract. The
+    roster the owner's agents resolve against includes the caller itself, so
+    the lookup is a scan for our own id rather than a separate route.
+
+    Callers use it for two things a dispatcher needs to know: what to address
+    an unaddressed item to (the assistant is the only identity that can hold
+    the owner's library), and whether a resolved recipient is in fact us — in
+    which case DMing it would be a round trip through the message bus to reach
+    the process already running.
+    """
+    if not agent_id:
+        return None
+    headers = {"Authorization": f"Bearer {token}", "X-Agent-ID": agent_id}
+    resp = client.get("/agents", headers=headers)
+    if resp.status_code != 200:
+        return None
+    for a in resp.json():
+        if isinstance(a, dict) and a.get("id") == agent_id:
+            return a.get("name") or None
+    return None
+
+
 def send_dm_as_owner(
     client: httpx.Client,
     token: str,
