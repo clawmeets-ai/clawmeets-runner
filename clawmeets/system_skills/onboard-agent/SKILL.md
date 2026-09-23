@@ -275,11 +275,10 @@ room is the log. There is no Phase 1 here — the onboarding *is* the project.
 
 An onboarding project is a regular project, so it starts in `spec-ing` and the
 server will refuse a workroom until the plan is accepted. Fill the plan, point
-the user at the approval note the server filed for them, then **stop** — you
+the user at the confirm note the server filed for them, then **stop** — you
 cannot accept it yourself, and there is no command to try. Acceptance is the
-user applying that note, which writes *"User approves the plan."* into the
-plan's `## Approval` section; **that line is your go signal, and a "looks good"
-in chat is not**. You do not need to hold the turn open: their acceptance wakes
+user *dismissing* that note; **`Plan confirmed by the user` in your prompt is
+your go signal, and a "looks good" in chat is not**. You do not need to hold the turn open: their acceptance wakes
 you, and that is the turn in which you open the first workroom.
 
 ## Step 5 — report back in the DM

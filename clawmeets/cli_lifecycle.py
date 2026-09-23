@@ -13,14 +13,26 @@ from __future__ import annotations
 
 import json
 import os
-import signal
 import subprocess
-import sys
-import time
 from pathlib import Path
 from typing import Optional
 
 import typer
+
+from clawmeets.utils.agent_processes import (
+    IS_WINDOWS,
+    agent_pid_file,
+    agents_dir as resolve_agents_dir,
+    find_agent_dir,
+    list_owned_agent_short_names,
+    pid_is_alive,
+    popen_detached_kwargs,
+    prefixed_name,
+    read_pid,
+    signal_kill,
+    signal_terminate,
+    stop_pid,
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -125,166 +137,52 @@ def load_user_config(data_dir: Path, username: str | None = None) -> tuple[dict,
 
 # ---------------------------------------------------------------------------
 # Helpers — cross-platform process management
+#
+# The discovery + liveness logic itself lives in
+# ``clawmeets/utils/agent_processes.py``, because the connection daemon
+# (``clawmeets_daemon``, shipped as its own distribution) has to answer the
+# same questions about the same machine and the two must never disagree. What
+# stays here is the terminal-CLI skin over it: the ``_``-prefixed aliases that
+# existing imports and tests resolve, and the ``typer.echo`` reporting the
+# shared module deliberately does not do.
 # ---------------------------------------------------------------------------
 
-_IS_WINDOWS = sys.platform == "win32"
+_IS_WINDOWS = IS_WINDOWS
 
-
-def _popen_detached_kwargs() -> dict:
-    """Popen kwargs that detach the child so it outlives the parent shell.
-
-    Windows needs DETACHED_PROCESS (no inherited console) plus
-    CREATE_NEW_PROCESS_GROUP (so we can later deliver CTRL_BREAK_EVENT).
-    POSIX just needs start_new_session=True.
-    """
-    if _IS_WINDOWS:
-        flags = (
-            getattr(subprocess, "DETACHED_PROCESS", 0)
-            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-        )
-        return {"creationflags": flags}
-    return {"start_new_session": True}
-
-
-def _pid_is_alive(pid: int) -> bool:
-    """Check whether a PID refers to a live process, without signaling it.
-
-    On Windows, ``os.kill(pid, 0)`` actually terminates the target — so we
-    must use a non-signaling query (tasklist) instead.
-    """
-    if _IS_WINDOWS:
-        result = subprocess.run(
-            ["tasklist", "/FI", f"PID eq {pid}", "/NH", "/FO", "CSV"],
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            text=True, check=False,
-        )
-        return f'"{pid}"' in (result.stdout or "")
-    try:
-        os.kill(pid, 0)
-        return True
-    except (OSError, ProcessLookupError):
-        return False
-
-
-def _signal_terminate(pid: int) -> None:
-    """Send a graceful termination request. Silently no-ops if the target is gone.
-
-    POSIX: SIGTERM. Windows: CTRL_BREAK_EVENT to the process group (works
-    because ``start_command`` spawns children with CREATE_NEW_PROCESS_GROUP).
-    """
-    try:
-        if _IS_WINDOWS:
-            os.kill(pid, getattr(signal, "CTRL_BREAK_EVENT", 15))
-        else:
-            os.kill(pid, signal.SIGTERM)
-    except (OSError, ProcessLookupError):
-        pass
-
-
-def _signal_kill(pid: int) -> None:
-    """Force-kill a process. Silently no-ops on failure.
-
-    POSIX: SIGKILL. Windows: ``taskkill /F`` — TerminateProcess via the
-    Win32 API equivalent, reliable even when graceful signaling didn't land.
-    """
-    try:
-        if _IS_WINDOWS:
-            subprocess.run(
-                ["taskkill", "/F", "/PID", str(pid)],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                check=False,
-            )
-        else:
-            os.kill(pid, signal.SIGKILL)
-    except OSError:
-        pass
-
-
-def _read_pid(pid_file: Path) -> int | None:
-    if not pid_file.exists():
-        return None
-    try:
-        pid = int(pid_file.read_text().strip())
-        return pid if _pid_is_alive(pid) else None
-    except (ValueError, OSError):
-        return None
+# Aliases, not reimplementations. `cli_server.py`, `cli_browser.py` and the
+# lifecycle tests import these names; keeping them pointed at the shared
+# module is what makes "one copy" true rather than aspirational.
+_popen_detached_kwargs = popen_detached_kwargs
+_pid_is_alive = pid_is_alive
+_signal_terminate = signal_terminate
+_signal_kill = signal_kill
+_read_pid = read_pid
 
 
 def _stop_pid(pid_file: Path, label: str) -> bool:
-    """Stop a process by PID file. Returns True if it was running.
+    """Stop a process by PID file and say so. Returns True if it was running.
 
     Graceful first (SIGTERM / CTRL_BREAK_EVENT), then a force kill after a
-    5-second grace period (SIGKILL / taskkill /F).
+    5-second grace period — all of which lives in ``stop_pid``. This wrapper
+    exists for the one thing the shared module must not do: print. The daemon
+    reports the same stop over a websocket, not to a terminal.
     """
-    if not pid_file.exists():
+    pid = stop_pid(pid_file)
+    if pid is None:
         return False
-    try:
-        pid = int(pid_file.read_text().strip())
-    except (ValueError, OSError):
-        pid_file.unlink(missing_ok=True)
-        return False
-
-    if not _pid_is_alive(pid):
-        pid_file.unlink(missing_ok=True)
-        return False
-
-    _signal_terminate(pid)
-    for _ in range(20):
-        time.sleep(0.25)
-        if not _pid_is_alive(pid):
-            break
-    else:
-        _signal_kill(pid)
-
-    pid_file.unlink(missing_ok=True)
     typer.echo(f"  Stopped {label} (PID {pid})")
     return True
 
 
 def _get_agents_dir() -> Path:
-    return Path(DEFAULT_DATA_DIR).expanduser() / "agents"
+    """``~/.clawmeets/agents`` — resolved through the module-level
+    ``DEFAULT_DATA_DIR`` so tests can repoint the whole tree by patching it."""
+    return resolve_agents_dir(Path(DEFAULT_DATA_DIR))
 
 
-def _prefixed_name(username: str, agent_name: str) -> str:
-    prefix = f"{username}-"
-    return agent_name if agent_name.startswith(prefix) else f"{prefix}{agent_name}"
-
-
-def _find_agent_dir(agents_dir: Path, prefixed_name: str) -> Path | None:
-    """Find an agent's directory matching {prefixed_name}-{id}/."""
-    if not agents_dir.exists():
-        return None
-    for d in agents_dir.iterdir():
-        if d.is_dir() and d.name.startswith(f"{prefixed_name}-"):
-            if (d / "credential.json").exists():
-                return d
-    return None
-
-
-def _list_owned_agent_short_names(agents_dir: Path, username: str) -> list[str]:
-    """Return owned agents' short names by globbing the filesystem.
-
-    Pattern: ``{agents_dir}/{username}-{short}-{id}/`` with ``credential.json``
-    present. Skips ``DELETED-*`` (renamed by self-destruct) and any dir
-    without a ``credential.json`` (half-registered). The trailing ``-{id}``
-    is stripped off the right.
-    """
-    if not agents_dir.exists():
-        return []
-    prefix = f"{username}-"
-    names: list[str] = []
-    for entry in sorted(agents_dir.iterdir()):
-        if not entry.is_dir() or entry.name.startswith("DELETED-"):
-            continue
-        if not entry.name.startswith(prefix):
-            continue
-        if not (entry / "credential.json").exists():
-            continue
-        rest = entry.name[len(prefix):]
-        short = rest.rsplit("-", 1)[0] if "-" in rest else rest
-        if short:
-            names.append(short)
-    return names
+_prefixed_name = prefixed_name
+_find_agent_dir = find_agent_dir
+_list_owned_agent_short_names = list_owned_agent_short_names
 
 
 def _build_agent_list(agents_dir: Path, username: str) -> list[str]:
@@ -403,7 +301,7 @@ def start_command(
             typer.echo(f"  Agent '{name}' not found in {agents_dir}, skipping.")
             continue
 
-        pid_file = agent_dir / "agent.pid"
+        pid_file = agent_pid_file(agent_dir)
         existing_pid = _read_pid(pid_file)
         if existing_pid:
             typer.echo(f"  Agent '{name}' already running (PID {existing_pid})")
@@ -509,7 +407,7 @@ def stop_command(
             )
             skipped_self = True
             continue
-        pid_file = agent_dir / "agent.pid"
+        pid_file = agent_pid_file(agent_dir)
         if _stop_pid(pid_file, f"agent '{name}'"):
             stopped += 1
 
@@ -567,7 +465,7 @@ def status_command(
             typer.echo(f"  {name:30s}  not registered")
             continue
 
-        pid_file = agent_dir / "agent.pid"
+        pid_file = agent_pid_file(agent_dir)
         pid = _read_pid(pid_file)
         if pid:
             typer.echo(f"  {name:30s}  running (PID {pid})")

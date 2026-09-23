@@ -270,74 +270,86 @@ FOLDED_REASON = (
     "— your text is in the section that landed"
 )
 
-#: The gate section, and the three strings that live in it.
+#: The confirm note's comment. Addressed to the user, so it says what
+#: dismissing DOES rather than naming the mechanism: the user is not reading
+#: about proposals, they are deciding whether work may start.
 #:
-#: ``## Approval`` is not decoration and it is not a status field the coordinator
-#: maintains. It is the **target of the go-note** — the bootstrap proposal the
-#: server files at project creation, whose whole content is *replace this
-#: section's body with "User approves the plan."*. Accepting that proposal is
-#: how a plan becomes accepted; there is no second act and no approve route.
+#: **It carries no diff and names no section**, and both are the same decision.
+#: There used to be a ``## Approval`` section for the acceptance to land in, and
+#: this note used to be a proposal to replace its body — which meant approving
+#: was a trip to a card holding a one-line diff, in a grammar unlike every other
+#: row in the list. The section is gone (see :data:`SEED_TEMPLATE`), so there is
+#: nothing to travel to, and the note is anchored to the document as a whole
+#: (``section == ""``) the way :class:`PlanNote` has always allowed.
 #:
-#: **A proposal is located by heading**, so the heading is load-bearing in a way
-#: no other seed section's is: a coordinator that rewrites the document without
-#: it leaves the go-note unappliable and its own project permanently gated.
-#: :func:`_prepare_locked` refuses that write while a go-note is open, which is
-#: what keeps the guarantee server-enforced rather than prompt-enforced.
-APPROVAL_SECTION = "approval"
-APPROVAL_HEADING = "## Approval"
-APPROVAL_PENDING = "_Not yet approved._"
-APPROVAL_GRANTED = "User approves the plan."
-
-#: The go-note's comment. Addressed to the user, so it says what accepting DOES
-#: rather than naming the mechanism: the user is not reading about proposals,
-#: they are deciding whether work may start.
+#: **The wording has to say that dismissing starts work and that replying does
+#: not**, because those are the only two acts this row offers and they are not
+#: symmetric: one releases the coordinator, the other leaves the gate up.
 GO_NOTE_COMMENT = (
-    "Work on this project does not start until you accept the plan. "
-    "Read it, then Accept this note to approve it — that is what unblocks the "
-    "coordinator. Reply here instead if you want something changed first; a "
-    "reply leaves this open."
+    "I've drafted this and I have nothing open on it. Have a read — dismiss "
+    "this note and I'll start. Reply instead if you want something changed; "
+    "that leaves it open."
 )
 
+#: **The confirm note's OTHER wording, and the one a project is born with.**
+#: :data:`GO_NOTE_COMMENT` says *"I have nothing open on it"*, and at
+#: ``POST /projects`` that sentence is false: :func:`seed_go_note` files the row
+#: in the same request that seeds ``PLAN.md``, before the coordinator has taken
+#: a turn, so the document it invites a read of is the bare
+#: :data:`SEED_TEMPLATE`. The coordinator's spec-stage contract then spends its
+#: whole first turn drafting and hands the draft to the roster
+#: (``clawmeets plan consult``) *before the user sees any of it* — and the
+#: ``BATCH_COMPLETE`` that brings the answers back is a worker turn away. Every
+#: regular project with a roster therefore had a window, minutes wide, in which
+#: the row on the user's desk invited them to confirm a draft that was still out
+#: for review. A dismiss inside it stamps ``first_accepted_at``, and the STEP 4
+#: fold-in of the consult the user never knew was running lands on the far side
+#: of that line — refused as a write, filed as a deviation. The user's first
+#: sight of the plan is then an off-contract alarm about a contract they were
+#: never shown.
+#:
+#: **The row does not move and the gate does not move; only these bytes do.**
+#: The seed stays where it is for the reason :func:`_sync_go_note_locked`
+#: records — a confirm note born when the coordinator sends a review is a gate
+#: the coordinator can skip — so this is one open, spec-layer, user-addressed
+#: note either way and ``_plan_execution_blocked`` cannot tell the two apart.
+#: :func:`_sync_go_note_locked` swaps it for :data:`GO_NOTE_COMMENT` on the
+#: keeper's first quiet round, which is the moment the plan is actually put in
+#: front of the user.
+#:
+#: **It still offers the dismiss, and saying so is the point.** The owner is the
+#: decider; a row that withheld the verb would be a lock aimed at the decider
+#: (:func:`_spec_is_locked`). What changes is that taking it now reads as
+#: *"start on the draft as it stands"* — which is what it always did — instead
+#: of as an answer to a question nobody had asked yet. It also leaves a
+#: coordinator that never reaches its review send unable to strand the user:
+#: the wording names the way out.
+#:
+#: **"ONLY YOUR OWN HAND" IS ADDRESSED TO THE ONE READER WHO IS NOT THE USER.**
+#: The previous wording ended *"dismiss now only if you want work to start"*,
+#: which is a sentence for a human at a desk — and it is also read by an agent
+#: holding the owner's credential, to whom it looks like an offered option. On
+#: ``onboard-angel-investor`` that is exactly how it was read. The bytes are not
+#: the guard (:func:`_refuse_presigned_go_note` is), but a row whose text
+#: contradicts the refusal is a row that invites the retry.
+#:
+#: ``{keeper}`` is interpolated at the filing site, which already has the name.
+GO_NOTE_DRAFTING = (
+    "@{keeper} is drafting this and has it out for review with the agents. "
+    "Nothing to do yet — it will come back to you for a confirm. Only your own "
+    "hand may dismiss this row, and dismissing it starts work on the draft as "
+    "it stands."
+)
 
-def approval_section(text: str) -> str:
-    """The ``## Approval`` section's FULL text — heading line included.
-
-    A section edit is the section's whole extent (:func:`replace_section`
-    splices over the heading too), so the go-note's proposal and the seed
-    template's pending text are built through here rather than by concatenating
-    a heading somewhere else and hoping the two agree.
-    """
-    return f"{APPROVAL_HEADING}\n\n{text}\n"
-
-
-def approval_state(body: str) -> str:
-    """What ``## Approval`` currently SAYS, heading stripped, or ``""``.
-
-    The read half of :func:`approval_section`, and the coordinator's own way of
-    checking whether it may start work. The server-side gate is the thing that
-    actually refuses ``create_room``; this is what lets the model *know why* —
-    a ``NO_OP`` refusal tells it nothing, so a coordinator that cannot see the
-    approval state narrates as though a room opened.
-
-    It reads the **document**, not the sidecar, and that is the point: the
-    acceptance is a diff the user applied to ``PLAN.md``, so the text they
-    approved and the fact of their approval are the same bytes. Nothing has to
-    be projected for the coordinator to see it, which is why this works on the
-    agent side where ``plan.json`` does not exist.
-
-    ``""`` when the section is absent — a coordinator that rewrote the document
-    without the heading. That is refused while a go-note is open
-    (:func:`_prepare_locked`), so an empty answer means *not approved* and never
-    *approval lost*.
-    """
-    extent = section_extent(body, APPROVAL_SECTION)
-    if extent is None:
-        return ""
-    text = body[extent[0]:extent[1]]
-    # Drop the heading line; the caller asked what the section says, and the
-    # heading is what it is called.
-    _, _, rest = text.partition("\n")
-    return rest.strip()
+#: Why the confirm note went away without being approved: the round the
+#: coordinator is sending carries real questions, so the answers to THOSE are
+#: the gate and a confirm row beside them would be false — the note says *"I
+#: have nothing open on it"*. Written as the note's ``resolution`` so the closed
+#: row still reads in the history. See :func:`_sync_go_note_locked`.
+GO_NOTE_RETIRED = (
+    "this round carries questions — answering them is what the plan is waiting "
+    "on, and the confirm comes back when nothing is open"
+)
 
 
 #: The section that says what the user's approval does **not** buy, and the
@@ -437,7 +449,7 @@ def not_authorized_state(body: str) -> str:
     coordinator that added the new heading without moving the content still gets
     the content enforced.
 
-    Unlike :func:`approval_state` this is not merely informational: it is the
+    **This is not merely informational**: it is the
     only route by which the section reaches a model at all, on either the
     coordinator or the worker side. It runs in the **agent** process against the
     synced document, so it must stay a pure function of the bytes — no sidecar,
@@ -461,52 +473,36 @@ def not_authorized_state(body: str) -> str:
     return ""
 
 
-def _section_prose(body: str, slug: str) -> str:
-    """A section's OWN prose: heading dropped, and **stopped at the first
-    heading of any depth** that follows.
-
-    Only :func:`_prepare_locked`'s go-note guard uses this, and the truncation
-    is the whole reason it is not :func:`approval_state`. Two different things
-    shorten the last section's extent without touching a word of its own text,
-    and a guard keyed on the raw extent refuses both:
-
-    * a new ``##`` lands after it, ending the extent early — invisible once the
-      edges are stripped, so this one is harmless either way;
-    * a **create** lands at the end of the document (:func:`_append_section` —
-      *"a create lands at the end, where a human can see it and move it"*), and
-      a deeper heading like ``### M2`` does not close an ``##`` extent, so it is
-      swallowed INTO the last section. ``## Approval`` is last in the seed
-      template, so renaming a milestone — a delete plus a create — would read as
-      a rewrite of the approval section. Stripping cannot see that; stopping at
-      the first heading can.
-
-    What survives the truncation is exactly the text the forgery has to change:
-    the sentence directly under the heading, which is what
-    :data:`APPROVAL_GRANTED` replaces and what the coordinator is told to read.
-    """
-    extent = section_extent(body, slug)
-    if extent is None:
-        return ""
-    _, _, rest = body[extent[0]:extent[1]].partition("\n")
-    prose: list[str] = []
-    for line in rest.split("\n"):
-        if line.lstrip().startswith("#"):
-            break
-        prose.append(line)
-    return "\n".join(prose).strip()
-
-
 #: §5.1's seed template, verbatim. **One template** — the ``full`` variant went
 #: with the ``plan_mode`` that selected it. The coordinator may replace every
 #: section: this is a starting document, not a schema (§2.4). ``<title>`` is the
 #: only substitution.
 #:
-#: **``## Approval`` is the one section with a rule attached**, and the rule is
-#: not "do not edit it" — it is that the *heading* must survive while a go-note
-#: is open, because that is what the go-note's proposal is located by. It is
-#: deliberately left UNMARKED rather than marked ``layer: spec``: spec is the
-#: default, so the marker would add a moving part and say nothing new, and the
-#: heading already carries its own protection.
+#: **``## Approval`` IS GONE, AND ITS GOING IS THE CHANGE RATHER THAN A
+#: TIDY-UP.** It existed to be the *target of the go-note* — a section whose
+#: body the user's acceptance replaced with one fixed sentence — and being a
+#: diff target is what made approving unlike every other act on this surface:
+#: the user travelled to a card, read a one-line diff they had no say in, and
+#: accepted it. The confirm note now carries no diff at all
+#: (:data:`GO_NOTE_COMMENT`) and is dismissed in the list, in the same grammar
+#: as every other row.
+#:
+#: **Three server guards went with it, and each was load-bearing only because
+#: the section was.** A write that dropped the heading left the go-note
+#: unappliable and the project silently gated, so it was refused; a second
+#: ``## Approval`` buried in another section took the ``approval`` slug and
+#: demoted the real one, so that was refused too; and an accept that closed the
+#: note without writing the line marked a plan approved that said it was not.
+#: None of the three has anything left to protect. The GENERAL duplicate-heading
+#: refusal in :func:`_prepare_locked` stays exactly where it is — it guards
+#: every section, and the approval incident was its occasion, not its subject.
+#:
+#: **And the digest is now what it always should have been.**
+#: :func:`spec_digest` hashes the spec-layer top-level sections, ``## Approval``
+#: among them — so the act of approving MOVED the hash, which is why the stamp
+#: has to be taken from the post-write body. What is left is Goal, Not
+#: Authorized and Acceptance Criteria: *"the plan moved without you"* now means
+#: exactly that.
 #:
 #: **The layered shape** (:func:`plan_markdown.section_layers`): Goal,
 #: Not Authorized and Acceptance Criteria are the user's — unmarked, therefore
@@ -576,10 +572,6 @@ reader can check IS a criterion; a scope boundary belongs in Goal. Grouped;
 ### M1: <action>  <!-- advances: AC-1.1 -->
 
 - [ ] **M1** — unassigned
-
-## Approval
-
-_Not yet approved._
 """
 
 
@@ -746,6 +738,23 @@ class WriteResult(BaseModel):
     #: two fields — one field with a flag would put the question inside a body
     #: that has to render one sentence.
     locked: list[StaleSection] = Field(default_factory=list)
+    #: **WHY the write in ``locked`` was refused, when the answer is a layer
+    #: flip.** ``[(slug, before, after)]`` for every top-level section whose
+    #: ``<!-- layer: … -->`` resolution changed.
+    #:
+    #: It exists because the rows in ``locked`` can fail to name the cause. The
+    #: layer manifest is hashed, so dropping ``<!-- layer: detail -->`` from a
+    #: heading IS a spec move — but ``_rows_worth_showing`` filters rows against
+    #: the STORED body, where that section is still ``detail``, so the one row
+    #: that explains the refusal is dropped and what survives are the derived
+    #: child rows. On ``onboard-angel-investor`` a coordinator rewrote
+    #: ``## Milestones`` without its marker and was told, four times, that it
+    #: *"could not add the section ``m1-…``"* — four slugs the document has
+    #: never had, and no mention of the marker. It retried, filed 17 notes, and
+    #: concluded it had a stale local copy.
+    #:
+    #: Empty whenever no layer moved, which is the ordinary spec edit.
+    relayered: list[tuple[str, str, str]] = Field(default_factory=list)
     note_ids: list[str] = Field(default_factory=list)
     #: True when the spliced result equalled the stored body — §4.1 step 6, an
     #: idempotent retry. Nothing was appended and no revision moved.
@@ -864,23 +873,36 @@ class PlanNote(BaseModel):
     #: **The go-note** — the one note the SERVER files, at project creation, and
     #: the only note whose resolution stamps acceptance.
     #:
-    #: It is an ordinary ``proposal`` in every other respect: it counts toward
+    #: It is an ordinary **comment** in every other respect: it counts toward
     #: :func:`open_notes_for_you`, it blocks ``create_room`` through the one
-    #: gate every other open note blocks through, it renders in the tray like
-    #: any other, and the user Accepts it with the control they already know.
+    #: gate every other open note blocks through, it renders in the comment list
+    #: like any other, and the user closes it with the ``Dismiss`` they already
+    #: know. It carries no ``proposal`` and no ``section`` — it is anchored to
+    #: the document as a whole — which is what removed the trip to a card
+    #: holding a one-line diff nobody had a say in.
+    #:
     #: This flag buys exactly three exceptions, each written down where it
     #: applies:
     #:
-    #: 1. a user **reply** does not close it (:func:`submit_review`'s ``ask``
-    #:    arm) — every other note closes ``answered`` on a reply, and on this
-    #:    one that would mean typing a question released the gate;
-    #: 2. applying it stamps ``accepted_*`` (:func:`_stamp_acceptance_locked`);
-    #: 3. while one is open, a write that drops ``## Approval`` is refused
-    #:    (:func:`_prepare_locked`).
+    #: 1. a user **reply** does not close it (:func:`_reply_closes_parent`) —
+    #:    every other note closes ``answered`` on a reply, and on this one that
+    #:    would mean typing a question released the gate;
+    #: 2. **``dismiss`` is the ONLY verb that closes it**, and it stamps
+    #:    ``accepted_*`` (:func:`_refuse_go_note_close`,
+    #:    :func:`_stamp_acceptance_locked`). Every other close — reject,
+    #:    answered, a supersede, a fold — releases the gate without meaning yes,
+    #:    so every other close is refused;
+    #: 3. the coordinator's own review send retires it when the round carries
+    #:    questions and re-files it when it does not
+    #:    (:func:`_sync_go_note_locked`).
     #:
-    #: Never an input on any route — set by :func:`seed_go_note` alone, at
-    #: project creation, and by nothing a caller can reach. There is exactly one
-    #: go-note in a plan's life: acceptance is one-way.
+    #: Never an input on any route — set by :func:`_seed_go_note_locked` alone,
+    #: and by nothing a caller can reach. **It may be filed more than once**,
+    #: which is the one thing that changed about its lifecycle: a round the
+    #: coordinator sends with nothing to ask re-files it, so a plan that came
+    #: back quiet after a round of questions still comes back for a confirm.
+    #: Acceptance itself stays one-way — once ``accepted_at`` is set it is never
+    #: filed again.
     bootstrap: bool = False
 
     #: **This note proposes REMOVING its section**, and it exists because
@@ -1035,7 +1057,21 @@ class ProjectPlan(BaseModel):
     #: written before this field existed, so there is no migration.
     first_accepted_at: str = ""
     accepted_by: str = ""
-    accepted_via: str = ""          # "owner" | "coordinator"
+    #: **WHICH HAND PUT THE OWNER'S NAME TO IT.** ``accepted_by`` is who the
+    #: decision belongs to and is always ``"user"`` on a regular project; this is
+    #: how their credential reached the server.
+    #:
+    #: ``"owner"`` — a real user session (the browser, or ``--token``).
+    #: ``"assistant"`` — the owner's ``{username}-assistant`` bearer, which
+    #: ``resolve_credential`` accepts AS the owner (``plan resolve --as-user``).
+    #: ``"coordinator"`` — a front-desk plan, which is final without the
+    #: requester's approval and never carried an owner in the accepting role.
+    #:
+    #: It was ``"owner"`` unconditionally, which made the record unable to say
+    #: what actually happened on ``onboard-angel-investor``: the coordinator ran
+    #: ``--as-user`` against the confirm note and every field in the acceptance
+    #: said the user. See :func:`_stamp_acceptance_locked`.
+    accepted_via: str = ""          # "owner" | "assistant" | "coordinator"
     accepted_revision: int = 0
     accepted_spec_digest: str = ""
     #: When ``init_plan_sidecar`` seeded this plan — and ONLY that call (§3.5
@@ -1067,9 +1103,10 @@ class ProjectPlan(BaseModel):
     #: It is not :attr:`PlanNote.revision`'s job and cannot be derived from it.
     #: That field records what a NOTE's author saw; the fact needed here is what
     #: the READER saw, and the two coincide only for a note the reader wrote.
-    #: Deriving it from the go-note's copy is worse than merely wrong — the
-    #: go-note is anchored to ``## Approval``, the one section the keeper may
-    #: not write while it is open, so its number is frozen at project creation.
+    #: Deriving it from the confirm note's copy is worse than merely wrong —
+    #: that note is filed by the server, not by a reader, so its number is the
+    #: revision at whatever moment the server filed it and never the revision
+    #: the owner was shown.
     #:
     #: Stamped in :func:`submit_review` by :func:`_stamp_owner_seen_locked`,
     #: **after** the batch has rendered, so the message the owner is reading
@@ -1080,8 +1117,51 @@ class ProjectPlan(BaseModel):
     #: field existed renders exactly as it did and the owner's first round is
     #: not handed a changelog of a draft they have never read.
     owner_last_seen_revision: int = 0
+    #: When the coordinator first PUT THIS PLAN IN FRONT OF the user — the
+    #: instant its first review round opened. The spec lock's other half
+    #: (:func:`_plan_was_offered`): ``accepted_at`` says they signed,
+    #: this says there was something to sign, and a plan can carry the first
+    #: without the second because the confirm row is dismissible from the desk
+    #: card while it still reads :data:`GO_NOTE_DRAFTING`.
+    #:
+    #: **LATCHED IN :func:`submit_review`, NOT DERIVED FROM ``rounds``**, and
+    #: the reason is the ordering note on :func:`_stamp_user_review_locked`'s
+    #: callsite: the round is not opened until step 5, BELOW the append that
+    #: carries this batch's messages — so a predicate reading ``rounds`` is
+    #: False for the projection those same messages ride with, and the very turn
+    #: they wake is told it may still rewrite the document. The latch is stamped
+    #: above the projection instead, so the batch that offers the plan is the
+    #: batch that says so.
+    #:
+    #: Author-agnostic on purpose: an owner-opened round means the user was IN
+    #: the document, which is the same fact from the other side.
+    first_offered_at: str = ""
     created_at: str = ""
     updated_at: str = ""
+
+    @model_validator(mode="after")
+    def _backfill_first_offered(self) -> "ProjectPlan":
+        """Recover ``first_offered_at`` from ``rounds`` — the same trick its
+        sibling below uses, and for the same reason: the fact was already on
+        disk and had no field.
+
+        Every plan written before this shipped reads correctly on its next load
+        and there is no migration script. That matters more here than it looks:
+        on the server this shipped against, 11 of 17 accepted plans carry a
+        blank ``first_user_review_at``, and keying the lock on THAT would have
+        silently unlocked ten ratified plans. All eleven have rounds, so this
+        backfill is what keeps them locked.
+
+        Fills a blank only, so the latch always wins; and because the trim takes
+        rounds from the FRONT, the recovered instant can be later than the true
+        first offer on a very busy plan. That is harmless — every reader asks
+        whether it is set, never what it says.
+        """
+        if not self.first_offered_at:
+            opened = [r.opened_at for r in self.rounds if r.opened_at]
+            if opened:
+                self.first_offered_at = min(opened)
+        return self
 
     @model_validator(mode="after")
     def _backfill_first_user_review(self) -> "ProjectPlan":
@@ -1212,6 +1292,47 @@ def open_notes_for_you(plan: ProjectPlan) -> int:
     )
 
 
+def execution_blocked(surface: str, open_notes: int) -> int:
+    """§7.4's gate — **the rule, once** — as the count that motivates it.
+
+    ::
+
+        blocked == surface == "regular" and open_notes_for_you > 0
+
+    **Two conjuncts, and they now have two callers in two processes.** The rule
+    used to live entirely inside ``_plan_execution_blocked`` in the AGENT
+    process, which reads its count off the runner's synced ``meta.json``. That
+    is still a caller and still correct — the whole argument for each conjunct
+    is written out there and is not repeated here. What changed is that
+    ``create_chatroom`` now asks the same question SERVER-side, off the sidecar,
+    because the agent-side answer is structurally one turn stale:
+
+    * the snapshot the validator reads is frozen once per turn, deliberately, so
+      the retry loop has a fixed target to terminate against; and
+    * un-freezing it would not help, because the count travels to the runner as
+      a ``PROJECT_PLAN_STATE`` changelog entry applied through the runloop — and
+      a coordinator turn is holding the runloop lock while it files the very
+      notes that should stop it.
+
+    So on the one shape the gate exists for — a coordinator that files blocking
+    notes and emits ``create_room`` inside a single turn — the agent-side check
+    is blind by construction. Measured on ``onboard-angel-investor``: the turn
+    ran 12:00:08 → 12:06:02, two spec notes to the user were filed at 12:04:42
+    and 12:04:43, and ``create_room milestone-2-field-research`` passed at
+    12:06:02 against a snapshot that had counted zero six minutes earlier.
+
+    **The count is the parameter and not the plan**, because the two callers
+    hold different sources for it and neither can hold the other's: the agent
+    has ``Project.plan_open_notes`` (the projection) and the server has
+    ``open_notes_for_you(plan)`` (the sidecar it is derived from). Passing the
+    number in is what lets one rule serve both without either process learning
+    about the other's storage. The two sources are reconciled by test.
+    """
+    if surface != "regular":
+        return 0
+    return max(open_notes, 0)
+
+
 def section_changed(body: str, note: PlanNote) -> bool:
     """Does this proposal still make sense? A string comparison, not a merge
     trial (§3.3). False when the section is gone — that is ``section_missing``,
@@ -1249,10 +1370,13 @@ def section_changed(body: str, note: PlanNote) -> bool:
 
     **Trailing newlines are not an edit**, and the normalization is
     :func:`extent_key`'s rather than this function's — the proof lives beside
-    the splice that motivates it. Without it the go-note was unacceptable on
-    every project ever created: ``## Approval`` is last in the seed template, so
-    the base captured at project creation ends in one newline, and the extent
-    ends in two the moment the coordinator appends anything after it.
+    the splice that motivates it. The incident that bought it: while the confirm
+    note was a proposal against ``## Approval`` — last in the seed template — the
+    base captured at project creation ended in one newline and the extent ended
+    in two the moment the coordinator appended anything after it, so the note
+    that unblocks a project reported itself stale on every project ever created.
+    That note carries no base now, but the rule it forced is general and every
+    last-section proposal still depends on it.
 
     The guard below stays on the **raw** ``base_section``. ``""`` still means
     *nothing was captured*; ``extent_key("")`` is ``""`` either way, so
@@ -1895,6 +2019,44 @@ def _user_has_reviewed(plan: ProjectPlan) -> bool:
     return bool(plan.first_user_review_at)
 
 
+def _plan_was_offered(plan: ProjectPlan) -> bool:
+    """Has the coordinator ever put this plan **in front of** the user?
+
+    ``rounds`` is appended by :func:`submit_review` and by nothing else, so a
+    non-empty list means at least one review batch reached somebody's plate.
+    That is the whole of *"this document has been handed over"*.
+
+    **NOT :func:`_user_has_reviewed`, and the difference is the point.** That
+    one asks whether the user has ANSWERED; this one asks whether they were
+    ASKED. A plan may be accepted without either — the confirm row is
+    dismissible from the desk card and, until the coordinator sends its first
+    round, that row reads :data:`GO_NOTE_DRAFTING`, so taking it says *"start on
+    the draft as it stands"* rather than *"I have read this"*.
+
+    **Why this fact and not the review stamp**, on a server holding 17 accepted
+    plans: 11 of them carry a blank ``first_user_review_at`` — legacy stamps
+    predating the field, which
+    :meth:`ProjectPlan._backfill_first_user_review` cannot recover because their
+    rounds were opened by the keeper. Keying the lock on the review stamp would
+    have silently unlocked ten ratified plans mid-execution. Every one of those
+    11 has between one and nine recorded rounds, so ``rounds`` separates them
+    from the drafting case with nothing to migrate and no new field.
+
+    **Monotone, which is what makes it safe to gate a lock on.** ``_save``
+    trims ``rounds`` to ``MAX_ROUNDS`` from the FRONT, so a list that has been
+    non-empty never returns to empty and this predicate never goes back to
+    False. A lock that could disengage on a busy project is the failure
+    :func:`_stamp_user_review_locked` latches against, reached from the other
+    side.
+
+    Named rather than inlined for the reason :func:`_user_has_reviewed` is:
+    three callers — the lock, ``changed_since_acceptance``, and
+    :func:`resolve_note`'s review stamp — and a predicate with three copies has
+    three answers.
+    """
+    return bool(plan.first_offered_at)
+
+
 def _spec_is_locked(project: "Project", plan: ProjectPlan, *, by: str) -> bool:
     """Whether ``by``'s write must leave ``spec_digest`` where it found it.
 
@@ -1916,6 +2078,8 @@ def _spec_is_locked(project: "Project", plan: ProjectPlan, *, by: str) -> bool:
       changing that shape by name.
     * **``plan.accepted_at``** — the start line, and the only conjunct that has
       ever moved.
+    * **:func:`_plan_was_offered`** — the baseline's other half. See
+      *"ACCEPTANCE ALONE STOPPED MEANING RATIFIED"* below.
 
     **THE START LINE IS ACCEPTANCE, AND IT MOVED BACK HERE ON PURPOSE.** It
     briefly read ``accepted_at or _user_has_reviewed(plan)`` — the lock engaged
@@ -1951,6 +2115,37 @@ def _spec_is_locked(project: "Project", plan: ProjectPlan, *, by: str) -> bool:
     line the receipt design must not leak across: there IS a ratified baseline
     then, drift is the thing being measured, and the diff is the evidence that a
     change is bounded.
+
+    **ACCEPTANCE ALONE STOPPED MEANING RATIFIED, WHICH IS WHY THERE IS A FOURTH
+    CONJUNCT.** Every sentence above rests on *"there IS a ratified baseline
+    then"*, and that implication held while ``accepted_at`` could only be
+    stamped one way: the user dismissing a row that said *"I've drafted this and
+    I have nothing open on it. Have a read"*. The confirm row now has a second
+    wording (:data:`GO_NOTE_DRAFTING`, seeded before the coordinator has taken a
+    turn), and taking THAT one says *"start on the draft as it stands"*. It
+    releases the gate, it is the owner's call to make, and it ratifies nothing —
+    ``rounds`` is empty, ``first_user_review_at`` is blank and
+    ``owner_last_seen_revision`` is zero, because the document was never put in
+    front of anybody.
+
+    Refusing there costs exactly what the paragraph above says refusing costs
+    when no baseline exists, and it was measured: on ``onboard-angel-investor``
+    the user dismissed the drafting row 2m12s in, the coordinator's next two
+    turns of ordinary drafting were refused section by section, and what reached
+    the user was **17 open proposals** — hunk-by-hunk adjudication of a document
+    they had never opened, against a baseline they had never agreed to. The
+    coordinator then abandoned the draft and told them it "had a stale copy
+    locally".
+
+    So the third conjunct is split in two: ``accepted_at`` is still the start
+    line, and :func:`_plan_was_offered` is *"of a document they were shown"*. A
+    legacy plan has rounds and locks exactly as it did.
+
+    **IT IS STILL NOT :func:`_user_has_reviewed`**, and the ``chuswine-geo-b2b``
+    argument above is why. The question this gate asks has never been *"did the
+    user answer?"* — it is *"is there something for a diff to be a delta
+    against?"*, and a plan the coordinator has handed over and the user has
+    signed is that, whether or not they wrote back.
 
     **``phase == "executing"`` is still gone**, and its going is not a narrowing
     of AC-3.1: ``accepted_at`` implies ``executing``, so the conjunct was
@@ -1988,6 +2183,7 @@ def _spec_is_locked(project: "Project", plan: ProjectPlan, *, by: str) -> bool:
         by == keeper(project)
         and project.surface == "regular"
         and bool(plan.accepted_at)
+        and _plan_was_offered(plan)
     )
 
 
@@ -2001,11 +2197,11 @@ def _owes_receipt(project: "Project", plan: ProjectPlan, *, by: str) -> bool:
     that then goes nowhere, or a receipt filed on a write nobody was asked to
     justify, are the two shapes a second copy produces.
 
-    **THREE STATES, NOT TWO, AND THE MIDDLE ONE IS THIS PREDICATE.** It is
-    tempting to read this as :func:`_spec_is_locked`'s complement — same author,
-    same surface, other side of ``accepted_at`` — and that reading is wrong in
-    the direction that costs the most. A plan's life has three phases for a
-    keeper's spec write:
+    **FOUR STATES, AND THE RECEIPT IS ONLY THE SECOND.** It is tempting to read
+    this as :func:`_spec_is_locked`'s complement — same author, same surface,
+    other side of ``accepted_at`` — and that reading is wrong in the direction
+    that costs the most. A plan's life has four phases for a keeper's spec
+    write:
 
     * **drafting**, before the user has opened a single review round: writes
       land, and owe NOTHING. There is no reader for a receipt — the user has
@@ -2018,9 +2214,17 @@ def _owes_receipt(project: "Project", plan: ProjectPlan, *, by: str) -> bool:
       after the user's first round closed, 0 of them recorded anywhere — and it
       is the only window where a keeper's write changes a document the user has
       an opinion about but has not signed.
-    * **accepted**: :func:`_spec_is_locked`. Writes are refused and filed as
-      proposals with diffs, because there is finally a ratified baseline for a
-      diff to be a bounded delta against.
+    * **accepted, but never offered**: writes land, and owe NOTHING — the same
+      answer as *drafting*, because it is the same situation. The user
+      dismissed the confirm row while it still read :data:`GO_NOTE_DRAFTING`,
+      which releases the work and ratifies nothing; the coordinator is still
+      composing a first draft and the reader a receipt would be written for has
+      still not seen the document. This is the state that stopped the two
+      predicates being complements, and the gap is deliberate — see
+      :func:`_spec_is_locked`'s *"ACCEPTANCE ALONE STOPPED MEANING RATIFIED"*.
+    * **offered and accepted**: :func:`_spec_is_locked`. Writes are refused and
+      filed as proposals with diffs, because there is finally a ratified
+      baseline for a diff to be a bounded delta against.
 
     So ``_user_has_reviewed`` is the start line, exactly as it was when it
     gated the lock. **What changed is the outcome, not the trigger** — the same
@@ -2081,7 +2285,11 @@ def _write_refusal(project: "Project", *, by: str) -> str:
 
 
 def _spec_lock_refusal(
-    project: "Project", *, by: str, note_ids: Sequence[str]
+    project: "Project",
+    *,
+    by: str,
+    note_ids: Sequence[str],
+    relayered: Sequence[tuple[str, str, str]] = (),
 ) -> str:
     """M3's own refusal, with its remedy in it (AC-3.3).
 
@@ -2096,18 +2304,81 @@ def _spec_lock_refusal(
     reviewed this"*, on which *"it is accepted"* would have been a stated reason
     the model can see is untrue — and a ``403`` a model can disprove is one it
     argues with rather than obeys. :func:`_spec_is_locked` now engages on
-    ``accepted_at`` alone, so the unaccepted half of that flag became
-    unreachable: a parameter with one possible value, and a sentence behind it
+    ``accepted_at`` (with :func:`_plan_was_offered`), so the unaccepted half of
+    that flag became unreachable: a parameter with one possible value, and a sentence behind it
     that no caller can ever produce. Pre-acceptance there is no refusal to word
     — the write lands and files a receipt.
+
+    **``relayered`` LEADS when there is one, because it is the one cause this
+    refusal could not otherwise name.** Every other spec move is visible in the
+    notes: the rows carry the section and the diff, and a coordinator reading
+    them knows what it changed. A layer flip is not — the row that moved is
+    filtered out (:func:`_relayered`), so the model is handed note ids for
+    sections it did not think it was touching and a sentence about *"what this
+    plan says"* it cannot reconcile with a rewrite it believes was detail-layer
+    and free.
+
+    What it does next is bisect. On ``onboard-angel-investor`` that cost two
+    turns, 41 shell calls, $3.15 and 17 notes the user never asked for, and
+    ended with the coordinator telling them it *"had a stale copy locally"* — a
+    wrong diagnosis it had no evidence against. The remedy is one marker, so
+    the sentence names it.
     """
     ids = ", ".join(note_ids) or "a note"
+    cause = ""
+    if relayered:
+        # A parent's flip drags every child it contains, so the list can run
+        # long on a big section. The first rows are the ones carrying the
+        # remedy — `_relayered` reports in document order, so the parent leads —
+        # and a sentence naming twelve slugs is one a model skims.
+        shown, rest = relayered[:3], len(relayered) - 3
+        moved = "; ".join(
+            f"`{slug}` from `{before}` to `{after}`" for slug, before, after in shown
+        )
+        if rest > 0:
+            moved += f" (and {rest} nested under it)"
+        cause = (
+            f" THE CAUSE IS A LAYER CHANGE, not the prose: {moved}. The "
+            f"`<!-- layer: ... -->` marker lives in the heading and is hashed, "
+            f"so a rewrite that drops it moves the spec however little else "
+            f"changed. Put the marker back on that heading and re-run the same "
+            f"write — it will land, and these notes become unnecessary."
+        )
     return (
         f"@{by} may not change what this plan says — it is accepted, and the "
         f"user decides what it says. Ticking a checkbox or editing an HTML "
         f"comment still applies. Your text is filed as {ids} for the user to "
-        f"accept in one click; say why in `user-communication`."
+        f"accept in one click; say why in `user-communication`.{cause}"
     )
+
+
+def _relayered(before: str, after: str) -> list[tuple[str, str, str]]:
+    """Sections whose resolved layer MOVED — ``[(slug, before, after)]``.
+
+    The one refusal cause that is invisible in the rows it produces.
+    ``_layer_manifest`` is hashed into ``spec_digest``, so flipping a heading's
+    ``<!-- layer: … -->`` marker is a spec move however little prose changed;
+    but :func:`_rows_worth_showing` decides what the user sees by looking the
+    row's slug up in the **stored** body, where the section still carries its
+    old layer. A detail section that just became spec is therefore dropped from
+    the notes, and the surviving rows are whatever its children looked like
+    after the rewrite — frequently *"could not add the section …"* naming slugs
+    the document has never had.
+
+    Reported rather than fixed, and the split is deliberate: the filter's own
+    argument is still right (reading layers out of the incoming text would let a
+    keeper suppress its own note by marking the section ``detail`` in the very
+    write being filtered), and the AC-3.3 invariant that a refusal always files
+    *something* is untouched. What changes is only that the refusal now says the
+    word ``layer``.
+
+    Restricted to slugs present on BOTH sides: a section that appeared or
+    vanished has no layer to have moved, and its row already names it.
+    """
+    a, b = section_layers(before), section_layers(after)
+    return [
+        (slug, a[slug], b[slug]) for slug in a if slug in b and a[slug] != b[slug]
+    ]
 
 
 def _coverage_regressed(before: str, after: str) -> bool:
@@ -2231,108 +2502,19 @@ def _prepare_locked(
                 f"heading at the same level"
             )
 
-    # **THE GO-NOTE'S SECTION SURVIVES WHILE THE GO-NOTE IS OPEN.** A proposal
-    # is located by heading, so a coordinator that rewrites the plan without
-    # ``## Approval`` — entirely legitimate under *"this is a starting document,
-    # not a schema"* — leaves the one note that unblocks its own project with
-    # nothing to apply to, and no surface anywhere says why the project stopped.
+    # **AND NO WRITE PUTS TWO HEADINGS UNDER ONE SLUG** — asked of every
+    # section, at every phase.
     #
-    # **Server-enforced, deliberately, and this is the whole reason it is here
-    # and not in the prompt.** The go-note replaced an Approve button precisely
-    # so the guarantee would not depend on an agent remembering a rule; a
-    # heading a coordinator can silently delete would hand that dependency
-    # straight back.
-    #
-    # Keyed on the NOTE'S OWN ``section``, not on the constant: a plan whose
-    # go-note points somewhere else (one seeded against a retitled section) is
-    # protected where it actually lives.
-    #
-    # It refuses only a write that REMOVES a section that is there now. A plan
-    # whose heading is already gone is already stuck, and refusing every
-    # subsequent write would take away the one move that could restore it.
-    go = open_go_note(plan)
-    if go is not None and go.section:
-        before = _current_section(body, go.section)
-        after = _current_section(spliced, go.section)
-        if before is not None and after is None:
-            raise PlanInputError(
-                f"this write removes the {go.section!r} section, and note "
-                f"{go.id} — the one the user accepts to approve this plan — "
-                f"proposes a replacement for it. Keep its heading line "
-                f"({APPROVAL_HEADING!r} unless you retitled it); rewrite "
-                f"anything else you like."
-            )
-        # **AND NOBODY BUT THE OWNER PUTS WORDS IN IT.** Keeping the heading is
-        # not enough on its own: the section's *text* is the sentence the
-        # coordinator is told to read as its go signal, and a keeper who can
-        # write "User approves the plan." into it is a keeper who can forge the
-        # signal it obeys.
-        #
-        # It would not actually start any work — the gate counts open notes and
-        # is indifferent to what the document says — so this is not a hole in
-        # the halt. It is a hole in the plan's honesty: the user opens PLAN.md
-        # and reads that they approved something they did not, and the desk
-        # agrees with the document.
-        #
-        # **KEYED ON THE EDIT, NOT ON THE SPLICED BODY**, and the difference is
-        # a false positive that fires on almost every write. A section's extent
-        # runs to the start of the next one, so the LAST section's text includes
-        # everything after it — and ``## Approval`` is last in the seed
-        # template. Appending any new section therefore shortens its extent
-        # without touching a word of it, and a comparison of before-and-after
-        # text would refuse a coordinator for adding `## Risks`.
-        #
-        # Comparing the edit's own replacement text against what the section
-        # says asks the question that was meant: *are you writing THIS section?*
-        # A whole-document rewrite that carries ``## Approval`` through
-        # unaltered still passes, which is the case the text comparison was
-        # there to protect.
-        if by != OWNER:
-            for edit in edits:
-                if edit.section != go.section:
-                    continue
-                current = _current_section(body, edit.section)
-                if current is not None and edit.text != current:
-                    raise PlanInputError(
-                        f"the {go.section!r} section is the user's to write while "
-                        f"note {go.id} is open — accepting that note is what "
-                        f"fills it in, and it is the signal that work may start. "
-                        f"Leave its text exactly as it stands; every other "
-                        f"section is yours."
-                    )
-            # **AND NOT THROUGH THE NEXT SECTION ALONG EITHER.** The loop above
-            # asks *"are you writing THIS section?"*, and a single heading line
-            # is all it takes for the answer to be no. A replacement for any
-            # OTHER section may carry its own ``## Approval`` inside it, and
-            # ``section_extent`` resolves a slug to the FIRST match — so the
-            # injected copy becomes ``approval``, the real one is demoted to
-            # ``approval-2``, and :func:`approval_state` reads the forged text.
-            # That is the same forgery the loop above refuses, reached by
-            # spelling it into a neighbour, and it lands on the one sentence the
-            # coordinator's contract tells it to obey.
-            #
-            # Asked of the DOCUMENT rather than of the edits, because the edits
-            # are what the trick hides in: no edit names ``approval``, and the
-            # spliced body is the only place the injected heading is visible.
-            # :func:`_section_prose` is what makes that safe to compare — it
-            # stops at the first heading that follows, so neither of the two
-            # ways an unrelated write shortens the last section's extent (a new
-            # ``##`` after it, or a create appended INTO it) reads as a rewrite.
-            # A legitimate whole-document rewrite that carries ``## Approval``
-            # through unaltered still passes.
-            if _section_prose(spliced, go.section) != _section_prose(body, go.section):
-                raise PlanInputError(
-                    f"this write changes what the {go.section!r} section says "
-                    f"while note {go.id} — the one the user accepts to approve "
-                    f"this plan — is open. That section is the user's alone, and "
-                    f"a second {APPROVAL_HEADING!r} heading inside another "
-                    f"section rewrites it just as surely as editing it does. "
-                    f"Keep one, and leave its text as it stands."
-                )
-
-    # **AND NO WRITE PUTS TWO HEADINGS UNDER ONE SLUG**, which is the general
-    # form of the arm directly above — asked of every section, at every phase,
-    # rather than of the go-note's own while that note happens to be open.
+    # **IT SURVIVED THE REMOVAL OF ``## Approval`` AND IS NOT A LEFTOVER OF IT.**
+    # The go-note used to be a proposal against that section, which gave this
+    # module two further arms here: keep the heading alive while the note is
+    # open, and refuse a second ``## Approval`` smuggled inside another
+    # section's replacement. Both were about ONE section's role as a diff
+    # target, and the confirm note carries no diff now, so both are gone. This
+    # one is about the id space every section shares — the approval incident
+    # below was its OCCASION, not its subject — and deleting it because its
+    # famous example retired would leave `## Goal` shadowable by exactly the
+    # copy-paste that started this.
     #
     # The two guards on each edit ask about its FIRST line: does it carry a
     # heading (`drops_heading`), and is that heading at the section's own level
@@ -2437,6 +2619,7 @@ def _prepare_locked(
                     StaleSection(section=slug, base=before, current=before, text=after)
                     for slug, before, after in _pair_renamed_rows(body, cleaned, changes)
                 ],
+                relayered=_relayered(body, cleaned),
             ),
             body=body,
         )
@@ -2450,9 +2633,17 @@ def _prepare_locked(
     # nobody agreed to leaves the plan in a state nobody designed.
     #
     # **It re-uses the arm above's predicate exactly, and deliberately so.** The
-    # digest test is the same expression on the same two values, and
-    # `_owes_receipt` is `_spec_is_locked`'s complement on the other three
-    # conjuncts, so no write can fall between them and none can satisfy both.
+    # digest test is the same expression on the same two values, and no write
+    # can satisfy both predicates — `_owes_receipt` requires `not accepted_at`
+    # and the lock requires it.
+    #
+    # **They are no longer complements, and the gap between them is deliberate.**
+    # The lock grew a fourth conjunct (`_plan_was_offered`), so an ACCEPTED plan
+    # the coordinator has never put in front of the user satisfies neither: the
+    # keeper's spec write lands, and owes nothing. That is not an oversight in
+    # this expression — it is the drafting phase, reached by a user who released
+    # work early rather than by one who has not answered yet, and the keeper
+    # still owns the document in both.
     # `_coverage_regressed` rides along for the same reason it does up there: a
     # milestone edit that drops the work behind a criterion changes what the
     # user is being asked to say yes to, and it is the one detail-layer edit
@@ -2745,9 +2936,10 @@ def _supersede_prior_locked(plan: ProjectPlan, note: PlanNote) -> None:
     (``routes/project_plans.py``) minus its ``status == "open"`` clause on the
     delete arm, which is redundant here — the loop only looks at open notes.
 
-    The go-note is exempt (``bootstrap``): it closes on ``apply`` and on
-    nothing else (:func:`_refuse_go_note_close`), and it is unique per plan
-    anyway, so nothing can legitimately replace it.
+    The confirm note is exempt (``bootstrap``): it closes on ``dismiss`` and on
+    nothing else (:func:`_refuse_go_note_close`), it carries no proposal so the
+    guard above has already returned, and at most one is ever open at a time, so
+    nothing can legitimately replace it.
     """
     if not (note.proposal or note.proposes_delete):
         return
@@ -2928,7 +3120,7 @@ def _reply_closes_parent(
       the second is a weaker fact and it would erase which decision was made.
     * **never the go-note.** :func:`_refuse_go_note_close` carries the argument
       at length — every way of closing it releases the execution gate and only
-      ``apply`` means yes, so typing *"what about the auth milestone?"* must not
+      ``dismiss`` means yes, so typing *"what about the auth milestone?"* must not
       start the work being questioned. The outgoing reply is filed either way;
       only the parent's status differs.
     * **only someone the note is addressed to**, which is :func:`resolve_note`'s
@@ -3464,6 +3656,7 @@ async def apply_edits(
                     project,
                     by=by,
                     note_ids=result.note_ids,
+                    relayered=result.relayered,
                 ),
                 note_ids=result.note_ids,
                 revision=result.revision,
@@ -3637,9 +3830,36 @@ def note_is_deviation(
     offset spelling and the same field widths — lexicographic order and
     chronological order are the same order. Parsing here would cost a
     ``datetime`` per note per read and buy nothing.
+
+    **``first_user_review_at`` IS A CONJUNCT, BECAUSE A DEPARTURE FROM A
+    CONTRACT NEEDS A CONTRACT THE USER ACTUALLY SAW.** Acceptance alone does not
+    establish one: the confirm note is dismissible from the desk card, so a user
+    may release the gate — legitimately, it is their call — without ever opening
+    the document. On ``onboard-angel-investor`` that is exactly what happened,
+    and the coordinator's very next write, the fold-in of the roster consult its
+    own contract told it to run, came back to the user as a red *"off-contract
+    — your call"* on a plan they had never read. The alarm was true about the
+    timestamps and false about everything it meant.
+
+    **It narrows the WORD, never the LOCK.** :func:`_spec_is_locked` keys on
+    ``accepted_at`` and is untouched, so the keeper still may not write the spec
+    and :func:`_file_spec_lock_locked` still files its text with the proposal
+    and the base the user accepts in one click. What changes is only that
+    :func:`note_kind` falls through to ``"proposal"`` — which is what such a row
+    is — and that :func:`_open_deviation` stops reddening a card about a
+    contract that was never handed over.
+
+    **The masking this could have caused is closed at the stamp, not here.**
+    ``first_user_review_at`` used to move only inside :func:`submit_review`, so
+    a user who only ever used the single-note resolve door would never set it
+    and would never see a deviation again for the life of the project. Both
+    acceptance doors now stamp it when the confirm note they are closing had
+    actually been offered (``plan.rounds`` non-empty) — see
+    :func:`_stamp_user_review_locked`.
     """
     return (
         bool(plan.first_accepted_at)
+        and bool(plan.first_user_review_at)
         and note.at > plan.first_accepted_at
         and note.to == OWNER
         and note.by == keeper(project)
@@ -4132,6 +4352,14 @@ async def add_note(
                 _note(plan, by, "resolve", section=parent.section,
                       detail=f"{parent.id} answered")
                 _auto_close_rounds(plan)
+                # **THE THIRD DOOR ONTO THE EXECUTION GATE.** Filing a note only
+                # ever RAISES `open_notes_for_you`, so this is the one branch of
+                # `add_note` that can lower it: the owner answering with
+                # `--reply-to` closes a `to == user` parent, and if it was the
+                # last one the gate goes down on an unaccepted plan. Hence the
+                # call is in here with the close and not at the function's end,
+                # where it would file a confirm note on plans no close touched.
+                _hold_gate_locked(project, plan)
             _save(project, ctx, plan)
         return ids
 
@@ -4637,6 +4865,7 @@ async def resolve_note(
     by: str,
     reason: str = "",
     force: bool = False,
+    acting_agent: str = "",
 ) -> WriteResult:
     """The status ladder, **server-side, always** (constraint C1).
 
@@ -4673,6 +4902,14 @@ async def resolve_note(
     Applying after acceptance is never blocked. It makes
     ``changed_since_acceptance`` true and — because it resolves a note — may be
     what *releases* the execution gate (§7.4).
+
+    ``acting_agent`` is **how the owner's credential got here** and is empty for
+    a real user JWT. It is not a second ``by``: ``by`` stays ``OWNER`` when it is
+    set, so every ownership rule above reads exactly as it did. Two things need
+    it and nothing else does — :func:`_refuse_presigned_go_note`, which refuses
+    the one act a borrowed hand must not make, and ``accepted_via``, which said
+    ``"owner"`` about an assistant's command. See
+    :class:`~clawmeets.server.routes.project_plans.PlanIdentity`.
     """
     if action not in RESOLVE_ACTIONS:
         raise PlanInputError(f"Unknown action {action!r}")
@@ -4680,6 +4917,21 @@ async def resolve_note(
     async with _lock:
         plan = _load(project, ctx)
         note = _find_note(plan, nid)
+
+        # **FIRST, ABOVE EVERY OTHER REFUSAL ON THIS ROUTE.** The confirm note
+        # carries no proposal, so an `apply` on it would otherwise come back as
+        # *"carries no proposal"* — true, and useless: it names a missing field
+        # where the caller needs to be told which verb this note takes and what
+        # that verb does. One list, one permitted verb.
+        _refuse_go_note_close(note, action, by=by)
+        # **AND WHOSE HAND, which `by` alone cannot say.** The guard above asks
+        # whether the caller may decide; this one asks whether the caller IS the
+        # decider or is borrowing their credential. Kept separate because the
+        # two questions have different inputs and only this door carries the
+        # second one — `submit_review` calls it from its own pre-pass.
+        _refuse_presigned_go_note(
+            project, plan, note, action, acting_agent=acting_agent
+        )
 
         if action in ("apply", "reject"):
             _refuse_non_owner_decision(by, action)
@@ -4696,7 +4948,6 @@ async def resolve_note(
             raise PlanForbiddenError(f"Note {nid} is not addressed to @{by}")
 
         if action != "apply":
-            _refuse_go_note_close(note, action)
             _refuse_unsent_self_close(plan, note, by=by)
 
         result = WriteResult(ok=True, revision=plan.revision)
@@ -4776,36 +5027,95 @@ async def resolve_note(
             # no-op that passes a careless review.
             note.applied_text = note.proposal
             note.proposal = ""
-            if (note.bootstrap or plan.accepted_at) and result.ok:
-                # THE CLI HALF OF ACCEPTANCE. `clawmeets plan resolve <id>
-                # --apply --as-user` is what replaced `plan approve`, so this
-                # arm and `submit_review`'s accept arm are the only two ways a
-                # plan is ever accepted — and both stamp through one helper, off
-                # `prepared.body`, so the digest is of the text that was
-                # approved and not of the text that preceded it.
+            if plan.accepted_at and result.ok:
+                # **RE-STAMPING, AND IT IS THE SAME ACT.** Applying a proposal
+                # is the owner putting their name to a piece of text, and on an
+                # already-accepted plan that is precisely a fresh approval of
+                # the document it produces. Without it `accepted_revision` would
+                # be frozen at whatever revision the confirm note closed on, and
+                # `changed_since_acceptance` would go true on the owner's own
+                # applied deviation and stay true for the life of the project —
+                # an amber warning, in the coordinator's prompt every turn,
+                # about changes the owner themselves signed off on.
                 #
-                # **`or plan.accepted_at` — RE-STAMPING, and it is the same act.**
-                # The bootstrap arm is the FIRST acceptance; this one is every
-                # one after it. Applying a proposal is the owner putting their
-                # name to a piece of text, and on an already-accepted plan that
-                # is precisely a fresh approval of the document it produces.
-                # Without it `accepted_revision` would be frozen at whatever
-                # revision the go-note closed on, and `changed_since_acceptance`
-                # would go true on the owner's own applied deviation and stay
-                # true for the life of the project — an amber warning, in the
-                # coordinator's prompt every turn, about changes the owner
-                # themselves signed off on.
+                # **THE `note.bootstrap` CONJUNCT IS GONE BECAUSE IT IS NOW
+                # UNREACHABLE, not because first acceptance stopped mattering.**
+                # `apply` used to be the confirm note's one permitted verb and
+                # therefore the CLI half of FIRST acceptance; `dismiss` is that
+                # verb now, and it stamps at the bottom of this function.
+                # Leaving the conjunct here would be a second acceptance trigger
+                # behind a guard that always refuses first.
                 #
                 # **No `by == OWNER` conjunct, and that is deliberate.** The
                 # guard at the top of this function is `may_decide`, so `by` is
                 # the owner by the time control reaches here; restating the
                 # comparison would give the ownership rule the second home
                 # :func:`may_decide` exists to prevent.
-                _stamp_acceptance_locked(plan, body=prepared.body, by=by)
+                _stamp_acceptance_locked(
+                    plan, body=prepared.body, by=by, acting_agent=acting_agent
+                )
 
+        # **THE CLI HALF OF ACCEPTANCE, AND IT IS A DISMISS NOW.** The only
+        # close `_refuse_go_note_close` permits on the confirm note is this one,
+        # so reaching here with `note.bootstrap` set means the owner said yes.
+        # Off the STORED body, unlike `submit_review`'s twin: this path writes
+        # no bytes, so the document as it stands is the document that was
+        # approved.
+        #
+        # `may_decide` does not guard `dismiss` — a note's own addressee may
+        # close its own — but the confirm note is addressed to the user and to
+        # nobody else, and `may_write` cannot reach it either: the branch above
+        # admits a writer only when `note.to != by`, and here it is `by`. So the
+        # owner is the only identity that can arrive at this line.
+        # **`status == "open"` IS THE WRITE-ONCE GUARD, and it is not
+        # defensive.** This route does not refuse a close on an
+        # already-closed note — `_close_note` just rewrites the same three
+        # fields — so a second `--dismiss` on the confirm note reached this
+        # stamp and moved `accepted_at`, `accepted_revision` and
+        # `accepted_spec_digest` forward onto whatever the document said by
+        # then. That silently clears a live *"the plan changed since
+        # approval"* warning, which is the one thing acceptance stamps exist
+        # to raise. `first_accepted_at` was already safe; these three were not.
+        if action == "dismiss" and note.bootstrap and note.status == "open":
+            _stamp_acceptance_locked(
+                plan, body=_read_body(project, ctx), by=by,
+                acting_agent=acting_agent,
+            )
+            # **AND WHETHER THAT DISMISS WAS ALSO A REVIEW, WHICH IT IS NOT
+            # ALWAYS.** `submit_review`'s twin stamps unconditionally and is
+            # right to: an owner composing a batch is an owner working in the
+            # document. This door is the single-row dismiss on the desk card,
+            # which reaches the confirm note without opening the plan at all —
+            # so the fact it records has to be the one the row was offering.
+            #
+            # `plan.rounds` is that fact, and it is the same one the wording
+            # flip keys on: empty means the coordinator has never put this plan
+            # in front of the user, so what was dismissed said `GO_NOTE_DRAFTING`
+            # — *"start on the draft as it stands"*, an instruction, not a
+            # verdict on a document they read. Non-empty means a round went out
+            # and the row had swapped to `GO_NOTE_COMMENT`, which is the confirm
+            # and IS the review.
+            #
+            # Without this the acceptance and the review would latch together on
+            # the one path where they genuinely come apart, and
+            # `note_is_deviation`'s new conjunct would buy nothing.
+            if _plan_was_offered(plan):
+                _stamp_user_review_locked(plan, by=by)
         _close_note(note, status=_STATUS_FOR[action], by=by, reason=reason)
         _note(plan, by, "resolve", section=note.section, detail=f"{nid} {action}")
         _auto_close_rounds(plan)
+        # **THE SECOND DOOR ONTO THE EXECUTION GATE, and it never asked.** This
+        # route closes exactly one note, so it is the shortest path there is to
+        # an unaccepted plan with nothing open for the user: retire the confirm
+        # with a question round, then `plan note --dismiss` that question, and
+        # `open_notes_for_you` — the whole of `_plan_execution_blocked` — reads
+        # zero on a plan nobody confirmed. Only `submit_review` used to restore
+        # the invariant, and only on a keeper's send.
+        #
+        # Below the close, so the count it reads is the one this call leaves
+        # behind, and below the acceptance stamp above, so the owner's `dismiss`
+        # of the confirm note is not answered with a fresh confirm note.
+        _hold_gate_locked(project, plan)
         _save(project, ctx, plan)
         return result
 
@@ -4826,12 +5136,16 @@ def _close_note(note: PlanNote, *, status: str, by: str, reason: str = "") -> No
 
 
 def open_go_note(plan: ProjectPlan) -> PlanNote | None:
-    """The open go-note, if this plan has one. At most one ever exists.
+    """The open confirm note, if this plan has one. **At most one is ever open**
+    — which is a weaker claim than the *"exactly one per plan"* this used to
+    make, and the weakening is :func:`_sync_go_note_locked`: a round that
+    carries questions retires the note and a later quiet round files a fresh
+    one, so a plan's history may hold several. Only the open one is ever asked
+    for, and acceptance is still one-way.
 
-    Public because three different questions are answered with it — may this
-    write drop ``## Approval``, does this reply close its parent, and is there
-    already a go-note to seed — and a predicate with three copies has three
-    answers.
+    Public because three different questions are answered with it — does this
+    reply close its parent, is there already one to seed, and does this round
+    need one — and a predicate with three copies has three answers.
     """
     return next((n for n in plan.notes if n.bootstrap and n.status == "open"), None)
 
@@ -4898,16 +5212,16 @@ def _refuse_unsent_self_close(plan: ProjectPlan, note: PlanNote, *, by: str) -> 
     )
 
 
-def _refuse_go_note_close(note: PlanNote, verb: str) -> None:
-    """**The go-note closes on ``apply`` and on nothing else.**
+def _refuse_go_note_close(note: PlanNote, verb: str, *, by: str = OWNER) -> None:
+    """**The go-note closes on ``dismiss`` and on nothing else.**
 
-    The sibling of the reply exemption in :func:`submit_review`, and it exists
-    for the identical reason. The execution gate counts notes that are OPEN, so
-    *every* way of closing the go-note releases it — and only one of them means
-    the user said yes. ``reject`` and ``dismiss`` would leave the plan
-    unaccepted **and** unblocked: the coordinator would start executing the very
-    plan the user had just turned down, which is the precise outcome the go-note
-    exists to make impossible.
+    The sibling of the reply exemption in :func:`_reply_closes_parent`, and it
+    exists for the identical reason. The execution gate counts notes that are
+    OPEN, so *every* way of closing this note releases it — and only one of them
+    means the user said yes. A ``reject`` would leave the plan unapproved **and**
+    unblocked: the coordinator would start executing the very plan the user had
+    just turned down, which is the precise outcome this note exists to make
+    impossible. So would ``answered``, a supersede and a fold.
 
     So the refusal is not a policy about what users may feel — it is the gate
     keeping its shape. Rejecting a plan is a real thing to want, and the act
@@ -4915,66 +5229,159 @@ def _refuse_go_note_close(note: PlanNote, verb: str) -> None:
     revision, and it leaves the gate up while that happens. What has no
     coherent meaning is closing the gate to signal disapproval.
 
-    Called from the two paths that can close a note by id — :func:`resolve_note`
-    and :func:`submit_review` — and from nowhere else, because a predicate with
-    two copies has two answers.
+    **THE PERMITTED VERB USED TO BE ``apply``, AND THE INVERSION IS THE WHOLE
+    CHANGE.** While the note was a proposal against ``## Approval``, saying yes
+    meant applying a diff, and ``dismiss`` was refused here on the grounds that
+    it released the gate without writing the approval. There is no section and
+    no diff now, so there is nothing for an apply to land and ``dismiss`` — the
+    verb already on every other row, meaning *"I'm not acting on this"* — is the
+    only close the row offers. What keeps *"no"* expressible is unchanged and is
+    the reason this guard still has a list to refuse: replying is how you turn a
+    plan down, and a reply leaves the gate up.
+
+    ``accept`` is on the refused list even though it can no longer write
+    anything: a proposal-less accept would close the note ``applied`` and
+    release the gate while :func:`_stamp_acceptance_locked` — which now hangs
+    off the dismiss — never ran. That is the *"approved plan that says it is
+    not"* failure one door over, and the old
+    ``_refuse_unapprovable_go_note_accept`` existed for exactly it. Naming the
+    verb here retires that function rather than the rule it carried.
+
+    ``by`` defaults to :data:`OWNER` so a caller that has already established
+    the identity — or is asking purely about the verb — reads unchanged. Both
+    live call sites pass it.
+
+    Called from the two paths that can close a note by id —
+    :func:`resolve_note` and :func:`submit_review` — and from nowhere else,
+    because a predicate with two copies has two answers.
     """
-    if note.bootstrap:
+    if note.bootstrap and verb == "dismiss" and not may_decide(by):
+        # **AND IT IS THE OWNER'S ALONE**, which `dismiss` does not otherwise
+        # guarantee: `dismiss` is a REPORT rather than a decision everywhere
+        # else, so `resolve_note` lets a note's addressee — or any writer —
+        # close one, and `submit_review` deliberately leaves it outside the
+        # ownership pass. On this note the report IS the decision: it stamps the
+        # acceptance and releases the coordinator.
+        #
+        # It was covered by accident before this line existed. The confirm note
+        # is never carried in a review batch (`pending_notes` excludes it), so
+        # `note_was_sent` is always false for it and `_refuse_unsent_self_close`
+        # caught the keeper on the "you wrote it and it has not been sent" arm.
+        # That is a true sentence about the wrong rule, and it would stop being
+        # true the day anything sent the note.
+        raise PlanForbiddenError(
+            f"@{by} may not dismiss the confirm note — dismissing it is how the "
+            f"user approves this plan, and approving it is theirs alone. Use "
+            f"`clawmeets plan note --to user` if you want to tell them "
+            f"something about it."
+        )
+    if note.bootstrap and verb != "dismiss":
         raise PlanConflictError(
-            f"The go-note is the plan's execution gate, not a proposal to "
-            f"{verb} — accepting it is the only act that closes it. Reply to "
-            f"it to ask for changes: the coordinator gets the question and the "
-            f"gate stays up while the plan is revised."
+            f"The confirm note is the plan's execution gate, not a proposal to "
+            f"{verb} — dismissing it is the only act that closes it, and that "
+            f"is what starts the work. Reply to it to ask for changes: the "
+            f"coordinator gets the question and the gate stays up while the "
+            f"plan is revised."
         )
 
 
-def _refuse_unapprovable_go_note_accept(
-    note: PlanNote, edit: SectionEdit | None
+def _refuse_presigned_go_note(
+    project: "Project",
+    plan: ProjectPlan,
+    note: PlanNote,
+    verb: str,
+    *,
+    acting_agent: str,
 ) -> None:
-    """**Accepting the go-note releases the execution gate, so the accept has to
-    actually write the approval.**
+    """**The keeper may not approve a plan the user has never been shown.**
+    Raise, or return.
 
-    The sibling of :func:`_refuse_go_note_close`, and the same argument one step
-    further in. That guard covers the closes that obviously are not approval —
-    ``reject``, ``dismiss``, a supersede, a fold. This one covers the close that
-    LOOKS like approval and is not: the accept arm closes the note ``applied``
-    and stamps ``accepted_at`` off THE ROW BEING SUBMITTED rather than off its
-    text landing, so an accept that leaves ``## Approval`` alone comes out with
-    the gate released, the coordinator dispatched, and the document still
-    reading *"_Not yet approved._"* — a sidecar that says the user approved a
-    plan they did not.
+    The credential-layer sibling of :func:`_refuse_go_note_close`'s ownership
+    arm. That one asks *may this identity decide?* and answers it with
+    :func:`may_decide`. This one asks a question ``by`` cannot carry — *is this
+    the decider, or the decider's assistant holding their credential?* — and it
+    is a separate function because it takes a separate input: the acting agent,
+    which only the plan route resolves and only two doors pass on.
 
-    **ASKED OF THE DERIVED WRITE, WHICH IS WHY IT STILL EXISTS.** It used to ask
-    the row's shape — *does this row name a section?* — which was the same
-    question while a section-less accept wrote nothing. :func:`_edit_for_row`
-    now answers such a row from its note, so the go-note's canonical
-    ``{"kind": "accept", "note_id": ...}`` writes ``## Approval`` and walks
-    straight through here. That repair did NOT make this guard redundant, and
-    keeping it is not defensiveness about a state that cannot happen: the row
-    shape it used to test never covered ``{"kind": "accept", "note_id": <go>,
-    "section": "goal", ...}``, which named A section, passed, wrote ``goal``,
-    and stamped the plan accepted with the approval untouched. One rule over the
-    write catches that, the empty derivation, and anything later that stops
-    producing one — where the old row-shaped rule caught exactly one of the
-    three.
+    **THE INCIDENT, and why the two existing refusals did not fire.** On
+    ``onboard-angel-investor`` the coordinator ran ``clawmeets plan resolve
+    --dismiss --as-user`` against the confirm note at 11:56:32, two seconds
+    after its own plan write, inside its own turn — and eight minutes before it
+    first offered the plan. Both of the guards that exist for this are keyed on
+    the caller's NAME, and ``resolve_user_from_credential`` had already rewritten
+    that to ``"user"``:
 
-    No shipped client loses anything, and one gains. The browser's ``acceptRow``
-    copies ``note.section`` onto the row, so its Accept has always carried
-    ``approval``; the CLI approves through ``plan resolve --apply``, which is
-    not this door at all.
+    * :func:`_refuse_go_note_close` — *"dismissing it is how the user approves
+      this plan, and approving it is theirs alone"*; and
+    * :func:`_refuse_unsent_self_close` — *"you wrote it, it is addressed to the
+      user, and it has not been sent yet"*, which covers the confirm note by
+      construction because :func:`pending_notes` never carries it.
+
+    So this is not a new policy. It is the rule those two already state, asked
+    of the credential instead of the name.
+
+    **THREE CONJUNCTS, AND THE THIRD IS WHAT KEEPS THE DOOR OPEN.**
+
+    ``acting_agent == keeper(project)`` — not *any* assistant. The conflict this
+    refuses is precisely the keeper approving its own draft; an owner's
+    assistant relaying a decision on a project it does not coordinate is doing
+    the job ``--as-user`` exists for.
+
+    ``not _plan_was_offered(plan)`` — **the narrow version, deliberately.**
+    Before the first round the row reads :data:`GO_NOTE_DRAFTING` and taking it
+    means *"start on the draft as it stands"*; a plan that has never been put in
+    front of the user cannot be a plan they meaningfully approved. Once the
+    coordinator has sent its review, the document is on the user's desk and the
+    assistant relaying *"they said approve it"* is a relay again — so this
+    refusal lifts by itself and nothing legitimate is permanently lost. The
+    wider reading (refuse the coordinating assistant always) would block that
+    relay, which is a real thing owners ask for.
+
+    ``verb == "dismiss"`` — the only close the confirm note takes at all
+    (:func:`_refuse_go_note_close` refuses the rest by name), and the one that
+    stamps the acceptance.
+
+    **What the keeper loses is nothing it needs.** Before the plan is offered
+    the spec lock keeps the pen with the keeper — :func:`_spec_is_locked` is
+    False for it — so it can still write, restructure and re-draft the document
+    freely. The single act taken away is putting the owner's name to it.
+
+    The remedy is named because a refusal that is a dead end is how an agent
+    retries forever: send the round, and let the user take the row.
     """
-    if not note.bootstrap:
+    if not note.bootstrap or verb != "dismiss" or not acting_agent:
         return
-    if edit is not None and edit.section == note.section:
+    if acting_agent != keeper(project) or _plan_was_offered(plan):
         return
-    raise PlanConflictError(
-        f"This accept does not write `{note.section}`, so the plan would be "
-        "marked approved with the approval section unchanged — and accepting "
-        "the go-note is what releases the execution gate. Send the accept with "
-        "no section so the note's own proposal is applied, or stage the row "
-        "with the approval section and text, so the document says what the "
-        "gate says."
+    raise PlanForbiddenError(
+        f"@{acting_agent} may not dismiss the confirm note on a plan it "
+        f"drafted and has never sent. Dismissing it is how the user approves "
+        f"this plan, and this plan has not been in front of them — you are the "
+        f"keeper holding their credential, which is the one hand that cannot "
+        f"make this decision. Send the round (`clawmeets plan review`) and let "
+        f"them take the row; until then the document is still yours to write."
     )
+
+
+def _stamp_offered_locked(plan: ProjectPlan) -> None:
+    """Latch :attr:`ProjectPlan.first_offered_at` — the spec lock's other half.
+    **Idempotent, and it never moves once set.**
+
+    Takes no ``by``: any round means this document has been in front of the
+    user, whoever opened it (:func:`_plan_was_offered`).
+
+    **Called ABOVE the projection, and that placement is the whole of it.**
+    :func:`_open_round_locked` runs in step 5, below the append that carries
+    this batch's messages, so a predicate derived from ``rounds`` reads False
+    for the ``plan_state_spec`` those messages ride with — and the coordinator
+    turn they wake would be told it is still the document's writer during the
+    very batch that hands the document over. Same hazard, same fix and same
+    argument as :func:`_stamp_user_review_locked` two functions down; that one
+    states it from the other side.
+    """
+    if plan.first_offered_at:
+        return
+    plan.first_offered_at = _now()
 
 
 def _stamp_user_review_locked(plan: ProjectPlan, *, by: str) -> None:
@@ -5021,7 +5428,9 @@ def _stamp_owner_seen_locked(
     plan.owner_last_seen_revision = plan.revision
 
 
-def _stamp_acceptance_locked(plan: ProjectPlan, *, body: str, by: str) -> None:
+def _stamp_acceptance_locked(
+    plan: ProjectPlan, *, body: str, by: str, acting_agent: str = ""
+) -> None:
     """Record the user's acceptance. **The only writer of the five stamps.**
 
     Called from the two places a proposal can be applied — the tray's Accept
@@ -5047,19 +5456,30 @@ def _stamp_acceptance_locked(plan: ProjectPlan, *, body: str, by: str) -> None:
     (:func:`_file_spec_lock_locked`), and applying that deviation re-stamps.
 
     ``body`` is the document **as this write leaves it**, never the stored one,
-    and that is the whole reason it is a parameter. The apply is what puts *"User
-    approves the plan."* into ``## Approval``, so hashing the pre-write body
-    would stamp a digest the document no longer has — and
-    ``changed_since_acceptance`` would read true the instant the plan was
-    accepted, on the strength of the acceptance itself.
+    and that is the whole reason it is a parameter. It used to be load-bearing
+    for acceptance ITSELF — the apply wrote *"User approves the plan."* into
+    ``## Approval``, a spec-layer section, so hashing the pre-write body stamped
+    a digest the document no longer had and ``changed_since_acceptance`` read
+    true the instant the plan was accepted. With ``## Approval`` gone, approving
+    moves no byte and the two bodies agree on the dismiss path. It stays a
+    parameter because the OTHER caller still needs it: a batch that accepts a
+    proposal and re-stamps in the same transaction must hash the text that
+    batch produced.
 
     ``accepted_revision`` is read off ``plan`` rather than passed, so it picks up
     :func:`submit_review`'s increment on that path and correctly does not on
     :func:`resolve_note`'s, which does not increment. Both are *"the revision
     this document had when it was approved"*.
 
-    ``accepted_via`` is ``"owner"`` unconditionally: :func:`may_decide` is the
-    door on both paths and it admits nobody else.
+    ``accepted_via`` names **which hand**, and it used to say ``"owner"``
+    unconditionally on the grounds that :func:`may_decide` is the door on both
+    paths and admits nobody else. That sentence is true about the NAME and false
+    about the credential: the owner's ``{username}-assistant`` bearer resolves to
+    the owner, so an assistant's ``--as-user`` command wrote ``accepted_by:
+    user``, ``accepted_via: owner``, ``history: by user, verb approve`` — three
+    fields, all of them the owner, none of them the actor. ``by`` still says
+    ``user`` and should: the assistant really was acting with the owner's
+    authority, on their instruction. This field is where the difference goes.
     """
     plan.accepted_at = _now()
     # WRITE-ONCE, and the guard is the whole of the difference between this
@@ -5069,10 +5489,12 @@ def _stamp_acceptance_locked(plan: ProjectPlan, *, body: str, by: str) -> None:
     # and moving it would demote every deviation filed since the last apply.
     plan.first_accepted_at = plan.first_accepted_at or plan.accepted_at
     plan.accepted_by = by
-    plan.accepted_via = "owner"
+    plan.accepted_via = "assistant" if acting_agent else "owner"
     plan.accepted_revision = plan.revision
     plan.accepted_spec_digest = spec_digest(body)
-    _note(plan, by, "approve", section=APPROVAL_SECTION)
+    # Section-less, like the note it records: approval is a fact about the
+    # document rather than about one heading in it.
+    _note(plan, by, "approve")
 
 
 # ---------------------------------------------------------------------------
@@ -6237,6 +6659,7 @@ async def submit_review(
     why: str = "",
     render: MessageRenderer | None = None,
     post: OwnerPoster | None = None,
+    acting_agent: str = "",
 ) -> PlanReviewRound:
     """**One transaction**, and the only place ``revision`` is incremented on a
     regular project (§2.5, §3.2, §4.2).
@@ -6306,10 +6729,19 @@ async def submit_review(
         for row in rows:
             if row.kind in ("accept", "reject"):
                 _refuse_non_owner_decision(by, row.kind)
-            # The tray's Reject/Dismiss reach the go-note the same way the CLI's
-            # do, and would release the gate on a plan nobody accepted.
-            if row.kind in ("reject", "dismiss") and row.note_id:
-                _refuse_go_note_close(_find_note(plan, row.note_id), row.kind)
+            # **EVERY CLOSING KIND, and `dismiss` is the one that passes.**
+            # These reach the confirm note the same way the CLI's do, and all
+            # but one of them would release the gate on a plan nobody approved.
+            # `accept` is on the list for the reason `_refuse_go_note_close`
+            # spells out: the note carries no proposal, so an accept writes
+            # nothing, closes it `applied`, and never reaches the stamp — the
+            # failure the retired `_refuse_unapprovable_go_note_accept` guarded.
+            # `ask` is absent because a reply closes nothing here
+            # (:func:`_reply_closes_parent`).
+            if row.kind in ("accept", "reject", "dismiss") and row.note_id:
+                _refuse_go_note_close(
+                    _find_note(plan, row.note_id), row.kind, by=by
+                )
             # BOTH DOORS, one rule. `submit_review` is owner-only for `accept`
             # and `reject` but NOT for `dismiss`/`ask`, so a keeper batch can
             # reach a close from here too — and a guard that lived only in
@@ -6318,7 +6750,15 @@ async def submit_review(
             # that is not already owner-gated above (`accept`/`reject`), and
             # `ask` does not close anything.
             if row.kind == "dismiss" and row.note_id:
-                _refuse_unsent_self_close(plan, _find_note(plan, row.note_id), by=by)
+                note = _find_note(plan, row.note_id)
+                _refuse_unsent_self_close(plan, note, by=by)
+                # **BOTH DOORS, one rule** — the paragraph above, applied to
+                # the credential guard as well. `by` is `OWNER` on an
+                # assistant bearer, so a rule keyed on the name alone is
+                # disarmed here in exactly the way it was on `resolve_note`.
+                _refuse_presigned_go_note(
+                    project, plan, note, row.kind, acting_agent=acting_agent
+                )
 
         comment = batch_comment or draft.batch_comment
         room_name = room or draft.room
@@ -6346,20 +6786,6 @@ async def submit_review(
             edit for edit in (_edit_for_row(plan, body, r) for r in applied_rows)
             if edit is not None
         ]
-
-        # AND THE ONE CLOSE `_refuse_go_note_close` PERMITS STILL HAS TO EARN
-        # IT: an `accept` that does not write the approval is not an approval,
-        # however much the sidecar it stamps says otherwise. **Asked of the
-        # derived write, and therefore only reachable from here** — the row's
-        # own shape stopped being the answer the moment a section-less accept
-        # started writing its note's proposal. Above `_prepare_locked` so the
-        # raise still costs the batch nothing: no bytes, no message, no note
-        # closed, and not even the spec lock's file-and-save.
-        for row in applied_rows:
-            if row.kind == "accept" and row.note_id:
-                _refuse_unapprovable_go_note_accept(
-                    _find_note(plan, row.note_id), _edit_for_row(plan, body, row)
-                )
 
         # ---- 1. the write, COMPUTED but not yet appended ------------------
         # **``why`` reaches the funnel from HERE too — the second half of
@@ -6394,7 +6820,7 @@ async def submit_review(
             _save(project, ctx, plan)
             raise PlanSpecLockedError(
                 _spec_lock_refusal(
-                    project, by=by, note_ids=ids
+                    project, by=by, note_ids=ids, relayered=result.relayered
                 ),
                 note_ids=ids,
                 revision=result.revision,
@@ -6683,8 +7109,9 @@ async def submit_review(
                 # too would make one act two revisions.
                 plan.revision += 1
 
-        # Set by an `accept` row below and consumed once, after the loop. See
-        # that row for why a batch must not stamp per decision.
+        # Set by an `accept` row below, or by a `dismiss` of the confirm note,
+        # and consumed once after the loop. See either row for why a batch must
+        # not stamp per decision.
         stamp_acceptance = False
         for idx, row in enumerate(decisions):
             if not row.note_id:
@@ -6711,6 +7138,21 @@ async def submit_review(
             elif row.kind == "reject":
                 _close_note(note, status="rejected", by=by, reason=row.comment)
             elif row.kind == "dismiss":
+                # **THE BROWSER HALF OF ACCEPTANCE.** `_refuse_go_note_close`
+                # ran in the pre-pass above and permits exactly this verb on the
+                # confirm note, so reaching here with `note.bootstrap` set means
+                # the owner said yes. Same flag, same one call below the loop,
+                # for the same reason the `accept` arm sets it rather than
+                # stamping: a batch may carry several closes and the history
+                # must record ONE approve.
+                #
+                # `status == "open"` is the same write-once guard `resolve_note`
+                # carries, for the same reason: a row naming an
+                # already-dismissed confirm note would re-stamp the acceptance
+                # onto a later document and clear a live *"changed since
+                # approval"* warning.
+                if note.bootstrap and note.status == "open":
+                    stamp_acceptance = True
                 _close_note(note, status="dismissed", by=by, reason=row.comment)
             elif row.kind == "ask":
                 # **M5 AC-5.9 — a reply CLOSES the parent ``answered``**, in
@@ -6745,9 +7187,9 @@ async def submit_review(
                 # gate. Closing it on reply would mean that typing *"hmm, what
                 # about the auth milestone?"* dropped the note count to zero,
                 # released the execution gate and started the work the user was
-                # in the middle of questioning. Accepting it is the only thing
-                # that means yes, so accepting it is the only thing that closes
-                # it.
+                # in the middle of questioning. Dismissing it is the only
+                # thing that means yes, so dismissing it is the only thing that
+                # closes it.
                 #
                 # The outgoing question is filed either way: a reply to the
                 # go-note is a real message to the coordinator and must reach
@@ -6781,8 +7223,8 @@ async def submit_review(
             status, reason = _close_spec_for_superseded(
                 row, _winner_note_for(plan, body, row, applied_rows), by=by
             )
-            # **EVERY way of closing the go-note releases the execution gate,
-            # and only `apply` means the user said yes** — that is
+            # **EVERY way of closing the confirm note releases the execution
+            # gate, and only `dismiss` means the user said yes** — that is
             # `_refuse_go_note_close`'s entire argument. This loop is the one
             # closing path in the module that calls `_close_note` directly: the
             # ownership pass above guards `reject`/`dismiss` rows and
@@ -6850,7 +7292,23 @@ async def submit_review(
         # plan unaccepted — the same ordering argument the block below makes for
         # the note count, and it is not a second argument, it is that one.
         if stamp_acceptance:
-            _stamp_acceptance_locked(plan, body=prepared.body, by=by)
+            _stamp_acceptance_locked(
+                plan, body=prepared.body, by=by, acting_agent=acting_agent
+            )
+
+        # **WHETHER THIS ROUND LEAVES A CONFIRM ON THE USER'S PLATE**, decided
+        # here — above `plan_state_spec`, which counts the open notes this batch
+        # leaves behind, and BELOW the stamp, which is what makes *"already
+        # approved"* true for it. See the function for the three rules.
+        #
+        # It ran ABOVE the stamp while the owner's own batch returned early out
+        # of it, and that order is now the wrong one: this batch may be the
+        # acceptance itself — the `dismiss` arm in step 3 closed the confirm note
+        # and set the flag above — and a rule that re-files a confirm whenever an
+        # unaccepted plan has nothing open for the user would, read one statement
+        # earlier, file a fresh gate note in the very write where the user said
+        # yes. The stamp is what tells it not to.
+        _sync_go_note_locked(project, plan, by=by, addressed=by_addressee)
 
         # **THE SPEC LOCK'S START LINE, AND IT IS STAMPED HERE FOR THE ARGUMENT
         # DIRECTLY ABOVE.** This is the user's own review batch, so it is the
@@ -6869,6 +7327,11 @@ async def submit_review(
         # messages just built report the span FROM the old value.
         _stamp_owner_seen_locked(plan, by=by, addressees=by_addressee)
 
+        # **THE OFFER, LATCHED ABOVE THE PROJECTION IT HAS TO REACH.** This
+        # batch is the plan going in front of somebody; the round that records
+        # it is not opened until step 5, below the append. See
+        # `_stamp_offered_locked`.
+        _stamp_offered_locked(plan)
         prelude = [prepared.spec] if prepared.wrote else []
         state_spec = plan_state_spec(project, plan)
         if state_spec is not None:
@@ -6957,77 +7420,261 @@ def _members_by_name(
 # ---------------------------------------------------------------------------
 
 
-def ensure_approval_section(body: str) -> str:
-    """``body`` with a ``## Approval`` section, appended if it has none.
+def _seed_go_note_locked(
+    project: "Project", plan: ProjectPlan, *, comment: str = GO_NOTE_COMMENT
+) -> str:
+    """File the confirm note. Returns its id, or ``""`` when one is already open.
 
-    The seed template already carries one, so this fires on exactly one input:
-    the coordinator-supplied v1 that ``POST /projects`` may pass instead of the
-    template (:func:`~clawmeets.server.routes.projects.generate_plan_file`).
-    Without it, such a project gets a go-note proposing a replacement for a
-    section that is not there — unappliable, so the gate never releases and the
-    project is stopped from its first turn with no surface saying why.
-
-    Appended rather than refused: a caller handing over a plan body is not
-    making a claim about approval mechanics, and failing project creation over a
-    missing heading would be a strange thing to do to them.
-    """
-    return body if section_extent(body, APPROVAL_SECTION) else (
-        body.rstrip("\n") + "\n\n" + approval_section(APPROVAL_PENDING)
-    )
-
-
-def _seed_go_note_locked(project: "Project", plan: ProjectPlan, body: str) -> str:
-    """File the go-note. Returns its id, or ``""`` when one is already open.
-
-    **An ordinary proposal, by the coordinator, to the user.** It is filed by
+    **An ordinary comment, by the coordinator, to the user.** It is filed by
     hand rather than through :func:`add_note` for one reason — ``bootstrap`` is
     not a parameter of that door and must not become one — and it deliberately
-    reproduces nothing else: addressing, the base capture and the quote
-    derivation are all the same helpers ``add_note`` uses, so the note the user
-    sees is shaped exactly like every other note in the tray — a comment
-    carrying a diff, which is all a proposal ever was.
+    reproduces nothing else: it is a plain note with a comment, addressed to the
+    owner, anchored to the document rather than to a section, so the row the
+    user sees is shaped exactly like every other row in the list.
 
-    Idempotent on the open go-note, so a retried project creation files one
+    **It takes no ``body`` and captures no base, which is the change.** It used
+    to be a proposal against ``## Approval``: a base capture, a derived quote,
+    and a one-line diff the user travelled to a card to read. The section is
+    gone (:data:`SEED_TEMPLATE`) and so is the trip.
+
+    Idempotent on the open confirm note, so a retried project creation files one
     note, not two.
 
     **Regular projects only, and this is the same guard the gate carries.** On a
     front-desk project there is nobody in the accepting role — that is what
-    ``surface == "regular"`` means in :func:`_plan_execution_blocked`. A
-    go-note on such a project would be a
-    proposal addressed to a ``user`` who is not reading it: never acceptable,
-    open forever, and counted in ``plan_open_notes`` on the desk card of a
-    project that is not waiting on anybody. Filing no note is the honest answer,
-    and it keeps *"which shapes have an acceptance step"* to one predicate
-    rather than two that have to agree.
+    ``surface == "regular"`` means in ``_plan_execution_blocked``. A confirm note
+    on such a project would be addressed to a ``user`` who is not reading it:
+    never closeable, open forever, and counted in ``plan_open_notes`` on the desk
+    card of a project that is not waiting on anybody. Filing no note is the
+    honest answer, and it keeps *"which shapes have an acceptance step"* to one
+    predicate rather than two that have to agree.
+
+    **``comment`` is a parameter and the default is the confirm wording**, so
+    the two callers read as what they are. :func:`seed_go_note` — the one at
+    ``POST /projects``, before the coordinator has drafted anything — passes
+    :data:`GO_NOTE_DRAFTING`; :func:`_hold_gate_locked` takes the default,
+    because it only ever RESTORES a gate on a plan that already had one, which
+    by construction is a plan the coordinator has already offered. It is
+    interpolated rather than concatenated so a wording may name the keeper
+    without this function growing a second formatting rule.
     """
     if project.surface != "regular":
         return ""
     if open_go_note(plan) is not None:
         return ""
-    base = _capture_base(body, APPROVAL_SECTION)
-    proposal = approval_section(APPROVAL_GRANTED)
     keeper_name = keeper(project)
     ids = _add_notes_locked(plan, [
         PlanNote(
             id="",
-            section=APPROVAL_SECTION,
             to=OWNER,
             by=keeper_name,
             at=_now(),
-            comment=GO_NOTE_COMMENT,
-            proposal=proposal,
-            base_section=base,
-            quote=_derive_quote(base, proposal),
+            comment=comment.format(keeper=keeper_name),
             revision=plan.revision,
             bootstrap=True,
         )
     ])
-    _note(plan, keeper_name, "note", section=APPROVAL_SECTION, detail=",".join(ids))
+    _note(plan, keeper_name, "note", detail=",".join(ids))
     return ids[0]
 
 
+def _hold_gate_locked(project: "Project", plan: ProjectPlan) -> None:
+    """**AN UNACCEPTED REGULAR PLAN ALWAYS HAS AT LEAST ONE OPEN NOTE FOR THE
+    USER.** The execution gate's whole content, asserted as an invariant rather
+    than reconstructed by each door that could break it. Lock held; mutates
+    ``plan`` only.
+
+    ``_plan_execution_blocked`` is ``open_notes_for_you`` and nothing else —
+    there is no *"has the user accepted"* conjunct anywhere in it — so *"the
+    count never reaches zero before acceptance"* is not a nice property of the
+    note flow, it IS the gate. :func:`seed_go_note` establishes the invariant in
+    the same request that seeds ``PLAN.md``; this restores it.
+
+    **THE INVARIANT HAS THREE DOORS, AND IT USED TO BE ASKED AT ONE.**
+    :func:`_sync_go_note_locked` ran only on a ``submit_review``, and only for a
+    keeper's send, so every other way of closing the user's last note left the
+    gate down on a plan nobody had confirmed:
+
+    * ``submit_review`` **by the owner** — the user answers the question round
+      that retired the confirm note. Their reply closes the parent (AC-5.9),
+      nothing is addressed back to them, and the count goes to zero *on the very
+      event that wakes the coordinator*. That turn could open workrooms.
+    * :func:`resolve_note` — ``plan note --dismiss``/``--reject`` on that last
+      question. Never called the sync at all.
+    * :func:`add_note` — the owner answering with ``--reply-to``, which closes
+      the parent through :func:`_reply_closes_parent`. Same hole, third door.
+
+    All three end with an unaccepted plan and an open gate, and the coordinator's
+    prompt line *"Plan confirmed by the user: NOT YET"* was the only thing left
+    standing in the way — a convention, which is precisely what
+    :func:`seed_go_note` argues a gate must not be. Worse, the re-file was
+    reachable only from a later keeper review round, so a coordinator that
+    answered in chat and never sent another round left the gate down for good.
+
+    **Asked as a count, not as a round shape.** *"Did this round carry
+    questions"* is a fact about one door's arguments; *"is anything open for the
+    user"* is a fact about the plan, which is what the gate reads. The count
+    includes the confirm note itself (``to == OWNER``, spec layer), so this is
+    idempotent on a plan that already has one open and it never files a second.
+
+    It also covers a case the round-shape rule got wrong on its own terms: a
+    round carrying only DETAIL-layer questions retired the confirm note, and
+    :func:`open_notes_for_you` does not count detail-layer notes — so the gate
+    dropped to zero inside a single write, with the retirement reason claiming
+    the user's answers were holding it.
+
+    **Acceptance is one-way and stops this**, or every close after it would
+    re-gate a project mid-execution. Front-desk projects have nobody in the
+    accepting role; :func:`_seed_go_note_locked` carries that argument.
+
+    **IT RESTORES A GATE AND NEVER INTRODUCES ONE**, which is the whole of the
+    ``any(n.bootstrap ...)`` guard and it is not defensive. :func:`seed_go_note`
+    establishes the invariant at project creation and is the ONLY thing entitled
+    to decide a plan has an acceptance step — a plan with no bootstrap note in
+    its history never had one, and filing the first one from a note-close would
+    gate a project on a rule that was not in force when it started. That set is
+    not empty: the creation route documents that *"a project whose seed fails has
+    no go-note, so it is unblocked as well as planless"*, and every project that
+    predates the seed is in it too.
+
+    With the guard, *"a closed bootstrap note on an unaccepted plan"* has exactly
+    one cause — :func:`_sync_go_note_locked` retired it, which is the one path in
+    the module that closes it without stamping acceptance
+    (:func:`_refuse_go_note_close` permits no other close, and ``dismiss`` by the
+    owner stamps). So this fires precisely when a retirement is outstanding, and
+    that is the obligation the retirement incurs.
+    """
+    if project.surface != "regular" or plan.accepted_at:
+        return
+    if not any(n.bootstrap for n in plan.notes):
+        return
+    if open_notes_for_you(plan) > 0:
+        return
+    # **NOT THROUGH `_validate_notes_locked`, like the creation seed it
+    # duplicates.** This is a server-filed note on a plan with nothing open for
+    # the user, so it lands at its quietest; refusing the caller's whole write
+    # over the open-note cap would refuse it for adding the one row that says
+    # the plan is waiting on a confirm.
+    _seed_go_note_locked(project, plan)
+
+
+def _sync_go_note_locked(
+    project: "Project",
+    plan: ProjectPlan,
+    *,
+    by: str,
+    addressed: dict[str, list[PlanNote]],
+) -> None:
+    """**Does this round leave a confirm note on the user's plate, and what does
+    it say?** Four rules, in one place, asked once per review send. Lock held;
+    mutates ``plan`` only.
+
+    * **The round carries at least one question for the user** → the open
+      confirm note is retired in the same write. The user's answers ARE the
+      gate, the open-note count never dips to zero, and they never read *"I have
+      nothing open on it"* directly above four things that are open.
+    * **The round carries none, it is the KEEPER's, and the row still holds the
+      drafting wording** → it is swapped for :data:`GO_NOTE_COMMENT`. This is
+      the same sentence as the rule above, asked of the other wording: a row
+      seeded at ``POST /projects`` says the coordinator is still drafting
+      (:data:`GO_NOTE_DRAFTING`), and leaving it there after the plan has been
+      handed over would state the mirror-image falsehood — *"nothing to do
+      yet"* on a plan whose only remaining act is the user's. The offer is the
+      send, so the send is where the bytes change.
+    * **The round carries none, and the plan is not approved** → the note is
+      filed, or left alone if it is already open. This is the quiet plan, and it
+      is also the case a once-per-project note misses entirely: round 1 asks
+      four questions, the user answers, the coordinator rewrites half the
+      document, and round 2 has nothing left to ask. Under a single seeded note
+      that round reaches the user silently and with the gate already released.
+      Under this rule it comes back for a confirm.
+    * **The plan is already approved** → never filed again. Acceptance is
+      one-way, and re-filing here would re-block a project mid-execution on
+      every quiet round the coordinator sent.
+
+    **THE CREATION SEED STAYS, AND IT IS WHAT MAKES THIS SAFE.** The execution
+    gate is *"a regular project with at least one open note addressed to the
+    user"* and nothing else — there is no *"has the user seen the plan"*
+    condition anywhere. So a confirm note born only when the coordinator sends a
+    review is a gate the coordinator can skip: draft a plan, send no review,
+    zero open notes, free to open workrooms on turn one. :func:`seed_go_note`
+    files it in the same request that seeds ``PLAN.md``, before the coordinator
+    has had a turn, and this function only ever moves it afterwards.
+
+    **``by == OWNER`` USED TO RETURN EARLY HERE, and that was the gate's hole.**
+    The reasoning was that the question is about what the COORDINATOR is handing
+    over, and the retire half is indeed the coordinator's alone — the owner's
+    replies are addressed to the keeper, so ``addressed`` holds nothing for them
+    and the retirement cannot fire on their batch anyway. But the FILE half is
+    not about who sent; it is about what the plan looks like afterwards, and the
+    owner's batch is exactly the one that empties their own plate: they answer
+    the question round that retired the confirm, their reply closes the parent,
+    and the count goes to zero on an unaccepted plan. The early return is gone
+    and :func:`_hold_gate_locked` — which is reached from this door and from the
+    two others that can close the last note — decides the file half. A confirm
+    the owner has deliberately left open is still left alone, by the count
+    rather than by the sender: an open one is one open note for them.
+
+    **CALLED BELOW ``submit_review``'S ACCEPTANCE STAMP, and it has to be.** The
+    call sat above it, which was harmless only while the owner returned early:
+    the acceptance batch dismisses the confirm note in step 3 and stamps
+    ``accepted_at`` after, so an unconditional file half above the stamp reads an
+    unaccepted plan with nothing open and re-files a confirm note during the very
+    write in which the user said yes. It is still above ``plan_state_spec``,
+    which is the ordering the projection argument needs.
+
+    ``addressed`` is ``submit_review``'s ``by_addressee`` **after** the send
+    ledger and the unresolved sweep, so it is what this round actually puts in
+    front of the user rather than what it was asked to. A re-send that the
+    ledger filtered to nothing is a quiet round, correctly.
+
+    The confirm note itself is excluded from the count, or a round that carried
+    only the confirm would read as a round of questions and retire it.
+    """
+    if project.surface != "regular" or plan.accepted_at:
+        return
+    questions = [n for n in addressed.get(OWNER, []) if not n.bootstrap]
+    go = open_go_note(plan)
+    if questions and go is not None:
+        _close_note(
+            go, status="dismissed", by=keeper(project), reason=GO_NOTE_RETIRED
+        )
+    elif (
+        go is not None
+        and by == keeper(project)
+        and go.comment != GO_NOTE_COMMENT
+    ):
+        # **THE OFFER, AND IT IS ONE ASSIGNMENT.** The row has been standing
+        # since `POST /projects` in the drafting wording (`GO_NOTE_DRAFTING`),
+        # because until this send the coordinator had not put the plan in front
+        # of anybody: it was drafting, then waiting on the roster. A keeper's
+        # quiet round IS that hand-over — nothing is open, and the only thing
+        # left for the user to do is confirm — so the row now says so.
+        #
+        # `by == keeper(project)` because the owner's own batch is not the
+        # coordinator offering the plan. It is reachable here: an owner who
+        # replies to the drafting note sends a round addressed to the keeper,
+        # which leaves `questions` empty, and flipping on it would claim an
+        # offer the coordinator has not made.
+        #
+        # In the `elif`, not beside it: a round that carries questions retires
+        # the row instead, and `_hold_gate_locked` re-files it at the
+        # `GO_NOTE_COMMENT` default once those questions close. Both post-round
+        # paths therefore land on the confirm wording, and neither can leave a
+        # plan that has been reviewed still calling itself a draft.
+        go.comment = GO_NOTE_COMMENT
+    # **THE FILE HALF IS THE INVARIANT AND IS ASKED AS ONE**
+    # (:func:`_hold_gate_locked`), unconditionally, including right after the
+    # retirement above: a round whose questions are all DETAIL-layer retires the
+    # confirm note and adds nothing `open_notes_for_you` counts, so the arm that
+    # used to `return` here dropped the gate to zero inside this write. When the
+    # questions do count, the call is a no-op.
+    _hold_gate_locked(project, plan)
+
+
 async def seed_go_note(project: "Project", ctx: "ModelContext") -> str:
-    """File the go-note at project creation. **The gate, and the whole of it.**
+    """File the confirm note at project creation. **The gate, and the whole of
+    it.**
 
     Called by ``init_plan_sidecar`` in the same request that seeds ``PLAN.md``,
     and **before** that route publishes ``PROJECT_PLAN_STATE`` — the ordering is
@@ -7038,16 +7685,28 @@ async def seed_go_note(project: "Project", ctx: "ModelContext") -> str:
     note asking for the go"* nothing blocks until the coordinator chooses to
     file one, so a coordinator that drafts a plan and immediately opens three
     workrooms would be doing something the server used to make impossible. One
-    call at creation keeps the guarantee where it was.
+    call at creation keeps the guarantee where it was —
+    :func:`_sync_go_note_locked` only ever moves the note afterwards, and never
+    creates the window this closes.
 
     It replaces ``approve_plan`` and ``POST /plan/approve`` outright. Acceptance
-    is now what happens when the user applies this note — one mechanism, the
-    same one every other proposal uses, on a surface they are already reading.
+    is now what happens when the user dismisses this note — one mechanism, the
+    same verb every other note offers, on a surface they are already reading.
+
+    **It files :data:`GO_NOTE_DRAFTING`, not the confirm wording, and that is
+    the only thing about this function that is not the gate.** At this instant
+    the coordinator has not taken a turn and the document is the bare
+    :data:`SEED_TEMPLATE`, so *"I've drafted this and I have nothing open on
+    it"* would be false for as long as the spec-stage contract takes — a
+    drafting turn plus the roster consult it ends on. The row, its addressee,
+    its layer and therefore ``_plan_execution_blocked`` are identical either
+    way; :func:`_sync_go_note_locked` swaps the bytes for
+    :data:`GO_NOTE_COMMENT` when the coordinator actually puts the plan in
+    front of the user.
     """
     async with _lock:
         plan = _load(project, ctx)
-        body = _read_body(project, ctx)
-        nid = _seed_go_note_locked(project, plan, body)
+        nid = _seed_go_note_locked(project, plan, comment=GO_NOTE_DRAFTING)
         if nid:
             _save(project, ctx, plan)
         return nid
@@ -7136,6 +7795,15 @@ def plan_state_spec(
             if project.plan_user_reviewed_at
             else None
         ),
+        # Monotone for the same reason and by the same `or`: the latch never
+        # clears, so this only ever goes None -> set and the prompt can never be
+        # told the lock lifted.
+        plan.first_offered_at
+        or (
+            project.plan_offered_at.isoformat()
+            if project.plan_offered_at
+            else None
+        ),
     )
     current = (
         project.plan_seeded_at.isoformat() if project.plan_seeded_at else None,
@@ -7148,6 +7816,7 @@ def plan_state_spec(
             if project.plan_user_reviewed_at
             else None
         ),
+        project.plan_offered_at.isoformat() if project.plan_offered_at else None,
     )
     # Timestamps round-trip through ``datetime`` on the Project side, so compare
     # on the parsed value rather than the string — otherwise an unchanged plan
@@ -7164,6 +7833,7 @@ def plan_state_spec(
             plan_accepted_spec_digest=incoming[3],
             plan_open_notes=incoming[4],
             plan_user_reviewed_at=incoming[5],
+            plan_offered_at=incoming[6],
         ),
     )
 
@@ -7214,8 +7884,19 @@ def changed_since_acceptance(body: str, plan: ProjectPlan) -> bool:
     compares ``spec_digest(cleaned)`` against ``spec_digest(body)``, both sides
     new formula, both computed in the same call. Same for ``approve
     --expect-spec``, which is a handshake inside one session.
+
+    **:func:`_plan_was_offered` guards the whole thing, for the same reason
+    :func:`_spec_is_locked` carries it.** *"The spec changed since the user
+    accepted it"* presumes the user has a mental model of what they accepted,
+    and on a plan dismissed out of the drafting row they have none: the document
+    was never put in front of them, and the keeper is still writing it because
+    that same fact leaves the lock open. Without this guard the coordinator is
+    told every turn that the spec has drifted — from a baseline the user never
+    saw, by writes the server just told it were fine. That is the third copy of
+    one falsehood; all three contract predicates now agree on what a contract
+    is, and they agree by naming the same two facts.
     """
-    if not plan.accepted_at:
+    if not plan.accepted_at or not _plan_was_offered(plan):
         return False
     return (
         spec_digest(body) != plan.accepted_spec_digest

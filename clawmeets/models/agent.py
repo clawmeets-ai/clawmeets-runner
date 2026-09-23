@@ -410,10 +410,17 @@ def _plan_execution_blocked(project: "Project") -> int:
     They arrive here over ``PROJECT_PLAN_STATE`` (D13). If that entry ever stops
     being published the gate silently reads zeros and never fires, which is why
     the projection is reconciled against its source by test rather than trusted.
+
+    **THE RULE ITSELF MOVED, AND ONLY THE SOURCE STAYED HERE.** The two
+    conjuncts live in :func:`~clawmeets.models.project_plan.execution_blocked`
+    now, because ``create_chatroom`` asks the same question server-side off the
+    sidecar — see that function for why a second, live check had to exist at
+    all. This function is what it always was from the caller's side: *the gate,
+    answered from the projection this process can reach.*
     """
-    if project.surface != "regular":
-        return 0
-    return max(project.plan_open_notes, 0)
+    from .project_plan import execution_blocked
+
+    return execution_blocked(project.surface, project.plan_open_notes)
 
 
 def plan_prompt_state(
@@ -440,15 +447,15 @@ def plan_prompt_state(
     from ..llm.prompt_builder import PlanPromptState
     from .chatroom import Chatroom
     from .plan_markdown import legacy_spec_digest, spec_digest
-    from .project_plan import approval_state, not_authorized_state
+    from .project_plan import not_authorized_state
 
     if project.surface != "regular" or project.plan_seeded_at is None:
         return None
     # One read of the synced document serves both facts. It used to be opened
-    # only when there was an acceptance digest to compare against — but the
-    # approval text matters most in exactly the case that had no digest, so the
-    # read moved out of the branch rather than being done a second time inside
-    # a new one.
+    # only when there was an acceptance digest to compare against; the read
+    # moved out of the branch when ``## Approval`` had to be read on every turn,
+    # and it stays out now that section is gone, because ``not_authorized``
+    # needs the same bytes and is most load-bearing on an unaccepted plan.
     try:
         room = Chatroom.get(project.id, "shared-context", ctx)
         raw = room.get_file("PLAN.md") if room is not None else None
@@ -480,10 +487,20 @@ def plan_prompt_state(
         phase=project.phase,
         changed_since_acceptance=changed,
         open_notes_for_you=project.plan_open_notes,
-        approval=approval_state(body) if body is not None else "",
+        # **THE PROJECTED FACT, NOT A SENTENCE IN THE DOCUMENT.** This used to
+        # be ``approval_state(body)`` — what ``## Approval`` said — and the
+        # coordinator was told to read that string before starting. The section
+        # is gone, and the swap is strictly tighter rather than a downgrade: the
+        # server has always gated on open notes and never on the sentence, so a
+        # prompt keyed on the text was a SECOND condition that merely happened
+        # to agree. ``plan_accepted_at`` is stamped by the one act that releases
+        # the gate, and it is already projected to this process over
+        # ``PROJECT_PLAN_STATE`` — no extra read, no second answer.
+        accepted=project.plan_accepted_at is not None,
         user_has_reviewed=project.plan_user_reviewed_at is not None,
-        # Sixth fact, off the SAME read as ``approval`` — which is why the read
-        # moving out of its branch (above) had to happen first. ``""`` whenever
+        offered=project.plan_offered_at is not None,
+        # Sixth fact, off the same document read as ``changed_since_acceptance``
+        # — which is why that read sits outside its branch. ``""`` whenever
         # the document is unreachable, which is the same answer as "the plan
         # forbids nothing" and renders nothing either way; a worker whose
         # `shared-context` is not synced is no worse off than before this
@@ -1267,11 +1284,25 @@ class Agent(PersistableParticipant):
             if not m.is_ack and m.from_participant_id == principal_id
         ]
         if _dm_title_is_too_terse(content):
-            if len(user_msgs) < _DM_TITLE_DEFER_BUDGET:
+            # RETRY before defer: reaching a terse message with the latch still
+            # on "New chat" means an earlier substantive message did NOT produce
+            # a title (a transient generator/route failure). Deferring here
+            # spends a budget slot on a thread that already has topic content and
+            # — on the common "<substantive ask>" then "go" shape — never titles
+            # at all, because a short thread never exhausts the budget. Title
+            # from the most recent substantive message instead.
+            substantive = [
+                m for m in user_msgs
+                if (m.content or "").strip() and not _dm_title_is_too_terse(m.content)
+            ]
+            if substantive:
+                source_text = substantive[-1].content.strip()
+            elif len(user_msgs) < _DM_TITLE_DEFER_BUDGET:
                 return  # DEFER: latch stays "New chat"; a later message titles it
-            # Budget exhausted on a persistently terse thread: converge off
-            # "New chat" using the accumulated user content (terminal fallback).
-            source_text = " ".join(m.content for m in user_msgs).strip() or content
+            else:
+                # Budget exhausted on a persistently terse thread: converge off
+                # "New chat" using the accumulated user content (terminal fallback).
+                source_text = " ".join(m.content for m in user_msgs).strip() or content
         else:
             # Substantive message: title from the later triggering message (MF3),
             # i.e. THIS message's content alone.

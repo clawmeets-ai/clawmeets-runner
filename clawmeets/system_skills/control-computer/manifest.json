@@ -1,0 +1,6 @@
+{
+  "audiences": ["assistant"],
+  "surfaces": ["agent_runtime"],
+  "version": "1.0.0",
+  "description": "Answer questions about the user's computers and drive the five allowed actions on them (start/stop/restart an agent, report status, update the connection software) through the web-backed host connection — including the case control-agent cannot reach, where the agent lives on another machine (assistant-only)."
+}

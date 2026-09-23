@@ -964,6 +964,7 @@ class ModelContextChangelogSubscriber(ChangelogSubscriber):
             plan_accepted_spec_digest=payload.plan_accepted_spec_digest,
             plan_open_notes=payload.plan_open_notes,
             plan_user_reviewed_at=payload.plan_user_reviewed_at,
+            plan_offered_at=payload.plan_offered_at,
         )
 
     async def _handle_chatroom_cleared(self, entry: ChangelogEntry) -> None:

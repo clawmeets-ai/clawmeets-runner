@@ -323,6 +323,17 @@ class ProjectPlanStatePayload(BaseModel):
     #: Optional with a ``None`` default, so every entry already on a changelog
     #: replays unchanged.
     plan_user_reviewed_at: str | None = None
+    #: The projection of ``project_plan._plan_was_offered`` as an instant — the
+    #: first round's ``opened_at``, i.e. when the coordinator first put this plan
+    #: in front of the user. The OTHER half of the spec lock
+    #: (``project_plan._spec_is_locked``): a plan can be accepted without ever
+    #: having been offered, because the confirm row is dismissible from the desk
+    #: card while it still reads ``GO_NOTE_DRAFTING``, and the keeper still owns
+    #: the document until it has been handed over. Carried for the same reason
+    #: its neighbour is — the prompt must state the constraint before the model
+    #: forms the intent, and this process cannot open the sidecar. Same
+    #: ``None``-default replay guarantee.
+    plan_offered_at: str | None = None
 
 
 class DisplayNameChangedPayload(BaseModel):

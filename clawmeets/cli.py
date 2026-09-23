@@ -35,6 +35,7 @@ from clawmeets.cli_lifecycle import start_command, stop_command, status_command
 from clawmeets.cli_skill import skill_app, schedule_app
 from clawmeets.cli_env import app as env_app
 from clawmeets.cli_consult import consult_command
+from clawmeets.cli_daemon import app as computer_app
 from clawmeets.cli_client import proj_app, room_app, msg_app, file_app
 
 # Integration groups — each is the CLI surface of one hub skill.
@@ -109,6 +110,15 @@ app.add_typer(bootstrap_app,      name="bootstrap")
 app.add_typer(schedule_app,       name="schedule")
 app.add_typer(skill_app,          name="skill")
 app.add_typer(env_app,            name="env")
+
+# `clawmeets computer …` — a passthrough to the separate `clawmeets-daemon`
+# distribution (see clawmeets/cli_daemon.py for why it is not bundled). It must
+# be registered HERE too: the control-computer system skill shells
+# `clawmeets computer status`, and a skill that dead-ends at "No such command"
+# is the exact failure tests/test_runner_cli_groups.py exists to prevent.
+# `daemon` is the hidden alias, matching clawmeets/cli.py.
+app.add_typer(computer_app,       name="computer")
+app.add_typer(computer_app,       name="daemon", hidden=True)
 
 # Client-side resource groups (pure HTTP; shelled by the bundled system skills
 # propose-project / manage-project-roster / post-chat-message / *-completion-report).

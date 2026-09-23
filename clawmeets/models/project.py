@@ -271,6 +271,14 @@ class Project(BaseModel):
     # be told is that the lock has lifted. ``None`` on every project that
     # predates the field and on every plan the user has not looked at yet.
     plan_user_reviewed_at: Optional[datetime] = None
+    # The projection of ``project_plan._plan_was_offered``: when the coordinator
+    # first put this plan in front of the user. The spec lock's OTHER half — a
+    # plan may be accepted without ever having been offered, and until it has
+    # been the keeper still owns the document, so the prompt must be able to
+    # tell the two apart. **Monotone** for the same reason its neighbour is.
+    # ``None`` on every project that predates the field and on every plan whose
+    # coordinator has not sent a review round yet.
+    plan_offered_at: Optional[datetime] = None
 
     # Private runtime state (not serialized)
     _ctx: Optional["ModelContext"] = PrivateAttr(default=None)
@@ -1108,6 +1116,7 @@ class ProjectState:
         plan_accepted_spec_digest: str,
         plan_open_notes: int,
         plan_user_reviewed_at: Optional[str] = None,
+        plan_offered_at: Optional[str] = None,
     ) -> bool:
         """Apply the plan lifecycle projection into meta.json (D13, §7.2).
 
@@ -1132,6 +1141,7 @@ class ProjectState:
             "plan_accepted_spec_digest": plan_accepted_spec_digest,
             "plan_open_notes": plan_open_notes,
             "plan_user_reviewed_at": plan_user_reviewed_at,
+            "plan_offered_at": plan_offered_at,
         }
         if all(project_dict.get(k) == v for k, v in incoming.items()):
             return False

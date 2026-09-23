@@ -26,9 +26,9 @@ Subcommands (§5)
   show        The document, a section, a note, the index, the versions.
   update      Replace/append/retitle/delete one section. Keeper or owner.
   note        A comment, with or without a proposal. Everyone's channel.
-  resolve     apply / reject / answered / dismiss. --apply on the go-note
-              is how a plan is accepted, and --apply on any later note is
-              how the owner re-signs what it changed.
+  resolve     apply / reject / answered / dismiss. --dismiss on the confirm
+              note is how a plan is accepted, and --apply on any later note
+              is how the owner re-signs what it changed.
   list-notes  Filter on every documented axis; --thread reads a thread.
   conflicts   The keeper's refused writes, with the command that closes each.
   consult     Seat the specialists in `shared-context` so they can be reached.
@@ -882,10 +882,16 @@ def resolve(
 
     **``--as-user``** is the owner's assistant acting for the owner, in the
     owner's own DM, on their explicit request. It carries more weight than it
-    used to: with ``plan approve`` gone, ``--apply`` on the **go-note** is how a
-    plan is accepted, so this flag is the whole of the CLI-only user's route to
-    approving their own project. ``plan list-notes <project> --to user`` prints
-    the id.
+    used to: with ``plan approve`` gone, ``--dismiss`` on the **confirm note**
+    is how a plan is accepted, so this flag is the whole of the CLI-only user's
+    route to approving their own project. ``plan list-notes <project> --to
+    user`` prints the id.
+
+    **``--dismiss`` means yes on that one note and means nothing on every
+    other**, which sounds like a trap and is the opposite of one: the confirm
+    note carries no proposal, so there is nothing else it COULD mean, and the
+    server refuses every other verb on it by name rather than letting a wrong
+    one through quietly (``_refuse_go_note_close``).
     """
     chosen = [n for n, on in
               (("apply", apply), ("reject", reject), ("answered", answered), ("dismiss", dismiss))

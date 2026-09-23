@@ -495,8 +495,8 @@ class ActionValidator:
             f"note{'' if one else 's'} {'is' if one else 'are'} addressed to you "
             f"and unresolved. Open the project's Plan tab and decide them — "
             f"Accept, Reject or Dismiss — and work continues. On a project that "
-            f"has not started yet, the note waiting for you IS the approval: "
-            f"accepting it is what approves the plan. Nothing else is held up "
+            f"has not started yet, the note waiting for you IS the confirmation: "
+            f"dismissing it is what starts the work. Nothing else is held up "
             f"meanwhile — you can keep talking to the coordinator, and it can "
             f"still bring other agents in."
         )

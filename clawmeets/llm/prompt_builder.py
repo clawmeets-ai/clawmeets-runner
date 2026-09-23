@@ -311,20 +311,26 @@ class PlanPromptState:
     on **and** the number the server-side execution gate refuses on (§7.4). One
     number, one definition; this carries it, it does not recompute it.
 
-    ``approval`` is what ``## Approval`` says right now — the section the user's
-    acceptance is a **diff into**. It replaced *"wait for the user to say go in
-    chat"*, which was a judgement call about a sentence: a coordinator reading
-    *"looks good, though I'd rethink M2"* had to decide whether that was a go,
-    and it decided wrong in the direction that starts work. The document's own
-    text is not a judgement call, and it is the same bytes the gate and the desk
-    are looking at.
+    ``accepted`` is whether the user has confirmed the plan. It replaced
+    *"wait for the user to say go in chat"*, which was a judgement call about a
+    sentence: a coordinator reading *"looks good, though I'd rethink M2"* had to
+    decide whether that was a go, and it decided wrong in the direction that
+    starts work.
+
+    **It used to be ``approval``, the text of a ``## Approval`` section, and the
+    swap tightened the contract rather than loosening it.** The server has never
+    gated on that sentence — the execution gate is ``open_notes_for_you`` and
+    always was — so a coordinator checking the document was checking a SECOND
+    condition that merely agreed with the first. When the section went, the two
+    collapsed into one: ``accepted`` is stamped by the same act that takes the
+    count to zero.
     """
 
     title: str
     phase: str
     changed_since_acceptance: bool
     open_notes_for_you: int
-    approval: str = ""
+    accepted: bool = False
     #: Has the USER opened a review round on this plan? The spec lock's start
     #: line before acceptance (``project_plan._spec_is_locked``). A fifth fact,
     #: and it earns its seat for the reason the block's own docstring gives
@@ -337,6 +343,15 @@ class PlanPromptState:
     #: member here, because this dataclass is assembled in the AGENT process and
     #: the sidecar that knows about rounds lives only on the server.
     user_has_reviewed: bool = False
+    #: Has the COORDINATOR put this plan in front of the user — sent one review
+    #: round? The spec lock's other half (``project_plan._plan_was_offered``),
+    #: and the fact that separates *"accepted, and they read it"* from
+    #: *"accepted because they told me not to wait"*. Until it is true the
+    #: keeper still owns the document and its spec writes LAND, which is the
+    #: opposite of what the accepted-plan paragraph below says — so the block
+    #: must branch on it or it states the wrong rule in exactly the window a
+    #: coordinator is still drafting.
+    offered: bool = False
     #: What the plan forbids OUTRIGHT — ``project_plan.not_authorized_state``
     #: of the same synced body every other member here is computed from, so it
     #: costs no extra read.
@@ -649,7 +664,9 @@ before you reply.)"""
 # ``_worker_role_contract``: a worker reports to the coordinator, a machine
 # reader that genuinely wants the log, the criteria checklist, and the
 # provenance. Two audiences, two shapes — the bug was never that the machine
-# shape exists, it is that only the machine shape existed.
+# shape exists, it is that only the machine shape existed. The machine shape
+# does not license machine INDICES, though: see ``_NAME_THINGS_NOT_NUMBERS``,
+# which the workroom surfaces do carry.
 _USER_FACING_WRITING = """== WRITE FOR THE READER ==
 The user reads to decide, not to audit you. Two surfaces:
 
@@ -695,6 +712,12 @@ Never write, in a user-facing message:
   - Bare attributions - "as @agent-x found", "the worker flagged a risk",
     "per the research milestone". Name the finding, not its source.
   - Bare file cites - "see model.md". Say what it concludes, then link it.
+  - Private labels - "C1", "V5-a", "M2", "AC-2.2", "objection #9", "the
+    B-list". A code is a pointer too: it resolves only in the message or
+    document that defined it. Say what the thing IS ("the week-1 completion
+    test: at least half of venue beginners finish week 1"). If the label is
+    the thing's real name and the user will meet it again, give its meaning
+    in the same sentence the first time it appears.
 
 Inline the content instead. If it is worth referencing, it is worth
 restating in one sentence; if restating costs more than a sentence, quote
@@ -702,11 +725,31 @@ the passage verbatim. Attribution goes AFTER the content, never instead
 of it:
   BAD  - "Per point 3 of the pricing analysis, we should reprice."
   GOOD - "Enterprise is priced 30% under the nearest comparable, so the
-          tier is leaving margin on the table (pricing analysis, M2)."
+          tier is leaving margin on the table (pricing analysis)."
 
 When you are relaying a worker's status report, do not forward its shape
 and do not forward its indices. Re-sort it by what the user must decide,
 and carry the content across."""
+
+
+# Injected into the WORKROOM surfaces (``_worker_role_contract`` and the
+# coordinator's steady state, for its delegation briefs) — the ones the two
+# blocks above deliberately skip. The user reads the workroom and every
+# deliverable too; round-internal indices ("A1-A7", "B2", "X1") and label
+# families that collide with the plan's own ("G2" as a test AND a criteria
+# group) made a finished project unreadable. The template stays; only the
+# naming changes.
+_NAME_THINGS_NOT_NUMBERS = """== NAME THINGS, NOT NUMBERS ==
+The user reads workroom messages and deliverable files too, with no other
+message open. So:
+  - Refer to a change, test, gate or objection by a short descriptive name
+    ("the freemium change", "the venue fee check"), never by an index that
+    another message defined ("B2", "X1", "the investor's M3").
+  - Never reuse the plan's own label families (G<n>, M<n>, AC-<m>.<n>) for
+    anything else.
+  - In a deliverable, each named thing gets ONE name, defined where a reader
+    first meets it (a table cell counts). A descriptive name beats a code; a
+    code borrowed from another document must be defined here or dropped."""
 
 
 # ---------------------------------------------------------------------------
@@ -950,6 +993,8 @@ Use this shape inside the `content` of your `reply`:
 If BLOCKED, add **Blocker**, **Proposed assumption**, **Risk of assumption**.
 If CANNOT_COMPLETE, add **Reason** and **Recommendation**.
 
+{_NAME_THINGS_NOT_NUMBERS}
+
 == CRITICAL RULES ==
 - Do NOT use @mentions (workers don't delegate).
 - Do NOT post to user-communication (coordinator handles user contact).
@@ -1134,6 +1179,8 @@ rather than reusing the failed one.
   is never triggered and the room stalls.
   Workers cannot see files from other work rooms — always include relevant
   findings or deliverable summaries directly in the delegation message.
+  Name each requested change by what it is, per NAME THINGS, NOT NUMBERS
+  below — never "apply A1-A7 and B1-B14".
 - CONTINUING a thread that is already running? invite_agent, not a second
   room: it adds the specialist to the EXISTING room and addresses them in one
   action. Reach for create_room only when the work is a new, separable task.
@@ -1183,9 +1230,11 @@ Use the `user-communication` chatroom to:
   - Escalate ambiguity raised by workers.
   - Report progress for long tasks.
   - Share final results when the project is complete.
-The two writing blocks at the end of this contract govern EVERY message you
-post there. They do NOT apply to delegation messages you write to workers —
-those keep the concrete, criteria-shaped form described above.
+WRITE FOR THE READER and NO POINTERS, ONLY CONTENT (at the end of this
+contract) govern EVERY message you post there. They do NOT apply to
+delegation messages you write to workers — those keep the concrete,
+criteria-shaped form described above. NAME THINGS, NOT NUMBERS applies to
+both.
 
 == AVAILABLE WORKER AGENTS ==
 Read the roster file AGENTS.md (its absolute path is listed under FILES &
@@ -1199,6 +1248,7 @@ written in the roster (not IDs, and do not add suffixes like '-agent')."""
 
         steady_state += self._plan_block()
         steady_state += "\n\n" + _USER_FACING_WRITING + "\n\n" + _NO_DANGLING_POINTERS
+        steady_state += "\n\n" + _NAME_THINGS_NOT_NUMBERS
 
         if self._flow_context == "spec-consult":
             return steady_state + self._spec_consult_flow_blocks()
@@ -1265,7 +1315,7 @@ written in the roster (not IDs, and do not add suffixes like '-agent')."""
             "\n\n== THIS PROJECT'S PLAN ==",
             f"PLAN.md — {plan.title}",
             f"Phase: {plan.phase}",
-            f"`## Approval` currently says: {plan.approval or '(no such section)'}",
+            f"Plan confirmed by the user: {'YES' if plan.accepted else 'NOT YET'}",
         ]
         # FIRST, ahead of every lifecycle clause below. Those tell the
         # coordinator how to move the document; this one can stop a turn.
@@ -1281,20 +1331,24 @@ written in the roster (not IDs, and do not add suffixes like '-agent')."""
             lines.append("\n" + forbidden + "\n")
         if plan.phase != "executing":
             lines.append(
-                "THAT LINE IS THE GO SIGNAL, and nothing else is. Work starts "
-                "when `## Approval` reads \"User approves the plan.\" — the text "
-                "the user's acceptance writes into the document itself. Until "
-                "then you do NOT create a milestone workroom and you do NOT "
-                "dispatch work, however clearly they seem to have said yes in "
-                "chat. \"Looks good\", \"go ahead\", a thumbs-up: none of those "
-                "are it. They accept in the plan tray, and you will be woken "
-                "when they do.\n"
-                "Do not write that line yourself. `## Approval` is the one "
-                "section you may not put words in while the approval note is "
-                "open — a `plan update` that reaches it is refused, and one "
-                "that deletes the `## Approval` heading is refused too, because "
-                "the user's acceptance is a diff that needs the heading to land "
-                "on. Rewrite every other section as freely as you like."
+                "THAT LINE IS THE GO SIGNAL, and nothing else is. Until it "
+                "reads YES you do NOT create a milestone workroom and you do "
+                "NOT dispatch work, however clearly they seem to have said yes "
+                "in chat. \"Looks good\", \"go ahead\", a thumbs-up: none of "
+                "those are it. The server filed one note on this plan asking "
+                "them to confirm it; they dismiss that note when they are "
+                "happy, and you will be woken when they do.\n"
+                "THAT NOTE IS NOT ASKING THEM ANYTHING YET. Until you send "
+                "your review round it reads \"nothing to do yet — it will come "
+                "back to you for a confirm\", and your send is what rewrites it "
+                "into the confirm. So the consult in STEP 3 is not a race "
+                "against the user, and you may tell them you will come back "
+                "when the roster has answered — that is exactly what the note "
+                "on their desk says too.\n"
+                "There is nothing for you to write in the document to make this "
+                "true, and no section to check — it is a fact about the plan, "
+                "not a sentence in it. Rewrite every section as freely as you "
+                "like."
             )
         if plan.changed_since_acceptance:
             lines.append(
@@ -1304,7 +1358,32 @@ written in the roster (not IDs, and do not add suffixes like '-agent')."""
                 "passes. (A ticked checkbox and an HTML comment are NOT scope "
                 "changes and never set this.)"
             )
-        if plan.phase == "executing":
+        if plan.phase == "executing" and not plan.offered:
+            # **ACCEPTED, BUT NEVER HANDED OVER, AND THE SERVER AGREES.** The
+            # user dismissed the confirm row while it still read "I am drafting
+            # this — nothing to do yet", which releases work and ratifies
+            # nothing: `project_plan._spec_is_locked` carries
+            # `_plan_was_offered` precisely so the keeper keeps the pen here.
+            # Printing the ACCEPTED paragraph below in this window told a
+            # coordinator mid-draft to file proposals instead of writing — on
+            # `onboard-angel-investor` that produced 17 of them against a
+            # document the user had never opened, and the draft was abandoned.
+            lines.append(
+                "The user has released the work WITHOUT reading the plan — they "
+                "dismissed the confirm note while it still said you were "
+                "drafting. So it is accepted, and it is NOT a contract yet: "
+                "nobody has seen what they signed.\n"
+                "YOU ARE STILL THIS DOCUMENT'S WRITER. `clawmeets plan update` "
+                "on any section still LANDS — no proposal, no `--why`, nothing "
+                "for them to accept. Do not file spec changes as notes; just "
+                "write them.\n"
+                "Finish the draft, `clawmeets plan consult <project>` and take "
+                "the roster's answers, then `clawmeets plan review <project>`. "
+                "THAT send is what puts the plan in front of them and turns the "
+                "row into a confirm — and from then on this document is a "
+                "contract and changes to it are theirs to accept."
+            )
+        if plan.phase == "executing" and plan.offered:
             lines.append(
                 "The plan is ACCEPTED. It is a contract now — but only its "
                 "SPEC LAYER is.\n"
@@ -1455,24 +1534,23 @@ written in the roster (not IDs, and do not add suffixes like '-agent')."""
         forever. The step therefore branches on what ``plan consult`` prints,
         and the fallthrough is the old single-turn behaviour unchanged.
 
-        **The closing section names a LINE IN THE DOCUMENT as the go signal,
-        and that is the whole point of it.** It used to say *"ask for their
-        acceptance explicitly and STOP"*, which left the coordinator reading
-        chat for a yes — and *"looks good, though I'd rethink M2"* is a sentence
-        a model resolves in the direction that starts work. ``## Approval`` is
-        not a sentence to interpret: the user's acceptance is a **diff into it**
-        (:data:`~clawmeets.models.project_plan.APPROVAL_GRANTED`), so the
-        coordinator checks a string instead of a mood, and it is the same string
-        the gate and the desk are looking at.
+        **The closing section names A STATE, not a sentence, as the go
+        signal.** It used to say *"ask for their acceptance explicitly and
+        STOP"*, which left the coordinator reading chat for a yes — and *"looks
+        good, though I'd rethink M2"* is a sentence a model resolves in the
+        direction that starts work. It then named ``## Approval``'s text, which
+        was better but still a string to interpret and a section to protect. It
+        now names the one fact the SERVER acts on: the confirm note is open, or
+        it is not.
 
-        Both halves are enforced, so neither is a rule the model merely
-        remembers: it cannot start work early (the note gate refuses
-        ``create_room`` while the go-note is open) and it cannot forge the line
-        (``_prepare_locked`` refuses a non-owner write that changes the
-        section's text, or one that removes its heading). What the prompt adds
-        is the *reason* — a ``NO_OP`` refusal is invisible to the model, so a
-        coordinator that did not know the rule would narrate as though a room
-        had opened.
+        The rule is enforced and not merely remembered: the note gate refuses
+        ``create_room`` while any note addressed to the user is open, and the
+        confirm note is one. What the prompt adds is the *reason* — a ``NO_OP``
+        refusal is invisible to the model, so a coordinator that did not know
+        the rule would narrate as though a room had opened. **And there is
+        nothing left to forge**: the three write-side guards that protected the
+        approval section retired with it, because the fact they protected is no
+        longer written in bytes a coordinator can reach.
 
         The one true and load-bearing fact in the old paragraph — nothing wakes
         a coordinator on its own — is kept, with the correction of what does
@@ -1518,6 +1596,8 @@ STEP 2: FILL — the document has TWO LAYERS and they are not equally yours.
         reader can now see and trust. "Produces 6 slides", "a Figma file with
         12 frames" and "a TSV with 10 rows" are artifacts. "Every
         recommendation cites a source the reader can open" is a criterion.
+        Name tests and documents by what they are, never by a label another
+        document defined ("the pitch's four pre-launch tests", not "C1-C4").
 
         THE ALTITUDE TEST — apply it to every line you write: IF AN ORDINARY
         CHANGE IN HOW THE WORK GETS DONE WOULD BREAK THE CRITERION, IT IS TOO
@@ -1590,8 +1670,8 @@ STEP 5: SEND — `clawmeets plan review <project>` puts those notes in front of
         note badges the user's card, and this is what they actually read. It
         creates no room and re-sends nothing whose text has not moved.
 STEP 6: reply in user-communication: what the plan says, what you are unsure
-        about, and that accepting the approval note is what starts the work.
-        Point them at it explicitly.
+        about, and — if you had nothing to ask — that dismissing the confirm
+        note on the plan is what starts the work. Point them at it explicitly.
 
 You are this plan's KEEPER — you and the user are the only two who write it.
 Everyone else proposes, and their proposals arrive as notes for the user to
@@ -1599,23 +1679,22 @@ accept. If someone else changed a section while you were writing it, your write
 is refused and your text becomes a note for the user; re-read that section and
 decide whether you still want the change.
 
-ACCEPTANCE IS A LINE IN THE DOCUMENT, AND `## Approval` IS WHERE IT LANDS.
-There is no approve command and no approve button. The server filed one note
-against `## Approval` when this project was created; when the user accepts it,
-the section stops reading "_Not yet approved._" and reads "User approves the
-plan." — and that line, in the plan, is the only go signal there is.
+ACCEPTANCE IS A NOTE THE USER DISMISSES, AND THERE IS NOTHING ELSE TO IT.
+There is no approve command and no approve button, and no section of the
+document records it. The server filed one note on this plan asking the user to
+confirm it; while that note is open the project is gated, and dismissing it is
+what starts the work.
 
-So: READ `## Approval` BEFORE YOU START ANYTHING. Not the chat. A user who
-writes "looks good", "ship it", or "go ahead" in user-communication has not
-approved the plan, and a turn where you dispatch work on the strength of a
-sentence like that is the failure this section exists to prevent. If they say
-something like that and `## Approval` still reads "_Not yet approved._", tell
-them where to accept and stop.
+So: CHECK "Plan confirmed by the user" IN THE PLAN BLOCK ABOVE BEFORE YOU START
+ANYTHING. Not the chat. A user who writes "looks good", "ship it", or "go ahead"
+in user-communication has not confirmed the plan, and a turn where you dispatch
+work on the strength of a sentence like that is the failure this section exists
+to prevent. If they say something like that and the line still reads NOT YET,
+tell them to dismiss the confirm note on the plan and stop.
 
-You may not write that line yourself. `## Approval` is the user's section while
-the approval note is open: a `plan update` that changes its text is refused, and
-so is one that deletes its heading — the acceptance is a diff, and it needs the
-heading to land on. Every other section is yours to rewrite freely.
+You cannot confirm it yourself and there is nothing in the document to write
+that would: it is a fact about the plan, not a sentence in it. Every section is
+yours to rewrite freely.
 
 Point them at it and STOP. You do not need to stay in this turn to hold the
 project open: their acceptance is a change of state that wakes you by itself,
@@ -1636,8 +1715,9 @@ gain a note mid-turn, so the note list is live state.
   3. Notes for every gap, all `--to user`.
   4. `clawmeets plan review` — always. It is what delivers them.
   5. reply to user-communication (what the plan says, what you need, no
-     @mentions), telling them that accepting the approval note starts the
-     work.""" + "\n\n" + _RELAY_PROCEDURE + "\n\n" + _USER_FACING_WRITING + "\n\n" + _NO_DANGLING_POINTERS
+     @mentions). If your round carried questions, what starts the work is their
+     answers; if it carried none, it is dismissing the confirm note on the
+     plan.""" + "\n\n" + _RELAY_PROCEDURE + "\n\n" + _USER_FACING_WRITING + "\n\n" + _NO_DANGLING_POINTERS
 
     def _batch_flow_blocks(self) -> str:
         """Coordinator blocks that ONLY matter when waking on a
@@ -1813,6 +1893,8 @@ burns the turn's token budget and the project never starts.
   the final user need) to proceed, the "good enough to unblock" bar, NOT a
   wishlist and NOT a description of an artifact. "Produces 6 slides" is not a
   criterion; "every recommendation cites a source the reader can open" is.
+  Name tests and documents by what they are, never by a label another
+  document defined ("the pitch's four pre-launch tests", not "C1-C4").
 - THE ALTITUDE TEST: if an ordinary change in HOW THE WORK GETS DONE would break
   the criterion, it is too fine-grained — a rename or a swapped library in code,
   a different source, sample window or tool in research. Neither may cost the

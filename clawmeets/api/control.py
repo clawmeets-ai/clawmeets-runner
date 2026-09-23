@@ -28,7 +28,8 @@ class ControlMessageType(str, Enum):
             SKILL_SYNC, MCP_SYNC, AGENT_SETTINGS_CHANGE, CANCEL_LLM,
             MCP_AUTH_CODE, KNOWLEDGE_PACK_SYNC, AGENT_REGISTRY_CHANGE
         - To user UIs (web frontend) only:
-            AGENT_STATUS_CHANGE, MCP_AUTH_URL_FOR_USER, AGENT_CARD_UPDATE
+            AGENT_STATUS_CHANGE, MCP_AUTH_URL_FOR_USER, AGENT_CARD_UPDATE,
+            RUNNER_VERSIONS, HOST_SYNC
         - To both (fan-out via ``ws_hub.broadcast_to_project`` over every
           project participant — agents, coordinator, owner, FD requester,
           share-token viewers):
@@ -81,6 +82,19 @@ class ControlMessageType(str, Enum):
     # latter sat one word from AGENT_STATUS_CHANGE — the shared, cross-tenant
     # envelope — and invited exactly that mistake.
     RUNNER_VERSIONS = "runner_versions"
+
+    # Server -> the ONE owning user: "one of your computers moved". Same
+    # recipient rule and same reason as RUNNER_VERSIONS — ``ws_hub.send_to``
+    # against ``host.owner_user_id``, never
+    # ``get_status_broadcast_recipients``, which spans other people's projects
+    # and other people's runners. A machine name, the software version it runs
+    # and the roster of agents on it are all this user's business alone.
+    #
+    # A CURSOR, not a snapshot: it names the host and what happened, and the
+    # browser refetches ``GET /me/computers``. Nothing about a machine's state
+    # travels in this payload, so a dropped frame costs a stale page until the
+    # next one rather than a wrong page.
+    HOST_SYNC = "host_sync"
 
 
 class ChangelogUpdatePayload(BaseModel):
@@ -548,6 +562,28 @@ class RunnerVersionsPayload(BaseModel):
     runners: list[RunnerVersion]
 
 
+class HostSyncPayload(BaseModel):
+    """Payload for HOST_SYNC — see the enum member.
+
+    ``action`` is why the browser is being woken, not an instruction:
+
+    - ``connected`` / ``disconnected`` — the machine's socket opened or closed.
+      This is the pair that makes "your computer is on, but none of your agents
+      are running" expressible at all.
+    - ``state`` — the machine re-reported which of its agents are running.
+    - ``renamed`` / ``revoked`` / ``paired`` — the user changed something from a
+      browser, possibly a different one of their own tabs.
+
+    Both fields are required, which is what keeps this member safe to append to
+    ``ControlEnvelope.payload``'s non-discriminated Union (see that docstring):
+    a model with no required fields would match every dict, including the empty
+    payload on an inbound HEARTBEAT.
+    """
+
+    host_id: str
+    action: str
+
+
 class ControlEnvelope(BaseModel):
     """Lightweight WebSocket notification - never carries file content.
 
@@ -567,7 +603,7 @@ class ControlEnvelope(BaseModel):
     would need a real discriminator first.
     """
     type: ControlMessageType
-    payload: Union[ChangelogUpdatePayload, AgentStatusChangePayload, ProjectDeletedPayload, SkillSyncPayload, McpSyncPayload, AgentSettingsChangePayload, CancelLLMPayload, ActiveWorkChangePayload, McpAuthUrlForUserPayload, McpAuthCodePayload, SkillAuthUrlForUserPayload, SkillAuthCodePayload, KnowledgePackSyncPayload, AgentRegistryChangePayload, AgentCardUpdatePayload, BriefTabSyncPayload, ProjectReportSyncPayload, ProjectPlanSyncPayload, DeskTodoSyncPayload, DeskReadStateSyncPayload, DeskSopSyncPayload, DeskLabelSyncPayload, RunnerVersionsPayload, dict] = Field(default_factory=dict)
+    payload: Union[ChangelogUpdatePayload, AgentStatusChangePayload, ProjectDeletedPayload, SkillSyncPayload, McpSyncPayload, AgentSettingsChangePayload, CancelLLMPayload, ActiveWorkChangePayload, McpAuthUrlForUserPayload, McpAuthCodePayload, SkillAuthUrlForUserPayload, SkillAuthCodePayload, KnowledgePackSyncPayload, AgentRegistryChangePayload, AgentCardUpdatePayload, BriefTabSyncPayload, ProjectReportSyncPayload, ProjectPlanSyncPayload, DeskTodoSyncPayload, DeskReadStateSyncPayload, DeskSopSyncPayload, DeskLabelSyncPayload, RunnerVersionsPayload, HostSyncPayload, dict] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_required_fields_for_type(self) -> "ControlEnvelope":
@@ -641,4 +677,7 @@ class ControlEnvelope(BaseModel):
         elif self.type == ControlMessageType.RUNNER_VERSIONS:
             if not isinstance(self.payload, RunnerVersionsPayload):
                 raise ValueError(f"control message type {self.type} requires RunnerVersionsPayload")
+        elif self.type == ControlMessageType.HOST_SYNC:
+            if not isinstance(self.payload, HostSyncPayload):
+                raise ValueError(f"control message type {self.type} requires HostSyncPayload")
         return self

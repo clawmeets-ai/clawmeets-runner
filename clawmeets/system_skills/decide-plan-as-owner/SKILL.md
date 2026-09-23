@@ -5,7 +5,7 @@ description: >
   REQUEST, from the owner's own DM. Use when the user says "approve the plan",
   "accept it", "go ahead with the plan", "apply that note", "reject n-a91f",
   or asks you to unblock a project waiting on their acceptance. Accepting a
-  plan IS applying its approval note, so this is `clawmeets plan resolve
+  plan IS dismissing its confirm note, so this is `clawmeets plan resolve
   --as-user` throughout. You are relaying a decision the user just made —
   never making one.
 ---
@@ -13,11 +13,17 @@ description: >
 # Decide a plan as the owner
 
 The coordinator **drafts and keeps** a project's plan. The user **alone
-decides**: acceptance, and applying or rejecting a note. Those are the same act
-now — accepting a plan means applying the **go-note**, the note the server
-files against `## Approval` when the project is created. `clawmeets plan
+decides**: acceptance, and applying or rejecting a note. Acceptance is a note
+decision like any other — accepting a plan means **dismissing its confirm
+note**, the one note the server files at project creation, addressed to the
+user and anchored to the document rather than to any section. `clawmeets plan
 resolve --apply/--reject` is 403 for every agent, including the project's own
-coordinator.
+coordinator, and `--dismiss` on the confirm note is refused for everyone but
+the user by the same door.
+
+There is **no `## Approval` section** and nothing in the document records the
+acceptance. It is a fact about the plan (`accepted_at` on the sidecar, `Plan
+confirmed by the user` in the coordinator's prompt), not a sentence in it.
 
 `--as-user` is the one exception, and it exists for one caller: a user who works
 in the terminal or in a DM rather than in the plan tab still has to be able to
@@ -58,16 +64,52 @@ credential is the same act with a different bearer token.
 **If any condition fails: do not run the command.** Say what you need — which
 project, or that you need them to ask you directly.
 
+## The one row you must never touch: the confirm note BEFORE it is a confirm
+
+The confirm note has **two wordings**, and only one of them is a confirm. A
+project is born with the row already filed, reading:
+
+> "@{keeper} is drafting this and has it out for review with the agents.
+> Nothing to do yet — it will come back to you for a confirm. Only the user's
+> own hand may dismiss this row, and dismissing it starts work on the draft as
+> it stands."
+
+That is the row **before** the coordinator has sent anything. It becomes the
+confirm — *"I've drafted this and I have nothing open on it"* — only when the
+keeper sends its first quiet review round. Dismissing it in the drafting
+wording stamps a **full acceptance at revision 1** of a document nobody has
+read.
+
+**The server now refuses that specific dismiss when the acting credential is
+this project's own keeper**, so a coordinator turn reaching for it gets a 403
+rather than a silent signature. Do not go looking for a way around it: the way
+forward is to finish the draft and `clawmeets plan review` it, which takes
+seconds and gives the user a document to skim. Once the round has gone out the
+refusal lifts and this skill works exactly as described.
+
+It happened, which is why this section exists: on `onboard-angel-investor` the
+coordinator dismissed the drafting row two seconds after its own plan write, and
+the user's first sight of the plan was an off-contract alarm about a contract
+they had signed and never seen.
+
 ## The commands
 
 ```bash
-# The go-note's id. It is addressed to the user and its comment starts
-# "Work on this project does not start until you accept the plan."
+# The confirm note's id. It is addressed to the user and its comment starts
+# "I've drafted this and I have nothing open on it."
+#
+# IF IT STARTS "@<keeper> is drafting this" INSTEAD, this plan has never been
+# sent and you are looking at the pre-confirm row — see the section above. Stop.
 clawmeets plan list-notes <project> --to user --status open
 
-# ACCEPTANCE. Applying the go-note writes "User approves the plan." into
-# `## Approval`, stamps the acceptance and releases the coordinator.
-clawmeets plan resolve <project> <go-note-id> --as-user --apply
+# ACCEPTANCE. --dismiss on the confirm note stamps the acceptance and releases
+# the coordinator. It writes no bytes: there is nothing to apply.
+#
+# --dismiss MEANS YES ON THIS ONE NOTE AND MEANS NOTHING ON EVERY OTHER, which
+# is safe rather than a trap: the confirm note carries no proposal, so there is
+# nothing else it could mean, and the server refuses every other verb on it by
+# name rather than letting a wrong one through quietly.
+clawmeets plan resolve <project> <confirm-note-id> --as-user --dismiss
 
 # Any other note the user decided on. --reject needs --reason. On a plan that
 # is already accepted, an --apply also RE-SIGNS it: the acceptance follows the
@@ -76,15 +118,16 @@ clawmeets plan resolve <project> <note-id> --as-user --apply
 clawmeets plan resolve <project> <note-id> --as-user --reject --reason "..."
 ```
 
-**Do not `--reject` the go-note when the user wants changes.** Rejecting it
-closes it, and closing it is what the execution gate is counting — a rejected
-go-note would leave the plan unapproved and the coordinator unblocked, which is
-the one outcome nobody wants. The server refuses that close for exactly this
-reason. What the user wants instead is a **reply**, which reaches the
-coordinator and leaves the gate up while the plan is revised:
+**Do not `--reject` the confirm note when the user wants changes.** Rejecting
+it closes it, and closing it is what the execution gate is counting — a
+rejected confirm note would leave the plan unapproved and the coordinator
+unblocked, which is the one outcome nobody wants. The server refuses that close,
+and `--answered` and `--apply` with it, for exactly this reason. What the user
+wants instead is a **reply**, which reaches the coordinator and leaves the gate
+up while the plan is revised:
 
 ```bash
-clawmeets plan note <project> --reply-to <go-note-id> --as-user -m "..."
+clawmeets plan note <project> --reply-to <confirm-note-id> --as-user -m "..."
 ```
 
 `--as-user` suppresses the runner's agent header so the call is authorised by
@@ -101,11 +144,13 @@ clawmeets plan list-notes <project> --status open   # what is waiting on them
 
 ## Then report
 
-Say, in the DM, what you ran and what came back. Quote the line `## Approval`
-now carries — that line, in the document, is what the coordinator reads as its
-go signal, so it is the thing that actually changed. `clawmeets plan show
-<project> --section approval` prints it. An acceptance you performed and did
-not report is, to the user, indistinguishable from one that did not happen.
+Say, in the DM, what you ran and what came back. There is no line in the
+document to quote — the acceptance is a state, not text — so report the state:
+the confirm note is closed, the plan is accepted at revision N, and the
+coordinator is released. `clawmeets plan show <project>` prints the revision and
+`clawmeets plan list-notes <project> --to user --status open` should now come
+back empty. An acceptance you performed and did not report is, to the user,
+indistinguishable from one that did not happen.
 
 ## What this skill is not for
 
@@ -113,8 +158,8 @@ not report is, to the user, indistinguishable from one that did not happen.
   is theirs.
 - Writing the plan. Only the coordinator and the owner write it, and after
   acceptance a coordinator may not change what it says at all — that comes back
-  as a deviation note for the user to accept. `## Approval` is narrower still:
-  while the go-note is open it is the user's section, and a coordinator write
-  that changes its text is refused.
+  as a deviation note for the user to accept. There is no section the
+  coordinator is barred from before acceptance: the acceptance is not written
+  in the document, so there is nothing in it to forge.
 - Answering a note addressed to the coordinator. `--answered` and `--dismiss`
   are reports, not decisions, and they belong to the note's own addressee.

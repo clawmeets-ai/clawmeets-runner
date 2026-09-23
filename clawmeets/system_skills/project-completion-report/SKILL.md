@@ -81,19 +81,20 @@ in document order and emit one row each:
 
 | field | value |
 |---|---|
-| `id` | `AC-<m>.<n>`, exactly as the plan writes it |
+| `id` | `AC-<m>.<n>`, exactly as the plan writes it — the one code the reader can look up, in the plan they accepted |
 | `criterion` | the plan's own words, quoted — not your paraphrase |
-| `claimed by` | the milestone(s) whose `advances:` names it, or `unclaimed` |
 | `verdict` | `met` \| `not met` \| `not applicable` |
-| `evidence` | the deliverable file or the room that satisfies it |
+| `evidence` | what now holds, in plain words — which part of the deliverable shows it |
 
+There is no milestone column: milestone IDs are workroom bookkeeping and mean
+nothing on the report page. Check the `advances:` claims anyway.
 **A criterion is an invariant, so judge the invariant and nothing else.**
 Its `<!-- evidence: … -->` comment records how the team meant to show it;
 that comment is the keeper's and may have changed since. If the invariant
 holds by some other demonstration, the verdict is `met` — a substituted
-test or artifact was never a deviation. `unclaimed` in the third column is
-itself worth a line in the report: it means no milestone ever took the
-criterion on.
+test or artifact was never a deviation. A criterion no milestone's
+`advances:` names is itself worth saying: write "no milestone took this on"
+in its evidence cell.
 
 **Why quoted rather than restated.** A criterion you retype is a criterion
 you can soften. The plan is the contract the user accepted, and a trace is
@@ -107,8 +108,7 @@ row you quietly drop.
 
 If the plan has no `## Acceptance Criteria` section — a pre-feature project,
 or one whose coordinator wrote a different shape — look for `AC-<m>.<n>`
-lines inside the `### M<n>` blocks, which is where they lived before, and
-leave the `claimed by` column as the enclosing milestone. If there are none
+lines inside the `### M<n>` blocks, which is where they lived before. If there are none
 at all, say so in one line and fall back to the criteria in the delegation
 messages. Do not invent the section.
 
@@ -118,8 +118,6 @@ Default structure (deviate when the project shape demands it):
 
 1. **Executive verdict** — one sentence at the top. The user should be
    able to read just this and know the outcome.
-1a. **Acceptance-criteria trace** — the table above, directly under the
-   verdict.
 2. **Open items** (optional) — anything that still needs a human hand,
    directly under the verdict. Each is `{item, why, owner}`. Omit the
    key entirely when there are none — never render an "Open items:
@@ -131,10 +129,13 @@ Default structure (deviate when the project shape demands it):
 4. **Supporting charts** — one or more Chart.js charts (bar / line /
    doughnut / scatter / radar) showing the numerical evidence. Inline
    in the page, not behind a click.
-5. **Methodology** (optional) — a short note on what data sources you
+5. **Acceptance-criteria trace** — the table above, below the charts. It
+   is the audit of the contract; the conclusions are the take-away, so
+   they come first.
+6. **Methodology** (optional) — a short note on what data sources you
    used, what you excluded, and known caveats. The user wants to know
    what to trust.
-6. **Sources** — links back to chatroom files / external URLs the user
+7. **Sources** — links back to chatroom files / external URLs the user
    can verify. Use root-relative server paths for chatroom files, with NO
    `/api` prefix — the renderer adds the dev-proxy prefix itself:
    `/projects/<project_id>/chatrooms/<room>/files/<name>`.
@@ -206,7 +207,7 @@ A canonical data shape worth starting from:
 
 ```json
 {
-  "executive": "SE region drove all of Q1 growth; APAC slipped on weak retail.",
+  "executive": "The Southeast region drove all of Q1 growth; APAC slipped on weak retail.",
   "open_items": [
     {
       "item": "Decide whether to re-staff APAC retail coverage before Q3 planning.",
@@ -216,8 +217,8 @@ A canonical data shape worth starting from:
   ],
   "conclusions": [
     {
-      "title": "SE region grew 23% YoY, vs. 4% company-wide.",
-      "rationale": "Comparing Q1-2025 to Q1-2026 by region (SE: $4.1M → $5.0M; rest flat). Driver was the enterprise renewal cohort closing on time, not new logos."
+      "title": "The Southeast region grew 23% YoY, vs. 4% company-wide.",
+      "rationale": "Comparing Q1-2025 to Q1-2026 by region (Southeast: $4.1M → $5.0M; rest flat). Driver was the enterprise renewal cohort closing on time, not new logos."
     },
     {
       "title": "APAC weakness concentrated in retail vertical.",
@@ -228,7 +229,7 @@ A canonical data shape worth starting from:
     {
       "title": "YoY revenue by region",
       "kind": "bar",
-      "labels": ["NA", "EU", "SE", "APAC"],
+      "labels": ["North America", "Europe", "Southeast", "Asia-Pacific"],
       "datasets": [
         {"label": "Q1-2025", "data": [12.0, 8.1, 4.1, 6.0]},
         {"label": "Q1-2026", "data": [12.4, 8.3, 5.0, 5.2]}
@@ -359,6 +360,14 @@ trusted analyst:
   reader can see none of it. State the finding; put the pointer in
   `sources` where it is clickable. Never "see source 2" — `sources` is
   a bibliography, not an index.
+- **No private labels.** The executive line, open items, conclusion
+  titles and rationales, evidence cells and methodology never use a code
+  the page has not explained — "C1", "V5-a", "PAY-b", "M2", "objection
+  #9". Name the test or gate by what it measures ("the week-1 completion
+  test: at least half of venue beginners finish week 1"). If the
+  deliverable's name for it helps the reader find it there, add that name
+  once, after the meaning. A rationale that strings several codes
+  together ("V5-a/b, PAY-a/b/c and G-COACH") has told the reader nothing.
 - No "we ran a query and found…" — the user knows you ran a query.
 - No emoji, no exclamation marks. Quiet confidence.
 

@@ -8,6 +8,7 @@ rendering primitives. ClawMeets-specific templates live in
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import html as _html
 import logging
@@ -15,7 +16,7 @@ import mimetypes
 import os
 import re
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import sendgrid
 from markdown_it import MarkdownIt
@@ -33,11 +34,22 @@ from sendgrid.helpers.mail import (
     To,
 )
 
+if TYPE_CHECKING:  # starlette is a SERVER dependency; this module ships in the
+    from starlette.background import BackgroundTasks  # runner wheel, which has none.
+
 logger = logging.getLogger("clawmeets.email")
 
 SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY")
 SENDGRID_FROM_EMAIL = os.environ.get("SENDGRID_FROM_EMAIL", "info@clawmeets.ai")
 SENDGRID_FROM_NAME = os.environ.get("SENDGRID_FROM_NAME", "ClawMeets AI")
+
+# Hard ceiling on one SendGrid round trip. The SendGrid SDK is a synchronous
+# urllib client and python_http_client defaults its timeout to ``None`` — i.e.
+# WAIT FOREVER. On a hung TCP connection that turns one notification into a
+# permanently parked worker thread, so this value is not a nicety.
+SENDGRID_TIMEOUT_SECONDS = float(
+    os.environ.get("CLAWMEETS_SENDGRID_TIMEOUT_SECONDS", "15")
+)
 
 # Attachment caps — keep a message under SendGrid's ~30 MB hard limit and
 # avoid inlining an unbounded deliverable set. Any candidate that trips a cap
@@ -334,7 +346,28 @@ class SendGridMailer(Mailer):
         self._from_name = from_name
 
     async def send(self, message: EmailMessage) -> None:
+        """Send via SendGrid WITHOUT BLOCKING THE EVENT LOOP.
+
+        ``sendgrid``'s client is synchronous: ``sg.send(mail)`` goes through
+        ``python_http_client``'s urllib opener and does not yield. Awaiting it
+        directly from a request handler — which is what every call site here
+        does — stops the **entire** server for the duration of the round trip,
+        because the API runs one uvicorn process with no ``workers`` argument.
+        That is not just slow responses: ``ws_hub.send_to`` only QUEUES an
+        envelope on an ``asyncio.Queue`` and a separate writer task drains it,
+        so a blocked loop means already-queued WebSocket frames cannot reach
+        the browser either. A desk to-do's ticket chip would sit on its old
+        value until SendGrid answered.
+
+        Two defences, and both are needed: ``to_thread`` moves the blocking
+        call off the loop, and the explicit timeout bounds the thread it moves
+        it to (the SDK's own default is no timeout at all).
+        """
         sg = sendgrid.SendGridAPIClient(api_key=self._api_key)
+        # Set on the underlying python_http_client, which propagates it to
+        # every client it builds for the method chain and falls back to it in
+        # ``_make_request``. The SDK exposes no timeout on its constructor.
+        sg.client.timeout = SENDGRID_TIMEOUT_SECONDS
         mail = Mail(
             from_email=Email(self._from_email, self._from_name),
             to_emails=To(message.to_email),
@@ -355,7 +388,7 @@ class SendGridMailer(Mailer):
                 )
             )
         try:
-            response = sg.send(mail)
+            response = await asyncio.to_thread(sg.send, mail)
             logger.info(
                 f"{message.log_label} sent to {message.to_email} "
                 f"(status={response.status_code})"
@@ -390,3 +423,46 @@ def get_mailer() -> Mailer:
     if SENDGRID_API_KEY:
         return SendGridMailer(SENDGRID_API_KEY, SENDGRID_FROM_EMAIL, SENDGRID_FROM_NAME)
     return ConsoleMailer()
+
+
+async def _send_notification(message: EmailMessage) -> None:
+    """One detached notification send, with its own error boundary.
+
+    The call sites used to wrap ``await get_mailer().send(...)`` in a
+    ``try/except`` that logged and moved on. Once the send is deferred past the
+    response, that wrapper no longer covers it — so the boundary moves here and
+    the semantics stay identical: a notification that cannot be delivered is
+    logged and never surfaces to the caller.
+    """
+    try:
+        await get_mailer().send(message)
+    except Exception:
+        logger.exception(
+            f"Failed to send {message.log_label.lower()} to {message.to_email}"
+        )
+
+
+def queue_notification(background: "BackgroundTasks", message: EmailMessage) -> None:
+    """Send a NOTIFICATION email AFTER the response, not before it.
+
+    Starlette flushes the response body and only then runs the background
+    tasks, so the browser gets its answer without waiting on SendGrid — while
+    graceful shutdown still drains the queue, which a detached
+    ``asyncio.create_task`` would not.
+
+    WHY THIS MATTERS FOR SOMETHING THAT LOOKS UNRELATED. "Mark done" completes
+    the project, pushes a ``desk_todo_sync`` frame to the owner's desk, and
+    then sent the completion email inline. Two consequences, both invisible
+    from the email's point of view: the browser's 200 — the client's only
+    non-WebSocket proof that the project is now completed — could not arrive
+    until SendGrid had answered; and because the send BLOCKED THE EVENT LOOP
+    (see :meth:`SendGridMailer.send`), the frame queued a moment earlier could
+    not be written to the socket either. The email is not part of the
+    transaction; the user waiting on it was an accident of ordering.
+
+    NOT for email that IS the transaction. A verification or password-reset
+    message is the thing the user is waiting to be told was sent, so those call
+    sites keep awaiting ``get_mailer().send`` directly and let a failure
+    surface in the response.
+    """
+    background.add_task(_send_notification, message)

@@ -53,18 +53,20 @@ Sequence:
    labelled `AC-<m>.<n>`, where `<m>` is the group and not a milestone; which
    milestone took each on is written on the milestone, as
    `### M2: Session layer <!-- advances: AC-1.1, AC-1.3 -->`. Emit one row per
-   criterion — `{id, criterion (the plan's own words, quoted), claimed by (the
-   milestone(s) whose advances: names it, or `unclaimed`), verdict: met | not
-   met | not applicable, evidence: the commit, file or room that satisfies
-   it}` — and put that table directly under the verdict.
+   criterion — `{id, criterion (the plan's own words, quoted), verdict: met |
+   not met | not applicable, evidence: what now holds, in plain words, and the
+   commit or file that shows it}` — and put that table below `summary` and
+   `review`, above the diff. The take-away comes first; the table is the audit.
+   No milestone column: milestone IDs are workroom bookkeeping. Check the
+   `advances:` claims anyway, and write "no milestone took this on" in the
+   evidence cell of a criterion none of them names.
 
    **Judge the invariant, not the artifact.** A criterion's
    `<!-- evidence: … -->` comment is the keeper's and may have changed since
    the plan was accepted; a test that moved or an artifact that was
    substituted is not a deviation. What the criterion's own sentence promises
    is the only thing the user signed. On an older plan the criteria sit inside
-   the `### M<n>` blocks instead — read them there and let the enclosing
-   milestone be the `claimed by`.
+   the `### M<n>` blocks instead — read them there.
 
    **The coding variant had no named source for "acceptance criteria" at all**,
    which is how a review ends up graded against the criteria the reviewer
@@ -577,6 +579,10 @@ trusted senior reviewer:
   reader can see none of it. State the finding; put the pointer in
   `diff_files` / `annotations` where it is clickable. Never "see
   annotation 2" — those are anchors, not an index.
+- **No private labels.** Never use a code the page has not explained —
+  a milestone ID, a reviewer's "M3", a gate or ticket shorthand from the
+  workroom. Say what the thing is; if its name helps the reader find it
+  elsewhere, add the name once, after the meaning.
 - No emoji, no exclamation marks, no "we ran git diff."
 
 The page IS the deliverable. Don't summarize it in chat afterward.

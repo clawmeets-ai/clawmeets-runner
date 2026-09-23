@@ -33,7 +33,7 @@ accepted plan says.
 
 | You are | You may | You may not |
 |---|---|---|
-| the project's **coordinator** (its keeper) | write any section **until the user accepts the plan** — after their first review round each spec change also needs `--why` (below); send review batches; close a note addressed to you (`--answered` / `--dismiss`); relay the user's questions in `shared-context` | **accept** the plan, **apply** or **reject** a note — including notes you wrote yourself. **Change what an ACCEPTED plan says** — that is a proposal (below). **Close your own note to the user before it has been sent** — the user has not seen it, so there is nothing to report. And you may not write `## Approval` while the approval note is open: that section is the user's |
+| the project's **coordinator** (its keeper) | write any section **until the user accepts the plan** — after their first review round each spec change also needs `--why` (below); send review batches; close a note addressed to you (`--answered` / `--dismiss`); relay the user's questions in `shared-context` | **accept** the plan, **apply** or **reject** a note — including notes you wrote yourself. **Change what an ACCEPTED plan says** — that is a proposal (below). **Close your own note to the user before it has been sent** — the user has not seen it, so there is nothing to report. **Close the confirm note** at all: `--dismiss` on it is the user's acceptance and 403 for you |
 | the **owner** (the human, from the UI or their own terminal) | everything the coordinator may, **and every decision**: accept, apply, reject | — |
 | **any other agent** | read the plan; answer in `shared-context` (before acceptance) or in your workroom (after) — and when a consult asks you to sign an acceptance criterion, answer **per criterion**, not per plan | write the file (`plan update` is a **403**), send a batch (`plan review` is a **403**), and **file a plan note at all** (`plan note` is a **400**, in both phases) |
 
@@ -250,9 +250,9 @@ never sent*, so the person who asked never hears it. `--reply-to` does all of
 that from the one flag — **including closing the parent**, which lands on
 `answered` in the same write. That is the whole of the second act, so there is
 no `plan resolve --answered` to run afterwards and nothing left open on the
-asker's screen for them to dismiss. The go-note is the one exception: replying
-to it leaves it open, because closing it releases the execution gate and only
-accepting it means yes.
+asker's screen for them to dismiss. The confirm note is the one exception: replying
+to it leaves it open, because closing it releases the execution gate and
+dismissing it is the only act that means yes.
 
 **Answer with the change, not just about it.** When your answer changes the
 plan, file it as a proposal (`--edit-file`) rather than prose. A proposal
@@ -442,8 +442,8 @@ standing alone — real, and now paid for on the answer instead: the reply's
 *"Answering your question"* line carries the parent's own first line, so the
 exchange still reads with the question closed.
 
-**Two notes do not close on reply.** The go-note, because closing it releases
-the execution gate and accepting it is the only act that means yes; and a
+**Two notes do not close on reply.** The confirm note, because closing it releases
+the execution gate and dismissing it is the only act that means yes; and a
 proposal of your own to the user that has never been sent, because the user has
 not seen it yet and closing it would decide it on their behalf.
 
@@ -672,27 +672,82 @@ Then send the batch, and say in `user-communication` what changed and what is
 still open; the rendered batch is diffs and threads, and on its own it is a
 changelog the user has to interpret unaided.
 
-## Acceptance: a note the user accepts, and a line in the document
+## Acceptance: a note the user dismisses
 
-**There is no approve command and no approve button.** When a project is
-created the server files one note against the plan's `## Approval` section,
-addressed to the user, proposing to replace its body with:
+**There is no approve command, no approve button, and no `## Approval`
+section.** When a project is created the server files one note on the plan,
+addressed to the user, anchored to the document as a whole.
+
+**That one row has two wordings, and your review send is what swaps them.** It
+is filed at project creation, before you have taken a turn, so it starts by
+saying what is true then:
 
 ```
-User approves the plan.
+@<you> is drafting this and has it out for review with the agents. Nothing to
+do yet — it will come back to you for a confirm. Only your own hand may dismiss
+this row, and dismissing it starts work on the draft as it stands.
 ```
 
-Accepting that note IS accepting the plan. It applies the proposal, so the
-section stops reading `_Not yet approved._` and starts reading the line above;
-in the same transaction the acceptance is stamped, the note closes, and the
-project's blocking-note count drops — which is what releases the coordinator.
-One verb for every decision the user makes about their plan, instead of a
-special one for the first decision.
+**"Only your own hand" is addressed to you as much as to the user.** While the
+row reads this way the server refuses a dismiss that arrives on this project's
+own keeper's credential — including the owner's `--as-user` bearer, which on
+most projects is you. Dismissing a row nobody has been shown stamps a full
+acceptance at revision 1 of a document the user has never read. Send the round
+first; the refusal lifts the moment you do.
+
+Your first quiet round — `clawmeets plan review` with nothing open for the user
+— rewrites it in place to the confirm:
+
+```
+I've drafted this and I have nothing open on it. Have a read — dismiss this
+note and I'll start. Reply instead if you want something changed; that leaves
+it open.
+```
+
+Nothing else about the row moves: same note, same addressee, same open count,
+same gate. **What this buys you is that STEP 3 is safe to take.** The contract
+has you draft, `plan consult` the roster, and stop — and the answers are a
+worker turn away. Before this, the confirm was standing throughout that window
+asking the user to sign a draft that was still out for review; a user who took
+it got your fold-in back as a deviation on a plan they had never opened. Now
+the row says *"nothing to do yet"* for exactly as long as that is true, so you
+can tell them in `user-communication` that you will come back — and be right.
+
+Dismissing that note IS accepting the plan. It writes no bytes — there is
+nothing to apply — and in the same transaction the acceptance is stamped, the
+note closes, and the project's blocking-note count drops, which is what releases
+the coordinator. One verb the user already knows, on a row in the list they are
+already reading, instead of a special act for the first decision.
+
+**If they take it while it still says you are drafting, you are still the
+writer.** That dismiss means *"start on the draft as it stands"* — it releases
+the work and ratifies nothing, because nobody has seen the document. So the
+plan reads accepted and the spec lock stays OPEN: `clawmeets plan update` on
+any section still lands, no proposal, no `--why`, nothing for the user to
+accept. Finish the draft, consult the roster, and send your review; that send
+is what turns the row into a confirm and the document into a contract. Do not
+start filing spec changes as notes the moment you see "accepted" — on a plan
+they have not been shown, every one of those notes is a hunk they are being
+asked to adjudicate against a baseline they never read.
 
 ```bash
-clawmeets plan list-notes <project> --to user     # the go-note's id is in here
-clawmeets plan resolve <project> <id> --apply     # this is the acceptance
+clawmeets plan list-notes <project> --to user  # the confirm note's id is here
+clawmeets plan resolve <project> <id> --dismiss   # this is the acceptance
 ```
+
+**`--dismiss` means YES on this one note and means nothing on every other.**
+That is not a trap: the confirm note carries no proposal, so there is nothing
+else it could mean, and the server refuses `--apply`, `--reject` and
+`--answered` on it **by name** rather than letting a wrong verb through quietly.
+
+**The coordinator's own review send moves it.** A round you send that carries
+at least one open question for the user retires the confirm note in the same
+write — their answers are the gate, and a row saying *"I have nothing open on
+it"* above four things that are open would be false. A round that carries no
+question files it again, or rewrites the drafting wording into the confirm if
+the row is still the one seeded at creation. So a plan that came back quiet after a round of
+questions still comes back for a confirm, and a plan you never had anything to
+ask about has exactly one thing on it.
 
 **Acceptance is one-way. There is no undo, and that is not a gap.** An accepted
 plan is not un-decided; it is CHANGED, by filing a note the user applies — and
@@ -704,35 +759,31 @@ filing one holds the project without touching the acceptance at all. Anchor it
 to what is actually being renegotiated — a note on a `<!-- layer: detail -->`
 section does not hold anything, for the reason in *The two layers* below.
 
-### If you are the coordinator: read the section, not the chat
+### If you are the coordinator: read the state, not the chat
 
-`## Approval` is your go signal and nothing else is. The steady-state prompt
-prints what it currently says on every turn, so you do not have to go looking —
-but if you want to check it yourself:
+`Plan confirmed by the user` in your steady-state prompt is your go signal and
+nothing else is. It prints on every turn, so there is nothing to go looking for
+— and nothing in the document to check, because the acceptance is not written
+there.
 
-```bash
-clawmeets plan show <project> --section approval
-```
-
-**A user saying "looks good" or "go ahead" in chat has not approved the plan.**
+**A user saying "looks good" or "go ahead" in chat has not confirmed the plan.**
 Neither has a thumbs-up, and neither has silence. Those are sentences you would
 have to interpret, and the interpretation that starts work is the expensive one
-to get wrong. The document is not a sentence to interpret. If they say
-something like that while `## Approval` still reads `_Not yet approved._`, tell
-them where to accept and stop.
+to get wrong. If they say something like that while the line still reads
+`NOT YET`, tell them to dismiss the confirm note on the plan and stop.
 
-The server holds the same line from the other side: while the go-note is open,
-`create_room` is refused, so a coordinator that reads the chat wrong cannot
-open a workroom anyway. What you lose by ignoring this section is not the
+The server holds the same line from the other side: while the confirm note is
+open, `create_room` is refused, so a coordinator that reads the chat wrong
+cannot open a workroom anyway. What you lose by ignoring this is not the
 guarantee — it is knowing *why* you were refused, and a refusal you cannot
 explain is one you will narrate as though it succeeded.
 
-**You may not write that line yourself.** While the go-note is open, a
-`plan update` that changes `## Approval`'s text is refused, and so is one that
-removes its heading — the acceptance is a diff, and a diff needs its heading to
-land on. Every other section is yours to rewrite as freely as ever, including
-the seed template's Goal and Not Authorized; `## Approval` is the one exception,
-and only until the plan is accepted.
+**There is nothing for you to write that would make it true**, and no section
+you are barred from either. The acceptance used to be a line the user's accept
+wrote into `## Approval`, which needed three server guards to stop a coordinator
+forging it, deleting the heading it had to land on, or shadowing the slug with a
+second copy. All three retired with the section. Every section is yours to
+rewrite as freely as ever.
 
 Point the user at the note and **stop**. You do not have to stay in the turn to
 hold the project open: their acceptance is a change of state and it wakes you
@@ -742,6 +793,7 @@ by itself.
 
 ```bash
 clawmeets plan resolve <project> <id> --apply --as-user
+clawmeets plan resolve <project> <id> --dismiss --as-user   # the confirm note
 ```
 
 `--as-user` authenticates as the **human**, not as the agent — it sends the
@@ -760,9 +812,12 @@ not yours; ask the user.
 **An apply on an already-accepted plan re-signs it.** The same verb, doing the
 same thing it always did — the user is putting their name to a piece of text —
 except that the plan already carries their name and this moves it onto what the
-document now says. It is why there is no revoke to miss: `## Approval` stays
-true, and the *"the plan changed since approval"* warning means the one thing it
-can still mean, that the document moved **without** them.
+document now says. It is why there is no revoke to miss: the
+*"the plan changed since approval"* warning means the one thing it can still
+mean, that the document moved **without** them. The digest behind it now covers
+Goal, Not Authorized and Acceptance Criteria and no longer covers `## Approval`
+— so approving no longer moves the very hash it is measured against, which is
+what that warning should always have meant.
 
 ## The two layers
 
