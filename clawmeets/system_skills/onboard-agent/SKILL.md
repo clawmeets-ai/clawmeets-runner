@@ -268,9 +268,11 @@ that firing a no-op.
 ## Step 4 — mark the milestone and close
 
 Standard coordinator bookkeeping: assess the milestone on `BATCH_COMPLETE`,
-tick its checkbox in `## Milestones` (`clawmeets plan update <project> --section
-milestones --body-file <f>`), post the pass/fail detail into the milestone's own
-chatroom, then `project_completed`. Do not add a log section to the plan — the
+tick its checkbox with `clawmeets plan tick <project> M1`, post the pass/fail
+detail into the milestone's own chatroom, then `project_completed`. Tick by
+LABEL, never by rewriting `## Milestones` — a section rewrite carries your copy
+of the section and is refused outright if the document has moved, which loses
+every tick in the same call. Do not add a log section to the plan — the
 room is the log. There is no Phase 1 here — the onboarding *is* the project.
 
 An onboarding project is a regular project, so it starts in `spec-ing` and the

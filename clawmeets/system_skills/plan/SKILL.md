@@ -82,10 +82,19 @@ a bounded delta against.
 What needs no `--why` and is never refused, in either phase, because the rule
 compares what the document *says* and not its bytes:
 
-- ticking and unticking milestone checkboxes as work completes;
+- ticking and unticking checkboxes as work completes — with `clawmeets plan
+  tick`, see below;
 - editing `<!-- … -->` provenance comments;
 - reflowing a table, reindenting a list, rewrapping a paragraph;
 - rewriting `## Milestones` or any other `<!-- layer: detail -->` section.
+
+**The rule is about the whole write, not about each change in it.** A write is
+all-or-nothing: if it moves what the document says ANYWHERE, none of it lands —
+including the parts of it from that list. So a tick that rides inside a section
+you rewrote is judged with that rewrite, and if your copy of the section had
+drifted from the accepted document by one paragraph, the tick is lost with it.
+That is why `plan tick` exists: it sends no section text, so there is nothing
+to have drifted.
 
 So **keep reporting progress exactly as you did before.** The schedule is yours.
 
@@ -119,6 +128,7 @@ cannot drift.
 | `clawmeets plan review-status` | Per addressee: sent / replied / resolved, and the round's state. |
 | `clawmeets plan show` | Read the plan: the file, a section, a note, the index, the versions. |
 | `clawmeets plan update` | Write one section. Owner or keeper only; no whole-body form, no retry. |
+| `clawmeets plan tick` | Tick a checkbox by label. The one write that cannot be refused. |
 
 Every command takes the project as its first argument — a name, a display name
 or an id.
@@ -254,6 +264,17 @@ asker's screen for them to dismiss. The confirm note is the one exception: reply
 to it leaves it open, because closing it releases the execution gate and
 dismissing it is the only act that means yes.
 
+**When you answer a note by editing the section yourself, edit first, then
+`--reply-to` THAT note** — the user's note, not only your own question it was
+replying to. Closing your own question leaves the user's reply open on their
+desk. The order matters: a reply records the section as it reads when you send
+it, and the *"this section changed"* warning on the user's note is measured from
+your newest reply. Reply after the edit and the warning stays quiet; reply
+before it and the user is told the section changed under them — by the very
+edit they asked for. Close the note (the default) when your edit does everything
+it asked; add `--keep-open` only when something is still unresolved — you did
+part of it, or you are asking something back.
+
 **Answer with the change, not just about it.** When your answer changes the
 plan, file it as a proposal (`--edit-file`) rather than prose. A proposal
 renders as a diff with **Accept** and **Reject** beside it, which is a decision
@@ -378,9 +399,18 @@ quote and edit addressed to that section would land on the wrong one.
 A write carries the section's current text as its precondition. If somebody
 changed that section since you read it, the write is refused, **nothing is
 written**, and a conflict note is filed carrying your text so it is not lost.
-`clawmeets plan conflicts` lists every refusal beside what the section says now,
-with the exact command to close it. **Do not loop.** Read what it says now,
+`clawmeets plan conflicts` lists every such refusal beside what the section says
+now, with the exact command to close it. **Do not loop.** Read what it says now,
 decide, write once.
+
+`plan conflicts` covers STALENESS refusals only — the `409`s. A `403` from the
+spec lock files a note too, but not a conflict note: it is a proposal for the
+user, so it is the user's row to act on and not yours to clear. Find those with
+`clawmeets plan list-notes <project> --by <your own name> --status open` (after
+acceptance they derive as `--kind deviation`; before it they are ordinary
+proposals). And read the `403` itself rather than counting the ids in it — it
+names which sections moved, which slugs the plan does not have, and how many
+more sections went down with the write and filed nothing at all.
 
 Two writers on two *different* sections never collide, in either order. That is
 the whole reason the unit is a section.
@@ -392,6 +422,34 @@ write is a `403` and your text comes back filed as a proposal instead. A
 checkbox tick, an HTML comment, a reflow and a `## Milestones` re-cut need
 neither, in either phase. See *"Two lines, and they do different things"* at the
 top.
+
+### Progress: `plan tick`, not `plan update`
+
+```bash
+clawmeets plan tick <project> M2                  # - [ ] **M2** → - [x] **M2**
+clawmeets plan tick <project> AC-2.1 AC-2.2       # several in one go
+clawmeets plan tick <project> M2 --untick         # reopen one
+```
+
+A label is the token that OPENS a box's line — `- [ ] **M2** — …` is `M2` — and
+it must name exactly one box. Zero or two is a `400` that tells you what it
+found, because ticking whichever came first in the file would be a guess.
+
+**This is the only write that cannot be refused**, and the reason is that it
+sends no section text at all: the server resolves the label against the live
+document and flips one character. So there is no precondition to be stale
+against, and because the rule compares what the document *says* and marker state
+is not part of that, there is nothing for the spec lock to refuse either. No
+`--why`, no `409`, no `403` on an accepted plan. Re-running is free — a box
+already ticked is a no-op.
+
+**Do not tick with `plan update`.** It works, and then one day it does not: the
+section text you send is your copy, and the day it has drifted from the accepted
+document the write is refused whole and every tick in it is lost. That has
+happened, at the end of a project, to thirteen boxes at once — and the
+coordinator, told only that two notes had been filed, reported to its owner that
+nothing but the boxes had changed. Two acceptance criteria groups had lost three
+criteria between them.
 
 ## Closing a note out: `plan resolve`
 

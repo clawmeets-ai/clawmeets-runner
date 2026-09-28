@@ -61,6 +61,12 @@ Sequence:
    `advances:` claims anyway, and write "no milestone took this on" in the
    evidence cell of a criterion none of them names.
 
+   Then tick the boxes of the criteria you marked `met` — `clawmeets plan tick
+   <project> AC-1.1 AC-1.3 ...` — leaving `not met` and `not applicable`
+   clear. Tick by LABEL; never rewrite `## Acceptance Criteria` to do it,
+   because a section rewrite carries your copy of the section and an accepted
+   plan refuses a copy that has drifted, losing every tick in the call.
+
    **Judge the invariant, not the artifact.** A criterion's
    `<!-- evidence: … -->` comment is the keeper's and may have changed since
    the plan was accepted; a test that moved or an artifact that was

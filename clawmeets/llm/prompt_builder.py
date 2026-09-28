@@ -1387,8 +1387,11 @@ written in the roster (not IDs, and do not add suffixes like '-agent')."""
             lines.append(
                 "The plan is ACCEPTED. It is a contract now — but only its "
                 "SPEC LAYER is.\n"
-                "Tick milestone checkboxes freely — a ticked box and an HTML "
-                "comment are not spec changes and nothing gates them.\n"
+                "Tick checkboxes with `clawmeets plan tick <project> "
+                "<label>` (`M2`, `AC-3.1`) — it sends no section text, so it is "
+                "never refused. Ticking by rewriting a section is refused whole "
+                "if your copy of that section has drifted, and takes every tick "
+                "in the same write down with it.\n"
                 "`## Milestones`, and any other section marked "
                 "`<!-- layer: detail -->`, is still YOURS: re-cut it, split or "
                 "merge milestones, re-sequence, re-assign, change the "
@@ -1742,9 +1745,13 @@ A BATCH_COMPLETE just fired in this room. Process it:
      own turn (no bash/python re-analysis of delegated output). If a criterion looks unmet or a result
      looks wrong, send it BACK to the worker (a revision room, step 4b) or
      escalate to the user — never silently redo a delegated task yourself.
-  3. TICK the milestone's checkbox in `## Milestones` with `clawmeets plan
-     update <project> --section milestones --body-file <f>`, and post the
-     pass/fail detail per acceptance criterion into THIS milestone's chatroom.
+  3. TICK the milestone's checkbox with `clawmeets plan tick <project> M2`
+     (the label is the token that opens the box's line), and post the pass/fail
+     detail per acceptance criterion into THIS milestone's chatroom. Tick each
+     criterion this milestone MET in the same way (`clawmeets plan tick
+     <project> AC-2.1 AC-2.2`) — a plan whose boxes are all clear at completion
+     records nothing about what was actually done. Never tick by rewriting
+     `## Milestones` or `## Acceptance Criteria`.
      Do NOT add a log section to the plan — the room IS the log. Everybody but
      you and the user PROPOSES: their edits arrive as notes, not as writes.
   4. DECIDE next action:
@@ -1766,7 +1773,12 @@ A BATCH_COMPLETE just fired in this room. Process it:
            complete — per criteria GROUP, naming which milestones claimed each
            (`<!-- advances: ... -->`), not milestone by milestone; a criterion
            you cannot mark met is either a caveat you state in
-           user-communication or a reason not to complete yet. When the
+           user-communication or a reason not to complete yet. TICK the ones
+           that are met (`clawmeets plan tick <project> AC-3.1 AC-3.2 ...`)
+           before you complete, and leave the rest clear — the boxes are the
+           record the user reads afterwards. Never tick by rewriting a
+           section. If any write is refused, report what did NOT land — never
+           describe a refused write to the user as though it landed. When the
            FINAL milestone's deliverable is in hand and criteria pass, your remaining job is to DELIVER, not to keep
            analyzing. If findings are worth presenting (numbers, comparisons,
            recommendations), publish an interactive report that surfaces in the

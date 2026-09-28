@@ -194,6 +194,36 @@ class PlanCriterion(BaseModel):
     checked: bool | None = None
 
 
+class PlanBox(BaseModel):
+    """One task-list box, with the two things needed to ADDRESS it and the one
+    thing needed to move it.
+
+    **The one shape here that is not display-only**, and the exception is the
+    point. ``PlanSection.boxes``, ``Shorthand.checked`` and
+    ``PlanCriterion.checked`` all describe a box to a reader; this one is how a
+    box gets ticked without rewriting the section it sits in. Ticking used to be
+    an ordinary whole-section replace — the only form available — so a
+    coordinator ticking ``M2`` had to resupply every byte of ``## Milestones``
+    from its own idea of what that section said, and any drift from the accepted
+    document turned a one-character edit into a spec move the plan lock refused.
+
+    ``label`` is what a caller types (:func:`_box_label`), ``section`` is the
+    deepest enclosing section, and ``at`` is the offset of the state character
+    itself — not of the line, not of the bullet — because that single character
+    is the entire edit.
+    """
+
+    model_config = {"frozen": True}
+
+    section: str
+    label: str
+    checked: bool
+    #: Offset **of the state character** inside the body the box was read from.
+    #: Only ever valid against that exact string, which is why
+    #: :func:`flip_boxes` takes the body back rather than remembering it.
+    at: int
+
+
 # ---------------------------------------------------------------------------
 # Grammar
 # ---------------------------------------------------------------------------
@@ -313,6 +343,98 @@ def count_boxes(text: str) -> tuple[int, int]:
         if m.group(1) in ("x", "X"):
             checked += 1
     return checked, total
+
+
+def _box_label(line: str) -> str:
+    """The label that OPENS a task-list line's text — ``M2``, ``AC-3.1``.
+
+    **Position, not search, and that is the whole of the addressing rule.** The
+    label must be the first token after the box, optionally bold-wrapped, which
+    is the form the seed template writes (``- [ ] **M1** — unassigned``). A
+    scanner that looked for the label anywhere on the line would resolve
+    ``AC-3.1`` to whichever milestone happens to CITE it in its
+    ``<!-- advances: … -->`` prose, so the one address a caller can type would
+    point at a different box than the one they can see.
+
+    ``""`` when the line is not a box, or opens with no word character — an
+    unaddressable box, which :func:`find_boxes` still reports so
+    :func:`count_boxes` and this function never disagree about what a box is.
+    """
+    m = BOX_RE.match(line)
+    if m is None:
+        return ""
+    text = line[m.end():].lstrip()
+    for fence in ("**", "__"):
+        if text.startswith(fence):
+            text = text[len(fence):].lstrip()
+            break
+    label = re.match(r"[A-Za-z][A-Za-z0-9._-]*", text)
+    # The trailing strip is what separates ``AC-2.1:`` from ``AC-2.1`` and
+    # ``M1.`` from ``M1``: a plan writes the separator it likes and the label is
+    # the same label either way.
+    return label.group(0).rstrip("._-") if label else ""
+
+
+def find_boxes(body: str) -> list[PlanBox]:
+    """Every task-list box, in source order, fence-aware — the addressable form
+    of what :func:`count_boxes` counts.
+
+    Shares that function's fence rule and its grammar (``BOX_RE``), so "what is
+    a box" keeps one answer; what this adds is an ADDRESS, the same way
+    :func:`parse_criteria` adds one for ``AC-<m>.<n>``. ``section`` is the
+    DEEPEST enclosing section, which is what keeps a tick's splice narrow: a box
+    under ``### G3`` rewrites G3, never the whole ``## Acceptance Criteria``.
+    """
+    fences = _fence_spans(body)
+    sections = parse_sections(body)
+    out: list[PlanBox] = []
+    for m in BOX_RE.finditer(body):
+        if not _outside_fences(m.start(), fences):
+            continue
+        line_start, line_end = _line_bounds(body, m.start())
+        out.append(
+            PlanBox(
+                section=_enclosing_section(sections, m.start()),
+                label=_box_label(body[line_start:line_end]),
+                checked=m.group(1) in ("x", "X"),
+                at=m.start(1),
+            )
+        )
+    return out
+
+
+def boxes_labelled(body: str, label: str) -> list[PlanBox]:
+    """Every box whose label is ``label``, case-insensitively.
+
+    Returns a LIST rather than one box on purpose: zero and two are both real
+    answers a caller has to refuse differently, and a function that picked the
+    first would make ``**M2**`` written twice resolve silently to whichever came
+    first in the file.
+    """
+    want = label.strip().casefold()
+    if not want:
+        return []
+    return [b for b in find_boxes(body) if b.label.casefold() == want]
+
+
+def flip_boxes(body: str, boxes: list[PlanBox], checked: bool) -> str:
+    """``- [ ]`` ⇄ ``- [x]`` for each box, by offset, in one pass.
+
+    **A one-character substitution, which is the property everything above this
+    rests on.** ``[ ]`` and ``[x]`` are the same width, so no offset moves and a
+    list of boxes taken from ONE read of ``body`` stays valid across every flip
+    in it. And because :func:`normalize_spec_text` folds marker state, the result
+    has the same :func:`spec_digest` as its input — a tick cannot move what the
+    plan says, so it cannot be refused for moving it.
+
+    The caller supplies the boxes, so this never searches and never decides
+    which box was meant; that is :func:`boxes_labelled`'s job and its refusals
+    are the caller's to make.
+    """
+    out = list(body)
+    for box in boxes:
+        out[box.at] = "x" if checked else " "
+    return "".join(out)
 
 
 def parse_sections(body: str) -> list[PlanSection]:

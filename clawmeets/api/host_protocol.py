@@ -139,6 +139,28 @@ class HostAgentReport(BaseModel):
     pid: Optional[int] = None
 
 
+class HostModelCLIReport(BaseModel):
+    """One model CLI as the machine found it. Mirror of ``doctor.ModelCLIState``.
+
+    This is the one fact in the zero-state checklist that no amount of
+    server-side reasoning can produce: whether a ``claude`` / ``codex`` / ``agy``
+    binary exists on someone's laptop and is signed in. The machine is the only
+    witness, so it reports and we store what it said.
+
+    ``None`` for ``model_clis`` on a frame means "this machine did not tell us",
+    which is deliberately different from an empty list ("it looked and found
+    nothing") — an un-upgraded computer, or one whose runner is missing, must
+    leave the checklist row unconfirmed rather than turn it red.
+    """
+
+    id: str
+    label: str = ""
+    binary: str = ""
+    present: bool = False
+    logged_in: bool = False
+    version: str = ""
+
+
 class HostHelloFrame(BaseModel):
     """The first frame on a host socket. Auth plus the machine's description."""
 
@@ -149,6 +171,11 @@ class HostHelloFrame(BaseModel):
     platform: Optional[str] = None
     os_version: Optional[str] = None
     agents: list[HostAgentReport] = Field(default_factory=list)
+    model_clis: Optional[list[HostModelCLIReport]] = None
+    # When the machine ran the check that produced ``model_clis`` — not when it
+    # sent the frame. A machine re-sends its last answer on every frame and only
+    # re-checks every few minutes, so the two differ.
+    model_clis_checked_at: Optional[str] = None
 
 
 class HostCommandOutcome(BaseModel):
@@ -168,6 +195,8 @@ class HostStateFrame(BaseModel):
     agents: list[HostAgentReport] = Field(default_factory=list)
     daemon_version: Optional[str] = None
     result: Optional[HostCommandOutcome] = None
+    model_clis: Optional[list[HostModelCLIReport]] = None
+    model_clis_checked_at: Optional[str] = None
 
 
 def command_frame(

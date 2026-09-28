@@ -26,8 +26,13 @@ they flow through the distributed changelog system.
 """
 from __future__ import annotations
 
+import json
+import logging
+import os
 import re
 import shutil
+import threading
+from collections import OrderedDict
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Optional
@@ -58,6 +63,91 @@ if TYPE_CHECKING:
 # handle. The name class is possessive (`*+`, 3.11+) so the engine can't
 # backtrack into a truncated match (`clawmeet` out of `@clawmeets.ai`).
 _MENTION_RE = re.compile(r'(?:^|(?<=[^a-zA-Z0-9_]))@([a-zA-Z][a-zA-Z0-9_-]*+)(?!\.[a-zA-Z])')
+
+logger = logging.getLogger(__name__)
+
+
+class _ChatLogCache:
+    """Process-wide cache of parsed CHATS.ndjson files, keyed by path.
+
+    CHATS.ndjson is append-only between clears, and every reader used to
+    re-read and re-validate the whole file. On the server that meant a desk
+    load parsed ~30 full histories back to back. The cache keeps the parsed
+    entries plus the byte offset consumed so far:
+
+    - file unchanged (same inode, size, mtime) → return the cached entries;
+    - file grew in place (same inode, larger) → parse only the new bytes;
+    - anything else (clear, same-size rewrite, shrink, new inode) → full
+      re-parse.
+
+    Only complete lines (up to the last ``\\n``) are consumed, so a reader
+    racing a half-written append picks the rest up on the next call.
+    Entries are shared between callers and must be treated as read-only.
+    """
+
+    MAX_FILES = 512
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        # path -> (inode, mtime_ns, size, consumed_offset, entries)
+        self._files: "OrderedDict[str, tuple[int, int, int, int, list[ChatLogEntry]]]" = OrderedDict()
+
+    def entries(self, path: Path) -> list[ChatLogEntry]:
+        try:
+            st = os.stat(path)
+        except FileNotFoundError:
+            return []
+        key = str(path)
+        with self._lock:
+            cached = self._files.get(key)
+            if cached is not None:
+                self._files.move_to_end(key)
+        if cached is not None:
+            inode, mtime_ns, size, offset, entries = cached
+            if inode == st.st_ino and size == st.st_size and mtime_ns == st.st_mtime_ns:
+                return entries
+            if inode == st.st_ino and st.st_size > size:
+                new_entries, new_offset = self._parse_from(path, offset)
+                entries = entries + new_entries
+                self._store(key, st, new_offset, entries)
+                return entries
+        entries, offset = self._parse_from(path, 0)
+        self._store(key, st, offset, entries)
+        return entries
+
+    def _store(self, key: str, st: os.stat_result, offset: int, entries: list[ChatLogEntry]) -> None:
+        with self._lock:
+            self._files[key] = (st.st_ino, st.st_mtime_ns, st.st_size, offset, entries)
+            self._files.move_to_end(key)
+            while len(self._files) > self.MAX_FILES:
+                self._files.popitem(last=False)
+
+    @staticmethod
+    def _parse_from(path: Path, offset: int) -> tuple[list[ChatLogEntry], int]:
+        try:
+            with open(path, "rb") as f:
+                f.seek(offset)
+                data = f.read()
+        except OSError as e:
+            logger.warning(f"Failed to read chat log {path}: {e}")
+            return [], offset
+        end = data.rfind(b"\n")
+        if end < 0:
+            return [], offset
+        result: list[ChatLogEntry] = []
+        # split on \n only — see FileUtil._read_ndjson for why not splitlines().
+        for raw in data[:end].decode("utf-8").split("\n"):
+            line = raw.strip()
+            if not line:
+                continue
+            try:
+                result.append(parse_log_line(json.loads(line)))
+            except json.JSONDecodeError:
+                logger.warning(f"Invalid JSON line in {path}: {line[:50]}...")
+        return result, offset + end + 1
+
+
+_chat_log_cache = _ChatLogCache()
 
 
 class Chatroom(BaseModel):
@@ -306,7 +396,9 @@ class Chatroom(BaseModel):
     def get_log_entries(self, limit: int = 9999999) -> list[ChatLogEntry]:
         """Load all CHATS.ndjson rows (messages + file events).
 
-        Legacy rows without `entry_type` are parsed as ChatMessage.
+        Legacy rows without `entry_type` are parsed as ChatMessage. Served
+        from a process-wide parse cache (``_ChatLogCache``); the returned list
+        is a fresh slice, but its entries are shared and must not be mutated.
 
         Args:
             limit: Maximum number of entries to return (most recent)
@@ -314,12 +406,7 @@ class Chatroom(BaseModel):
         Returns:
             List of ChatMessage | ChatFileEvent in file order
         """
-        if not self.chats_path.exists():
-            return []
-        result: list[ChatLogEntry] = []
-        for line_data in FileUtil.read(self.chats_path, "ndjson"):
-            result.append(parse_log_line(line_data))
-        return result[-limit:]
+        return _chat_log_cache.entries(self.chats_path)[-limit:]
 
     def get_messages(self, limit: int = 9999999) -> list[ChatMessage]:
         """Load messages from this chatroom, filtering out file events.

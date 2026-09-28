@@ -214,3 +214,11 @@ _passthrough(
 _passthrough("status", "Is this computer connected, and what is running on it?")
 _passthrough("logs", "Show what this computer's connection has been doing.")
 _passthrough("update", "Update this computer's connection software.")
+# Has its own subcommands (enable / disable / status). They need no
+# registration here: `allow_extra_args` forwards them untouched, which is the
+# same reason a new flag on any command above works the day it ships.
+_passthrough(
+    "autostart",
+    "Start this computer's connection automatically when you log in "
+    "(enable / disable / status).",
+)

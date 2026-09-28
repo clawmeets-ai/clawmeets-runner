@@ -29,7 +29,7 @@ class ControlMessageType(str, Enum):
             MCP_AUTH_CODE, KNOWLEDGE_PACK_SYNC, AGENT_REGISTRY_CHANGE
         - To user UIs (web frontend) only:
             AGENT_STATUS_CHANGE, MCP_AUTH_URL_FOR_USER, AGENT_CARD_UPDATE,
-            RUNNER_VERSIONS, HOST_SYNC
+            RUNNER_VERSIONS, HOST_SYNC, INSTALL_SYNC
         - To both (fan-out via ``ws_hub.broadcast_to_project`` over every
           project participant — agents, coordinator, owner, FD requester,
           share-token viewers):
@@ -95,6 +95,7 @@ class ControlMessageType(str, Enum):
     # travels in this payload, so a dropped frame costs a stale page until the
     # next one rather than a wrong page.
     HOST_SYNC = "host_sync"
+    INSTALL_SYNC = "install_sync"      # owner-scoped cursor: their one-command install moved
 
 
 class ChangelogUpdatePayload(BaseModel):
@@ -562,6 +563,26 @@ class RunnerVersionsPayload(BaseModel):
     runners: list[RunnerVersion]
 
 
+class InstallSyncPayload(BaseModel):
+    """Payload for INSTALL_SYNC — see the enum member.
+
+    A cursor, like :class:`HostSyncPayload`: it says the user's one-command
+    install reported a new step, and the browser refetches
+    ``GET /me/install-progress``. The step itself is NOT carried here — the run is
+    defined in one place (the route) and a pushed copy could only be a second one
+    to keep in step.
+
+    ``step`` and ``state`` are named anyway, and required, for two reasons: a
+    payload with no required fields would match every dict and so could not be
+    appended safely to ``ControlEnvelope.payload``'s non-discriminated Union (see
+    that docstring), and they make a websocket trace readable without joining it
+    against a REST call.
+    """
+
+    step: str
+    state: str
+
+
 class HostSyncPayload(BaseModel):
     """Payload for HOST_SYNC — see the enum member.
 
@@ -603,7 +624,7 @@ class ControlEnvelope(BaseModel):
     would need a real discriminator first.
     """
     type: ControlMessageType
-    payload: Union[ChangelogUpdatePayload, AgentStatusChangePayload, ProjectDeletedPayload, SkillSyncPayload, McpSyncPayload, AgentSettingsChangePayload, CancelLLMPayload, ActiveWorkChangePayload, McpAuthUrlForUserPayload, McpAuthCodePayload, SkillAuthUrlForUserPayload, SkillAuthCodePayload, KnowledgePackSyncPayload, AgentRegistryChangePayload, AgentCardUpdatePayload, BriefTabSyncPayload, ProjectReportSyncPayload, ProjectPlanSyncPayload, DeskTodoSyncPayload, DeskReadStateSyncPayload, DeskSopSyncPayload, DeskLabelSyncPayload, RunnerVersionsPayload, HostSyncPayload, dict] = Field(default_factory=dict)
+    payload: Union[ChangelogUpdatePayload, AgentStatusChangePayload, ProjectDeletedPayload, SkillSyncPayload, McpSyncPayload, AgentSettingsChangePayload, CancelLLMPayload, ActiveWorkChangePayload, McpAuthUrlForUserPayload, McpAuthCodePayload, SkillAuthUrlForUserPayload, SkillAuthCodePayload, KnowledgePackSyncPayload, AgentRegistryChangePayload, AgentCardUpdatePayload, BriefTabSyncPayload, ProjectReportSyncPayload, ProjectPlanSyncPayload, DeskTodoSyncPayload, DeskReadStateSyncPayload, DeskSopSyncPayload, DeskLabelSyncPayload, RunnerVersionsPayload, HostSyncPayload, InstallSyncPayload, dict] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_required_fields_for_type(self) -> "ControlEnvelope":
@@ -680,4 +701,7 @@ class ControlEnvelope(BaseModel):
         elif self.type == ControlMessageType.HOST_SYNC:
             if not isinstance(self.payload, HostSyncPayload):
                 raise ValueError(f"control message type {self.type} requires HostSyncPayload")
+        elif self.type == ControlMessageType.INSTALL_SYNC:
+            if not isinstance(self.payload, InstallSyncPayload):
+                raise ValueError(f"control message type {self.type} requires InstallSyncPayload")
         return self

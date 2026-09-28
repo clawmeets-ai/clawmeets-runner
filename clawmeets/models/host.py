@@ -106,6 +106,25 @@ class HostAgent(BaseModel):
     pid: Optional[int] = None
 
 
+class HostModelCLI(BaseModel):
+    """One model CLI as the MACHINE found it, not as the server guessed.
+
+    Stored because it is the only route by which the server can honestly answer
+    "can this computer actually invoke a model?" — the credential lives in an OS
+    keychain or a dotfile on someone's laptop, and nothing server-side can see
+    it. ``logged_in`` is the machine's best-effort reading (see
+    ``clawmeets/doctor.py`` on why it is a heuristic), carried through verbatim
+    rather than re-interpreted here.
+    """
+
+    id: str
+    label: str = ""
+    binary: str = ""
+    present: bool = False
+    logged_in: bool = False
+    version: str = ""
+
+
 class HostCommandResult(BaseModel):
     """The outcome of the most recent command the server sent this machine.
 
@@ -114,6 +133,11 @@ class HostCommandResult(BaseModel):
     nothing; ``ok=False`` plus ``detail`` is the whole contract.
     """
 
+    # Echoes the id the command route returned, so the page can tell "the
+    # command I just sent finished" from "some earlier command finished" and
+    # release that button at the right moment. Empty on records written before
+    # the field existed.
+    command_id: str = ""
     action: str
     agent: Optional[str] = None
     ok: bool = True
@@ -146,6 +170,14 @@ class HostRecord(BaseModel):
     agents: list[HostAgent] = Field(default_factory=list)
     agents_reported_at: str = ""
     last_command: Optional[HostCommandResult] = None
+    # None = this machine has never told us. Distinct from [] ("it looked and
+    # found none"), because a computer running an older release cannot report
+    # this at all and must not be rendered as having nothing installed.
+    model_clis: Optional[list[HostModelCLI]] = None
+    model_clis_reported_at: str = ""
+    # When the machine last ran the check, by its own clock. Older machines do
+    # not say, and fall back to ``model_clis_reported_at``.
+    model_clis_checked_at: str = ""
 
     @property
     def is_revoked(self) -> bool:
@@ -163,7 +195,27 @@ class HostRecord(BaseModel):
         data["status"] = derive_status(self, connected=connected)
         data["running_count"] = sum(1 for a in self.agents if a.state == "running")
         data["agent_count"] = len(self.agents)
+        # Three-valued on purpose, and the reason it is computed here rather than
+        # in the frontend: True = this machine reported a usable model CLI,
+        # False = it looked and found none, None = it never said. A checklist row
+        # that cannot tell "no" from "don't know" either nags a working user or
+        # reassures a broken one.
+        data["model_cli_ready"] = self.model_cli_ready
         return data
+
+    @property
+    def model_cli_ready(self) -> Optional[bool]:
+        """Did this machine report a model CLI that is installed AND signed in?
+
+        Installed-but-signed-out counts as False: the runner will shell the
+        binary, the binary will refuse, and the agent will go silent — which is
+        indistinguishable, from the browser, from nothing being installed at all.
+        That equivalence is the whole reason the machine reports ``logged_in``
+        separately instead of just presence.
+        """
+        if self.model_clis is None:
+            return None
+        return any(c.present and c.logged_in for c in self.model_clis)
 
 
 class PairingCode(BaseModel):
@@ -470,9 +522,8 @@ def find_host(data_dir: Path, host_id: str) -> Optional[HostRecord]:
 def list_hosts(data_dir: Path, owner_user_id: str) -> list[HostRecord]:
     """Every computer one user has connected, newest first.
 
-    Revoked hosts are INCLUDED. A machine the user disconnected is still part
-    of the answer to "what have I connected?", and dropping the row would leave
-    the page unable to explain why the machine went quiet.
+    Revoked hosts are INCLUDED — this is the store, not the view. The
+    ``/me/computers`` route is what hides them from the user.
     """
     owner_dir = _owner_dir(data_dir, owner_user_id)
     if not owner_dir.is_dir():
@@ -562,6 +613,41 @@ async def record_agent_snapshot(
         record.last_seen_at = record.agents_reported_at
         if command_result is not None:
             record.last_command = command_result
+        _save(data_dir, record)
+        return record
+
+
+async def record_model_clis(
+    data_dir: Path,
+    owner_user_id: str,
+    host_id: str,
+    model_clis: list[HostModelCLI],
+    checked_at: Optional[str] = None,
+) -> Optional[HostRecord]:
+    """Store what the machine found when it looked for model CLIs.
+
+    A full replacement, like the agent snapshot and for the same reason: the
+    machine re-probes and re-reports, so merging would keep a CLI alive in our
+    copy after the user uninstalled it.
+
+    Separate from :func:`record_agent_snapshot` even though both arrive on the
+    same frames, because the two have different reasons to be absent. A frame
+    with no ``agents`` means "nothing is running"; a frame with no ``model_clis``
+    means "this machine's software is too old to tell you" — so the caller must
+    be able to write one without touching the other, and an omitted report must
+    never clear a good one.
+
+    Does NOT move ``last_seen_at``: the frames that carry this already stamp it,
+    and a second write here would be the only place a check-in could be recorded
+    twice for one frame.
+    """
+    async with _lock:
+        record = get_host(data_dir, owner_user_id, host_id)
+        if record is None:
+            return None
+        record.model_clis = list(model_clis)
+        record.model_clis_reported_at = _now()
+        record.model_clis_checked_at = checked_at or record.model_clis_reported_at
         _save(data_dir, record)
         return record
 

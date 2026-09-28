@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable, Optional
@@ -24,7 +25,9 @@ from .changelog import (
     ChangelogEntryType,
     ChangelogPayload,
     MirroredFromRef,
+    iter_entries,
     ndjson_safe,
+    read_tip_version_and_stat,
 )
 from .subscriber import ChangelogSubscriber
 from clawmeets.utils.file_io import FileUtil
@@ -114,6 +117,12 @@ class ChangelogRunloop:
 
         # Pending entries queue
         self._pending_entries: list[ChangelogEntry] = []
+
+        #: ``(inode, size, mtime_ns, version)`` for the changelog's last entry,
+        #: or None. Four ints — **never parsed entries**: one project's are
+        #: 1.2 GB of Python objects and a project-list request touches a
+        #: thousand. See the note above ``read_tip_version_and_stat``.
+        self._tip_cache: Optional[tuple[int, int, int, int]] = None
 
     # ─────────────────────────────────────────────────────────
     # Subscriber Management
@@ -362,16 +371,14 @@ class ChangelogRunloop:
         Returns:
             List of ChangelogEntry objects
         """
+        # **The dominant call is `since == tip`, and it now costs one stat.**
+        # A runner's reconnect catch-up asks this of every project it is in, and
+        # almost always has nothing to fetch; parsing the file to discover that
+        # is what made a reconnect storm self-sustaining.
+        if since_version >= self.get_current_version():
+            return []
         changelog_path = self._changelog_dir / "changelog.ndjson"
-        entries = []
-        for line in changelog_path.read_text(encoding="utf-8").split("\n"):
-            if not line.strip():
-                continue
-            entry = ChangelogEntry.model_validate_json(line)
-            if entry.version <= since_version:
-                continue
-            entries.append(entry)
-        return entries
+        return [e for e in iter_entries(changelog_path) if e.version > since_version]
 
     def get_entries_by_source_version(
         self,
@@ -383,28 +390,51 @@ class ChangelogRunloop:
         entries appended in the same atomic batch, which carry
         ``source_version == message.version``).
         """
+        # **A full scan on purpose — do not "optimise" it into a tail scan.**
+        # ``append_batch`` gives the FILE entries of a batch LOWER versions than
+        # the MESSAGE that links them (``link_to_index``), so
+        # ``source_version > version`` is the normal shape and a backwards scan
+        # stopping at ``version == source_version`` would miss exactly the
+        # attachments this exists to find. Streamed, so it retains nothing.
         changelog_path = self._changelog_dir / "changelog.ndjson"
-        if not changelog_path.exists():
-            return []
-        entries: list[ChangelogEntry] = []
-        for line in changelog_path.read_text(encoding="utf-8").split("\n"):
-            if not line.strip():
-                continue
-            entry = ChangelogEntry.model_validate_json(line)
-            if entry.source_version == source_version:
-                entries.append(entry)
-        return entries
+        return [
+            e for e in iter_entries(changelog_path)
+            if e.source_version == source_version
+        ]
 
     def get_current_version(self) -> int:
-        """Get latest version number (0 if no entries)."""
+        """Latest version number, or 0 when there are no entries.
+
+        **Was the single most expensive call on the server.** It read the whole
+        file, ``.strip()``-ed it into a second full copy and split that, to look
+        at one line: 13.6 s on a 1.2 GB changelog — slower than fully parsing
+        it — while ``append``, ``append_batch``, ``sync`` and a per-project loop
+        in ``GET /participants/{id}/projects`` all call it. A tail read answers
+        in ~4 ms; the cache below makes the repeat free.
+
+        Two layers rather than either one: a bare tail read still costs ~0.6 s
+        across 1300 projects on the list path, and a bare cache can neither
+        start cold nor notice the out-of-band writes that tests and migration
+        scripts perform.
+        """
         changelog_path = self._changelog_dir / "changelog.ndjson"
-        if not changelog_path.exists():
+        try:
+            st = os.stat(changelog_path)
+        except (FileNotFoundError, NotADirectoryError):
+            self._tip_cache = None
             return 0
-        lines = changelog_path.read_text(encoding="utf-8").strip().split('\n')
-        if not lines or not lines[-1]:
+        cached = self._tip_cache
+        if cached is not None and cached[:3] == (st.st_ino, st.st_size, st.st_mtime_ns):
+            return cached[3]
+        result = read_tip_version_and_stat(changelog_path)
+        if result is None:
+            self._tip_cache = None
             return 0
-        last_entry = ChangelogEntry.model_validate_json(lines[-1])
-        return last_entry.version
+        version, read_st = result
+        # Keyed on the stat taken INSIDE the read, on its own descriptor — see
+        # that function's docstring for why a separate stat is unsafe here.
+        self._tip_cache = (read_st.st_ino, read_st.st_size, read_st.st_mtime_ns, version)
+        return version
 
     # ─────────────────────────────────────────────────────────
     # Internal Methods (lock must be held)
@@ -477,6 +507,13 @@ class ChangelogRunloop:
                 mode="a",
             )
 
+        # **Invalidate; never set it to ``entries[-1].version``.** Assigning the
+        # value we just wrote would assert that nothing else appends to this
+        # file — and a migration script or a test that does would then hand the
+        # next ``append`` a stale tip and duplicate a version. Invalidating
+        # costs one tail read (~4 ms worst case) and assumes nothing.
+        self._tip_cache = None
+
     async def _save_state_internal(self) -> None:
         """Save runloop state. Lock must be held."""
         state_path = self._changelog_dir / "runloop_state.json"
@@ -489,19 +526,34 @@ class ChangelogRunloop:
         FileUtil.write(state_path, state, "json", atomic=True)
 
     async def _load_pending_entries(self) -> None:
-        """Load unprocessed entries from changelog."""
+        """Load unprocessed entries from changelog. Lock must be held.
+
+        **This, not ``get_current_version``, is what read 2.1 GB during a
+        reconnect storm.** Every ``get_or_create`` for a project carrying a
+        ``runloop_state.json`` came through here — and all of them do, so the
+        old ``exists()`` check never short-circuited — to parse the entire file
+        and, on a cleanly shut down server, append nothing.
+
+        The guard below is the whole fix, and it introduces no new assumption:
+        the file's tip IS its maximum version (append-only, ascending), which is
+        what ``get_current_version`` has always relied on.
+        """
         changelog_path = self._changelog_dir / "changelog.ndjson"
         if not changelog_path.exists():
             return
 
-        for line in changelog_path.read_text(encoding="utf-8").split("\n"):
-            if not line.strip():
-                continue
-            entry = ChangelogEntry.model_validate_json(line)
-            if entry.version <= self._last_processed_version:
-                continue
-            self._pending_entries.append(entry)
+        if self.get_current_version() <= self._last_processed_version:
+            return  # caught up — the steady state, and now free
 
+        # Genuine crash recovery. Off the loop: a single-process server must not
+        # stall every other request (and every WebSocket handshake) while it
+        # replays. Safe under ``self._lock`` — the thread only reads the file.
+        floor = self._last_processed_version
+        self._pending_entries.extend(
+            await asyncio.to_thread(
+                lambda: [e for e in iter_entries(changelog_path) if e.version > floor]
+            )
+        )
         self._pending_entries.sort(key=lambda e: e.version)
 
     def __repr__(self) -> str:

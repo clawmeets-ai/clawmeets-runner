@@ -53,7 +53,14 @@ action — last thing, after all worker batches have returned and you've
 verified acceptance criteria. Sequence:
 
 1. Verify all acceptance criteria pass, and build the **criteria trace**
-   below while you do it.
+   below while you do it. Tick the boxes of the ones that are met —
+   `clawmeets plan tick <project> AC-1.1 AC-2.1 ...` — and leave the rest
+   clear. The plan's boxes are what the user reads after you are gone, so a
+   completed project whose boxes are all clear has thrown that record away.
+   Tick by LABEL only: rewriting `## Acceptance Criteria` sends your own copy
+   of the section, and on an accepted plan a copy that has drifted is refused
+   entirely — every tick in the call lost, and the user left holding deviation
+   notes asking them to accept prose you never meant to change.
 2. Author + publish the report (this skill).
 3. Post one short line in `user-communication`: e.g., *"Wrap-up done —
    the report is on the project page."*

@@ -35,6 +35,7 @@ from clawmeets.cli_lifecycle import start_command, stop_command, status_command
 from clawmeets.cli_skill import skill_app, schedule_app
 from clawmeets.cli_env import app as env_app
 from clawmeets.cli_consult import consult_command
+from clawmeets.cli_doctor import doctor_command
 from clawmeets.cli_daemon import app as computer_app
 from clawmeets.cli_client import proj_app, room_app, msg_app, file_app
 
@@ -96,6 +97,11 @@ app.command("start")(start_command)
 app.command("stop")(stop_command)
 app.command("status")(status_command)
 app.command("consult")(consult_command)
+# Shelled by the one-line installer as its last step, and by this computer's
+# connection (`clawmeets doctor --model-clis`) to report whether a model CLI is
+# usable. Both live OUTSIDE this package, so omitting it here breaks them
+# silently in the released wheel while the in-repo CLI keeps working.
+app.command("doctor")(doctor_command)
 
 app.add_typer(assistant_app, name="assistant")
 app.add_typer(agent_team_app, name="agent-team")

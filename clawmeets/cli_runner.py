@@ -25,10 +25,26 @@ import json
 import logging
 import os
 import platform
+import random
 import shutil
 import subprocess
 import sys
 import uuid
+
+#: Reconnect backoff, decorrelated. **The jitter is the point, not the cap.**
+#: Every runner on a machine loses the same server restart, so a bare
+#: `min(delay * 2, 60)` marches them all in lockstep: 228 runners arrived
+#: together every 60 s, and each arrival calls the catch-up endpoint whose cost
+#: was what broke the server in the first place — the retries WERE the load.
+#:
+#: Full jitter over [0.5, 1.0) spreads them across a 30 s window at the cap.
+#: Sleeping *less* than `delay` on average is deliberate: it shortens recovery
+#: rather than lengthening it, and the spread is what stops the herd re-forming.
+async def _sleep_backoff(delay: float) -> float:
+    """Sleep a jittered `delay`, and return the next (doubled, capped) one."""
+    await asyncio.sleep(delay * random.uniform(0.5, 1.0))
+    return min(delay * 2, 60.0)
+
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import List, Optional
@@ -2031,6 +2047,72 @@ def user_login(
         typer.echo(token)
 
 
+@user_app.command("link")
+def user_link(
+    token: str = typer.Argument(..., help="The one-time token from the install command."),
+    server: str = typer.Option(DEFAULT_SERVER, "--server", "-s"),
+    data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir"),
+) -> None:
+    """Sign in on this computer with a one-time install token.
+
+    This is the step that removes the password from the terminal. The web app
+    mints a short-lived token, the one-line installer passes it here, and this
+    exchanges it for an ordinary session — written by the same
+    ``save_user_session`` that ``clawmeets user login`` uses, so nothing
+    downstream can tell the two apart.
+
+    Single use: the token is spent on the exchange. Running this twice is an
+    error with a clear message rather than a silent no-op, because the second
+    caller is usually someone re-running an installer and the remedy is a fresh
+    command from the browser.
+
+    The username is NOT an argument — it comes back from the server with the
+    session. Asking for it would let a typo produce a session saved under a name
+    the rest of the CLI then cannot find.
+    """
+    url = _server_url(server)
+    with _http(url, as_user=True) as client:
+        try:
+            response = client.post("/install/claim", json={"token": token})
+        except httpx.HTTPError as e:
+            typer.echo(f"Error: could not reach {url}: {e}", err=True)
+            raise typer.Exit(1)
+
+    if response.status_code != 200:
+        # The server distinguishes spent (409) from invalid/expired (401) and
+        # says what to do about each; passing its own words through beats
+        # reinterpreting them here.
+        detail = ""
+        try:
+            detail = response.json().get("detail", "")
+        except ValueError:
+            detail = response.text[:200]
+        typer.echo(f"Error: {detail or response.status_code}", err=True)
+        raise typer.Exit(1)
+
+    result = response.json()
+    username = (result.get("username") or "").strip()
+    if not username:
+        typer.echo(
+            "Error: unexpected response from server (no username).", err=True
+        )
+        raise typer.Exit(1)
+    access = _require_access_token(result)
+
+    path = save_user_session(
+        Path(data_dir).expanduser(),
+        username,
+        # Prefer the server's own idea of its public URL: a deployment behind a
+        # proxy knows its external address better than the URL the installer
+        # happened to be fetched from.
+        _server_url(result.get("server_url") or url),
+        access,
+        refresh_token=result.get("refresh_token"),
+        auth_method="install-token",
+    )
+    typer.echo(f"Signed in as {username}. Session saved to {path}.")
+
+
 @user_app.command("logout")
 def user_logout(
     username: Optional[str] = typer.Option(
@@ -2362,8 +2444,7 @@ async def _user_listen_loop(
             # transport/DNS errors. All transient — reconnect rather than
             # crash the runner.
             logging.warning(f"WebSocket disconnected: {e}. Reconnecting in {reconnect_delay}s…")
-            await asyncio.sleep(reconnect_delay)
-            reconnect_delay = min(reconnect_delay * 2, 60)
+            reconnect_delay = await _sleep_backoff(reconnect_delay)
         except asyncio.CancelledError:
             await loop_obj.stop()
             await http_client.aclose()
@@ -2734,8 +2815,7 @@ async def _runner_loop(
             # InvalidHandshake, and transport/DNS errors. All transient —
             # reconnect rather than crash the runner.
             logging.warning(f"WebSocket connect/transport error: {e}. Reconnecting in {reconnect_delay}s…")
-            await asyncio.sleep(reconnect_delay)
-            reconnect_delay = min(reconnect_delay * 2, 60)
+            reconnect_delay = await _sleep_backoff(reconnect_delay)
             continue
         except httpx.HTTPError as e:
             # The on-connect HTTP catch-up (skill/mcp/knowledge-pack sync +
@@ -2746,8 +2826,7 @@ async def _runner_loop(
             # the WS-transport arm above (the WS upgrade succeeding then the
             # immediate HTTP burst failing is exactly the gap this closes).
             logging.warning(f"HTTP catch-up error: {e}. Reconnecting in {reconnect_delay}s…")
-            await asyncio.sleep(reconnect_delay)
-            reconnect_delay = min(reconnect_delay * 2, 60)
+            reconnect_delay = await _sleep_backoff(reconnect_delay)
             continue
         except asyncio.CancelledError:
             # Graceful shutdown (Ctrl-C, or an explicit cancel of the runner
@@ -2778,8 +2857,7 @@ async def _runner_loop(
             return
 
         logging.warning(f"Reconnecting in {reconnect_delay}s…")
-        await asyncio.sleep(reconnect_delay)
-        reconnect_delay = min(reconnect_delay * 2, 60)
+        reconnect_delay = await _sleep_backoff(reconnect_delay)
 
 
 # ---------------------------------------------------------------------------

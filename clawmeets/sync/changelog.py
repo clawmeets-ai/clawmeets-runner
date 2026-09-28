@@ -8,14 +8,21 @@ It defines the changelog types that are used for event sourcing.
 """
 from __future__ import annotations
 
+import json
+import logging
+import os
+import re
 from datetime import UTC, datetime
 from enum import Enum
-from typing import TYPE_CHECKING, Optional, Union
+from pathlib import Path
+from typing import TYPE_CHECKING, Iterator, Optional, Union
 
 from pydantic import BaseModel, Field, model_validator
 
 if TYPE_CHECKING:
     pass
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -508,3 +515,172 @@ class ChangelogEntry(BaseModel):
         return cls.model_validate_json(line)
 
 
+
+
+# ---------------------------------------------------------------------------
+# Reading changelog.ndjson without reading all of it
+#
+# **The file is an append-only log that also stores file bodies.** `FilePayload`
+# above carries `content_b64`, so one entry can be 18 MB and one project's
+# changelog 1.2 GB in 4,700 lines. Every reader here used to be
+# `read_text().split("\n")`, which on the server — single-process, single event
+# loop — meant a `GET /participants/{id}/projects` over 1001 projects read
+# ~2.2 GB synchronously and no WebSocket handshake could be serviced while it
+# did. 147 of 228 runners could not connect, each retry calling that same
+# endpoint, so it degraded instead of settling.
+#
+# Two primitives replace that, and both rest on ONE invariant: **the changelog
+# is append-only and ascending by version.** Nothing here may assume it is
+# DENSE — the runner's copy is fetched with `participant_id` filtering and has
+# gaps.
+#
+# **Deliberately NOT shared with `_ChatLogCache`** (`models/chatroom.py`), which
+# solves the same-shaped problem for CHATS.ndjson. That class caches the parsed
+# entry list; doing so here would pin ~1.2 GB of Python objects for one project,
+# and a list request touches a thousand. Its `_parse_from` also slurps
+# `f.read()` to EOF, which is right for a 2.4 MB chat log and is exactly the
+# 9.3 s bug for a changelog. What IS borrowed is the discipline: validate with
+# (inode, mtime_ns, size), consume only complete lines, split on b"\n" alone.
+# Unify only if a third caller appears.
+# ---------------------------------------------------------------------------
+
+#: Backwards/forwards scan granularity. Also the read size for `iter_entries`.
+_TAIL_CHUNK = 65536
+
+#: How much of a line to inspect for its version before falling back to a full
+#: parse. `version` is `ChangelogEntry`'s FIRST field and pydantic preserves
+#: declaration order, so a written line always begins `{"version":N,`.
+_HEAD_WINDOW = 4096
+
+#: **Anchored at the line start, and that is load-bearing.** An unanchored
+#: `"version"\s*:` also matches the nested key inside `mirrored_from`
+#: (:class:`MirroredFromRef`), so a mirrored entry as the last line would
+#: silently report *a foreign project's* version as this project's tip — and the
+#: tip is what `append` adds 1 to.
+_HEAD_VERSION_RE = re.compile(rb'^\{\s*"version"\s*:\s*(\d+)')
+
+
+def _read_exactly(fd: int, offset: int, length: int) -> bytes:
+    """`length` bytes from `offset`, tolerating short reads."""
+    out = bytearray()
+    os.lseek(fd, offset, os.SEEK_SET)
+    while len(out) < length:
+        chunk = os.read(fd, length - len(out))
+        if not chunk:
+            break
+        out += chunk
+    return bytes(out)
+
+
+def _last_line_bounds(fd: int, size: int) -> tuple[int, int] | None:
+    """`(start, end)` of the last non-blank line, or None if there is none.
+
+    Scans backwards a chunk at a time and **keeps at most one chunk in memory**
+    — an 18 MB final line costs ~280 reads and 64 KB of RSS, not 18 MB. A chunk
+    containing no newline is the ordinary case here, not an error.
+    """
+    # Trailing "\n" run first, so a file ending in a newline, a file ending
+    # without one, and a file with blank lines at the end all agree.
+    end = size
+    while end > 0:
+        step = min(_TAIL_CHUNK, end)
+        stripped = _read_exactly(fd, end - step, step).rstrip(b"\n")
+        if stripped:
+            end = end - step + len(stripped)
+            break
+        end -= step
+    if end == 0:
+        return None
+
+    # Then the newline that precedes it. `end - 1` is a content byte, so any
+    # match is strictly inside the previous line's terminator.
+    pos = end
+    while pos > 0:
+        step = min(_TAIL_CHUNK, pos)
+        nl = _read_exactly(fd, pos - step, step).rfind(b"\n")
+        if nl >= 0:
+            return pos - step + nl + 1, end
+        pos -= step
+    return 0, end  # the whole file is one line
+
+
+def read_tip_version_and_stat(path: Path) -> tuple[int, os.stat_result] | None:
+    """`(version of the last entry, stat)`, or None when the file is absent.
+
+    **The stat comes from `fstat` on the same descriptor the read used**, and
+    callers that cache on it depend on that: a separate `os.stat` before or
+    after could pair "size S" with a version read at size S' > S, and a cache
+    keyed on the smaller size would then hand `append` a stale tip and duplicate
+    a version.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    try:
+        st = os.fstat(fd)
+        bounds = _last_line_bounds(fd, st.st_size)
+        if bounds is None:
+            return 0, st
+        start, end = bounds
+        head = _read_exactly(fd, start, min(_HEAD_WINDOW, end - start))
+        m = _HEAD_VERSION_RE.match(head)
+        if m:
+            return int(m.group(1)), st
+        # A line whose keys were not written in declaration order — a fixture
+        # using FileUtil.write(..., "ndjson"), say. Correctness over speed.
+        try:
+            return int(json.loads(_read_exactly(fd, start, end - start))["version"]), st
+        except (ValueError, KeyError, TypeError) as e:
+            logger.warning(f"Unreadable last changelog line in {path}: {e}")
+            return 0, st
+    finally:
+        os.close(fd)
+
+
+def read_tip_version(path: Path) -> int:
+    """The last entry's version — `0` when the file is absent or has no entries.
+
+    O(size of the last entry), not O(file). For the caller that also needs the
+    stat to cache on, use :func:`read_tip_version_and_stat`.
+    """
+    result = read_tip_version_and_stat(path)
+    return 0 if result is None else result[0]
+
+
+def iter_entries(path: Path) -> Iterator[ChangelogEntry]:
+    """Every entry, in file order, **retaining nothing**.
+
+    Replaces `read_text(...).split("\\n")`, which held the file, a decoded copy
+    and a list of lines at once — `.strip()` on a 1.2 GB string alone cost 4.3 s
+    of the 13.6 s that `get_current_version` used to take.
+
+    Yields the trailing line even when the file does not end in `\\n`, which is
+    what the `split("\\n")` it replaces did; a genuinely half-written append
+    therefore raises here exactly as it did before.
+    """
+    try:
+        f = open(path, "rb")
+    except (FileNotFoundError, NotADirectoryError):
+        return
+    with f:
+        buf = bytearray()
+        while True:
+            chunk = f.read(_TAIL_CHUNK)
+            if not chunk:
+                break
+            # bytearray `+=` amortises; `del buf[:start]` below is one memmove
+            # per chunk. Slicing a growing `bytes` instead would make an 18 MB
+            # line quadratic.
+            buf += chunk
+            start = 0
+            while (nl := buf.find(b"\n", start)) >= 0:
+                line = bytes(buf[start:nl]).strip()
+                start = nl + 1
+                if line:
+                    yield ChangelogEntry.model_validate_json(line)
+            if start:
+                del buf[:start]
+        tail = bytes(buf).strip()
+        if tail:
+            yield ChangelogEntry.model_validate_json(tail)

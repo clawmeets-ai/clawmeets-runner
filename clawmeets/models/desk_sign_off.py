@@ -159,6 +159,35 @@ def _files_for_message(
     return list(by_name.values())
 
 
+
+def latest_message_slice(entries: list[ChatLogEntry]) -> list[ChatLogEntry]:
+    """The rows a live desk card reads: the newest non-ack message plus the
+    file events that rode in with it, in file order (``[]`` for an empty room).
+
+    Same selection as ``_newest_message`` + ``_files_for_message``, but returns
+    the raw ``ChatLogEntry`` rows so the client's own ``newestMessage`` /
+    ``filesForMessage`` fold runs over the slice unchanged. This is what lets
+    the desk fetch one small slice per card instead of each room's full log.
+    """
+    newest = _newest_message(entries)
+    if newest is None:
+        return []
+    out: list[ChatLogEntry] = []
+    for e in entries:
+        if e is newest:
+            out.append(e)
+            continue
+        if not isinstance(e, ChatFileEvent) or e.source_version is None:
+            continue
+        if e.from_participant_id != newest.from_participant_id:
+            continue
+        if (
+            (newest.source_version is not None and newest.source_version == e.source_version)
+            or (newest.version is not None and newest.version == e.source_version)
+        ):
+            out.append(e)
+    return out
+
 async def build_sign_off_feed(
     ctx: "ServerContext",
     owner_user_id: str,

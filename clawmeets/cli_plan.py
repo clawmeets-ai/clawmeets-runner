@@ -25,6 +25,8 @@ Subcommands (§5)
   create      Seed PLAN.md from --body-file or the one template.
   show        The document, a section, a note, the index, the versions.
   update      Replace/append/retitle/delete one section. Keeper or owner.
+  tick        Tick a checkbox by label. The one write that cannot be refused
+              for staleness or by the spec lock — use it for progress.
   note        A comment, with or without a proposal. Everyone's channel.
   resolve     apply / reject / answered / dismiss. --dismiss on the confirm
               note is how a plan is accepted, and --apply on any later note
@@ -591,6 +593,72 @@ def update(
             )
 
 
+@app.command("tick", help="Tick a checkbox by its label. Never refused for staleness or the spec lock.")
+def tick(
+    project: str = PROJECT_ARG,
+    labels: list[str] = typer.Argument(
+        ..., help="Box labels — `M2`, `AC-3.1`. The token that OPENS the line.",
+    ),
+    untick: bool = typer.Option(False, "--untick", help="Clear the boxes instead."),
+    server: str = typer.Option(DEFAULT_SERVER, "--server", "-s"),
+    token: Optional[str] = typer.Option(None, "--token", "-t"),
+    json_out: bool = typer.Option(False, "--json"),
+):
+    """Tick ``- [ ]`` → ``- [x]`` on the boxes with these labels. **Owner or
+    keeper only**, like every other write.
+
+    **Use this, not ``update --section milestones``, for progress.** A tick is a
+    one-character edit, and routing it through a whole-section replace was a
+    trap: the section text you send is your idea of that section, and on an
+    accepted plan any drift from the document promotes the tick into a spec
+    change. The write is all-or-nothing, so ONE drifted paragraph loses every
+    tick in the same call — in the incident this command exists for, thirteen of
+    them — and leaves deviation notes on the user's desk asking them to accept
+    prose they never asked to change.
+
+    This command sends no section text at all. The server resolves each label
+    against the live document under the plan lock and flips exactly one
+    character, so there is nothing to be stale against and nothing for the spec
+    lock to refuse. No ``--why``, no ``409``, no ``403`` on an accepted plan.
+
+    A label is the token that OPENS a box's line — ``- [ ] **M2** — …`` is
+    ``M2`` — and it must resolve to exactly one box. Zero or several is a
+    ``400`` that names what it found, because ticking whichever came first in
+    the file is a guess.
+
+    Ticking a box that is already ticked is a no-op, so re-running is free.
+    """
+    headers = _headers(token)
+    payload: dict[str, Any] = {
+        "edits": [],
+        "ticks": [{"label": label, "checked": not untick} for label in labels],
+    }
+    with _http(server) as client:
+        pid = _pid(client, token, project)
+        resp = client.put(_url(pid), json=payload, headers=headers)
+        # **No 403 or 409 arm, and their absence is the point.** A tick carries
+        # no section text, so it cannot be stale; and marker state folds out of
+        # `spec_digest`, so it cannot move what the plan says. The only refusal
+        # left is `may_write` (a non-keeper, non-owner) and a 400 on a label
+        # that resolves to nothing or to two boxes — both of which `_ok` prints
+        # as the server worded them. Adding the arms `update` has would be
+        # inventing remedies for refusals this route cannot give.
+        result = _ok(resp)
+
+    if json_out:
+        _echo_json(result)
+        return
+    verb = "Unticked" if untick else "Ticked"
+    if result.get("noop"):
+        typer.echo(f"No change — already {'clear' if untick else 'ticked'}.")
+    else:
+        typer.echo(
+            f"{verb} {', '.join(labels)} in "
+            f"{', '.join(result.get('sections') or [])} — "
+            f"revision {result.get('revision')}"
+        )
+
+
 def _new_section_text(
     body: str,
     section: str,
@@ -660,6 +728,11 @@ def note(
         help="Parent note id. Inherits its section, quote and the other end of "
              "the thread as --to, and CLOSES it `answered`.",
     ),
+    keep_open: bool = typer.Option(
+        False, "--keep-open",
+        help="With --reply-to: file the reply but leave the parent open — a "
+             "partial answer, or a question back.",
+    ),
     as_user: bool = typer.Option(
         False,
         "--as-user",
@@ -722,6 +795,8 @@ def note(
         raise _fail("--edit-file is a replacement for a section; pass --section too.")
     if not body_comment and proposal is None:
         raise _fail("a note needs one of --comment / --comment-file / --edit-file.")
+    if keep_open and not reply_to:
+        raise _fail("--keep-open only means something on a reply; pass --reply-to.")
     # The body is assembled **before** the first request, so the guard below can
     # walk the thing that actually goes on the wire rather than a hand-copied
     # list of some of its fields. ``base_section`` is the one member the server
@@ -735,6 +810,7 @@ def note(
         "base_section": "",
         "quote": quote,
         "reply_to": reply_to,
+        "keep_open": keep_open,
     }
     # The server owns this rule and refuses it too (``_validate_notes_locked``
     # per field, ``_save`` for the sidecar as a whole), but the server never

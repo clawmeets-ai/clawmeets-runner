@@ -63,6 +63,9 @@ from clawmeets.models.plan_markdown import (
     SPEC,
     PlanLimitError,
     body_sha,
+    boxes_labelled,
+    find_boxes,
+    flip_boxes,
     drops_heading,
     duplicated_heading,
     extent_key,
@@ -707,6 +710,44 @@ class SectionEdit(BaseModel):
     create: bool = False
 
 
+class PlanTick(BaseModel):
+    """*"Tick the box labelled M2."* — a write that carries no section text.
+
+    **The only input to this module that names WHAT to change without saying what
+    the result should say**, and the asymmetry is the whole reason it exists. A
+    :class:`SectionEdit` is a full-section replacement, so ticking a checkbox
+    through one meant resupplying every byte of ``## Milestones`` — which is what
+    :mod:`clawmeets.llm.prompt_builder` told coordinators to do, and it is a trap.
+    The writer's copy of a section is its own idea of that section; on an accepted
+    plan any drift from the document promotes a one-character edit into a spec
+    move, the whole write is refused atomically, and **every** tick in it is lost
+    — including the ones in sections that had not drifted at all. On
+    ``ig-incumbent-teardown`` that cost thirteen ticks, produced four deviation
+    notes on a closed project, and ended with the coordinator telling its owner in
+    a published report that nothing but the boxes had changed. It was wrong, and
+    the refusal it read gave it no way to know.
+
+    So a tick names a box and nothing else. The section text is materialized in
+    :func:`_prepare_locked` from the body it already holds under ``_lock``, which
+    is the only authoritative copy there is — so a tick **cannot be stale**, and
+    because :func:`normalize_spec_text` folds marker state it **cannot move the
+    spec digest** either. Two of the three ways a write is refused are closed by
+    construction rather than by a check; the third, ``may_write``, still applies.
+
+    ``label`` addresses the box by the token that opens its text — ``M2``,
+    ``AC-3.1`` (:func:`_box_label`). It resolves against the live document or it
+    is a ``400`` naming what it saw: a tick must never fall through to creating a
+    section, which is exactly what the old whole-section path did with a retitled
+    milestone's stale slug.
+    """
+
+    label: str
+    #: ``False`` unticks. Present so the verb is symmetric — a milestone reopened
+    #: is as ordinary as one finished, and an agent that can only tick would
+    #: reach for a section replace to undo one.
+    checked: bool = True
+
+
 class StaleSection(BaseModel):
     """One row of a refusal (§4.1 step 4).
 
@@ -755,6 +796,34 @@ class WriteResult(BaseModel):
     #:
     #: Empty whenever no layer moved, which is the ordinary spec edit.
     relayered: list[tuple[str, str, str]] = Field(default_factory=list)
+    #: **WHAT moved, for the ordinary refusal — the case ``relayered`` does not
+    #: cover.** Slugs whose normalized text differs, and slugs the stored
+    #: document does not have.
+    #:
+    #: ``relayered`` was the first answer to *"a refusal that does not name its
+    #: cause is one a model bisects"*, and it only ever covered the layer flip.
+    #: The plain arm stayed silent, and it fails the same way: on
+    #: ``ig-incumbent-teardown`` a coordinator re-sent ``## Acceptance Criteria``
+    #: and ``## Milestones`` built from its pre-review draft, was handed two note
+    #: ids and the sentence *"ticking a checkbox still applies"*, and told its
+    #: owner — in ``user-communication`` and then in a published report — that
+    #: nothing but the boxes had changed. Two sections had lost three acceptance
+    #: criteria between them. Nothing it was told contradicted its conclusion.
+    #:
+    #: ``added`` is its own field rather than part of ``moved`` because the two
+    #: have different remedies and the note's own wording conflates them: a slug
+    #: the plan has never had reads as *"could not add the section …"*, which
+    #: describes a deliberate addition, when the cause is almost always a
+    #: heading that was retitled and re-slugged underneath the writer.
+    moved: list[str] = Field(default_factory=list)
+    added: list[str] = Field(default_factory=list)
+    #: **How many per-section rows the refusal dropped without filing a note.**
+    #: ``_rows_worth_showing`` is right to drop them — nobody should be asked to
+    #: accept a checkbox tick or a re-cut milestone — but the WRITER has to know
+    #: its other sections did not land either, because the write is
+    #: all-or-nothing. Thirteen sections, four notes and no number is how *"only
+    #: the boxes"* became a conclusion a model could reach honestly.
+    dropped: int = 0
     note_ids: list[str] = Field(default_factory=list)
     #: True when the spliced result equalled the stored body — §4.1 step 6, an
     #: idempotent retry. Nothing was appended and no revision moved.
@@ -1386,6 +1455,53 @@ def section_changed(body: str, note: PlanNote) -> bool:
         return False
     current = _current_section(body, note.section)
     return current is not None and extent_key(current) != extent_key(note.base_section)
+
+
+def section_changed_since_answer(plan: ProjectPlan, body: str, note: PlanNote) -> bool:
+    """:func:`section_changed` as a READER of the note should see it: measured
+    from the newest reply by the person the note was addressed to, when there
+    is one, rather than from the moment the note was filed.
+
+    **The incident.** The user replied *"skip BTG for now"* on a section; the
+    coordinator rewrote the section to do exactly that 32 seconds later; the
+    user's own note then read *"This section changed since @user wrote this"* —
+    a warning about the fix it asked for. The edit was the answer, and the
+    compare had no way to know it.
+
+    **The reply chain already carries what this needs.** Every reply captures
+    its own base at file time (:func:`_capture_base` via :func:`add_note`), so
+    an addressee reply filed AFTER the edit holds the section as the addressee
+    left it. Comparing against that says *"changed since this was dealt
+    with"*, which is the question the banner is really asking: an edit by
+    anyone after the answer still fires it. Nothing stored changes — the note
+    keeps the base its author saw — and the answer is derived on every read.
+
+    **Comments only.** A proposal's ``base_section`` is not a reading
+    position, it is the base :func:`resolve_note` rebases against, and the
+    editor's collision flow keys off this same flag; quieting it there would
+    make ``Accept`` look clean and then 409. So a note carrying a proposal (or
+    a delete flag) gets :func:`section_changed` unchanged.
+
+    **Order matters, and the safe way.** A reply filed BEFORE the edit captured
+    the old text, so the banner still fires — which is why the ``plan`` skill
+    says *edit, then reply*.
+    """
+    if note.proposal or note.proposes_delete:
+        return section_changed(body, note)
+    answers = [
+        n for n in plan.notes
+        if n.reply_to == note.id
+        and n.base_section
+        and n.section == note.section
+        and n.by != note.by
+        and (not note.to or n.by == note.to)
+    ]
+    if not answers:
+        return section_changed(body, note)
+    latest = max(answers, key=lambda n: n.at)
+    return section_changed(
+        body, PlanNote(id=note.id, section=note.section, base_section=latest.base_section)
+    )
 
 
 def section_new(body: str, note: PlanNote) -> bool:
@@ -2290,6 +2406,9 @@ def _spec_lock_refusal(
     by: str,
     note_ids: Sequence[str],
     relayered: Sequence[tuple[str, str, str]] = (),
+    moved: Sequence[str] = (),
+    added: Sequence[str] = (),
+    dropped: int = 0,
 ) -> str:
     """M3's own refusal, with its remedy in it (AC-3.3).
 
@@ -2343,6 +2462,58 @@ def _spec_lock_refusal(
             f"so a rewrite that drops it moves the spec however little else "
             f"changed. Put the marker back on that heading and re-run the same "
             f"write — it will land, and these notes become unnecessary."
+        )
+    # **The ordinary refusal names what moved, for `relayered`'s own reason.**
+    # `cause` above leads when a layer flipped because that is the one cause the
+    # rows cannot show. This is the other silence: the rows exist, but they reach
+    # the model as note IDS, and an id says nothing about what is in it. A
+    # coordinator told only *"filed as n-85511d, n-377b28"* has to open the notes
+    # to learn anything, and the sentence it was told instead — that ticking a
+    # checkbox still applies — is an invitation to conclude the boxes were the
+    # whole of it. One did, in a report its owner read.
+    #
+    # Subordinate to `relayered`: when a layer moved, the marker is the remedy
+    # and the moved prose is downstream of it, so naming both would offer two
+    # fixes for one cause.
+    if not relayered and (moved or added):
+        parts = []
+        if moved:
+            shown = ", ".join(f"`{s}`" for s in list(moved)[:4])
+            rest = len(moved) - 4
+            parts.append(
+                f"{shown}{f' (and {rest} more)' if rest > 0 else ''} — the text "
+                f"you sent for {'these' if len(moved) > 1 else 'this'} is not "
+                f"what the plan says now"
+            )
+        if added:
+            shown = ", ".join(f"`{s}`" for s in list(added)[:4])
+            rest = len(added) - 4
+            parts.append(
+                f"{shown}{f' (and {rest} more)' if rest > 0 else ''} — "
+                f"{'these are' if len(added) > 1 else 'this is'} not "
+                f"{'sections' if len(added) > 1 else 'a section'} this plan "
+                f"has, so the write would ADD "
+                f"{'them' if len(added) > 1 else 'it'}; a slug comes from "
+                f"heading text, so a heading retitled since you last read it "
+                f"re-slugged and your old slug now names nothing"
+            )
+        cause = (
+            f" WHAT MOVED: {'; '.join(parts)}. Re-read with `clawmeets plan "
+            f"show <project> --section <slug>` and send that text back, "
+            f"changed only where you mean to change it."
+        )
+    # **The dropped count, because the write is ALL-OR-NOTHING.** The filtered
+    # rows are correctly not the user's business — nobody accepts a checkbox
+    # tick — but their sections did not land either, and a coordinator counting
+    # note ids to find out what happened undercounts by exactly this number.
+    if dropped:
+        cause += (
+            f" AND {dropped} further section(s) in the same write were refused "
+            f"with it and filed nothing, because their only change was one the "
+            f"user does not decide (a checkbox, an HTML comment, a `layer: "
+            f"detail` section). This write was all-or-nothing: NONE of it "
+            f"landed. Re-send those separately — and tick boxes with `clawmeets "
+            f"plan tick <project> <label>`, which is never refused."
         )
     return (
         f"@{by} may not change what this plan says — it is accepted, and the "
@@ -2404,6 +2575,79 @@ def _coverage_regressed(before: str, after: str) -> bool:
     return bool(unclaimed_criteria(after) - unclaimed_criteria(before))
 
 
+def _tick_edits(body: str, ticks: Sequence[PlanTick]) -> list[SectionEdit]:
+    """Resolve each :class:`PlanTick` against ``body`` into an ordinary
+    :class:`SectionEdit`, so that below this line there is one kind of write.
+
+    **The materialization is the feature.** ``body`` is the document as it reads
+    under ``_lock``, so the ``base`` this hands ``_splice`` is by definition the
+    section's current text and the staleness check cannot fire; and the only
+    difference between ``base`` and ``text`` is marker state, which
+    :func:`normalize_spec_text` folds — so ``spec_digest`` cannot move and the
+    spec lock cannot fire either. Nothing downstream needs to know a tick
+    happened, which is why this returns edits rather than growing a second path.
+
+    **One edit per SECTION, not per tick.** Two boxes in one ``### G3`` are two
+    ticks and one splice: ``_splice`` checks every edit against the body as it
+    stands *before* applying any, so two edits naming the same slug would both
+    carry the pre-flip base and the second would overwrite the first's flip.
+    Flipping both into one section text is the only shape that composes.
+
+    A label that resolves to nothing, or to more than one box, is a ``400`` that
+    NAMES WHAT IT SAW. The alternatives are both worse than refusing: falling
+    through to a create is how a retitled milestone's stale slug got appended to
+    the end of a plan as a phantom duplicate, and picking the first of two
+    matches would tick whichever box happens to come first in the file.
+    """
+    if not ticks:
+        return []
+
+    flipped = body
+    #: The slugs to splice, in the order their first tick named them — a set
+    #: would make the edit list's order depend on the hash of a slug.
+    touched: dict[str, None] = {}
+    for tick in ticks:
+        found = boxes_labelled(body, tick.label)
+        if not found:
+            labels = sorted({b.label for b in find_boxes(body) if b.label})
+            raise PlanInputError(
+                f"no checkbox labelled {tick.label!r} in this plan. A tick "
+                f"addresses a box by the label that OPENS its line — "
+                f"`- [ ] **M2** — …` is `M2`. This plan has: "
+                f"{', '.join(labels) or '(no labelled checkboxes)'}"
+            )
+        if len(found) > 1:
+            where = ", ".join(f"`{b.section}`" for b in found)
+            raise PlanInputError(
+                f"{len(found)} checkboxes are labelled {tick.label!r}, in "
+                f"{where}. Give the label one home — a duplicate label is an "
+                f"ambiguous address, and ticking whichever came first in the "
+                f"file would be a guess"
+            )
+        box = found[0]
+        flipped = flip_boxes(flipped, [box], tick.checked)
+        touched[box.section] = None
+
+    out: list[SectionEdit] = []
+    for slug in touched:
+        current = _current_section(body, slug)
+        after = _current_section(flipped, slug)
+        if current is None or after is None:
+            # **Raised, never skipped.** A box whose enclosing section cannot be
+            # addressed has no splice to ride, and dropping it here would be the
+            # very failure this whole path exists to remove: a tick the caller
+            # was told nothing about. `_enclosing_section` gives preamble boxes
+            # the `_lede` slug, so there is no known document shape that reaches
+            # this — which is the reason to make it loud rather than tolerated.
+            raise PlanInputError(
+                f"the checkbox is in a part of the plan that cannot be "
+                f"addressed as a section (slug {slug!r}). Give it a heading and "
+                f"tick it again"
+            )
+        out.append(SectionEdit(section=slug, text=after, base=current))
+    return out
+
+
 def _prepare_locked(
     project: "Project",
     ctx: "ModelContext",
@@ -2412,6 +2656,7 @@ def _prepare_locked(
     *,
     by: str,
     why: str = "",
+    ticks: Sequence[PlanTick] = (),
 ) -> _PreparedWrite:
     """§4.1 steps 1–6, plus step 7's shorthand extraction. **Appends nothing.**
 
@@ -2444,6 +2689,7 @@ def _prepare_locked(
             )
 
     body = _read_body(project, ctx)
+    edits = list(edits) + _tick_edits(body, ticks)
     spliced, stale = _splice(body, edits)
     if stale:
         return _PreparedWrite(
@@ -2610,16 +2856,27 @@ def _prepare_locked(
         # filed by the caller, which is the one holding the transaction that will
         # save it. ``changes`` carries both texts at once — the only place they
         # are both in hand — which is exactly what ``StaleSection`` exists for.
+        rows = [
+            StaleSection(section=slug, base=before, current=before, text=after)
+            for slug, before, after in _pair_renamed_rows(body, cleaned, changes)
+        ]
+        # **Computed here, off the same rows and the same stored body the filer
+        # uses.** `_rows_worth_showing` is what decides which rows become notes,
+        # so asking it here is how the refusal's own count of what it dropped
+        # cannot disagree with the number of notes the user actually receives.
+        # Recomputing it in the filer would be a second answer to one question.
+        shown = _rows_worth_showing(rows, body)
+        present = section_layers(body)
         return _PreparedWrite(
             WriteResult(
                 ok=False,
                 revision=plan.revision,
                 sha=body_sha(body),
-                locked=[
-                    StaleSection(section=slug, base=before, current=before, text=after)
-                    for slug, before, after in _pair_renamed_rows(body, cleaned, changes)
-                ],
+                locked=rows,
                 relayered=_relayered(body, cleaned),
+                moved=[s.section for s in shown if s.section in present],
+                added=[s.section for s in shown if s.section not in present],
+                dropped=len(rows) - len(shown),
             ),
             body=body,
         )
@@ -2748,6 +3005,7 @@ async def _apply_locked(
     by: str,
     verb: str = "write",
     why: str = "",
+    ticks: Sequence[PlanTick] = (),
 ) -> _PreparedWrite:
     """§4.1, steps 1–7. **The entire concurrency mechanism**, prepared and
     committed in one go — the shape every caller but :func:`submit_review` wants.
@@ -2764,7 +3022,7 @@ async def _apply_locked(
     Callers that want only the verdict take ``.result``, which is the same
     object they used to be handed.
     """
-    prepared = _prepare_locked(project, ctx, plan, edits, by=by, why=why)
+    prepared = _prepare_locked(project, ctx, plan, edits, by=by, why=why, ticks=ticks)
     if prepared.result.locked:
         # **M3 AC-3.3, filed here and not in each caller, because it is
         # unconditional.** Staleness has a ``file_conflict`` flag — it is a
@@ -3610,6 +3868,7 @@ async def apply_edits(
     runloop: "ChangelogRunloop",
     file_conflict: bool = False,
     why: str = "",
+    ticks: Sequence[PlanTick] = (),
 ) -> WriteResult:
     """**The one funnel.** Every byte that reaches PLAN.md comes through here.
 
@@ -3629,6 +3888,13 @@ async def apply_edits(
     :func:`_prepare_locked` rather than requested by a prompt, because
     prompt-level trust is what failed on ``chuswine-geo-b2b``.
 
+    ``ticks`` are :class:`PlanTick` rows — *"tick the box labelled M2"* — which
+    :func:`_prepare_locked` materializes into ordinary edits against the body it
+    reads under this lock. They carry no section text, so they cannot be stale
+    and cannot move the spec digest; a tick therefore never earns a 409, a 403 or
+    a ``--why``. They compose with ``edits`` in one transaction, and a label that
+    does not resolve to exactly one box is a 400 before anything is written.
+
     Raises :class:`PlanConflictError` (409) on a stale write and
     :class:`PlanSpecLockedError` (403) on one M3 refused — **both after the
     save**, because both refusals have already filed the notes that are their
@@ -3638,7 +3904,9 @@ async def apply_edits(
     async with _lock:
         plan = _load(project, ctx)
         result = (
-            await _apply_locked(project, ctx, runloop, plan, edits, by=by, why=why)
+            await _apply_locked(
+                project, ctx, runloop, plan, edits, by=by, why=why, ticks=ticks
+            )
         ).result
         if result.stale and file_conflict:
             # ``+=``, not ``=``. On this path ``note_ids`` is empty, but the
@@ -3657,6 +3925,9 @@ async def apply_edits(
                     by=by,
                     note_ids=result.note_ids,
                     relayered=result.relayered,
+                    moved=result.moved,
+                    added=result.added,
+                    dropped=result.dropped,
                 ),
                 note_ids=result.note_ids,
                 revision=result.revision,
@@ -3999,6 +4270,7 @@ async def add_note(
     base_section: str = "",
     quote: str = "",
     reply_to: str = "",
+    keep_open: bool = False,
 ) -> list[str]:
     """File one note per addressee. **Never refused for staleness** — a note
     cannot clobber anything (§4.4).
@@ -4069,7 +4341,9 @@ async def add_note(
 
     **A reply CLOSES the parent** ``answered`` (AC-5.9), in the same save that
     files it, under :func:`_reply_closes_parent` — the same predicate
-    ``submit_review``'s ``ask`` row asks.
+    ``submit_review``'s ``ask`` row asks. ``keep_open`` files the reply and
+    leaves the parent open: the replier's own *"not done yet"* — a partial
+    answer, or a question back — which the predicate cannot infer.
 
     **This reverses what stood here, and the reversal is the point.** The old
     rule was that ``submit_review`` closed and this door deliberately did not,
@@ -4347,7 +4621,15 @@ async def add_note(
             # path that can make that true. Without it the coordinator's answer
             # would close the note and leave the round it arrived in open
             # forever, which is the bookkeeping half of the same asymmetry.
-            if parent is not None and _reply_closes_parent(project, plan, parent, by=by):
+            # `keep_open` is the replier saying *not done yet* — a partial
+            # answer, or a question back. The reply is filed either way; only
+            # the parent's status differs, exactly as for the shapes
+            # `_reply_closes_parent` refuses.
+            if (
+                parent is not None
+                and not keep_open
+                and _reply_closes_parent(project, plan, parent, by=by)
+            ):
                 _close_note(parent, status="answered", by=by)
                 _note(plan, by, "resolve", section=parent.section,
                       detail=f"{parent.id} answered")
@@ -6820,7 +7102,13 @@ async def submit_review(
             _save(project, ctx, plan)
             raise PlanSpecLockedError(
                 _spec_lock_refusal(
-                    project, by=by, note_ids=ids, relayered=result.relayered
+                    project,
+                    by=by,
+                    note_ids=ids,
+                    relayered=result.relayered,
+                    moved=result.moved,
+                    added=result.added,
+                    dropped=result.dropped,
                 ),
                 note_ids=ids,
                 revision=result.revision,
