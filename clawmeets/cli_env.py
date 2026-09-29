@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
+from typing import Optional
 
 import typer
 
@@ -61,11 +63,32 @@ def _resolve_base(agent: str, data_dir: Path) -> Path:
 @app.command("set")
 def set_(
     key: str = typer.Argument(..., help="Env var name (^[A-Z_][A-Z0-9_]*$; no CLAWMEETS_ prefix)."),
-    value: str = typer.Argument(..., help="Value (not echoed back)."),
+    value: Optional[str] = typer.Argument(
+        None,
+        help="Value (not echoed back). Omit it to be prompted, so it stays out of shell history.",
+    ),
+    value_stdin: bool = typer.Option(
+        False, "--value-stdin",
+        help="Read the value from stdin (one trailing newline stripped) instead of argv.",
+    ),
     agent: str = typer.Option("", "--agent", "-a", help="Agent name/dir; default $CLAWMEETS_AGENT_DIR."),
     data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir"),
 ) -> None:
-    """Set/overwrite one variable in the agent's store (value never echoed)."""
+    """Set/overwrite one variable in the agent's store (value never echoed).
+
+    Three ways to pass the value: as an argument, on stdin (``--value-stdin`` —
+    how the computer connection does it, so a secret never shows in ``ps``), or
+    typed at a hidden prompt when neither is given.
+    """
+    if value is not None and value_stdin:
+        _echo({"status": "error", "error": "pass the value as an argument or --value-stdin, not both"})
+        raise typer.Exit(1)
+    if value_stdin:
+        value = sys.stdin.read()
+        if value.endswith("\n"):
+            value = value[:-1]
+    elif value is None:
+        value = typer.prompt(f"Value for {key}", hide_input=True, err=True)
     base = _resolve_base(agent, data_dir)
     try:
         env_store.set_var(base, key, value)

@@ -7,7 +7,7 @@ description: >
   about a computer by name, asks why agents look offline, asks to start or stop
   an agent that lives on a DIFFERENT machine, or asks what ClawMeets is
   allowed to do on their computer. Drives the five allowed actions (start,
-  stop, restart, report status, update the connection software) on any
+  stop, restart, report status, update the ClawMeets software) on any
   connected computer. Never deletes anything. Assistant-only.
 ---
 
@@ -99,7 +99,15 @@ curl -s -X POST \
 | `stop` | yes | Stop one of them |
 | `restart` | yes | Stop then start, as two steps |
 | `status` | no | Make the computer re-report what is running |
-| `update` | no | Update that computer's own connection software |
+| `update` | no | Update the ClawMeets software on that computer (`clawmeets` + connection software, each via whichever of uv tool / pipx / pip installed it; running agents restart) |
+
+Two more actions exist — `env_set` / `env_unset`, which add or remove an
+environment variable for one agent — but they take the **user's own browser
+sign-in** and refuse your token (401). A secret must never pass through chat. If
+the user wants to set one, send them to that computer's page in the web app
+(Computers → the computer → the agent's "Environment variables"), or give them
+`clawmeets env set KEY --agent <name>` to run on the machine, which prompts for
+the value. Never ask them to paste a value to you.
 
 Anything else is refused — by the server before it sends, and again by the
 machine before it runs. If the user asks for something outside this list, say so
@@ -137,18 +145,30 @@ a human in their browser. Tell them the path and what it grants:
 > In ClawMeets, open **Computers** in the left rail and press **+**. You'll get
 > a code that's good for 15 minutes, and one command to run on that computer.
 > Connecting lets me start, stop and restart your own agents there, see which
-> are running, and keep its connection software current — nothing else. You can
+> are running, and keep its ClawMeets software current — nothing else. You can
 > disconnect it at any time from the same page, and its key stops working
 > immediately.
 
-## What ClawMeets may never do on a computer
+## What this connection can do, honestly
 
-Say these out loud if the user asks, or if they seem uneasy about the whole
-idea. They are enforced in two places, not one — the server will not send an
-unlisted command, and the machine will not run one:
+Say this plainly if the user asks, or if they seem uneasy about the whole idea.
 
-- Run any other command
-- Open, read, copy or send their files
+- The server can ask a computer to do only a fixed set of things — start, stop
+  and restart one of their agents, report which are running, update its own
+  ClawMeets software, and add or remove an agent's environment variable. That
+  list is checked twice: the server will not send anything else, and the
+  machine will not run anything else.
+- The agents it runs act as the user and can run commands on that computer.
+- **Terminal:** on by default. The user can open a full shell on the computer,
+  as themselves, from its page in ClawMeets. It is turned off (and back on) only
+  on the machine itself: `clawmeets computer terminal disable` /
+  `clawmeets computer terminal enable`. You cannot open a terminal — the route
+  refuses your token — so if the user wants one, point them to the Terminal card
+  on the computer's page.
+
+It will never:
+
+- Read back or send the value of an environment variable
 - Install or change anything else
 - Delete an agent — only they can, in the browser
 - Reach any other computer or account

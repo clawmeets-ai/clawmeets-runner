@@ -1,0 +1,6 @@
+{
+  "audiences": ["worker", "coordinator"],
+  "surfaces": ["agent_runtime"],
+  "version": "1.0.0",
+  "description": "Save a repeatable procedure to the owner's My Desk SOP library as a reusable prompt with typed blanks (`clawmeets sop create`)."
+}

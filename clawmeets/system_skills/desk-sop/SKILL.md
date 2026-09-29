@@ -35,9 +35,13 @@ personal surface — an agent write path open to all of them would invite
 spam into it — so every route here accepts the owner's browser session or
 the owner's assistant bearer and nothing else. Reads included.
 
-If you are not that assistant, every command below returns
-`Error 401: Invalid token`. That is correct, not a misconfiguration. Say
-so plainly and stop.
+The one exception is `clawmeets sop create`: every agent the owner has
+registered may store a new SOP (the `desk-sop-publish` skill). Listing,
+editing, deleting, running and scheduling stay assistant-only.
+
+If you are not that assistant, every command below other than `create`
+returns `Error 401: Invalid token`. That is correct, not a
+misconfiguration. Say so plainly and stop.
 
 ## § The blank grammar
 

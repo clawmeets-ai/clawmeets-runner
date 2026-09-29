@@ -24,16 +24,17 @@ import re
 import stat
 from pathlib import Path
 
+from .agent_processes import ENV_KEY_PATTERN, ENV_RESERVED_PREFIX, ENV_STORE_FILENAME
 from .file_io import FileUtil
 
 # POSIX-ish env-var name: leading letter/underscore, then alnum/underscore.
-KEY_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
+KEY_RE = re.compile(ENV_KEY_PATTERN)
 
 # Keys under this prefix carry agent identity/token and are runner-owned; the
 # store must never write or surface them.
-RESERVED_PREFIX = "CLAWMEETS_"
+RESERVED_PREFIX = ENV_RESERVED_PREFIX
 
-_STORE_FILENAME = "env.json"
+_STORE_FILENAME = ENV_STORE_FILENAME
 
 
 def store_path(agent_dir: Path) -> Path:

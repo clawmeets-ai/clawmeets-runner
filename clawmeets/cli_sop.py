@@ -5,12 +5,15 @@ clawmeets/cli_sop.py
 ``clawmeets sop <subcmd>`` — CLI for the owner's My Desk SOP library, the
 stored, reusable prompts they hand an agent over and over.
 
-Paired with ``skills/desk-sop/SKILL.md``. Unlike ``clawmeets todo``, this group
-is **assistant-only** by design: the SOP library is a curated personal surface,
-so ``/me/desk/sops`` accepts the owner's browser JWT or the owner's own
-``{username}-assistant`` bearer and nothing else. Every verb here 401s for any
-other agent — including ``list``. That is the correct failure, and ``_ok``
-surfaces the server's message verbatim rather than masking it.
+Paired with ``skills/desk-sop/SKILL.md`` (the assistant) and
+``skills/desk-sop-publish/SKILL.md`` (every other agent). ``create`` works for
+ANY of the owner's agents — the SOP lands in that agent's owner's library.
+Every other verb is **assistant-only** by design: the SOP library is a curated
+personal surface, so reading, editing, deleting and firing accept the owner's
+browser JWT or the owner's own ``{username}-assistant`` bearer and nothing
+else, and 401 for any other agent — including ``list``. That is the correct
+failure, and ``_ok`` surfaces the server's message verbatim rather than
+masking it.
 
 Auth resolved from env (standard agent-runtime injection, same as
 ``clawmeets todo`` / ``clawmeets brief``):

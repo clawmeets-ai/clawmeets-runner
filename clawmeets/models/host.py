@@ -104,6 +104,10 @@ class HostAgent(BaseModel):
     name: str
     state: AgentRunState = "stopped"
     pid: Optional[int] = None
+    # Key names in the agent's env-var store on this machine — never values.
+    # None = the machine did not say (its software predates env-var support);
+    # [] = it looked and the store is empty.
+    env_keys: Optional[list[str]] = None
 
 
 class HostModelCLI(BaseModel):
@@ -140,6 +144,9 @@ class HostCommandResult(BaseModel):
     command_id: str = ""
     action: str
     agent: Optional[str] = None
+    # The env-var key an env command touched, so a failure can name it. Never
+    # a value: no field here could hold one.
+    key: Optional[str] = None
     ok: bool = True
     detail: str = ""
     finished_at: str = ""
@@ -167,6 +174,8 @@ class HostRecord(BaseModel):
     last_seen_at: str = ""
     revoked_at: Optional[str] = None
     daemon_version: Optional[str] = None
+    # The installed ``clawmeets`` runner's version, as the machine reported it.
+    runner_version: Optional[str] = None
     agents: list[HostAgent] = Field(default_factory=list)
     agents_reported_at: str = ""
     last_command: Optional[HostCommandResult] = None
@@ -178,6 +187,10 @@ class HostRecord(BaseModel):
     # When the machine last ran the check, by its own clock. Older machines do
     # not say, and fall back to ``model_clis_reported_at``.
     model_clis_checked_at: str = ""
+    # Whether the terminal is switched on AT the machine (only its local CLI
+    # can change that). None = the machine's software predates the terminal,
+    # which the page reads as "update this computer", not as "off".
+    terminal_enabled: Optional[bool] = None
 
     @property
     def is_revoked(self) -> bool:
@@ -305,6 +318,15 @@ def _owner_dir(data_dir: Path, owner_user_id: str) -> Path:
 
 def _host_path(data_dir: Path, owner_user_id: str, host_id: str) -> Path:
     return _owner_dir(data_dir, owner_user_id) / f"{validate_host_id(host_id)}.json"
+
+
+def terminal_audit_path(data_dir: Path, owner_user_id: str, host_id: str) -> Path:
+    """``hosts/<owner>/<host>.terminal.jsonl`` — one line per session open/close.
+
+    ``.jsonl``, not ``.json``, so :func:`list_hosts` never mistakes it for a
+    host record.
+    """
+    return _owner_dir(data_dir, owner_user_id) / f"{validate_host_id(host_id)}.terminal.jsonl"
 
 
 def _pairing_path(data_dir: Path, code: str) -> Path:
@@ -564,6 +586,7 @@ async def touch_host(
     hostname: Optional[str] = None,
     platform: Optional[str] = None,
     os_version: Optional[str] = None,
+    runner_version: Optional[str] = None,
 ) -> Optional[HostRecord]:
     """Record a check-in, and refresh whatever the machine re-reported.
 
@@ -579,6 +602,8 @@ async def touch_host(
         record.last_seen_at = _now()
         if daemon_version is not None:
             record.daemon_version = daemon_version
+        if runner_version is not None:
+            record.runner_version = runner_version
         if hostname is not None:
             record.hostname = hostname
         if platform is not None:
@@ -688,4 +713,27 @@ async def revoke_host(
         record.revoked_at = _now()
         record.token_hash = "revoked"
         _save(data_dir, record)
+        return record
+
+
+async def record_terminal_enabled(
+    data_dir: Path,
+    owner_user_id: str,
+    host_id: str,
+    enabled: Optional[bool],
+) -> Optional[HostRecord]:
+    """Store the machine's terminal switch as it reported it.
+
+    Written even when ``enabled`` is None on a hello: a hello is the machine's
+    whole self-description, so a daemon downgraded to one that has no terminal
+    must stop reading as "on". State frames only call this with a real value.
+    Skips the write when nothing changed — it rides every 30-second frame.
+    """
+    async with _lock:
+        record = get_host(data_dir, owner_user_id, host_id)
+        if record is None:
+            return None
+        if record.terminal_enabled is not enabled:
+            record.terminal_enabled = enabled
+            _save(data_dir, record)
         return record
