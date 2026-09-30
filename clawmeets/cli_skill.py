@@ -308,18 +308,3 @@ def skill_set_config(
         )
         _ok(resp)
     typer.echo(f"Set config for {skill_name!r} on '{agent_name}'.")
-
-
-@skill_app.command("reload")
-def skill_reload(
-    token: str = typer.Option(..., "--token", "-t", help="Admin auth token"),
-    server: str = typer.Option(DEFAULT_SERVER, "--server", "-s"),
-):
-    """Reload skill registry from disk (admin only). Run after git pull to pick up new skills."""
-    with _http(server) as client:
-        resp = client.post(
-            "/skills/reload",
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        data = _ok(resp)
-    typer.echo(f"Reloaded {data['reloaded']} skills: {', '.join(data['skills'])}")

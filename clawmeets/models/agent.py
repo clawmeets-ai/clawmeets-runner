@@ -227,7 +227,7 @@ def build_state_snapshot(
         )
         resolvable_agents = frozenset(
             variant
-            for other in Agent.list_all(model_ctx, viewer_is_admin=True)
+            for other in Agent.list_all(model_ctx, include_private=True)
             for variant in _agent_name_variants(other.name)
         )
     else:
@@ -819,7 +819,7 @@ class Agent(PersistableParticipant):
         # (envelope never delivered) and retroactively cleans any stale
         # cards from before AGENT_REGISTRY_CHANGE(delete) was wired up.
         pruned_count = 0
-        for peer in cls.list_all(ctx, viewer_is_admin=True):
+        for peer in cls.list_all(ctx, include_private=True):
             if peer.id in server_ids or peer.id in exclude_ids:
                 continue
             if cls.prune_peer_card(peer.id, ctx):
@@ -865,7 +865,7 @@ class Agent(PersistableParticipant):
         """
         if owner_user_id is None and owner_username:
             prefix = f"{owner_username}-"
-            for peer in cls.list_all(ctx, viewer_is_admin=True):
+            for peer in cls.list_all(ctx, include_private=True):
                 if peer.registered_by and peer.name.startswith(prefix):
                     owner_user_id = peer.registered_by
                     break
@@ -1088,7 +1088,7 @@ class Agent(PersistableParticipant):
         viewer_owner_id = project._invitable_viewer_owner_id(model_ctx)
         candidates = [
             a
-            for a in cls.list_all(model_ctx, viewer_is_admin=True)
+            for a in cls.list_all(model_ctx, include_private=True)
             if a.id not in exclude_ids
         ]
         if project.enforces_invitable_allowlist:

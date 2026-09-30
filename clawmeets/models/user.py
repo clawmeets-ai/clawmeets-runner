@@ -98,7 +98,8 @@ class User(Participant):
     This ensures the model always reflects the current state on disk.
     """
 
-    # Short names are reserved for admin-created accounts; public
+    # Short names are reserved for operator-created accounts
+    # (``clawmeets admin create-user`` on the server host); public
     # self-registration enforces this minimum.
     MIN_PUBLIC_USERNAME_LENGTH = 5
 
@@ -339,7 +340,7 @@ class User(Participant):
         calls :meth:`_load_passwd_entry`, which re-reads and re-parses the whole
         passwd file — so a caller that builds N rows by touching K properties
         each performs N*K full parses. Callers that need many fields for many
-        users (admin listings, exports) should read the dicts once through this
+        users (exports) should read the dicts once through this
         method and never touch a ``User`` instance property in the loop.
 
         Keys are the same as :meth:`to_dict`'s source entry: ``username``,
@@ -414,7 +415,6 @@ class User(Participant):
         username: str,
         password: str,
         ctx: "ModelContext",
-        is_admin: bool = False,
         email: Optional[str] = None,
         email_verified: bool = False,
     ) -> "User":
@@ -424,9 +424,8 @@ class User(Participant):
             username: The username (will be normalized)
             password: The password (will be hashed)
             ctx: ModelContext for filesystem operations
-            is_admin: Whether user is an admin
             email: Email address (required for self-registration)
-            email_verified: Whether email is pre-verified (True for admin-created users)
+            email_verified: Whether email is pre-verified (True for operator-created users)
 
         Returns:
             New User instance
@@ -463,7 +462,9 @@ class User(Participant):
             entry = {
                 "id": user_id,
                 "username": username,
-                "role": "admin" if is_admin else "user",
+                # Legacy passwd field, kept for file-format compatibility.
+                # Nothing reads it; every account is a regular user.
+                "role": "user",
                 "password_hash": cls._hash_password(password),
                 "created_at": _now().isoformat(),
                 "email": email,
@@ -793,9 +794,6 @@ class User(Participant):
     async def initialize(cls, ctx: "ModelContext") -> None:
         """Initialize user store, ensuring passwd file exists.
 
-        If no admin user is found, logs a warning instructing the operator
-        to create one via `server init`.
-
         Args:
             ctx: ModelContext for filesystem operations
         """
@@ -807,20 +805,6 @@ class User(Participant):
             if data is None:
                 data = {"users": {}}
                 FileUtil.write(passwd_path, data, "json", atomic=True)
-
-            users = data.get("users", {})
-
-            # Check if any admin user exists
-            has_admin = any(
-                u.get("role") == "admin"
-                for u in users.values()
-            )
-
-            if not has_admin:
-                logger.warning(
-                    "No admin user found. Create one with: "
-                    "python -m clawmeets.cli server init <password>"
-                )
 
     # ─────────────────────────────────────────────────────────────────────────
     # Instance Properties
@@ -866,11 +850,6 @@ class User(Participant):
         return self.assistant_id is not None
 
     @property
-    def is_admin(self) -> bool:
-        """Check if user is an admin."""
-        return self._load_passwd_entry().get("role") == "admin"
-
-    @property
     def email(self) -> Optional[str]:
         """Get email from filesystem."""
         return self._load_passwd_entry().get("email")
@@ -904,11 +883,6 @@ class User(Participant):
     def description(self) -> str:
         """Users don't have descriptions."""
         return ""
-
-    @property
-    def user_role(self) -> str:
-        """Get the user's role (admin/user)."""
-        return self._load_passwd_entry().get("role", "user")
 
     def get_project(self, project_id: str):
         """Load a project by ID.
@@ -1179,7 +1153,6 @@ class User(Participant):
             "email_verified": entry.get("email_verified", False),
             "assistant_agent_id": entry.get("assistant_agent_id"),
             "created_at": entry.get("created_at", ""),
-            "is_admin": entry.get("role") == "admin",
             # Additive OAuth fields (absent/empty on legacy password-only records).
             "oauth_identities": entry.get("oauth_identities", []) or [],
             "display_name": entry.get("display_name"),

@@ -422,16 +422,19 @@ class PersistableParticipant(Participant, ABC):
         ctx: "ModelContext",
         discoverable_only: bool = True,
         viewer_user_id: Optional[str] = None,
-        viewer_is_admin: bool = False,
+        include_private: bool = False,
     ) -> list["Self"]:
         """List all participants from filesystem.
 
         Args:
             ctx: ModelContext for filesystem operations
             discoverable_only: If True, only return discoverable participants
-                (plus non-discoverable ones owned by viewer or visible to admin)
+                (plus non-discoverable ones owned by viewer)
             viewer_user_id: User ID of the viewer (for ownership-based visibility)
-            viewer_is_admin: Whether the viewer is an admin (sees all agents)
+            include_private: Internal-caller escape hatch (schedulers, auth
+                credential lookup, maintenance scripts) — return every
+                participant regardless of discoverability or owner. Never
+                derived from a request's caller.
 
         Returns:
             List of participant instances
@@ -450,11 +453,11 @@ class PersistableParticipant(Participant, ABC):
                 )
                 continue
             is_discoverable = data.get("discoverable_through_registry", True)
-            if viewer_is_admin:
-                # Admin sees all agents
+            if include_private:
+                # Internal caller: every participant
                 result.append(cls(participant_id, ctx))
             elif viewer_user_id:
-                # Authenticated non-admin: own agents + discoverable agents
+                # Authenticated viewer: own agents + discoverable agents
                 if data.get("registered_by") == viewer_user_id or is_discoverable:
                     result.append(cls(participant_id, ctx))
             elif not discoverable_only or is_discoverable:
@@ -471,7 +474,7 @@ class PersistableParticipant(Participant, ABC):
         through :meth:`_load_card`, which re-reads ``card.json`` on EVERY
         access, so aggregating over the whole roster via instances is one file
         read per property touch. Callers that just need fields (ownership
-        rollups, admin listings) read the dicts once through this method — the
+        rollups) read the dicts once through this method — the
         same "load each card once and filter in memory" shape :meth:`search`
         already uses internally.
 
@@ -505,7 +508,6 @@ class PersistableParticipant(Participant, ABC):
         limit: int = 20,
         sort: str = "status_first",
         viewer_user_id: Optional[str] = None,
-        viewer_is_admin: bool = False,
         discoverable_only: bool = False,
     ) -> tuple[list["Self"], int]:
         """Search participants with filtering and pagination.
@@ -521,9 +523,8 @@ class PersistableParticipant(Participant, ABC):
             limit: Page size (max 50)
             sort: Sort order - "status_first" (online first) or "name"
             viewer_user_id: User ID of the viewer (for visibility)
-            viewer_is_admin: Whether the viewer is an admin
             discoverable_only: If True, return only discoverable (public) agents
-                and ignore viewer-ownership and admin visibility expansions.
+                and ignore the viewer-ownership visibility expansion.
                 Used by the public agent directory browse view.
 
         Returns:
@@ -547,12 +548,11 @@ class PersistableParticipant(Participant, ABC):
             if discoverable_only:
                 if not is_discoverable:
                     continue
-            elif not viewer_is_admin:
-                if viewer_user_id:
-                    if not (data.get("registered_by") == viewer_user_id or is_discoverable):
-                        continue
-                elif not is_discoverable:
+            elif viewer_user_id:
+                if not (data.get("registered_by") == viewer_user_id or is_discoverable):
                     continue
+            elif not is_discoverable:
+                continue
 
             # Text search filter
             if query_lower:
@@ -752,7 +752,7 @@ class PersistableParticipant(Participant, ABC):
 
     @property
     def is_verified(self) -> bool:
-        """Check if this participant is admin-verified."""
+        """Check if this participant is operator-verified."""
         return self._load_card().get("is_verified", False)
 
     def verify(self) -> None:

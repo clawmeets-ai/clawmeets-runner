@@ -160,41 +160,6 @@ class AgentSearchResponse(BaseModel):
     limit: int
 
 
-class AdminUserRow(BaseModel):
-    """One row of the admin Users directory (``GET /admin-api/users``).
-
-    Identity fields mirror ``User.to_dict``; the four counts are derived
-    aggregates computed per request (see ``server/routes/admin_users.py``).
-
-    ``is_admin`` and ``email_verified`` are carried so the client can disable
-    its Impersonate action up front — the impersonation gate blocks admin →
-    admin, and the picker excludes unverified accounts, so offering the action
-    on those rows would only ever produce a 403.
-    """
-    id: str
-    username: str
-    email: Optional[str] = None
-    display_name: Optional[str] = None    # OAuth-only field; None on password accounts
-    created_at: str = ""                  # ISO-8601; "" on rows predating the field
-    is_admin: bool = False
-    email_verified: bool = False
-    agents_created: int = 0               # agent cards with registered_by == id
-    dm_threads: int = 0                   # projects created_by == id, surface == "dm"
-    projects: int = 0                     # projects created_by == id, surface == "regular"
-    agents_in_progress: int = 0           # owned agents outstanding in an open work batch
-
-
-class AdminUserListResponse(BaseModel):
-    """Paginated admin Users directory. Envelope mirrors AgentSearchResponse.
-
-    ``total`` is the match count BEFORE the offset/limit slice.
-    """
-    users: list[AdminUserRow]
-    total: int
-    offset: int
-    limit: int
-
-
 class AgentRegistrationResponse(BaseModel):
     """Flat response from agent registration.
 
@@ -216,9 +181,9 @@ class AgentRegistrationResponse(BaseModel):
 
 
 class UserResponse(BaseModel):
-    """Flat response from user creation (admin and self-register).
+    """Flat response from user self-registration.
 
-    Used by both POST /users and POST /auth/register. The assistant agent is
+    Used by POST /auth/register. The assistant agent is
     created separately via `clawmeets assistant register` after signup, so it
     is not part of this response.
     """
@@ -330,6 +295,6 @@ class ParticipantProjectResponse(BaseModel):
     surface: Optional[str] = None  # "regular" | "dm"
     display_name: Optional[str] = None  # raw model-set label; frontend renders `display_name ?? name`
     last_modified: datetime  # ISO-8601, non-null; sidebar sorts the PROJECTS list by this desc
-    report_published_at: Optional[datetime] = None  # Same meaning as Project.report_published_at: ISO ts string | null, non-null EXACTLY when the project has a real completion report. Present on every row of the desk's non-admin list (GET /participants/{id}/projects).
+    report_published_at: Optional[datetime] = None  # Same meaning as Project.report_published_at: ISO ts string | null, non-null EXACTLY when the project has a real completion report. Present on every row of the desk's list (GET /participants/{id}/projects).
     plan_updated_at: Optional[datetime] = None  # Same meaning as Project.plan_updated_at: when PLAN.md or its sidecar last moved. From meta.json — no extra read.
     plan: Optional[PlanSummary] = None  # D23, §6.2. ABSENT means: this project has no plan at all (a DM, or a pre-feature project with no PLAN.md).

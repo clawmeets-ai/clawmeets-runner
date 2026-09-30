@@ -75,7 +75,7 @@ project is born with the row already filed, reading:
 > it stands."
 
 That is the row **before** the coordinator has sent anything. It becomes the
-confirm — *"I've drafted this and I have nothing open on it"* — only when the
+confirm — *"Nothing in this plan is waiting on an answer from you"* — only when the
 keeper sends its first quiet review round. Dismissing it in the drafting
 wording stamps a **full acceptance at revision 1** of a document nobody has
 read.
@@ -96,7 +96,7 @@ they had signed and never seen.
 
 ```bash
 # The confirm note's id. It is addressed to the user and its comment starts
-# "I've drafted this and I have nothing open on it."
+# "Nothing in this plan is waiting on an answer from you."
 #
 # IF IT STARTS "@<keeper> is drafting this" INSTEAD, this plan has never been
 # sent and you are looking at the pre-confirm row — see the section above. Stop.

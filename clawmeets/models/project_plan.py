@@ -289,13 +289,14 @@ FOLDED_REASON = (
 #: not**, because those are the only two acts this row offers and they are not
 #: symmetric: one releases the coordinator, the other leaves the gate up.
 GO_NOTE_COMMENT = (
-    "I've drafted this and I have nothing open on it. Have a read — dismiss "
-    "this note and I'll start. Reply instead if you want something changed; "
-    "that leaves it open."
+    "Nothing in this plan is waiting on an answer from you. This is the start "
+    "gate: dismiss it to start work on the plan as written. Reply instead if "
+    "you want changes; that keeps the gate closed."
 )
 
 #: **The confirm note's OTHER wording, and the one a project is born with.**
-#: :data:`GO_NOTE_COMMENT` says *"I have nothing open on it"*, and at
+#: :data:`GO_NOTE_COMMENT` says *"Nothing in this plan is waiting on an
+#: answer from you"*, and at
 #: ``POST /projects`` that sentence is false: :func:`seed_go_note` files the row
 #: in the same request that seeds ``PLAN.md``, before the coordinator has taken
 #: a turn, so the document it invites a read of is the bare
@@ -346,8 +347,8 @@ GO_NOTE_DRAFTING = (
 
 #: Why the confirm note went away without being approved: the round the
 #: coordinator is sending carries real questions, so the answers to THOSE are
-#: the gate and a confirm row beside them would be false — the note says *"I
-#: have nothing open on it"*. Written as the note's ``resolution`` so the closed
+#: the gate and a confirm row beside them would be false — the note says
+#: *"Nothing in this plan is waiting on an answer from you"*. Written as the note's ``resolution`` so the closed
 #: row still reads in the history. See :func:`_sync_go_note_locked`.
 GO_NOTE_RETIRED = (
     "this round carries questions — answering them is what the plan is waiting "
@@ -2235,8 +2236,8 @@ def _spec_is_locked(project: "Project", plan: ProjectPlan, *, by: str) -> bool:
     **ACCEPTANCE ALONE STOPPED MEANING RATIFIED, WHICH IS WHY THERE IS A FOURTH
     CONJUNCT.** Every sentence above rests on *"there IS a ratified baseline
     then"*, and that implication held while ``accepted_at`` could only be
-    stamped one way: the user dismissing a row that said *"I've drafted this and
-    I have nothing open on it. Have a read"*. The confirm row now has a second
+    stamped one way: the user dismissing a row that said *"Nothing in this plan
+    is waiting on an answer from you. This is the start gate"*. The confirm row now has a second
     wording (:data:`GO_NOTE_DRAFTING`, seeded before the coordinator has taken a
     turn), and taking THAT one says *"start on the draft as it stands"*. It
     releases the gate, it is the owner's call to make, and it ratifies nothing —
@@ -7859,8 +7860,9 @@ def _sync_go_note_locked(
 
     * **The round carries at least one question for the user** → the open
       confirm note is retired in the same write. The user's answers ARE the
-      gate, the open-note count never dips to zero, and they never read *"I have
-      nothing open on it"* directly above four things that are open.
+      gate, the open-note count never dips to zero, and they never read *"Nothing in
+      this plan is waiting on an answer from you"* directly above four things
+      that are open.
     * **The round carries none, it is the KEEPER's, and the row still holds the
       drafting wording** → it is swapped for :data:`GO_NOTE_COMMENT`. This is
       the same sentence as the rule above, asked of the other wording: a row
@@ -7984,8 +7986,8 @@ async def seed_go_note(project: "Project", ctx: "ModelContext") -> str:
     **It files :data:`GO_NOTE_DRAFTING`, not the confirm wording, and that is
     the only thing about this function that is not the gate.** At this instant
     the coordinator has not taken a turn and the document is the bare
-    :data:`SEED_TEMPLATE`, so *"I've drafted this and I have nothing open on
-    it"* would be false for as long as the spec-stage contract takes — a
+    :data:`SEED_TEMPLATE`, so *"Nothing in this plan is waiting on an
+    answer from you"* would be false for as long as the spec-stage contract takes — a
     drafting turn plus the roster consult it ends on. The row, its addressee,
     its layer and therefore ``_plan_execution_blocked`` are identical either
     way; :func:`_sync_go_note_locked` swaps the bytes for

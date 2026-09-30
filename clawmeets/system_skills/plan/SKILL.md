@@ -757,9 +757,9 @@ Your first quiet round — `clawmeets plan review` with nothing open for the use
 — rewrites it in place to the confirm:
 
 ```
-I've drafted this and I have nothing open on it. Have a read — dismiss this
-note and I'll start. Reply instead if you want something changed; that leaves
-it open.
+Nothing in this plan is waiting on an answer from you. This is the start
+gate: dismiss it to start work on the plan as written. Reply instead if you
+want changes; that keeps the gate closed.
 ```
 
 Nothing else about the row moves: same note, same addressee, same open count,
@@ -800,8 +800,8 @@ else it could mean, and the server refuses `--apply`, `--reject` and
 
 **The coordinator's own review send moves it.** A round you send that carries
 at least one open question for the user retires the confirm note in the same
-write — their answers are the gate, and a row saying *"I have nothing open on
-it"* above four things that are open would be false. A round that carries no
+write — their answers are the gate, and a row saying *"Nothing in this plan is
+waiting on an answer from you"* above four things that are open would be false. A round that carries no
 question files it again, or rewrites the drafting wording into the confirm if
 the row is still the one seeded at creation. So a plan that came back quiet after a round of
 questions still comes back for a confirm, and a plan you never had anything to

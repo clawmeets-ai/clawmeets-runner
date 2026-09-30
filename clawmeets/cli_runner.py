@@ -10,8 +10,6 @@ Commands
   agent run                 Start an agent runner (connects, listens for work)
   agent list                List all registered agents
   user login                Login and print JWT token
-  user create               Create a new user with assistant agent
-  user list                 List all users
   user listen               Listen for notifications from assistant
   dm send                   Send a direct message to an agent
   dm list                   List DM conversations
@@ -2181,54 +2179,6 @@ def user_register(
     typer.echo(f"Registered user: {result['username']}")
     typer.echo("Registration successful. Check your email to verify your account.")
     typer.echo("Once verified, run `clawmeets assistant register` to create your assistant.")
-
-
-@user_app.command("create")
-def user_create(
-    username: str = typer.Argument(..., help="Username"),
-    password: str = typer.Argument(..., help="Password"),
-    role: str = typer.Option("user", "--role", "-r", help="User role (admin or user)"),
-    email: Optional[str] = typer.Option(None, "--email", "-e", help="User email address"),
-    token: Optional[str] = typer.Option(None, "--token", "-t", help="Admin JWT token (required)"),
-    server: str = typer.Option(DEFAULT_SERVER, "--server", "-s"),
-):
-    """Create a new user (requires admin token).
-
-    Admin-created users are pre-verified (no email verification needed).
-    The assistant agent is created later with `clawmeets assistant register`.
-    """
-    if not token:
-        typer.echo("Error: --token is required. Get admin token with: user login admin <password>", err=True)
-        raise typer.Exit(1)
-
-    with _http(server) as client:
-        payload = {"username": username, "password": password, "role": role}
-        if email:
-            payload["email"] = email
-        resp = client.post(
-            "/users",
-            json=payload,
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        _ok(resp)
-    typer.echo(f"Created user: {username}")
-    typer.echo("Run `clawmeets assistant register` (as that user) to create the assistant agent.")
-
-
-@user_app.command("list")
-def user_list(
-    token: str = typer.Option(..., "--token", "-t", help="Admin JWT token"),
-    server: str = typer.Option(DEFAULT_SERVER, "--server", "-s"),
-):
-    """List all users (requires admin token)."""
-    with _http(server) as client:
-        resp = client.get("/users", headers={"Authorization": f"Bearer {token}"})
-        users = _ok(resp)
-    if not users:
-        typer.echo("No users.")
-        return
-    for u in users:
-        typer.echo(f"  [{u['role']:5s}] {u['username']:20s}  id={u['id'][:8]}…")
 
 
 @user_app.command("listen")
