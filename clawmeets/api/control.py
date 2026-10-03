@@ -26,7 +26,8 @@ class ControlMessageType(str, Enum):
     - Server -> Client (everything else):
         - To runners (agents) only:
             SKILL_SYNC, MCP_SYNC, AGENT_SETTINGS_CHANGE, CANCEL_LLM,
-            MCP_AUTH_CODE, KNOWLEDGE_PACK_SYNC, AGENT_REGISTRY_CHANGE
+            MCP_AUTH_CODE, KNOWLEDGE_PACK_SYNC, AGENT_REGISTRY_CHANGE,
+            AGENT_ENV_REQUEST
         - To user UIs (web frontend) only:
             AGENT_STATUS_CHANGE, MCP_AUTH_URL_FOR_USER, AGENT_CARD_UPDATE,
             RUNNER_VERSIONS, HOST_SYNC, INSTALL_SYNC
@@ -56,7 +57,7 @@ class ControlMessageType(str, Enum):
     SKILL_AUTH_CODE = "skill_auth_code"    # Skill-rail sibling of MCP_AUTH_CODE
     KNOWLEDGE_PACK_SYNC = "knowledge_pack_sync"  # Server notifies client to install/uninstall a knowledge pack
     AGENT_REGISTRY_CHANGE = "agent_registry_change"  # Server notifies peer runners that an agent was registered/updated
-    AGENT_CARD_UPDATE = "agent_card_update"  # Server notifies the agent's owner UI of card-field bumps (last_reflected_at, last_synced_at)
+    AGENT_CARD_UPDATE = "agent_card_update"  # Server notifies the agent's owner UI of card-field bumps (last_reflected_at)
     BRIEF_TAB_SYNC = "brief_tab_sync"  # Server notifies the owning user that a brief-tab was upserted / deleted
     PROJECT_REPORT_SYNC = "project_report_sync"  # Server notifies project participants that the report was upserted / deleted
     PROJECT_PLAN_SYNC = "project_plan_sync"  # Server notifies project participants that PLAN.md or its sidecar moved
@@ -96,6 +97,14 @@ class ControlMessageType(str, Enum):
     # next one rather than a wrong page.
     HOST_SYNC = "host_sync"
     INSTALL_SYNC = "install_sync"      # owner-scoped cursor: their one-command install moved
+
+    # Server -> the ONE agent whose env-var store is being read or changed
+    # (``ws_hub.send_to(agent.id)``). The runner performs the change itself,
+    # against the same ``env_store`` the ``clawmeets env`` CLI writes, and
+    # answers over HTTP (``POST /agents/{id}/env/requests/{request_id}``).
+    # An ``env_set`` carries the value — a secret — so this envelope must never
+    # reach a browser or another participant.
+    AGENT_ENV_REQUEST = "agent_env_request"
 
 
 class ChangelogUpdatePayload(BaseModel):
@@ -326,21 +335,17 @@ class AgentRegistryChangePayload(BaseModel):
 class AgentCardUpdatePayload(BaseModel):
     """Payload for AGENT_CARD_UPDATE messages.
 
-    Server-side cursor bump on the agent card: trigger replies move
-    ``last_reflected_at`` / ``last_synced_at``. Delivered to the agent's
+    Server-side cursor bump on the agent card: reflect-trigger replies move
+    ``last_reflected_at``. Delivered to the agent's
     owner so the Agent Settings page's "Memory & Reflection" panel can
     live-refresh without a full page reload. Distinct from
     ``AGENT_SETTINGS_CHANGE`` (runner-local config) and
     ``AGENT_REGISTRY_CHANGE`` (peer-visible registry fan-out): these cursors
     are neither settings nor peer-visible.
-
-    Convention mirrors ``AgentSettingsChangePayload``: only the field that
-    changed in this envelope is populated; the others stay ``None``.
     """
     agent_id: str
     agent_name: str
-    last_reflected_at: str | None = None  # None = unchanged in this envelope
-    last_synced_at: str | None = None  # None = unchanged in this envelope
+    last_reflected_at: str | None = None
 
 
 class BriefTabSyncPayload(BaseModel):
@@ -605,6 +610,25 @@ class HostSyncPayload(BaseModel):
     action: str
 
 
+class AgentEnvRequestPayload(BaseModel):
+    """Payload for AGENT_ENV_REQUEST — see the enum member.
+
+    ``action`` is ``list`` / ``set`` / ``unset``. ``key`` is set for the two
+    writes, ``value`` only for ``set``. ``request_id`` pairs the runner's HTTP
+    answer with the browser request the server is holding open; it is also the
+    required field no other payload has, which keeps this member distinguishable
+    when appended to ``ControlEnvelope.payload``'s non-discriminated Union.
+
+    SECURITY: ``value`` is the secret the user typed. Delivered ONLY to the
+    agent's own runner; never logged, never echoed back.
+    """
+    agent_id: str
+    request_id: str
+    action: str  # "list" | "set" | "unset"
+    key: str | None = None
+    value: str | None = None
+
+
 class ControlEnvelope(BaseModel):
     """Lightweight WebSocket notification - never carries file content.
 
@@ -624,7 +648,7 @@ class ControlEnvelope(BaseModel):
     would need a real discriminator first.
     """
     type: ControlMessageType
-    payload: Union[ChangelogUpdatePayload, AgentStatusChangePayload, ProjectDeletedPayload, SkillSyncPayload, McpSyncPayload, AgentSettingsChangePayload, CancelLLMPayload, ActiveWorkChangePayload, McpAuthUrlForUserPayload, McpAuthCodePayload, SkillAuthUrlForUserPayload, SkillAuthCodePayload, KnowledgePackSyncPayload, AgentRegistryChangePayload, AgentCardUpdatePayload, BriefTabSyncPayload, ProjectReportSyncPayload, ProjectPlanSyncPayload, DeskTodoSyncPayload, DeskReadStateSyncPayload, DeskSopSyncPayload, DeskLabelSyncPayload, RunnerVersionsPayload, HostSyncPayload, InstallSyncPayload, dict] = Field(default_factory=dict)
+    payload: Union[ChangelogUpdatePayload, AgentStatusChangePayload, ProjectDeletedPayload, SkillSyncPayload, McpSyncPayload, AgentSettingsChangePayload, CancelLLMPayload, ActiveWorkChangePayload, McpAuthUrlForUserPayload, McpAuthCodePayload, SkillAuthUrlForUserPayload, SkillAuthCodePayload, KnowledgePackSyncPayload, AgentRegistryChangePayload, AgentCardUpdatePayload, BriefTabSyncPayload, ProjectReportSyncPayload, ProjectPlanSyncPayload, DeskTodoSyncPayload, DeskReadStateSyncPayload, DeskSopSyncPayload, DeskLabelSyncPayload, RunnerVersionsPayload, HostSyncPayload, InstallSyncPayload, AgentEnvRequestPayload, dict] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_required_fields_for_type(self) -> "ControlEnvelope":
@@ -704,4 +728,7 @@ class ControlEnvelope(BaseModel):
         elif self.type == ControlMessageType.INSTALL_SYNC:
             if not isinstance(self.payload, InstallSyncPayload):
                 raise ValueError(f"control message type {self.type} requires InstallSyncPayload")
+        elif self.type == ControlMessageType.AGENT_ENV_REQUEST:
+            if not isinstance(self.payload, AgentEnvRequestPayload):
+                raise ValueError(f"control message type {self.type} requires AgentEnvRequestPayload")
         return self

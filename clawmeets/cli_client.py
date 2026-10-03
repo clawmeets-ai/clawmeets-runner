@@ -10,7 +10,7 @@ imports uvicorn + clawmeets.server.app at module top, which the wheel does not
 carry, but these 16 commands are shelled by bundled system skills
 (propose-project, manage-project-roster, post-chat-message,
 project-completion-report, coding-project-completion-report, schedule-message)
-that DO ship. Same move as cli_skill / cli_env / cli_consult before it.
+that DO ship. Same move as cli_skill / cli_env before it.
 
 Commands
 --------

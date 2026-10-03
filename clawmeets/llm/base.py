@@ -367,7 +367,7 @@ class LLMProvider(ABC):
                 subprocess backends / root of file tools for API backends).
             log_dir: Directory for per-invocation logs.
             additional_dirs: Extra dirs the model may read (project_dir when
-                different from working_dir, knowledge bases, dwh, memory).
+                different from working_dir, knowledge bases, memory).
             notification_center: Dispatcher for LLM_COMPLETE / LLM_ERROR.
             action_schema: JSON schema for the structured action output,
                 selected per invocation by the caller (WORKER vs COORDINATOR).

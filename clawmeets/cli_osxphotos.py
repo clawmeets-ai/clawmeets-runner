@@ -2,7 +2,7 @@
 """
 clawmeets/cli_osxphotos.py — macOS Photos library CLI.
 
-Subcommands: list-albums, list-photos, export, export-jpeg, sync.
+Subcommands: list-albums, list-photos, export, export-jpeg.
 """
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from clawmeets.integrations.osxphotos import _lib
 
 app = typer.Typer(
     name="osxphotos",
-    help="macOS Photos library (read-only metadata + paths + sync). Paired skill: osxphotos. macOS only.",
+    help="macOS Photos library (read-only metadata + paths). Paired skill: osxphotos. macOS only.",
     no_args_is_help=True,
 )
 
@@ -72,22 +72,6 @@ def export_jpeg_cmd(
     try:
         _emit_json(_lib.export_photo_as_jpeg(
             uuid, dest_dir, max_dim=max_dim, quality=quality,
-        ))
-    except RuntimeError as exc:
-        typer.echo(f"Error: {exc}", err=True)
-        raise typer.Exit(1) from exc
-
-
-@app.command()
-def sync(
-    dwh: str = typer.Option(..., "--dwh"),
-    config: str = typer.Option("", "--config"),
-    max_runtime: int = typer.Option(1500, "--max-runtime"),
-) -> None:
-    """Sync newly-added photos into the warehouse."""
-    try:
-        _emit_json(_lib.sync_to_warehouse(
-            dwh, config_file=config, max_runtime_seconds=max_runtime,
         ))
     except RuntimeError as exc:
         typer.echo(f"Error: {exc}", err=True)

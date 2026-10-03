@@ -2,7 +2,7 @@
 """
 clawmeets/cli_caldav.py — CalDAV calendar CLI.
 
-Subcommands: list, list-events, get, create, update, delete, sync.
+Subcommands: list, list-events, get, create, update, delete.
 """
 from __future__ import annotations
 
@@ -123,15 +123,3 @@ def delete(
     except RuntimeError as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(1) from exc
-
-
-@app.command()
-def sync(
-    dwh: str = typer.Option(..., "--dwh"),
-    config: str = typer.Option("", "--config"),
-    max_runtime: int = typer.Option(1500, "--max-runtime"),
-) -> None:
-    """Sync CalDAV calendars into the warehouse."""
-    _emit_json(_lib.sync_to_warehouse(
-        dwh, config_file=config, max_runtime_seconds=max_runtime,
-    ))

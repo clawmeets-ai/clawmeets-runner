@@ -4,23 +4,21 @@ clawmeets/utils/knowledge_index.py
 
 The shared *knowledge-index contract* — one markdown shape reused by every
 place the agent discovers domain knowledge: installed knowledge packs
-(``memory/KNOWLEDGE_PACKS.md``), the data-warehouse catalog
-(``{dwh}/CATALOG.md``), and the proprietary-reference index
+(``memory/KNOWLEDGE_PACKS.md``) and the proprietary-reference index
 (``memory/REFERENCES.md``).
 
-Storage stays decoupled — three separate index files, no cross-pointers — but
+Storage stays decoupled — separate index files, no cross-pointers — but
 they all render entries the same way so the agent's consumption is identical
 regardless of source: read the index, match the one-line *consult when*, then
 open only the file it points at. The always-on prompt enumerates whichever
 indexes exist (see ``llm/prompt_builder._build_knowledge_precedence``).
 
-All three indexes are built deterministically in Python and import the helpers
-here: ``runner/knowledge_pack_manager`` (packs),
+Both indexes are built deterministically in Python and import the helpers
+here: ``runner/knowledge_pack_manager`` (packs) and
 ``runner/references_index.build_references_index`` (knowledge_dir →
-``REFERENCES.md``, filename + content preview), and
-``integrations/_sync_warehouse.refresh_catalog`` (dwh). The
-``consult-proprietary-knowledge`` skill is now a *reader/searcher* of
-``REFERENCES.md`` (grep/find over the live files), not its author.
+``REFERENCES.md``, filename + content preview). The agent only *reads*
+``REFERENCES.md`` and greps the live files (per the prompt's REFERENCES.md
+line); it never authors it.
 
 Canonical entry::
 

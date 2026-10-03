@@ -72,6 +72,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from clawmeets.runner.invocation_registry import InvocationRegistry
+    from clawmeets.utils.agent_storage import AgentStorage
 
 
 logger = logging.getLogger(__name__)
@@ -103,8 +104,8 @@ class ModelContext:
         knowledge_dirs: Optional[list[Path]] = None,
         client: Optional["ClawMeetsClient"] = None,
         claude_plugin_dirs: Optional[list[Path]] = None,
-        dwh_dir: Optional[Path] = None,
         git_url: Optional[str] = None,
+        storage: Optional["AgentStorage"] = None,
     ) -> None:
         """Initialize context with a single base directory.
 
@@ -125,6 +126,10 @@ class ModelContext:
         The git-workflow skill — not the runner — drives clone/branch/commit/push.
         This field is rendered as a one-line binding nudge in the agent prompt.
 
+        ``storage`` is the agent's resolved local + shared storage folders
+        (``clawmeets.utils.agent_storage``), listed in the prompt and exposed
+        to the LLM as $AGENT_LOCAL_STORAGE_DIR / $AGENT_SHARED_STORAGE_DIR.
+
         Args:
             base_dir: Base directory for all data
             cli: LLM provider for invocation (optional, for agent runtime)
@@ -141,8 +146,8 @@ class ModelContext:
         self._claude_plugin_dirs = claude_plugin_dirs or []
         self._notification_center = notification_center
         self._invocation_registry: Optional["InvocationRegistry"] = None
-        self._dwh_dir = dwh_dir
         self._git_url = git_url or None
+        self._storage = storage
         # Optional factory (local_settings dict -> LLMProvider), shared with the
         # reactive loop's hot-swap path. Set on the runner so the per-request
         # model override (model_config_name) can build a one-turn provider from a
@@ -180,15 +185,6 @@ class ModelContext:
         self._knowledge_dirs = dirs
 
     @property
-    def dwh_dir(self) -> Optional[Path]:
-        """Personal data-warehouse root (network-shared across runners). None if not configured."""
-        return self._dwh_dir
-
-    def update_dwh_dir(self, dwh_dir: Optional[Path]) -> None:
-        """Replace the dwh_dir. Takes effect on the next LLM invocation."""
-        self._dwh_dir = dwh_dir
-
-    @property
     def git_url(self) -> Optional[str]:
         """Git repo this agent is bound to (None if not configured). Surfaced
         in the prompt; the actual clone/branch/commit/push is run by the
@@ -198,6 +194,15 @@ class ModelContext:
     def update_git_url(self, git_url: Optional[str]) -> None:
         """Replace the bound git_url. Takes effect on the next LLM invocation."""
         self._git_url = git_url or None
+
+    @property
+    def storage(self) -> Optional["AgentStorage"]:
+        """The agent's local + shared storage folders (None off the runner)."""
+        return self._storage
+
+    def update_storage(self, storage: Optional["AgentStorage"]) -> None:
+        """Replace the storage folders. Takes effect on the next LLM invocation."""
+        self._storage = storage
 
     @property
     def claude_plugin_dirs(self) -> list[Path]:

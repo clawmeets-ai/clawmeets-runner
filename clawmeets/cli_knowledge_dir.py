@@ -8,9 +8,9 @@ content preview). The runner rebuilds it automatically at startup and on a
 knowledge_dir settings change; this command is the on-demand path for when the
 user edits the knowledge folder out-of-band ("refresh your knowledge index").
 
-The paired `consult-proprietary-knowledge` skill shells this with the resolved
-knowledge_dir path(s) it reads from its prompt's `User-curated reference
-material` line, so no relative-path resolution is needed here.
+The agent prompt's REFERENCES.md line (``llm/prompt_builder``) spells out this
+command with the resolved knowledge_dir path(s) already filled in, so no
+relative-path resolution is needed here.
 """
 from __future__ import annotations
 

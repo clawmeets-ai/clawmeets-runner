@@ -81,14 +81,20 @@ MAX_BODY_CHARS = 16_384
 #
 # The ``SYSTEM:`` prefix is not decoration and not an enum. Titles of the form
 # ``Prefix:Name`` group the rail into sections (``utils/sopSection.ts`` in the
-# frontend derives the section from the prefix), so these three land under one
-# SYSTEM heading and stay out of the owner's own list. An owner who renames one
+# frontend derives the section from the prefix), so the three platform SOPs land
+# under one SYSTEM heading and stay out of the owner's own list. The eight
+# ``SOLOPRENEUR:`` rows after them are a numbered playbook (register an investor,
+# validate the idea, ... build the product) and file under their own heading;
+# the rail orders a section by display name with numeric collation, so the
+# ``1.``..``8.`` in each title is what keeps them in playbook order. An owner who
+# renames one
 # to ``Ops:Register new agent`` moves it to an Ops section; that is the whole
 # mechanism, and there is no server-side registry of section names to keep in
 # sync with it.
 #
-# Every seed leaves ``agent_id``/``agent_name`` null: all three are jobs only
-# the owner's assistant can do, and a null recipient already resolves to
+# Every seed leaves ``agent_id``/``agent_name`` null: every one is a job only
+# the owner's assistant can do (the SOLOPRENEUR ones create projects and
+# register agents on the owner's behalf), and a null recipient already resolves to
 # ``{username}-assistant`` (``utils/sopRecipient.ts``). Naming it here instead
 # would bake one user's assistant name into a constant.
 SEED_TIMESTAMP = "1970-01-01T00:00:00+00:00"
@@ -188,6 +194,199 @@ SEED: tuple[dict[str, str], ...] = (
             "there is no undo. Once I approve, create it with that roster and "
             "those milestones, and tell me anything you need from me that would "
             "otherwise block the work."
+        ),
+    },
+    {
+        "id": "sop-seed-solopreneur-1-register-angel-investor",
+        "title": "SOLOPRENEUR:1. Register angel_investor",
+        "body": (
+            "Please use the SOP \"SYSTEM:Register new agent\" to register an "
+            "angel_investor agent specialized in investing in pre-revenue "
+            "companies in the {{industry|text:AI application}} industry. The "
+            "agent's expertise should focus on evaluating the quality of the "
+            "idea and its product market fit rather than anything else "
+            "including sourcing deals, legal, compliance, corporate formation "
+            "which we will have some other experts to cover the ground. While "
+            "many other important signals exist in fundraising, such as deal "
+            "source channel and founder background, the agent should evaluate "
+            "an investment opportunity purely on the quality of the idea and "
+            "its product market fit. The investor agent understands the risk "
+            "of early stage investing. Rather than looking for a bulletproof "
+            "product, it seeks a strong contrarian view that, once validated, "
+            "would generate far more value than incumbents, along with early "
+            "indicators or evidence supporting that contrarian view."
+        ),
+    },
+    {
+        "id": "sop-seed-solopreneur-2-validate-idea",
+        "title": "SOLOPRENEUR:2. Validate idea",
+        "body": (
+            "Please create a project with angel_investor to iterate on the "
+            "following:\n"
+            "\n"
+            "- Problem: {{pain point|text:many amateur golfers who find golfing "
+            "cool but don't know where to start yet finding and paying for a "
+            "coach seems to be a big commitment}}\n"
+            "- Proposed Solution: {{proposed solution|text:golf app built for "
+            "amateur that teaches users with a pre-defined curriculum and can "
+            "watch user's swing live, analyze the swing, suggest suitable "
+            "drills, and essentially act as an AI coach who is always "
+            "available, constructive, and never embarrassing for shy users}}\n"
+            "- Unique Insight that something only I know: {{unique insight|"
+            "text:existing golf coaching apps have been focusing on golf "
+            "enthusiasts while I want to focus on the people just started golf "
+            "and youtube shorts have been a popular source for knowledge and "
+            "drills but very unreliable quality and often wrong}}\n"
+            "\n"
+            "In the project, you should act as an entrepreneur to iterate with "
+            "angel_investor. In each iteration, you should make a revised pitch "
+            "to the angel_investor. Based on the feedback, either push back or "
+            "adapt and revise your pitch. The iterations should stop only when "
+            "no substantial progress can be made, max 10 back-and-forth "
+            "iterations, or the angel_investor accepts the pitch (willing to "
+            "invest). The acceptance can be conditional yet the conditions "
+            "should be as plausible as possible.\n"
+            "\n"
+            "Please also help name the product while researching existing "
+            "trademarks, patented names, and DNS availability. Lastly, in the "
+            "case that an acceptable pitch can be identified, please create an "
+            "interactive HTML pitch deck as well."
+        ),
+    },
+    {
+        "id": "sop-seed-solopreneur-3-register-product-marketing",
+        "title": "SOLOPRENEUR:3. Register product and marketing agents",
+        "body": (
+            "Please use the \"SYSTEM:Register new agent\" SOP to create the "
+            "product and marketing agents about the {{product name or idea "
+            "description|text:the golf app for beginner}} with relevant agents "
+            "as mentors."
+        ),
+    },
+    {
+        "id": "sop-seed-solopreneur-4-icp-go-to-market",
+        "title": "SOLOPRENEUR:4. Strategize ICP and Go-To-Market",
+        "body": (
+            "Please create a project with product and marketing agents to "
+            "design the go-to-market strategy. For the output, I would like to "
+            "see two tables:\n"
+            "\n"
+            "- ICP table listing persona, user demand, product supply, and how "
+            "product satisfies user demand\n"
+            "- Channel table listing marketing channel, persona, messaging, "
+            "estimated investment, estimated return, priority, how the message "
+            "through the channel can touch the persona effectively. The "
+            "estimated investment, estimated return, desired outcome; priority "
+            "can be 1-5 or high, low, mid.\n"
+            "\n"
+            "In the project, you should act as an entrepreneur and coordinate "
+            "with marketing, product and angel_investor agents to iterate on "
+            "the go-to-market strategy. In each iteration, you should ask "
+            "marketing agent to revise the go-to-market strategy, and ask "
+            "product and angel_investor agents for feedback. The iterations "
+            "should stop only when no substantial progress can be made, after "
+            "a maximum of 8 back-and-forth iterations, or when you, as an "
+            "entrepreneur, are comfortable that at least one marketing channel "
+            "can effectively reach one of our ICP personas and the "
+            "corresponding messaging can effectively convert them to use our "
+            "product."
+        ),
+    },
+    {
+        "id": "sop-seed-solopreneur-5-register-design-eng",
+        "title": "SOLOPRENEUR:5. Register designer and eng team",
+        "body": (
+            "Please create and set up the shared git mono repo at "
+            "~/clawmeets_demo for the agents to collaborate on. Its git repo url "
+            "is file:// followed by that directory's absolute path (git does not "
+            "expand ~ inside a url, so file:///~/clawmeets_demo would not "
+            "resolve). In the repo, there should be a README.md describing your understanding of "
+            "the product ({{product name or idea description|text:the golf app "
+            "for beginner}}) and ios, android, web, db, backend folders empty "
+            "initially.\n"
+            "\n"
+            "Then, use the \"SYSTEM:Register new agent\" SOP to create the "
+            "designer, fullstack_engineer, android_engineer, ios_engineer "
+            "agents with relevant agents as mentors.\n"
+            "\n"
+            "- The designer agent should be experienced in web, mobile and "
+            "graphic UI/UX design, information architecture, color palette and "
+            "font selection\n"
+            "- The fullstack_engineer agent should be experienced in python, "
+            "sqlite, javascript, html css react tailwind and set its git repo "
+            "url to that repo url\n"
+            "- The android_engineer agent should be experienced in android "
+            "development stack and set its git repo url to that repo url\n"
+            "- The ios_engineer agent should be experienced in iOS development "
+            "stack (Swift/SwiftUI/Xcode) and set its git repo url to that repo "
+            "url"
+        ),
+    },
+    {
+        "id": "sop-seed-solopreneur-6-spec-product",
+        "title": "SOLOPRENEUR:6. Spec product",
+        "body": (
+            "Please create a project with product agent to create a product PRD "
+            "that describes the necessary features to make an MVP for "
+            "{{product name or idea description|text:the golf app for "
+            "beginner}} that provides substantial value to the ICP.\n"
+            "\n"
+            "In the project, you should act as an entrepreneur and coordinate "
+            "with product agent to iterate on the user stories for each "
+            "necessary feature and then order the feature in a way that's easy "
+            "to be built incrementally. In each iteration, the product agent "
+            "should write or revise each feature along with its user story "
+            "while you as an entrepreneur should evaluate if each feature "
+            "should be included in the MVP. The iterations should stop only "
+            "when no substantial progress can be made, after a maximum of 8 "
+            "back-and-forth iterations, or when you, as an entrepreneur, are "
+            "comfortable that the implemented features can provide substantial "
+            "value to the ICP for them to engage.\n"
+            "\n"
+            "When the project is done, please save the PRD to the "
+            "~/clawmeets_demo git repo and commit to the main branch."
+        ),
+    },
+    {
+        "id": "sop-seed-solopreneur-7-design-product",
+        "title": "SOLOPRENEUR:7. Design product",
+        "body": (
+            "Please create a project with designer agent to create the product "
+            "mock up based on the PRD for {{product name or idea description|"
+            "text:the golf app for beginner}} MVP saved under the "
+            "~/clawmeets_demo git repo.\n"
+            "\n"
+            "In the project, you should act as an entrepreneur and coordinate "
+            "with designer agent to iterate on the design mock up. In each "
+            "iteration, the designer agent should create or revise its mock up "
+            "for better user experience while you as an entrepreneur should "
+            "evaluate how the ICP user would feel about the mock up and give "
+            "feedback on how the design can be improved. The iterations should "
+            "stop only when no substantial progress can be made, after a "
+            "maximum of 8 back-and-forth iterations, or when you, as an "
+            "entrepreneur, are comfortable that the design once implemented, "
+            "will be easy enough for the ICP to engage with.\n"
+            "\n"
+            "When the project is done, please save the design mockup to the "
+            "~/clawmeets_demo git repo and commit to the main branch."
+        ),
+    },
+    {
+        "id": "sop-seed-solopreneur-8-build-product",
+        "title": "SOLOPRENEUR:8. Build product",
+        "body": (
+            "Please create a project with product and relevant engineer agents "
+            "to build the product based on the PRD and design mockup saved "
+            "under the ~/clawmeets_demo git repo. The engineer agents "
+            "should break the milestones down based on the features/user "
+            "stories (build incrementally one feature at a time) rather than "
+            "horizontally (storage layer, backend service layer, frontend "
+            "layer). In each milestone, you should coordinate for the engineer "
+            "to implement the feature and have the product agent review the "
+            "change to accept the milestone or push back for the engineer to "
+            "iterate further. If there are multiple products say ios, android, "
+            "website need to be built, we should prioritize the milestones to "
+            "build website first, ios second, and android last."
         ),
     },
 )

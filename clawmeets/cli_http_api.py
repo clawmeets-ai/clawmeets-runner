@@ -1,41 +1,29 @@
 # SPDX-License-Identifier: MIT
 """
-clawmeets/cli_http_api.py — Generic HTTP-API sync CLI.
+clawmeets/cli_http_api.py — Generic HTTP client CLI.
+
+Subcommands: get, post, put, patch, delete.
 """
 from __future__ import annotations
 
-import json
-
 import typer
 
-from clawmeets.integrations.http_api import _client, _lib
+from clawmeets.integrations.http_api import _client
 
 app = typer.Typer(
     name="http-api",
-    help="Generic HTTP-API sync (REST + JSON/CSV/TSV). Paired skill: http-api.",
+    help="Generic HTTP client (get / post / put / patch / delete). Paired skill: http-api.",
     no_args_is_help=True,
 )
 
 
-@app.command()
-def sync(
-    dwh: str = typer.Option(..., "--dwh"),
-    config: str = typer.Option("", "--config"),
-    max_runtime: int = typer.Option(1500, "--max-runtime"),
-) -> None:
-    """Run configured HTTP endpoints into the warehouse per --config."""
-    typer.echo(json.dumps(_lib.sync_to_warehouse(
-        dwh, config_file=config, max_runtime_seconds=max_runtime,
-    ), indent=2, ensure_ascii=False))
-
-
-# --- Ad-hoc HTTP client (get / post / put / patch / delete) ------------------
-# Independent of `sync`. A session jar (--save-session / --session) makes login
-# just another request that writes cookies. Redirects are OFF by default so a
-# login's 3xx auth signal is not masked as a final 200. Because a failed login
-# is itself an ordinary 3xx with its own cookie, --expect-location /
-# --expect-status let the caller declare what success looks like; an unmet
-# expectation exits 23 and suppresses the jar write. See skills/http-api.
+# --- HTTP client (get / post / put / patch / delete) ------------------------
+# A session jar (--save-session / --session) makes login just another request
+# that writes cookies. Redirects are OFF by default so a login's 3xx auth
+# signal is not masked as a final 200. Because a failed login is itself an
+# ordinary 3xx with its own cookie, --expect-location / --expect-status let the
+# caller declare what success looks like; an unmet expectation exits 23 and
+# suppresses the jar write. See skills/http-api.
 #
 # get() takes no body; post/put/patch/delete share the body-carrying option set
 # below. All delegate to _client.run(), whose int return becomes the exit code.

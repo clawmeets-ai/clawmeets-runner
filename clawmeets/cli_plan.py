@@ -465,9 +465,9 @@ def update(
     delete: bool = typer.Option(False, "--delete", help="Remove the section."),
     why: str = typer.Option(
         "", "--why",
-        help="One CHANGELOG LINE: what this changes and whose feedback caused "
-             "it. Required when the write moves what the plan SAYS and the user "
-             "has not accepted it yet.",
+        help="One line: what this changes and whose feedback caused it. If the "
+             "user has reviewed the plan and the write moves what it SAYS, the "
+             "write is refused and filed as a proposal led by this line.",
     ),
     server: str = typer.Option(DEFAULT_SERVER, "--server", "-s"),
     token: Optional[str] = typer.Option(None, "--token", "-t"),
@@ -484,12 +484,10 @@ def update(
     wrote and stops — a refusal is information, and the conflict note it filed
     is how it gets resolved (§4.3).
 
-    **``--why`` is the changelog line, and it is required on exactly one kind of
-    write**: one that moves what the plan SAYS, on a plan the user has not
-    accepted. That write LANDS — before acceptance the keeper writes the
-    document, it does not propose it — and files a comment-only receipt carrying
-    this line, which is what the user reads at review time in place of a diff.
-    A ``400`` names it if you left it out.
+    **Once the user has reviewed the plan, a write that moves what it SAYS is
+    a ``403``** and is filed as a proposal for them instead — a diff they
+    accept or reject. ``--why`` leads that proposal. Prefer answering their
+    note directly: ``plan note --reply-to <id> --edit-file <f>``.
 
     Write it as a change and its cause, not as a summary. The user answers by
     quoting one of these lines back at you, so *"M2 now owns auth setup, moved
@@ -582,15 +580,12 @@ def update(
             f"Wrote {', '.join(result.get('sections') or [section])} — "
             f"revision {result.get('revision')}"
         )
-        # The receipt ids, named for the same reason the spec lock's refusal
-        # names the notes it filed: a note the user will read, that this command
-        # created without being asked to, is not a thing to leave silent.
+        # Notes the write filed (shorthand in the text), named for the same
+        # reason the spec lock's refusal names its notes: a note this command
+        # created without being asked to is not a thing to leave silent.
         ids = result.get("note_ids") or []
         if ids:
-            typer.echo(
-                f"Filed {', '.join(ids)} — the user reads this line at their "
-                f"next review round."
-            )
+            typer.echo(f"Filed {', '.join(ids)}.")
 
 
 @app.command("tick", help="Tick a checkbox by its label. Never refused for staleness or the spec lock.")
@@ -1424,6 +1419,15 @@ def review(
         typer.echo(
             f"Warning: @{name} resolves to nobody in `{result.get('room')}` — "
             f"skipped; every other note still sent.",
+            err=True,
+        )
+    own = result.get("own_inbox", [])
+    if own:
+        typer.echo(
+            f"Skipped {len(own)} note(s) addressed to YOU — {', '.join(own)}. "
+            f"They are yours to answer, not to send: `clawmeets plan note "
+            f"{project} --reply-to <id> -m \"...\"` (add `--edit-file` to "
+            f"propose the change). The reply closes the note.",
             err=True,
         )
     sent = result.get("sends", {})

@@ -425,19 +425,17 @@ class FileUtil:
             return False
 
     @staticmethod
-    def resolve_local_dir(raw: str, user_config_dir: Optional[Path]) -> Optional[Path]:
+    def resolve_local_dir(raw: str, base_dir: Path) -> Optional[Path]:
         """Resolve a path string from card.json local_settings.
 
         - Absolute paths (`/foo/bar`) and `~`-prefixed paths are honored
           verbatim (the latter is expanded against the user's home).
         - Relative paths (`./foo`, `foo`, `../foo`) are joined to
-          ``user_config_dir`` — the same base ``cli_init`` used when
-          writing CLAUDE.md. When ``user_config_dir`` is None, relative
-          paths fall through to ``Path(raw)`` (legacy behavior, relative
-          to CWD).
+          ``base_dir`` — the agent's own home (AGENT_DIR), where every
+          other agent-owned folder lives.
         - Empty strings return None.
 
-        Callers that want a per-resource subfolder (e.g. dwh, knowledge,
+        Callers that want a per-resource subfolder (e.g. knowledge,
         scratch) append it themselves:
         ``FileUtil.resolve_local_dir(raw, base) / "sub"``.
         """
@@ -447,6 +445,4 @@ class FileUtil:
             return Path(raw).expanduser()
         if raw.startswith("/"):
             return Path(raw)
-        if user_config_dir is None:
-            return Path(raw)
-        return user_config_dir / raw
+        return base_dir / raw

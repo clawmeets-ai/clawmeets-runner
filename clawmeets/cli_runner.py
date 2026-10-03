@@ -53,6 +53,7 @@ import websockets
 
 from clawmeets.api.responses import AgentRegistrationResponse
 from clawmeets.api.control import ControlEnvelope, ControlMessageType
+from clawmeets.api.fs_protocol import FS_CAPABILITY, FS_WS_MAX_SIZE
 from clawmeets.api.client import ClawMeetsClient
 from clawmeets import cli_oauth
 from clawmeets.cli_lifecycle import (
@@ -63,6 +64,12 @@ from clawmeets.cli_lifecycle import (
 )
 from clawmeets.models.chat_message import ChatMessage
 from clawmeets.utils import invoke_timeout
+from clawmeets.utils.agent_storage import (
+    LOCAL_STORAGE_KEY,
+    SHARED_STORAGE_KEY,
+    ensure_storage,
+    resolve_storage,
+)
 from clawmeets.utils.file_io import FileUtil
 from clawmeets.utils.notification_center import NotificationCenter
 from clawmeets.utils.version import installed_clawmeets_version
@@ -79,7 +86,10 @@ from clawmeets.models.user import User, NotificationConfig
 from clawmeets.sync.console_subscriber import ConsoleOutputSubscriber, ConsoleConfig
 from clawmeets.runner.reactive_loop import ReactiveControlLoop
 from clawmeets.runner.mcp_manager import McpManager
+from clawmeets.runner.knowledge_dir_migration import migrate_legacy_knowledge_dir
 from clawmeets.runner.knowledge_pack_manager import KnowledgePackManager
+from clawmeets.runner.home_fs_handler import FsJob, HomeFsRequestHandler, is_fs_frame
+from clawmeets.runner.agent_dir_readmes import write_agent_dir_readmes
 from clawmeets.runner.references_index import build_references_index
 from clawmeets.runner.personal_skill_manager import PersonalSkillManager
 from clawmeets.runner.skill_manager import SkillManager
@@ -616,7 +626,6 @@ def _construct_llm_provider(
 def _build_initial_local_settings(
     llm_provider: Optional[str],
     llm_model: Optional[str],
-    dwh_dir: Optional[str] = None,
     llm_api_key: Optional[str] = None,
     git_url: Optional[str] = None,
     git_base_branch: Optional[str] = None,
@@ -635,7 +644,7 @@ def _build_initial_local_settings(
     (optional) overrides the branch new work is cut from (default: repo default).
 
     ``knowledge_dir`` points at the owner's proprietary-reference files. Stored
-    verbatim (absolute, or relative to the owner's settings.json —
+    verbatim (absolute, or relative to the agent's own AGENT_DIR —
     ``FileUtil.resolve_local_dir`` resolves it at runner start). Deliberately
     NOT checked for existence here: the directory may live on the machine that
     will run the agent, which need not be the machine running this command.
@@ -659,8 +668,6 @@ def _build_initial_local_settings(
         settings["llm_base_url"] = llm_base_url
     if output_mode:
         settings["output_mode"] = output_mode
-    if dwh_dir:
-        settings["dwh_dir"] = dwh_dir
     if knowledge_dir:
         settings["knowledge_dir"] = knowledge_dir
     if git_url:
@@ -734,11 +741,6 @@ def agent_register(
              "tools) or 'native' (single-shot JSON — for local models with flaky "
              "tool-call parsing). Omit for the default (native on base_url, "
              "tool-calling on hosted providers).",
-    ),
-    dwh_dir: Optional[str] = typer.Option(
-        None, "--dwh-dir",
-        help="Personal data-warehouse root for this agent (typically a network shared file system mount, e.g. /mnt/dwh). "
-             "Written to card.json local_settings; rendered into the agent prompt.",
     ),
     knowledge_dir: Optional[str] = typer.Option(
         None, "--knowledge-dir", "-k",
@@ -889,7 +891,7 @@ def agent_register(
         if user_teams:
             card["user_teams"] = user_teams
         initial_local_settings = _build_initial_local_settings(
-            llm_provider, llm_model, dwh_dir, llm_api_key, git_url, git_base_branch,
+            llm_provider, llm_model, llm_api_key, git_url, git_base_branch,
             llm_base_url=llm_base_url, output_mode=llm_output_mode,
             knowledge_dir=knowledge_dir,
         )
@@ -898,6 +900,7 @@ def agent_register(
         card_path = agent_work_dir / "card.json"
         card_path.write_text(json.dumps(card, indent=2, default=str))
         typer.echo(f"Card saved to {card_path}")
+        _provision_agent_home(agent_work_dir, initial_local_settings)
 
 
 # ---------------------------------------------------------------------------
@@ -1625,51 +1628,14 @@ def agent_invoke_timeout(
 # agent list
 # ---------------------------------------------------------------------------
 
-@agent_app.command("set-dwh-dir")
-def agent_set_dwh_dir(
-    agent: str = typer.Argument(..., help="Agent name or id"),
-    dwh_dir: str = typer.Argument(..., help="Personal data-warehouse root (e.g. /mnt/dwh). Pass empty string to clear."),
-    token: Optional[str] = typer.Option(None, "--token", "-t"),
-    server: Optional[str] = typer.Option(None, "--server", "-s"),
-    data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir"),
-):
-    """Set the dwh_dir on an agent's local_settings (in-place merge).
-
-    Reads the current local_settings via GET /agents/{id}, sets/clears
-    ``dwh_dir``, and PUTs back. Triggers AGENT_SETTINGS_CHANGE so a running
-    runner picks it up on the next LLM invocation.
-    """
-    server_url, token = _resolve_user_session(data_dir, token, server)
-    with _http(server_url) as client:
-        agent_id, agent_name = _resolve_agent_id(client, token, agent)
-        current = _ok(client.get(
-            f"/agents/{agent_id}",
-            headers={"Authorization": f"Bearer {token}"},
-        ))
-        local_settings = dict(current.get("local_settings") or {})
-        if dwh_dir:
-            local_settings["dwh_dir"] = dwh_dir
-        else:
-            local_settings.pop("dwh_dir", None)
-        put_resp = client.put(
-            f"/agents/{agent_id}",
-            json={"local_settings": local_settings},
-            headers={"Authorization": f"Bearer {token}"},
-        )
-        _ok(put_resp)
-    if dwh_dir:
-        typer.echo(f"Set dwh_dir={dwh_dir!r} on agent '{agent_name}'.")
-    else:
-        typer.echo(f"Cleared dwh_dir on agent '{agent_name}'.")
-
-
 @agent_app.command("reconfigure")
 def agent_reconfigure(
     agent: str = typer.Argument(..., help="Agent name or id, or 'self' (agent self-reconfigures via runner-injected env)"),
     git_url: Optional[str] = typer.Option(None, "--git-url", help="Bind to this git repo (empty string clears)."),
     git_base_branch: Optional[str] = typer.Option(None, "--git-base-branch", help="Base branch new work is cut from (empty string clears)."),
     knowledge_dir: Optional[str] = typer.Option(None, "--knowledge-dir", help="Proprietary-knowledge dir (empty string clears)."),
-    dwh_dir: Optional[str] = typer.Option(None, "--dwh-dir", help="Personal data-warehouse root (empty string clears)."),
+    local_storage_dir: Optional[str] = typer.Option(None, "--local-storage-dir", help="Agent's local storage folder, $AGENT_LOCAL_STORAGE_DIR (empty string clears → {agent_dir}/storage)."),
+    shared_storage_dir: Optional[str] = typer.Option(None, "--shared-storage-dir", help="Shared storage folder, $AGENT_SHARED_STORAGE_DIR (empty string clears → ~/.clawmeets/shared_storage)."),
     llm_provider: Optional[str] = typer.Option(None, "--llm-provider", help=f"LLM backend, one of {_VALID_LLM_PROVIDERS} (empty string clears)."),
     llm_model: Optional[str] = typer.Option(None, "--llm-model", help="Provider-specific model (empty string clears)."),
     llm_api_key: Optional[str] = typer.Option(None, "--llm-api-key", help="BYO key for a '-api' provider (empty string clears). NOTE: prefer the web UI — keys typed into chat sync to the server."),
@@ -1682,9 +1648,10 @@ def agent_reconfigure(
 ):
     """Change an agent's local_settings (partial merge) via PATCH /agents/{id}/local-settings.
 
-    Supersedes the single-key ``set-dwh-dir``: sets/clears any of git_url,
-    git_base_branch, knowledge_dir, dwh_dir, llm_provider, llm_model,
-    llm_api_key, llm_base_url, output_mode, invoke_timeout_seconds in one call.
+    Sets/clears any of git_url,
+    git_base_branch, knowledge_dir, local_storage_dir, shared_storage_dir,
+    llm_provider, llm_model, llm_api_key, llm_base_url, output_mode,
+    invoke_timeout_seconds in one call.
     Only flags you pass are touched; pass an empty
     string to clear a key. Triggers AGENT_SETTINGS_CHANGE so a running runner
     picks it up on the next LLM invocation.
@@ -1706,7 +1673,8 @@ def agent_reconfigure(
         ("git_url", git_url),
         ("git_base_branch", git_base_branch),
         ("knowledge_dir", knowledge_dir),
-        ("dwh_dir", dwh_dir),
+        (LOCAL_STORAGE_KEY, local_storage_dir),
+        (SHARED_STORAGE_KEY, shared_storage_dir),
         ("llm_provider", llm_provider),
         ("llm_model", llm_model),
         ("llm_api_key", llm_api_key),
@@ -1820,7 +1788,7 @@ def agent_run(
     working_dir: Optional[Path] = typer.Option(None, "--working-dir", "-w", help="Sandbox directory for Claude (default: agent-dir/sandbox)"),
     knowledge_dir: Optional[Path] = typer.Option(None, "--knowledge-dir", "-k", help="Knowledge base directory (passed as --add-dir to Claude)"),
     claude_plugin_dir: Optional[list[Path]] = typer.Option(None, "--claude-plugin-dir", help="Claude plugin directory (passed as --plugin-dir to Claude CLI, repeatable)"),
-    user_config: Optional[Path] = typer.Option(None, "--user-config", help="Path to the owning user's settings.json; used as the base for resolving relative knowledge_dir/dwh_dir strings in card.json local_settings."),
+    user_config: Optional[Path] = typer.Option(None, "--user-config", hidden=True, help="Deprecated. Path to the owning user's settings.json; only locates a legacy knowledge folder for the one-time move into AGENT_DIR."),
     log_level: str = typer.Option("info"),
 ):
     """
@@ -1908,6 +1876,22 @@ async def _ws_heartbeat_task(ws, agent_id: str, loop_obj=None) -> None:
         await ws.send(env.model_dump_json(by_alias=True))
         if loop_obj is not None:
             await loop_obj.stamp_self_presence("online")
+
+
+async def _answer_fs_request(ws, handler: "HomeFsRequestHandler", job: "FsJob") -> None:
+    """Answer one home-folder request on the socket it arrived on.
+
+    Its own task, so a large read or a recursive delete never holds up the
+    receive loop. ``handler.answer`` never raises; each frame is sent (and
+    drained) before the next is made, so keepalive pongs interleave with a
+    large read's chunks. A socket that closed before the answer was sent just
+    loses it (the server has already failed the request as offline).
+    """
+    try:
+        async for frame in handler.answer(job):
+            await ws.send(frame)
+    except websockets.ConnectionClosed:
+        pass
 
 
 def _create_dispatch_callback() -> callable:
@@ -2465,15 +2449,27 @@ async def _runner_loop(
         card_path.write_text(json.dumps(card_data, indent=2, default=str))
         typer.echo("Migrated llm_provider/llm_model into local_settings in card.json")
 
-    effective_knowledge_dir = knowledge_dir or local_settings.get("knowledge_dir", "")
-
-    # Resolve relative knowledge_dir paths (e.g. "./owner") against the user's
-    # config dir (~/.clawmeets/config/<username>/) — the anchor for any
-    # CLAUDE.md the user keeps alongside their settings. Absolute and
-    # ~-prefixed paths pass through unchanged. Falls back to legacy
-    # CWD-relative behavior only when --user-config is absent (shouldn't
-    # happen under cli_lifecycle).
-    user_config_dir: Optional[Path] = user_config.parent if user_config else None
+    # Relative knowledge_dir values resolve against AGENT_DIR. Cards written
+    # before that resolved them against ~/.clawmeets/config/<username>/; move
+    # (or pin) such a folder once so its files stay reachable. An explicit
+    # --knowledge-dir flag is an ordinary CLI path (CWD-relative) and skips
+    # the card entirely.
+    owner_username = agent_name.split("-", 1)[0] if "-" in agent_name else agent_name
+    migrated_knowledge_dir: Optional[str] = None
+    if knowledge_dir is None:
+        legacy_base = (
+            user_config.parent if user_config
+            else get_user_config_path(Path(DEFAULT_DATA_DIR), owner_username).parent
+        )
+        try:
+            migrated_knowledge_dir = migrate_legacy_knowledge_dir(
+                agent_dir, owner_username, legacy_base,
+            )
+        except (OSError, json.JSONDecodeError) as e:
+            typer.echo(f"Warning: legacy knowledge_dir migration failed: {e}", err=True)
+        if migrated_knowledge_dir is not None:
+            local_settings["knowledge_dir"] = migrated_knowledge_dir
+            typer.echo(f"Migrated knowledge_dir to {migrated_knowledge_dir!r}")
 
     # Set up skill manager (downloads skills from server on startup)
     skill_manager = SkillManager(agent_dir)
@@ -2544,6 +2540,15 @@ async def _runner_loop(
     if _git_base_branch:
         agent_env["CLAWMEETS_AGENT_GIT_BASE_BRANCH"] = _git_base_branch
 
+    # Local + shared storage folders. Created here as well as at registration
+    # so agents registered before storage existed (or created from the web
+    # app) get them on their next start. Kept on agent_env for the same
+    # hot-swap reason as the git binding.
+    storage = resolve_storage(agent_dir, local_settings)
+    ensure_storage(agent_dir, storage)
+    agent_env.update(storage.env())
+    write_agent_dir_readmes(agent_dir, storage)
+
     # The user's assistant agent (name ends with "-assistant") gets its own
     # bearer token exposed as $CLAWMEETS_ASSISTANT_TOKEN so admin system
     # skills (install-skill, register-agent, etc.) can shell `clawmeets <cmd>`
@@ -2606,14 +2611,12 @@ async def _runner_loop(
 
     # Build knowledge_dirs list (e.g., knowledge bases)
     knowledge_dirs_list: list[Path] = []
-    resolved = FileUtil.resolve_local_dir(str(effective_knowledge_dir), user_config_dir) if effective_knowledge_dir else None
-    if resolved is not None:
-        knowledge_dirs_list.append(resolved)
-
-    # Resolve dwh_dir (personal data warehouse root, typically network-shared).
-    # None when unset — the prompt block is omitted in that case.
-    raw_dwh_dir = local_settings.get("dwh_dir") or ""
-    resolved_dwh_dir = FileUtil.resolve_local_dir(str(raw_dwh_dir), user_config_dir) if raw_dwh_dir else None
+    if knowledge_dir is not None:
+        knowledge_dirs_list.append(knowledge_dir.expanduser().resolve())
+    else:
+        resolved = FileUtil.resolve_local_dir(local_settings.get("knowledge_dir") or "", agent_dir)
+        if resolved is not None:
+            knowledge_dirs_list.append(resolved)
 
     # Create HTTP client with auth
     http_client = httpx.AsyncClient(
@@ -2628,6 +2631,18 @@ async def _runner_loop(
     # Create ClawMeetsClient wrapper
     client = ClawMeetsClient(http_client=http_client, server_url=server_http)
 
+    # Persist a migrated knowledge_dir to the server's copy of local_settings,
+    # so an AGENT_SETTINGS_CHANGE echo can't restore the legacy relative path.
+    if migrated_knowledge_dir is not None:
+        try:
+            resp = await http_client.patch(
+                f"/agents/{agent_id}/local-settings",
+                json={"local_settings": {"knowledge_dir": migrated_knowledge_dir}},
+            )
+            resp.raise_for_status()
+        except httpx.HTTPError as e:
+            typer.echo(f"Warning: failed to sync migrated knowledge_dir to server: {e}", err=True)
+
     # Create ModelContext for the agent with all runtime dependencies
     notification_center = NotificationCenter()
     model_ctx = ModelContext(
@@ -2637,8 +2652,8 @@ async def _runner_loop(
         client=client,
         claude_plugin_dirs=all_plugin_dirs,
         notification_center=notification_center,
-        dwh_dir=resolved_dwh_dir,
         git_url=_git_url or None,
+        storage=storage,
     )
     # Share the CLI factory so a per-request model_config_name override can build
     # a one-turn provider from a non-default named config (same factory the
@@ -2667,7 +2682,6 @@ async def _runner_loop(
         skill_manager=skill_manager,
         mcp_manager=mcp_manager,
         knowledge_pack_manager=knowledge_pack_manager,
-        user_config_dir=user_config_dir,
         cli_factory=cli_factory,
         # Shared agent_env dict so a git_url/git_base_branch settings change can
         # update CLAWMEETS_AGENT_GIT_URL for the next invocation (the CLI is
@@ -2676,7 +2690,7 @@ async def _runner_loop(
         # Owner username from the startup credential (agent_name == "{owner}-{suffix}";
         # usernames have no hyphens). Lets catch_up build a populated AGENTS.md roster
         # on the first cold-start sync, before any self peer-card exists.
-        owner_username=agent_name.split("-", 1)[0] if "-" in agent_name else agent_name,
+        owner_username=owner_username,
     )
 
     # Start the loop
@@ -2688,6 +2702,11 @@ async def _runner_loop(
 
     handle_exception = _create_dispatch_callback()
     reconnect_delay = 2.0
+
+    # Answers the server's home-folder requests (the agent home-folder
+    # browser). Always this runner's own agent_dir — never a root or agent id
+    # taken from a request.
+    fs_handler = HomeFsRequestHandler(agent_dir)
 
     # Resolved ONCE, here, before the reconnect loop — deliberately not
     # per-connect. importlib.metadata reads *.dist-info off disk at call time,
@@ -2701,7 +2720,9 @@ async def _runner_loop(
     while True:
         close_code: Optional[int] = None
         try:
-            async with websockets.connect(ws_connect_url) as ws:
+            # max_size: matches the server's ws_max_size; fs frames stay
+            # under FS_MAX_FRAME_CHARS, well inside it (api/fs_protocol.py).
+            async with websockets.connect(ws_connect_url, max_size=FS_WS_MAX_SIZE) as ws:
                 logging.getLogger("clawmeets").info(f"WebSocket connected to {ws_url}")
 
                 # Send auth message (server expects this as first message).
@@ -2711,12 +2732,19 @@ async def _runner_loop(
                 # `while True:` loop. There is exactly one place a socket is
                 # established, so "sent on connect" and "sent on reconnect"
                 # cannot drift apart.
+                #
+                # `capabilities` tells the server which optional frames this
+                # runner answers; a server never sends an fs_request to a
+                # socket that did not list FS_CAPABILITY.
                 await ws.send(json.dumps({
                     "token": token,
                     "clawmeets_version": runner_version,  # str | None
+                    "capabilities": [FS_CAPABILITY],
                 }))
 
                 reconnect_delay = 2.0  # reset on success
+                # Uploads half-received on a previous socket died with it.
+                fs_handler.socket_closed()
 
                 # Sync installed skills from server (catch-up on connect/reconnect)
                 await skill_manager.sync_from_server(client, agent_id)
@@ -2741,6 +2769,16 @@ async def _runner_loop(
 
                 try:
                     async for raw in ws:
+                        # Home-folder frames are not ControlEnvelopes (they
+                        # carry file content); they are routed on their frame
+                        # prefix, taken here in arrival order (a write's
+                        # chunks), and answered in their own task.
+                        if is_fs_frame(raw):
+                            job = fs_handler.on_frame(raw)
+                            if job is not None:
+                                task = asyncio.create_task(_answer_fs_request(ws, fs_handler, job))
+                                task.add_done_callback(handle_exception)
+                            continue
                         try:
                             env = ControlEnvelope.model_validate_json(raw)
                             proj_id = env.payload.project_id if env.type == ControlMessageType.CHANGELOG_UPDATE else None
@@ -3807,36 +3845,6 @@ def _find_agent_dir_by_id(agents_dir: Path, agent_id: str) -> Optional[Path]:
     return None
 
 
-def _resolve_agent_knowledge_dir(
-    server_card: Optional[dict],
-    agent_dir: Optional[Path],
-    user_config_dir: Path,
-) -> Optional[Path]:
-    """Read `local_settings.knowledge_dir`, preferring the server's card
-    (just-saved value) and falling back to the local card.json on disk
-    if the server doesn't expose it.
-
-    The runner mirrors AGENT_SETTINGS_CHANGE into local card.json, but the
-    web-UI save → broadcast → write cycle has a delay window. Reading the
-    server first means we pick up changes the user just made even when the
-    local card hasn't caught up yet.
-    """
-    raw = ""
-    if server_card:
-        raw = (server_card.get("local_settings") or {}).get("knowledge_dir") or ""
-    if not raw and agent_dir is not None:
-        card_path = agent_dir / "card.json"
-        if card_path.exists():
-            try:
-                card = json.loads(card_path.read_text())
-                raw = (card.get("local_settings") or {}).get("knowledge_dir") or ""
-            except (json.JSONDecodeError, OSError):
-                pass
-    if not raw:
-        return None
-    return FileUtil.resolve_local_dir(str(raw), user_config_dir)
-
-
 def _bootstrap_session_setup(
     data_dir: Path,
     server: Optional[str],
@@ -4017,7 +4025,18 @@ def _write_agent_card(
         card["local_settings"] = dict(local_settings)
     card_path = agent_dir / "card.json"
     card_path.write_text(json.dumps(card, indent=2, default=str))
+    _provision_agent_home(agent_dir, local_settings)
     return card_path
+
+
+def _provision_agent_home(agent_dir: Path, local_settings: Optional[dict]) -> None:
+    """Create the agent's storage folders (local + the shared-storage link)
+    and the system-folder READMEs at registration, so a new agent's home is
+    complete before its runner first starts. The runner repeats both on every
+    start; this is what makes them exist for an agent that has never run."""
+    storage = resolve_storage(agent_dir, local_settings or {})
+    ensure_storage(agent_dir, storage)
+    write_agent_dir_readmes(agent_dir, storage)
 
 
 def _write_agent_credential(
@@ -4217,7 +4236,7 @@ def assistant_register(
     tz = (reflect_timezone or "").strip() or _host_iana_timezone()
     cron_expression = _daily_at_to_cron(self_learning_daily_at)
     local_settings = _build_initial_local_settings(
-        llm_provider, llm_model, dwh_dir=None, llm_api_key=llm_api_key,
+        llm_provider, llm_model, llm_api_key=llm_api_key,
         llm_base_url=llm_base_url, output_mode=llm_output_mode,
     )
 
@@ -4369,7 +4388,7 @@ def _register_one_worker(
         )
     _archive_stale_agent_dirs(agents_dir, registered_name, keep=agent_work_dir)
 
-    # Build local_settings (mirrors cli_init._register_agents logic).
+    # Build local_settings from the template entry.
     local_settings: dict = {}
     if agent.get("knowledge_dir"):
         local_settings["knowledge_dir"] = agent["knowledge_dir"]
@@ -4389,9 +4408,6 @@ def _register_one_worker(
     base_url_for_agent = llm_base_url_override or agent.get("llm_base_url")
     if base_url_for_agent:
         local_settings["llm_base_url"] = base_url_for_agent
-    agent_dwh_dir = agent.get("dwh_dir") or os.environ.get("CLAWMEETS_DWH_DIR", "")
-    if agent_dwh_dir:
-        local_settings["dwh_dir"] = agent_dwh_dir
 
     if local_settings:
         put_resp = client.put(

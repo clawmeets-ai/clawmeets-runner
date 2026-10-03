@@ -160,15 +160,10 @@ MAX_HISTORY = 200
 MAX_NOTE_CHARS = 32 * 1024
 MAX_EDIT_CHARS = 32 * 1024
 
-#: A pre-acceptance keeper write's ``--why`` — the changelog line the user
-#: reads instead of a diff (:func:`_file_write_receipt_locked`).
-#:
-#: **Small on purpose, and the smallness is the feature.** The whole value of a
-#: receipt is that the user can answer *"drop the auth move"* by naming one
-#: line; a paragraph is a summary, and a summary is the thing this replaced. It
-#: is also the guarantee that :func:`_finish_locked` cannot raise: capped here,
-#: at input validation, the receipt comment it builds can never breach
-#: ``MAX_NOTE_CHARS`` above the append.
+#: A keeper write's ``--why`` — one line saying what the write changes and
+#: why. On a write the spec lock refuses it leads the proposal the user is
+#: handed (:func:`_file_spec_lock_locked`), so it is capped like a changelog
+#: line: the rationale belongs in ``user-communication``.
 MAX_WHY_CHARS = 600
 
 #: A note's ``quote`` — the excerpt it is anchored to. **Not a second number**:
@@ -1087,6 +1082,10 @@ class PlanReviewRound(BaseModel):
     #: **Reported and skipped, never fatal** (AC-5.6): one bad name must not
     #: swallow a batch, and a name silently dropped is worse than one printed.
     unresolved: list[str] = Field(default_factory=list)
+    #: Notes the sender named that are addressed to the SENDER — its own inbox,
+    #: not a send. Skipped and reported (:func:`submit_review`): mailing them
+    #: back to their addressee opens a round nobody will ever answer.
+    own_inbox: list[str] = Field(default_factory=list)
 
 
 class PlanHistoryEntry(BaseModel):
@@ -2068,11 +2067,9 @@ class _PreparedWrite:
     (§4.2) is only true if they share it.
     """
 
-    __slots__ = ("result", "spec", "notes", "moved", "body", "receipts", "why")
+    __slots__ = ("result", "spec", "notes", "moved", "body", "why")
 
-    def __init__(
-        self, result, spec=None, notes=(), moved=(), body="", receipts=(), why=""
-    ):
+    def __init__(self, result, spec=None, notes=(), moved=(), body="", why=""):
         self.result = result
         self.spec = spec
         #: The shorthand notes this write owes the sidecar, built **here** and
@@ -2087,17 +2084,9 @@ class _PreparedWrite:
         #: §5.7 quotes back to a reviewer. On a refusal or a no-op it is the
         #: stored body, which is the same sentence: what the section says now.
         self.body = body
-        #: The sections this write moves the SPEC in, on a plan the user has
-        #: not accepted — the rows :func:`_file_write_receipt_locked` turns
-        #: into receipts. Disjoint from ``result.locked`` by construction and
-        #: never populated alongside it: ``locked`` is the refusal, this is the
-        #: landing. Empty on every write that leaves ``spec_digest`` alone, so
-        #: a checkbox tick carries none.
-        self.receipts = list(receipts)
-        #: The writer's one-line changelog for those receipts. Validated in
-        #: :func:`_prepare_locked` — required and length-capped there — so
-        #: :func:`_finish_locked` can file them without ever raising, which is
-        #: the property its two callers' ordering rests on.
+        #: The writer's one-line reason, carried onto the proposals a refused
+        #: spec write files (:func:`_file_spec_lock_locked`). Length-checked in
+        #: :func:`_prepare_locked`, above the append.
         self.why = why
 
     @property
@@ -2193,49 +2182,45 @@ def _spec_is_locked(project: "Project", plan: ProjectPlan, *, by: str) -> bool:
       U3). Without this conjunct M3 locks every front-desk coordinator out of
       its own document on its second write, and the project's Guardrails forbid
       changing that shape by name.
-    * **``plan.accepted_at``** — the start line, and the only conjunct that has
-      ever moved.
-    * **:func:`_plan_was_offered`** — the baseline's other half. See
-      *"ACCEPTANCE ALONE STOPPED MEANING RATIFIED"* below.
+    * **the start line** — ``accepted_at`` (with :func:`_plan_was_offered`)
+      OR :func:`_user_has_reviewed`, whichever comes first. See below.
 
-    **THE START LINE IS ACCEPTANCE, AND IT MOVED BACK HERE ON PURPOSE.** It
-    briefly read ``accepted_at or _user_has_reviewed(plan)`` — the lock engaged
-    at the user's FIRST review round rather than at their signature — and that
-    version was answering a real incident. Measured on one real project
-    (``chuswine-geo-b2b``): after the user's first review round closed the
-    coordinator made 26 direct writes to the document — Goal, Guardrails,
-    Sequencing and every milestone — against 0 proposals the user could accept
-    or reject. The plan was never accepted, so the lock never fired once.
+    **THE START LINE IS THE USER'S FIRST REVIEW, AND IT MOVED HERE ON PURPOSE —
+    FOR THE SECOND TIME.** It read ``accepted_at or _user_has_reviewed(plan)``
+    once before (``39a88eac``), answering ``chuswine-geo-b2b``: after the user's
+    first review the coordinator made 26 direct writes and 0 proposals. It was
+    then moved back to acceptance (``a7008e30``) with write *receipts* in the
+    gap, on the argument that before a signature there is no baseline for a
+    diff to be a delta against.
 
-    **The incident's cause was not the writing.** It was that nothing recorded
-    that a decision had been made: 26 acts of judgement about what the user's
-    feedback "settled", and no surface anywhere naming one of them. Refusing the
-    writes is one way to force that record, and it is the expensive way — it
-    puts the user in the seat of merge arbiter over a document nobody has
-    ratified yet, adjudicating hunk by hunk against a baseline they never
-    agreed to. Rejecting one hunk of five does not return the plan to a good
-    state; it returns it to a state nobody designed. And plan sections are
-    entangled in a way code hunks are not — narrowing M2 silently changes M4's
-    dependencies, and no diff shows that.
+    That argument was wrong about the baseline. Once the user has reviewed the
+    draft there IS one — the document they read and commented on — and the
+    receipts design failed in its own way on ``agent-home-folder-view``: the
+    coordinator folded the user's three answers straight into the text, closed
+    only its own questions, and left the user's three notes open on sections
+    that had moved under them, each now warning *"this section changed since
+    you wrote this"* about the very edit it asked for. The owner's stated
+    preference settles it: after their first review they read diffs and
+    comments, never a document that moved unnoticed. So a keeper's spec move
+    after that point is refused and filed as a proposal, exactly as it is after
+    acceptance.
 
-    So the record is reinstated without the refusal. Pre-acceptance a keeper's
-    spec write **lands**, and :func:`_file_write_receipt_locked` files a
-    comment-only receipt naming what moved and why — enforced by the write path
-    (``why`` is required, :func:`_prepare_locked` raises without it) rather than
-    requested by a prompt, because prompt-level trust is precisely what failed
-    on ``chuswine-geo-b2b``. What the user gets back is a coherent document plus
-    a named changelog; what they give up is one-click rejection of a single
-    pre-acceptance hunk, which is stated in the trade-off table in
-    ``COLLABORATION_MODEL.md`` rather than hidden here.
+    **The never-shown case stays unlocked**, and that is what the
+    ``_plan_was_offered`` conjunct on the acceptance arm is for. A user who
+    dismissed the confirm row while it still read :data:`GO_NOTE_DRAFTING`
+    released the work and reviewed nothing — on ``onboard-angel-investor``
+    locking there produced 17 proposals against a draft nobody had opened.
+    :func:`_user_has_reviewed` cannot be true in that state: it needs a review
+    round the OWNER closed.
 
-    **After acceptance nothing about this function changed**, and that is the
-    line the receipt design must not leak across: there IS a ratified baseline
-    then, drift is the thing being measured, and the diff is the evidence that a
-    change is bounded.
+    The coherence risk a7008e30 named — rejecting one hunk of five leaves a
+    plan nobody designed — is handled where it arises: a proposal is a whole
+    section, never a hunk, and the keeper files related proposals as one batch
+    naming each other (``system_skills/plan/SKILL.md``).
 
-    **ACCEPTANCE ALONE STOPPED MEANING RATIFIED, WHICH IS WHY THERE IS A FOURTH
-    CONJUNCT.** Every sentence above rests on *"there IS a ratified baseline
-    then"*, and that implication held while ``accepted_at`` could only be
+    **ACCEPTANCE ALONE STOPPED MEANING RATIFIED, WHICH IS WHY THE ACCEPTANCE ARM
+    CARRIES :func:`_plan_was_offered`.** A lock on an accepted plan rests on
+    *"there IS a baseline the user saw"*, and that implication held while ``accepted_at`` could only be
     stamped one way: the user dismissing a row that said *"Nothing in this plan
     is waiting on an answer from you. This is the start gate"*. The confirm row now has a second
     wording (:data:`GO_NOTE_DRAFTING`, seeded before the coordinator has taken a
@@ -2254,26 +2239,18 @@ def _spec_is_locked(project: "Project", plan: ProjectPlan, *, by: str) -> bool:
     coordinator then abandoned the draft and told them it "had a stale copy
     locally".
 
-    So the third conjunct is split in two: ``accepted_at`` is still the start
-    line, and :func:`_plan_was_offered` is *"of a document they were shown"*. A
-    legacy plan has rounds and locks exactly as it did.
-
-    **IT IS STILL NOT :func:`_user_has_reviewed`**, and the ``chuswine-geo-b2b``
-    argument above is why. The question this gate asks has never been *"did the
-    user answer?"* — it is *"is there something for a diff to be a delta
-    against?"*, and a plan the coordinator has handed over and the user has
-    signed is that, whether or not they wrote back.
+    So the acceptance arm is split in two: ``accepted_at``, and
+    :func:`_plan_was_offered` — *"of a document they were shown"*. A legacy plan
+    has rounds and locks exactly as it did. The review arm needs no such guard:
+    a review the owner closed is itself proof they were shown the document.
 
     **``phase == "executing"`` is still gone**, and its going is not a narrowing
     of AC-3.1: ``accepted_at`` implies ``executing``, so the conjunct was
     redundant on the only inputs that reach it.
 
-    :func:`_user_has_reviewed` and :attr:`ProjectPlan.first_user_review_at` are
-    KEPT, and they still mark the same moment — they just mark the start of
-    RECORDING rather than the start of refusing (:func:`_owes_receipt`). The
-    validator that recovers the fact from ``rounds`` keeps every legacy plan
-    answering correctly, and the coordinator's prompt reads the same projection
-    it always did.
+    :attr:`ProjectPlan.first_user_review_at` is latched and backfilled from
+    ``rounds`` on load, so every legacy plan answers the review arm correctly,
+    and the coordinator's prompt reads the same projection it always did.
 
     **What is still legal for the keeper after the lock engages**, because the
     comparison is on ``spec_digest`` and that digest normalizes them away
@@ -2299,71 +2276,10 @@ def _spec_is_locked(project: "Project", plan: ProjectPlan, *, by: str) -> bool:
     return (
         by == keeper(project)
         and project.surface == "regular"
-        and bool(plan.accepted_at)
-        and _plan_was_offered(plan)
-    )
-
-
-def _owes_receipt(project: "Project", plan: ProjectPlan, *, by: str) -> bool:
-    """Whether this writer's spec move must leave the user a **receipt**.
-
-    Named rather than inlined for the one reason that matters here: **two
-    callers ask it and they must never disagree.** :func:`_prepare_locked` asks
-    it to decide whether a missing ``why`` is a ``400``, and asks it again to
-    decide whether to hand the caller receipt rows. A ``400`` demanding a flag
-    that then goes nowhere, or a receipt filed on a write nobody was asked to
-    justify, are the two shapes a second copy produces.
-
-    **FOUR STATES, AND THE RECEIPT IS ONLY THE SECOND.** It is tempting to read
-    this as :func:`_spec_is_locked`'s complement — same author, same surface,
-    other side of ``accepted_at`` — and that reading is wrong in the direction
-    that costs the most. A plan's life has four phases for a keeper's spec
-    write:
-
-    * **drafting**, before the user has opened a single review round: writes
-      land, and owe NOTHING. There is no reader for a receipt — the user has
-      not seen the document, so there is nothing for a changelog to be a
-      changelog *since*, and :func:`_owner_changelog` renders none. Demanding a
-      line here would tax every keystroke of composing a first draft to produce
-      a record nobody will ever read.
-    * **reviewed but unaccepted**: writes land, and owe a receipt. This is the
-      window the ``chuswine-geo-b2b`` incident happened in — 26 direct writes
-      after the user's first round closed, 0 of them recorded anywhere — and it
-      is the only window where a keeper's write changes a document the user has
-      an opinion about but has not signed.
-    * **accepted, but never offered**: writes land, and owe NOTHING — the same
-      answer as *drafting*, because it is the same situation. The user
-      dismissed the confirm row while it still read :data:`GO_NOTE_DRAFTING`,
-      which releases the work and ratifies nothing; the coordinator is still
-      composing a first draft and the reader a receipt would be written for has
-      still not seen the document. This is the state that stopped the two
-      predicates being complements, and the gap is deliberate — see
-      :func:`_spec_is_locked`'s *"ACCEPTANCE ALONE STOPPED MEANING RATIFIED"*.
-    * **offered and accepted**: :func:`_spec_is_locked`. Writes are refused and
-      filed as proposals with diffs, because there is finally a ratified
-      baseline for a diff to be a bounded delta against.
-
-    So ``_user_has_reviewed`` is the start line, exactly as it was when it
-    gated the lock. **What changed is the outcome, not the trigger** — the same
-    act that used to be refused now lands and is recorded — which is why that
-    predicate and :attr:`ProjectPlan.first_user_review_at` are kept rather than
-    deleted, backfill validator and all.
-
-    It does **not** ask whether the spec actually moved. That question needs
-    ``cleaned`` and ``body``, which only exist after the splice, and folding it
-    in here would put an I/O-shaped argument on a predicate the prompt layer
-    also wants to read. The caller ands the two together, once.
-
-    ``surface == "regular"`` for the same reason the lock carries it: a
-    front-desk plan is ``executing`` from creation and the coordinator's write
-    IS the acceptance there, so there is no user round for a receipt to be read
-    in and nobody it would be addressed to.
-    """
-    return (
-        by == keeper(project)
-        and project.surface == "regular"
-        and not plan.accepted_at
-        and _user_has_reviewed(plan)
+        and (
+            (bool(plan.accepted_at) and _plan_was_offered(plan))
+            or _user_has_reviewed(plan)
+        )
     )
 
 
@@ -2423,11 +2339,10 @@ def _spec_lock_refusal(
     while the lock had two start lines and one of them was *"the user has
     reviewed this"*, on which *"it is accepted"* would have been a stated reason
     the model can see is untrue — and a ``403`` a model can disprove is one it
-    argues with rather than obeys. :func:`_spec_is_locked` now engages on
-    ``accepted_at`` (with :func:`_plan_was_offered`), so the unaccepted half of
-    that flag became unreachable: a parameter with one possible value, and a sentence behind it
-    that no caller can ever produce. Pre-acceptance there is no refusal to word
-    — the write lands and files a receipt.
+    argues with rather than obeys. :func:`_spec_is_locked` engages at the
+    user's first review OR at acceptance, and the user having reviewed the plan
+    is true in both, so the notes name the review (:func:`_spec_lock_comment`)
+    and this refusal names neither.
 
     **``relayered`` LEADS when there is one, because it is the one cause this
     refusal could not otherwise name.** Every other spec move is visible in the
@@ -2517,8 +2432,8 @@ def _spec_lock_refusal(
             f"plan tick <project> <label>`, which is never refused."
         )
     return (
-        f"@{by} may not change what this plan says — it is accepted, and the "
-        f"user decides what it says. Ticking a checkbox or editing an HTML "
+        f"@{by} may not change what this plan says — the user has reviewed "
+        f"it, and decides what it says. Ticking a checkbox or editing an HTML "
         f"comment still applies. Your text is filed as {ids} for the user to "
         f"accept in one click; say why in `user-communication`.{cause}"
     )
@@ -2672,16 +2587,19 @@ def _prepare_locked(
     *the plan is accepted and this changes what it says, so it is the user's
     call now*. Neither is ever populated alongside the other.
 
-    ``why`` is the keeper's changelog line for a **pre-acceptance** spec move.
-    It is validated here — required, and capped at ``MAX_WHY_CHARS`` — because
-    this is the last point at which refusing is free: below the append the
-    write has already been broadcast to every participant, and a cap tripped
-    there would leave the document written and the caller told nothing was.
-    A write that moves no spec never sees it, so ticking a checkbox needs no
-    flag.
+    ``why`` is the keeper's one-line reason. It is never required; on a write
+    the spec lock refuses it leads each proposal filed for the user. Capped
+    here, at input validation, so a note built from it cannot breach
+    ``MAX_NOTE_CHARS`` below.
     """
     if not may_write(project, by):
         raise PlanForbiddenError(_write_refusal(project, by=by))
+    if len(why) > MAX_WHY_CHARS:
+        raise PlanInputError(
+            f"--why is {len(why)} chars, limit is {MAX_WHY_CHARS}. It is one "
+            f"line, not the rationale — the rationale goes in "
+            f"`user-communication`, where the user can answer it."
+        )
 
     for edit in edits:
         if len(edit.text) > MAX_EDIT_CHARS:
@@ -2880,69 +2798,7 @@ def _prepare_locked(
                 dropped=len(rows) - len(shown),
             ),
             body=body,
-        )
-
-    # **THE SAME QUESTION, ASKED ON THE OTHER SIDE OF ACCEPTANCE, WITH THE
-    # OPPOSITE OUTCOME.** The arm above refuses a keeper's spec move on an
-    # ACCEPTED plan and files a proposal. This one lets the identical move LAND
-    # on an unaccepted one and files a receipt — a comment naming what moved and
-    # why — because before acceptance there is no ratified baseline for a diff
-    # to be a bounded delta against, and hunk-by-hunk adjudication of a draft
-    # nobody agreed to leaves the plan in a state nobody designed.
-    #
-    # **It re-uses the arm above's predicate exactly, and deliberately so.** The
-    # digest test is the same expression on the same two values, and no write
-    # can satisfy both predicates — `_owes_receipt` requires `not accepted_at`
-    # and the lock requires it.
-    #
-    # **They are no longer complements, and the gap between them is deliberate.**
-    # The lock grew a fourth conjunct (`_plan_was_offered`), so an ACCEPTED plan
-    # the coordinator has never put in front of the user satisfies neither: the
-    # keeper's spec write lands, and owes nothing. That is not an oversight in
-    # this expression — it is the drafting phase, reached by a user who released
-    # work early rather than by one who has not answered yet, and the keeper
-    # still owns the document in both.
-    # `_coverage_regressed` rides along for the same reason it does up there: a
-    # milestone edit that drops the work behind a criterion changes what the
-    # user is being asked to say yes to, and it is the one detail-layer edit
-    # that owes them a line.
-    #
-    # **Filtered HERE, through the same `_rows_worth_showing` the refusal path
-    # uses**, and here rather than in the filer because that filter reads its
-    # layers out of the STORED body — the document as it stands before this
-    # write — and this is the last frame in which the stored body exists. Pass
-    # the post-write text and a keeper could suppress its own receipt by marking
-    # the section `<!-- layer: detail -->` in the very write being recorded.
-    receipts: list[StaleSection] = []
-    if _owes_receipt(project, plan, by=by) and (
-        spec_digest(cleaned) != spec_digest(body)
-        or _coverage_regressed(body, cleaned)
-    ):
-        if not why.strip():
-            raise PlanInputError(
-                "this write changes what the plan SAYS, and the user has not "
-                "accepted it yet — so it lands, and it owes them a line saying "
-                "what moved and why. Pass --why (`why` on a review batch), "
-                "and make it a CHANGELOG LINE "
-                "naming the change and its cause (\"M2 now owns auth setup, "
-                "moved out of M3 — backend flagged M3's endpoints cannot be "
-                "built before it\"), not a summary (\"incorporated feedback\"): "
-                "they answer you by naming one of these lines. Ticking a "
-                "checkbox, editing an HTML comment and re-cutting `## "
-                "Milestones` still need no --why."
-            )
-        if len(why) > MAX_WHY_CHARS:
-            raise PlanInputError(
-                f"--why is {len(why)} chars, limit is {MAX_WHY_CHARS}. It is one "
-                f"changelog line, not the rationale — the rationale goes in "
-                f"`user-communication`, where the user can answer it."
-            )
-        receipts = _rows_worth_showing(
-            [
-                StaleSection(section=slug, base=before, current=before, text=after)
-                for slug, before, after in _pair_renamed_rows(body, cleaned, changes)
-            ],
-            body,
+            why=why,
         )
 
     return _PreparedWrite(
@@ -2954,7 +2810,6 @@ def _prepare_locked(
         ],
         moved=moved,
         body=cleaned,
-        receipts=receipts,
         why=why,
     )
 
@@ -2975,18 +2830,8 @@ def _finish_locked(
     function only mutates the in-memory ``plan``, ``_save`` is the module's only
     writer, and it runs after the append on both paths — so an append that
     raises persists nothing either way.
-
-    **The receipts are filed HERE and not in :func:`_apply_locked`**, and the
-    reason is the second caller. :func:`submit_review` reaches the append
-    through ``_prepare_locked`` + this function directly, never through
-    ``_apply_locked``; filing there would mean a keeper write carried inside a
-    review batch moved the spec and left no line. One filer, both doors.
     """
     prepared.result.note_ids += _add_notes_locked(plan, prepared.notes)
-    if prepared.receipts:
-        prepared.result.note_ids += _file_write_receipt_locked(
-            plan, prepared.receipts, by=by, why=prepared.why
-        )
     if project.surface == "frontdesk" and by == keeper(project):
         # §7.2 U3 — the coordinator is the sole acceptor on a front-desk plan,
         # so its write IS the acceptance. One extra call site, not a second
@@ -3040,7 +2885,8 @@ async def _apply_locked(
         # loses the write AND shows the user a traceback. :func:`apply_edits`
         # raises on the way out, once the sidecar is saved.
         prepared.result.note_ids += _file_spec_lock_locked(
-            project, plan, prepared.result.locked, by=by, body=prepared.body
+            project, plan, prepared.result.locked, by=by, body=prepared.body,
+            why=prepared.why,
         )
         _note(
             plan, by, "refused",
@@ -3881,13 +3727,9 @@ async def apply_edits(
     Does **not** bump ``revision`` on a regular project: that happens once, in
     :func:`submit_review`'s transaction (§2.5).
 
-    ``why`` is the keeper's one-line changelog for a write that moves the spec
-    on a plan the user has NOT accepted. Such a write lands — the lock starts at
-    acceptance — and files a receipt carrying this line
-    (:func:`_file_write_receipt_locked`). It is **required** on exactly those
-    writes and ignored on every other, and the requirement is enforced in
-    :func:`_prepare_locked` rather than requested by a prompt, because
-    prompt-level trust is what failed on ``chuswine-geo-b2b``.
+    ``why`` is the keeper's optional one-line reason. On a write the spec lock
+    refuses it leads each proposal filed for the user
+    (:func:`_file_spec_lock_locked`); a write that lands ignores it.
 
     ``ticks`` are :class:`PlanTick` rows — *"tick the box labelled M2"* — which
     :func:`_prepare_locked` materializes into ordinary edits against the body it
@@ -3900,7 +3742,7 @@ async def apply_edits(
     :class:`PlanSpecLockedError` (403) on one M3 refused — **both after the
     save**, because both refusals have already filed the notes that are their
     only remedy — and :class:`PlanInputError` (400), before anything is written,
-    on a pre-acceptance spec move with no ``why``.
+    on a ``why`` over :data:`MAX_WHY_CHARS`.
     """
     async with _lock:
         plan = _load(project, ctx)
@@ -4729,13 +4571,11 @@ def _rows_worth_showing(
     """Which of a write's per-section rows are **worth putting in front of the
     user** — the ones whose change the plan's own rules call a spec change.
 
-    **ONE HOME, TWO CALLERS, AND THAT IS WHY IT IS A FUNCTION.** Both outcomes a
-    keeper's spec move can have need this exact answer:
+    **ONE HOME, TWO CALLERS, AND THAT IS WHY IT IS A FUNCTION.**
     :func:`_file_spec_lock_locked` asks it to decide which sections become
-    proposals on an accepted plan, and :func:`_prepare_locked`'s receipt arm
-    asks it to decide which become receipts on an unaccepted one. A second copy
-    would be a second answer, and this filter has already drifted from its
-    caller once — see below.
+    proposals, and :func:`_prepare_locked` asks it to count what the refusal
+    dropped. A second copy would be a second answer, and this filter has
+    already drifted from its caller once — see below.
 
     **The decision to refuse is NOT taken here, and must not be.** That belongs
     to :func:`_prepare_locked`, which asks it of the UNFILTERED document;
@@ -4773,9 +4613,7 @@ def _rows_worth_showing(
     :func:`_spec_lock_refusal` names the ids it filed; zero notes is the dead end
     AC-3.3 exists to prevent. It should be unreachable — a moved digest means
     some section's normalized text moved — but the fallback costs one comparison
-    and removes the need to prove that. The receipt path inherits the same
-    guarantee for the same reason: a spec move the user is never told about is
-    the failure the receipt exists to end.
+    and removes the need to prove that.
     """
     layers = section_layers(body) if body else {}
     kept = [s for s in rows if layers.get(s.section, SPEC) == SPEC]
@@ -4881,32 +4719,43 @@ def _spec_lock_comment(
     :func:`~clawmeets.models.plan_markdown.relevels_heading` refuse it at input
     validation, which is where the incident above actually began.
 
-    **The ``accepted`` split is gone with the lock's second start line.** It
-    was added when the lock also engaged on an UNACCEPTED plan the user had
-    reviewed once — *"the plan is accepted"* on a plan they had not accepted is
-    the note contradicting the Accept button beside it. The lock reads
-    ``accepted_at`` alone again, so this sentence is only ever read on an
-    accepted plan, and a flag with one reachable value is a flag that only
-    invites a caller to pass the wrong one.
+    **The lede names the user's review, not acceptance**, because the lock
+    engages at whichever comes first (:func:`_spec_is_locked`) and *"the plan is
+    accepted"* on a plan they have only reviewed is the note contradicting the
+    Accept button beside it. A review is true in both states, so one sentence
+    serves both without a flag.
     """
     verb = "add the section" if creates else "change"
-    lede = f"@{by} could not {verb} `{section}` — the plan is accepted"
+    lede = (
+        f"@{by} could not {verb} `{section}` directly — you have reviewed this "
+        f"plan, so what it says changes only when you accept it"
+    )
     if text:
         moves = "this adds to what it says" if creates else "this moves what it says"
-        return f"{lede} and {moves}. Accept this to make the change."
+        return f"{lede}; {moves}. Accept this to make the change."
     if deletes:
         return (
-            f"{lede}, and this write REMOVES the section. Accept it and "
+            f"{lede}; this write REMOVES the section. Accept it and "
             f"`{section}` is DELETED from the plan — there is no replacement "
             f"text, the diff below is the whole section against nothing, and "
             f"nothing puts it back. If you want it kept, reply to @{by} "
             f"instead, or make the change yourself."
         )
     return (
-        f"{lede}, and this write REMOVES the section, which moves what it says. "
+        f"{lede}; this write REMOVES the section, which moves what it says. "
         f"There is no replacement text to accept: reply to @{by}, or make the "
         f"change yourself."
     )
+
+
+def _lead_with_why(why: str, comment: str) -> str:
+    """Put the writer's one-line reason above the system's sentence.
+
+    The reason is what the user scans for; the sentence beneath it says what
+    Accept will do.
+    """
+    why = why.strip()
+    return f"{why}\n\n{comment}" if why else comment
 
 
 def _file_spec_lock_locked(
@@ -4916,6 +4765,7 @@ def _file_spec_lock_locked(
     *,
     by: str,
     body: str = "",
+    why: str = "",
 ) -> list[str]:
     """M3 AC-3.3/AC-3.4 — one **deviation** note per section a refused
     executing-phase keeper write would have moved, ``to=user``, carrying the
@@ -4965,7 +4815,8 @@ def _file_spec_lock_locked(
                 section=s.section,
                 to=OWNER,
                 by=by,
-                comment=(
+                comment=_lead_with_why(
+                    why,
                     _spec_lock_comment(
                         by=by,
                         section=s.section,
@@ -5001,13 +4852,12 @@ def _file_spec_lock_locked(
 #: computed from the note's existing fields, and a receipt is nothing more
 #: exotic than a comment the system filed and closed in the same breath. A
 #: fifth :data:`NOTE_KINDS` member would be a second place to keep that rule.
+#:
+#: **Legacy only.** Receipts were filed for pre-acceptance keeper writes until
+#: the spec lock moved to the user's first review (:func:`_spec_is_locked`);
+#: nothing files one any more, and this survives so the ones already on disk
+#: still render in the owner's changelog.
 RECEIPT_RESOLUTION = "recorded — a keeper write before acceptance, nothing pending"
-
-#: A receipt's comment. ``{why}`` is the keeper's changelog line verbatim, so
-#: the user can quote it back; the section is named first because that is what
-#: they scan for when they want to object to exactly one thing.
-RECEIPT_COMMENT = "Rewrote `{section}` — {why}"
-
 
 def _is_write_receipt(note: PlanNote) -> bool:
     """Is this note a pre-acceptance write receipt?
@@ -5018,71 +4868,6 @@ def _is_write_receipt(note: PlanNote) -> bool:
     string acquires a second, subtly different spelling.
     """
     return note.resolution == RECEIPT_RESOLUTION
-
-
-def _file_write_receipt_locked(
-    plan: ProjectPlan,
-    moved: Sequence[StaleSection],
-    *,
-    by: str,
-    why: str,
-) -> list[str]:
-    """One **receipt** per section a landed pre-acceptance keeper write moved —
-    ``to=user``, comment-only, filed already closed.
-
-    The pre-acceptance sibling of :func:`_file_spec_lock_locked`: same rows,
-    same filter (:func:`_rows_worth_showing`, applied by the caller against the
-    stored body), opposite outcome. That one REQUESTS a change the server
-    refused to make; this one RECORDS one the server already made.
-
-    **Three properties, each load-bearing.**
-
-    * **``proposal`` stays empty.** :func:`note_kind` therefore returns
-      ``"note"``, ``has_proposal`` is false so no ``Accept`` appears,
-      :func:`_changed_warning` returns ``""`` on its first guard, and
-      :func:`render_batch_message` renders no diff. That is the entire
-      implementation of *"a comment, not a diff"*, and it costs no new field.
-      ``base_section`` is left empty for the same reason — a base with no
-      proposal is half of a diff nobody will ever render.
-    * **Filed already closed** (``status="applied"``, ``resolved_by=by``).
-      Nothing is pending on it, so it must never reach
-      :func:`open_notes_for_you` — which counts ``status == "open"`` — and can
-      therefore never hold §7.4's execution gate. A receipt that blocked would
-      turn every keeper write into a stop.
-    * **Not superseded and not superseding.**
-      :func:`_supersede_prior_locked` returns immediately on a note with no
-      proposal, so ten receipts on one section stay ten lines of changelog
-      rather than collapsing to the last one. Collapsing is right for
-      proposals, where the document can hold one replacement text; it is wrong
-      for history, where each line is a separate thing the user may object to.
-
-    **Cannot raise, and that is a contract its caller depends on.**
-    :func:`_finish_locked` calls it below the append, where a raise would leave
-    the document written and broadcast while the caller was told nothing was.
-    It is safe because the two caps :func:`_validate_notes_locked` enforces
-    cannot be reached: ``why`` is capped at :data:`MAX_WHY_CHARS` at input
-    validation, well under ``MAX_NOTE_CHARS``, and a closed note spends none of
-    the ``MAX_OPEN_NOTES`` budget.
-
-    Runs with ``_lock`` held, so :func:`_add_notes_locked` and never
-    ``add_note`` — the third caller of that door, not a new one.
-    """
-    notes = [
-        PlanNote(
-            id="",
-            section=s.section,
-            to=OWNER,
-            by=by,
-            comment=RECEIPT_COMMENT.format(section=s.section, why=why),
-            status="applied",
-            resolved_by=by,
-            resolved_at=_now(),
-            resolution=RECEIPT_RESOLUTION,
-            revision=plan.revision,
-        )
-        for s in moved
-    ]
-    return _add_notes_locked(plan, notes)
 
 
 async def file_conflict_note(
@@ -6379,17 +6164,17 @@ def render_batch_message(
                 first = (reply.comment or "").split("\n")[0]
                 lines.append(f"> `{reply.id}` @{reply.by}: {first}")
 
-    owner_ref = keeper_name or "<keeper>"
     example = notes[0].id if notes else "n-xxxx"
-    example_slug = (notes[0].section if notes else "") or "<slug>"
     lines += [
         "",
         "---",
         "### How to respond",
         f'- Answer or discuss: `clawmeets plan note {ref} --reply-to {example} -m "..."`',
-        f"- Suggest a change: `clawmeets plan note {ref} --section {example_slug} "
-        f'--to {owner_ref} --edit-file <file> -m "why"`',
-        f"- Close it out: `clawmeets plan resolve {ref} {example} --answered|--dismiss`",
+        f"- Answer with a change: `clawmeets plan note {ref} --reply-to {example} "
+        f'--edit-file <the section\'s whole new text> -m "why"` — a diff they '
+        f"accept or reject",
+        "- Either reply closes the note you answer. Do not leave a note open "
+        "after acting on it.",
         f"- Read the whole plan: `clawmeets plan show {ref} --clean`",
     ]
     return "\n".join(lines)
@@ -6979,14 +6764,11 @@ async def submit_review(
     a ``FILE_UPDATED`` and leaves ``revision`` unchanged (§2.5).
 
     ``why`` is :func:`apply_edits`'s parameter, taken here for the same write and
-    forwarded unchanged: an ``edit`` row from the keeper on a reviewed-but-
-    unaccepted plan moves the spec through step 1 exactly as a ``PUT …/plan``
-    would, so it owes the user the same changelog line and files the same
-    receipt. It is **not** ``batch_comment`` — that is the sentence above the
+    forwarded unchanged, so a keeper ``edit`` row the spec lock refuses files
+    its proposal with the same lead line a ``PUT …/plan`` would. It is **not**
+    ``batch_comment`` — that is the sentence above the
     notes in the rendered message, addressed to whoever the batch is sent to;
-    this is the line filed on the document, addressed to the owner. Ignored on
-    every batch that does not reach the receipt arm, which is every batch the
-    tray and the CLI send today.
+    this is the line filed on the document, addressed to the owner.
     """
     async with _lock:
         plan = _load(project, ctx)
@@ -7071,15 +6853,9 @@ async def submit_review(
         ]
 
         # ---- 1. the write, COMPUTED but not yet appended ------------------
-        # **``why`` reaches the funnel from HERE too — the second half of
-        # `_finish_locked`'s "one filer, both doors".** That docstring's promise
-        # is that a keeper spec move carried inside a review batch files a
-        # receipt rather than vanishing; a call that dropped `why` on the floor
-        # could never keep it, because `_prepare_locked` refuses such a write
-        # before it reaches the filer. Without this argument the refusal names
-        # a flag this door does not accept, so the batch is unrecoverable AND
-        # files nothing — strictly worse than the spec lock's refusal below,
-        # which at least lands the coordinator's text as a note.
+        # **``why`` reaches the funnel from HERE too**, so a keeper spec move
+        # carried inside a review batch and refused by the lock files its
+        # proposal with the same lead line as a `plan update` would.
         prepared = _prepare_locked(project, ctx, plan, edits, by=by, why=why)
         result = prepared.result
         if result.locked:
@@ -7094,7 +6870,8 @@ async def submit_review(
             # desk as a deviation they can accept in one click. That is the whole
             # of AC-3.3, and a refusal that dropped it would be a dead end.
             ids = _file_spec_lock_locked(
-                project, plan, result.locked, by=by, body=prepared.body
+                project, plan, result.locked, by=by, body=prepared.body,
+                why=prepared.why,
             )
             _note(
                 plan, by, "refused",
@@ -7199,9 +6976,33 @@ async def submit_review(
                         row, whole_sentence=whole
                     )
                 _address(addressee, note)
+        # A NOTE ADDRESSED TO THE SENDER IS ITS INBOX, NOT A SEND. On
+        # `agent-home-folder-view` the coordinator ran `plan review` after
+        # folding the user's answers in; the user's three replies — addressed to
+        # it and still open — were its default set, and went out as a round
+        # addressed to itself that nothing would ever wake it for. They are
+        # answered with `plan note --reply-to`, never re-sent.
+        #
+        # AGENTS ONLY. The owner sending a keeper's `to=user` notes lands a
+        # message on their own plate and wakes nobody — the supported way an
+        # owner's terminal pushes a batch out — so it stays a send.
+        own_inbox: list[str] = []
         for nid in note_ids:
             note = _find_note(plan, nid)
-            _address(note.to or keeper(project), note)
+            addressee = note.to or keeper(project)
+            if addressee == by and by != OWNER:
+                own_inbox.append(nid)
+                continue
+            _address(addressee, note)
+        if own_inbox and not by_addressee and not rows:
+            raise PlanInputError(
+                f"{', '.join(own_inbox)} "
+                f"{'is' if len(own_inbox) == 1 else 'are'} addressed to you — "
+                f"they are yours to answer, not to send. Answer each with "
+                f"`clawmeets plan note <project> --reply-to <id> -m \"...\"` "
+                f"(add `--edit-file <section.md>` to propose the change it asks "
+                f"for); the reply closes the note and reaches its author."
+            )
 
         # The send ledger, applied HERE and not after the append. A note whose
         # digest has not moved is already out: naming it explicitly is §5.7's
@@ -7646,6 +7447,7 @@ async def submit_review(
         )
         round_.room_created = room_created
         round_.unresolved = unresolved
+        round_.own_inbox = sorted(own_inbox)
         round_.revision = plan.revision if wrote else 0
         round_.sha = result.sha if wrote else ""
         round_.batch_comment = comment

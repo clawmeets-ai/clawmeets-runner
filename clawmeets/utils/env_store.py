@@ -24,17 +24,20 @@ import re
 import stat
 from pathlib import Path
 
-from .agent_processes import ENV_KEY_PATTERN, ENV_RESERVED_PREFIX, ENV_STORE_FILENAME
 from .file_io import FileUtil
 
 # POSIX-ish env-var name: leading letter/underscore, then alnum/underscore.
-KEY_RE = re.compile(ENV_KEY_PATTERN)
+KEY_RE = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 
 # Keys under this prefix carry agent identity/token and are runner-owned; the
 # store must never write or surface them.
-RESERVED_PREFIX = ENV_RESERVED_PREFIX
+RESERVED_PREFIX = "CLAWMEETS_"
 
-_STORE_FILENAME = ENV_STORE_FILENAME
+# A generous ceiling for one value set from the web UI (a PEM key fits), small
+# enough that a pasted file cannot ride a websocket frame into someone's env.
+VALUE_MAX_BYTES = 8192
+
+_STORE_FILENAME = "env.json"
 
 
 def store_path(agent_dir: Path) -> Path:
@@ -80,6 +83,11 @@ def load(agent_dir: Path) -> dict[str, str]:
         for k, v in read_raw(agent_dir).items()
         if KEY_RE.match(k) and not k.startswith(RESERVED_PREFIX)
     }
+
+
+def key_names(agent_dir: Path) -> list[str]:
+    """Sorted key names of the effective store. Never the values."""
+    return sorted(load(agent_dir))
 
 
 def set_var(agent_dir: Path, key: str, value: str) -> None:

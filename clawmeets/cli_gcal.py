@@ -2,7 +2,7 @@
 """
 clawmeets/cli_gcal.py — Google Calendar CLI.
 
-Subcommands: calendars, list-events, get, create, update, delete, sync, auth.
+Subcommands: calendars, list-events, get, create, update, delete, auth, revoke.
 """
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from clawmeets.integrations.gcal import _lib
 
 app = typer.Typer(
     name="gcal",
-    help="Google Calendar (list / get / create / update / delete / sync). Paired skill: google-calendar.",
+    help="Google Calendar (list / get / create / update / delete). Paired skill: google-calendar.",
     no_args_is_help=True,
 )
 
@@ -114,20 +114,6 @@ def delete(
 ) -> None:
     """Delete an event."""
     _emit_json({"deleted": _lib.delete_event(_svc(token), event_id, calendar_id=calendar_id)})
-
-
-@app.command()
-def sync(
-    dwh: str = typer.Option(..., "--dwh"),
-    config: str = typer.Option("", "--config"),
-    max_runtime: int = typer.Option(1500, "--max-runtime"),
-    token: str = typer.Option("", "--token"),
-) -> None:
-    """Sync calendars into the warehouse per --config."""
-    _emit_json(_lib.sync_to_warehouse(
-        _svc(token), dwh,
-        config_file=config, max_runtime_seconds=max_runtime,
-    ))
 
 
 @app.command()

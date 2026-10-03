@@ -1498,6 +1498,7 @@ class Agent(PersistableParticipant):
             coordinator_name=project.coordinator_name,
             capabilities=self.capabilities,
             git_url=self._model_ctx.git_url,
+            storage=self._model_ctx.storage,
         )
 
         is_dm = project.is_dm_shaped  # owned DM OR Front Desk end -> DM prompt variant
@@ -1528,7 +1529,6 @@ class Agent(PersistableParticipant):
             project_name=project.name,
             agent_dir=self._model_ctx.base_dir,
             knowledge_dirs=self._model_ctx.knowledge_dirs,
-            dwh_dir=self._model_ctx.dwh_dir,
             is_dm=is_dm,
             chat_history=chat_history,
             # Only ``not_authorized`` is read on this side. It is here rather
@@ -1656,7 +1656,8 @@ class Agent(PersistableParticipant):
         invoke site.
 
         Order: the synced project data dir (only when distinct from the
-        sandbox cwd), the knowledge dirs, then the agent ``memory_dir``. The
+        sandbox cwd), the knowledge dirs, the agent ``memory_dir``, then the
+        local + shared storage folders (both may live outside the agent dir). The
         memory dir is appended so every provider that gates file access on the
         allow-list (gemini ``--include-directories``, codex/claude
         ``--add-dir``) can reach ``memory/`` — the reflect/personalize
@@ -1669,6 +1670,9 @@ class Agent(PersistableParticipant):
             dirs.append(data_dir)
         dirs.extend(self._model_ctx.knowledge_dirs)
         dirs.append(self._model_ctx.memory_dir)
+        storage = self._model_ctx.storage
+        if storage is not None:
+            dirs.extend([storage.local, storage.shared])
         return dirs
 
     async def _invoke_with_transient_retry(
@@ -2233,6 +2237,7 @@ class Agent(PersistableParticipant):
         coordinator_builder = create_prompt_builder(
             OperationalMode.COORDINATOR,
             git_url=self._model_ctx.git_url,
+            storage=self._model_ctx.storage,
         )
         assert isinstance(coordinator_builder, CoordinatorPromptBuilder)
 
@@ -2254,7 +2259,6 @@ class Agent(PersistableParticipant):
             project_name=project.name,
             agent_dir=self._model_ctx.base_dir,
             knowledge_dirs=self._model_ctx.knowledge_dirs,
-            dwh_dir=self._model_ctx.dwh_dir,
             is_dm=project.is_dm_shaped,
             dm_is_owned=dm_is_owned,
             invitable_agents=self._resolve_invitable_agents_for_prompt(project),
@@ -2333,6 +2337,7 @@ class Agent(PersistableParticipant):
         coordinator_builder = create_prompt_builder(
             OperationalMode.COORDINATOR,
             git_url=self._model_ctx.git_url,
+            storage=self._model_ctx.storage,
         )
         assert isinstance(coordinator_builder, CoordinatorPromptBuilder)
 
@@ -2362,7 +2367,6 @@ class Agent(PersistableParticipant):
                 project_name=project.name,
                 agent_dir=self._model_ctx.base_dir,
                 knowledge_dirs=self._model_ctx.knowledge_dirs,
-                dwh_dir=self._model_ctx.dwh_dir,
                 is_dm=True,
                 dm_is_owned=dm_is_owned,
                 invitable_agents=self._resolve_invitable_agents_for_prompt(project),
@@ -2385,7 +2389,6 @@ class Agent(PersistableParticipant):
                 project_name=project.name,
                 agent_dir=self._model_ctx.base_dir,
                 knowledge_dirs=self._model_ctx.knowledge_dirs,
-                dwh_dir=self._model_ctx.dwh_dir,
                 invitable_agents=self._resolve_invitable_agents_for_prompt(project),
                 # §7.3's one branch: `spec-ing` gets the spec contract, anything
                 # else (a pre-feature project, an already-accepted plan) keeps
@@ -2484,6 +2487,7 @@ class Agent(PersistableParticipant):
         prompt_builder = create_prompt_builder(
             OperationalMode.COORDINATOR,
             git_url=self._model_ctx.git_url,
+            storage=self._model_ctx.storage,
         )
         assert isinstance(prompt_builder, CoordinatorPromptBuilder)
 
@@ -2507,7 +2511,6 @@ class Agent(PersistableParticipant):
             project_name=project.name,
             agent_dir=self._model_ctx.base_dir,
             knowledge_dirs=self._model_ctx.knowledge_dirs,
-            dwh_dir=self._model_ctx.dwh_dir,
             is_dm=project.is_dm_shaped,
             dm_is_owned=dm_is_owned,
             invitable_agents=self._resolve_invitable_agents_for_prompt(project),

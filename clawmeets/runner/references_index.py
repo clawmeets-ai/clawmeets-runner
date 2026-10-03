@@ -5,18 +5,18 @@ clawmeets/runner/references_index.py
 Deterministic builder for ``{agent_dir}/memory/REFERENCES.md`` — the index of
 the user's proprietary reference files (the configured ``knowledge_dir``).
 
-Previously REFERENCES.md was LLM-authored lazily by the
+Previously REFERENCES.md was LLM-authored lazily by a (since retired)
 ``consult-proprietary-knowledge`` skill, which left it stale/missing whenever
 the agent read it directly (the prompt points at it). This builder makes it
 runner-owned and always-fresh, exactly like the knowledge-pack index
-(``KNOWLEDGE_PACKS.md``) and the dwh catalog (``CATALOG.md``): one bullet per
+(``KNOWLEDGE_PACKS.md``): one bullet per
 file in the shared knowledge-index format (``utils.knowledge_index``), with a
 deterministic first-words **content preview** as the per-file "consult when".
 
 The preview is a *map* — it tells the agent which files exist and roughly what
 each opens with. Targeted lookups ("which file mentions X") are handled live by
-the grep/find ``consult-proprietary-knowledge`` skill, which also covers any
-staleness from nested-file edits between rebuilds.
+the ``grep -ril`` hint the prompt's REFERENCES.md line gives the agent, which
+also covers any staleness from nested-file edits between rebuilds.
 
 Rebuilt at runner startup, on a knowledge_dir ``AGENT_SETTINGS_CHANGE``, and on
 demand via ``clawmeets knowledge-dir reindex``.

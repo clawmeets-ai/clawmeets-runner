@@ -84,14 +84,10 @@ automatically, so no `--config` flag is needed.
 | `media` | `media` — image, audio (TTS) and video generation |
 | `homekit` | `homekit` — run macOS Shortcuts / HomeKit scenes |
 | `osxphotos` | `osxphotos` — query the macOS Photos library |
-| `database` | `database` — sync a SQL database into the warehouse |
-| `http-api` | `http-api` — sync a generic HTTP API into the warehouse |
+| `http-api` | `http-api` — generic HTTP client (get / post / put / patch / delete) |
 | `brief` | `brief` — publish briefing tabs to My Desk |
 | `todo` | `desk-todo` — My Desk todo items |
-| `dwh` | data-warehouse catalog and queries |
 | `knowledge-dir` | browse the agent's proprietary knowledge directory |
-| `etl` | `etl` — scheduled extract/transform/load runs |
-| `website-monitor` | `website-monitor` — watch pages for changes |
 | `om` | `om-stage` — OpenMontage stage handoff |
 | `ib` | `ib` — Interactive Brokers market data |
 

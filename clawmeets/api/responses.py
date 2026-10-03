@@ -80,7 +80,6 @@ class AgentResponse(BaseModel):
     model_configs: list[dict] = Field(default_factory=list)
     default_model_config_name: Optional[str] = None
     last_reflected_at: Optional[datetime] = None  # Last successful reflection cycle
-    last_synced_at: Optional[datetime] = None  # Last successful DWH sync trigger reply
 
 
 class ModelConfig(BaseModel):

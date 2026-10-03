@@ -34,7 +34,7 @@ from clawmeets.cli_runner import (
 from clawmeets.cli_lifecycle import start_command, stop_command, status_command
 from clawmeets.cli_skill import skill_app, schedule_app
 from clawmeets.cli_env import app as env_app
-from clawmeets.cli_consult import consult_command
+from clawmeets.cli_fs import app as fs_app
 from clawmeets.cli_doctor import doctor_command
 from clawmeets.cli_daemon import app as computer_app
 from clawmeets.cli_client import proj_app, room_app, msg_app, file_app
@@ -50,16 +50,12 @@ from clawmeets.cli_mailbox import app as mailbox_app
 from clawmeets.cli_media import app as media_app
 from clawmeets.cli_homekit import app as homekit_app
 from clawmeets.cli_osxphotos import app as osxphotos_app
-from clawmeets.cli_database import app as database_app
 from clawmeets.cli_http_api import app as http_api_app
 from clawmeets.cli_brief import app as brief_app
 from clawmeets.cli_todo import app as todo_app
 from clawmeets.cli_sop import app as sop_app
 from clawmeets.cli_plan import app as plan_app
-from clawmeets.cli_dwh import app as dwh_app
 from clawmeets.cli_knowledge_dir import app as knowledge_dir_app
-from clawmeets.cli_etl import app as etl_app
-from clawmeets.cli_website_monitor import app as website_monitor_app
 from clawmeets.cli_om import app as om_app
 from clawmeets.cli_ib import app as ib_app
 
@@ -96,7 +92,6 @@ def _root(
 app.command("start")(start_command)
 app.command("stop")(stop_command)
 app.command("status")(status_command)
-app.command("consult")(consult_command)
 # Shelled by the one-line installer as its last step, and by this computer's
 # connection (`clawmeets doctor --model-clis`) to report whether a model CLI is
 # usable. Both live OUTSIDE this package, so omitting it here breaks them
@@ -116,6 +111,7 @@ app.add_typer(bootstrap_app,      name="bootstrap")
 app.add_typer(schedule_app,       name="schedule")
 app.add_typer(skill_app,          name="skill")
 app.add_typer(env_app,            name="env")
+app.add_typer(fs_app,             name="fs")
 
 # `clawmeets computer …` — a passthrough to the separate `clawmeets-daemon`
 # distribution (see clawmeets/cli_daemon.py for why it is not bundled). It must
@@ -144,16 +140,12 @@ app.add_typer(mailbox_app, name="mailbox")
 app.add_typer(media_app, name="media")
 app.add_typer(homekit_app, name="homekit")
 app.add_typer(osxphotos_app, name="osxphotos")
-app.add_typer(database_app, name="database")
 app.add_typer(http_api_app, name="http-api")
 app.add_typer(brief_app, name="brief")
 app.add_typer(todo_app, name="todo")
 app.add_typer(sop_app, name="sop")
 app.add_typer(plan_app, name="plan")
-app.add_typer(dwh_app, name="dwh")
 app.add_typer(knowledge_dir_app, name="knowledge-dir")
-app.add_typer(etl_app, name="etl")
-app.add_typer(website_monitor_app, name="website-monitor")
 app.add_typer(om_app, name="om")
 app.add_typer(ib_app, name="ib")
 

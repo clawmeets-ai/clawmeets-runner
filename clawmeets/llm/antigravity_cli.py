@@ -253,7 +253,7 @@ class AntigravityCLI(SubprocessLLMProvider):
 
         # `--add-dir` pins extra workspace dirs (repeatable). Static skill_dirs
         # merge with the per-invocation additional_dirs (project / knowledge /
-        # dwh / memory); dedupe by resolved absolute path. Passed defensively —
+        # memory); dedupe by resolved absolute path. Passed defensively —
         # mirroring gemini's `--include-directories` — because whether agy
         # restricts reads to its workspace is unverified; harmless if it doesn't.
         seen: set[str] = set()

@@ -3,7 +3,7 @@
 clawmeets/integrations/http_api/_client.py
 
 General-purpose HTTP client backing ``clawmeets http-api {get,post,put,patch,
-delete}``. Independent of the warehouse ``sync`` driver in ``_lib.py``.
+delete}``.
 
 Design contract (see skills/http-api/SKILL.md):
 

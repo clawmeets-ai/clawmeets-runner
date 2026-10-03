@@ -1,0 +1,6 @@
+{
+  "audiences": ["worker", "coordinator", "assistant"],
+  "surfaces": ["agent_runtime"],
+  "version": "1.0.0",
+  "description": "Browse and manage an agent's home folder through the server (clawmeets fs ls/cat/write/mkdir/rm/download) — your own, or, for the assistant, any of the owner's agents'."
+}

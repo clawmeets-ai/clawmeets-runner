@@ -14,11 +14,17 @@ passed them. The runner already writes per-skill configs at
 ``$CLAWMEETS_AGENT_DIR/skill-hub/state/<skill>/<token_file>``. These
 resolvers consolidate the runner-side convention so each CLI subcommand
 only needs to call them.
+
+Also home to :func:`expand_env`, the ``${VAR}`` substitution the env-var
+credentialed skills (mailbox, calendar) apply to their loaded config.
 """
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
+
+_ENV_TOKEN_RE = re.compile(r"\$\{([A-Z_][A-Z0-9_]*)\}")
 
 
 def resolve_skill_config_path(skill_name: str, explicit: str = "") -> str:
@@ -67,3 +73,26 @@ def resolve_skill_token_path(
             f"CLAWMEETS_AGENT_DIR is not set and --token was not passed."
         )
     return Path(agent_dir) / "skill-hub" / "state" / skill_name / token_file
+
+
+def expand_env(value, scope: dict[str, str], missing: list[str]):
+    """Substitute ``${VAR}`` tokens in any string value (recursing into dicts and lists).
+
+    Resolution order: ``scope`` first (per-call runtime values), then
+    ``os.environ``. Unset tokens substitute ``""`` and are appended to
+    ``missing`` so the caller can short-circuit with a clear error.
+    """
+    if isinstance(value, str):
+        def sub(m: re.Match) -> str:
+            name = m.group(1)
+            v = scope.get(name) if name in scope else os.environ.get(name)
+            if v is None:
+                missing.append(name)
+                return ""
+            return str(v)
+        return _ENV_TOKEN_RE.sub(sub, value)
+    if isinstance(value, dict):
+        return {k: expand_env(v, scope, missing) for k, v in value.items()}
+    if isinstance(value, list):
+        return [expand_env(v, scope, missing) for v in value]
+    return value

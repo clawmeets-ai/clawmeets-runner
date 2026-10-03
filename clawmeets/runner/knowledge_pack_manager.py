@@ -50,6 +50,7 @@ import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from clawmeets.runner.agent_dir_readmes import README_FILENAME
 from clawmeets.utils.knowledge_index import file_preview, render_index_entry
 
 if TYPE_CHECKING:
@@ -234,7 +235,8 @@ class KnowledgePackManager:
         # Drop local pack dirs (and the legacy <slug>.md flat files) the
         # server no longer reports.
         for entry in pdir.iterdir():
-            if entry.name == META_FILENAME:
+            # README.md is the runner's folder guide (agent_dir_readmes), not a pack.
+            if entry.name in (META_FILENAME, README_FILENAME):
                 continue
             slug = entry.stem if entry.is_file() else entry.name
             if slug in server_slugs:

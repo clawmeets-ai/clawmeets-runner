@@ -2,7 +2,7 @@
 """
 clawmeets/cli_mailbox.py — Generic IMAP+SMTP mailbox CLI.
 
-Subcommands: list-folders, search, get, attachment, send, sync.
+Subcommands: list-folders, search, get, attachment, send.
 """
 from __future__ import annotations
 
@@ -57,7 +57,7 @@ def get(
     folder: str = typer.Option("INBOX", "--folder"),
     config: str = typer.Option("", "--config"),
 ) -> None:
-    """Fetch one message envelope by UID."""
+    """Fetch one message by UID (headers, text + html body, attachment list)."""
     try:
         _emit_json(_lib.get_message(config, uid, folder=folder))
     except RuntimeError as exc:
@@ -111,15 +111,3 @@ def send(
     except RuntimeError as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(1) from exc
-
-
-@app.command()
-def sync(
-    dwh: str = typer.Option(..., "--dwh"),
-    config: str = typer.Option("", "--config"),
-    max_runtime: int = typer.Option(1500, "--max-runtime"),
-) -> None:
-    """Sync IMAP folders into the warehouse per --config."""
-    _emit_json(_lib.sync_to_warehouse(
-        dwh, config_file=config, max_runtime_seconds=max_runtime,
-    ))

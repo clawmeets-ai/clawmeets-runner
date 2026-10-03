@@ -360,6 +360,25 @@ class ClawMeetsClient:
         resp.raise_for_status()
         logger.debug(f"Registered skill auth-init for {skill_name} (state={state[:8]}…)")
 
+    async def post_env_request_answer(
+        self,
+        agent_id: str,
+        request_id: str,
+        *,
+        ok: bool,
+        detail: str,
+        keys: list[str],
+    ) -> None:
+        """Answer one ``AGENT_ENV_REQUEST`` with its outcome and the key names.
+
+        Never carries a value: ``detail`` and ``keys`` name keys only.
+        """
+        url = f"{self._base_url}/agents/{agent_id}/env/requests/{request_id}"
+        resp = await self._http.post(
+            url, json={"ok": ok, "detail": detail, "keys": keys}
+        )
+        resp.raise_for_status()
+
     async def get_changelog(
         self,
         project_id: str,

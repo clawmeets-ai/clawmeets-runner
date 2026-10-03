@@ -33,7 +33,7 @@ accepted plan says.
 
 | You are | You may | You may not |
 |---|---|---|
-| the project's **coordinator** (its keeper) | write any section **until the user accepts the plan** — after their first review round each spec change also needs `--why` (below); send review batches; close a note addressed to you (`--answered` / `--dismiss`); relay the user's questions in `shared-context` | **accept** the plan, **apply** or **reject** a note — including notes you wrote yourself. **Change what an ACCEPTED plan says** — that is a proposal (below). **Close your own note to the user before it has been sent** — the user has not seen it, so there is nothing to report. **Close the confirm note** at all: `--dismiss` on it is the user's acceptance and 403 for you |
+| the project's **coordinator** (its keeper) | write any section **until the user's first review** — after it, a change to what the plan says is a proposal replying to the note that asked for it (below); send review batches; close a note addressed to you (`--answered` / `--dismiss`); relay the user's questions in `shared-context` | **accept** the plan, **apply** or **reject** a note — including notes you wrote yourself. **Change what a REVIEWED plan says** — that is a proposal (below). **Close your own note to the user before it has been sent** — the user has not seen it, so there is nothing to report. **Close the confirm note** at all: `--dismiss` on it is the user's acceptance and 403 for you |
 | the **owner** (the human, from the UI or their own terminal) | everything the coordinator may, **and every decision**: accept, apply, reject | — |
 | **any other agent** | read the plan; answer in `shared-context` (before acceptance) or in your workroom (after) — and when a consult asks you to sign an acceptance criterion, answer **per criterion**, not per plan | write the file (`plan update` is a **403**), send a batch (`plan review` is a **403**), and **file a plan note at all** (`plan note` is a **400**, in both phases) |
 
@@ -45,41 +45,37 @@ its own error text.
 
 ### Two lines, and they do different things
 
-**You write the plan until the user ACCEPTS it. You do not propose it.** Before
-acceptance nothing has been ratified, so a diff is not a change *to* anything
-the user agreed — and rejecting one hunk of five leaves the plan in a state
-nobody designed. Plan sections are entangled: narrow M2 and you change what M4
-depends on, and no diff view shows that. So the user reads the document.
+**You write the plan until the user's FIRST REVIEW. After it, you propose.**
+Before the user has seen the document you draft it freely — there is nobody
+yet for a diff to be addressed to. Once they have reviewed it, they read
+**diffs and comments**, never a document that moved without them seeing how.
 
-The first line is **the user's first review round**, and it starts a
-*record*, not a refusal. From there every `plan update` that moves what the plan
-**says** must carry a changelog line:
+So the line is **the user's first review round**, and from there a `plan
+update` that moves what the plan **says** is a **403**. Your text is not lost:
+it is filed for the user as a note carrying your proposal (led by your `--why`,
+if you passed one) and you get back the note ids. Do not retry it smaller — a
+smaller spec edit is still a spec edit. Acceptance changes nothing here; the
+rule is the same on both sides of it.
+
+**Answer each of their notes with a reply that carries the change:**
 
 ```bash
-clawmeets plan update <project> --section m2 --body-file ./m2.md \
-  --why "M2 now owns auth setup, moved out of M3 — backend flagged that M3's endpoints can't be built before it"
+clawmeets plan note <project> --reply-to n-e790dc --edit-file ./goal.md \
+  -m "Goal now says the server forwards each file operation to the runner — as you chose"
 ```
 
-That is enforced: without `--why` the write is a **400** and nothing lands. The
-line is filed as a **receipt** — a comment on the user's plan, no diff, already
-closed — and their next review round opens with every receipt since they last
-read the document, under a banner naming the span it moved over.
+The reply closes their note and lands a diff with **Accept** / **Reject**. A
+note of theirs left open after you acted on it is the worst outcome on this
+surface: it sits on their screen warning that the section changed under their
+comment.
 
-**Write a changelog line, not a summary.** The user answers by quoting one of
-your lines back at you. *"M2 now owns auth setup, moved out of M3 — backend
-flagged the ordering"* is answerable. *"Incorporated feedback from all agents"*
-is not: it hands them nothing to object to and pushes them into a full re-read
-to find the one thing they disliked. That is the exact cost this shape exists to
-remove, so a lazy `--why` gives back everything it bought.
+**Several sections, one answer?** File every proposal in the same turn and say
+in each `-m` which others it pairs with, then send them as ONE `plan review`.
+Each proposal is a whole section, so rejecting one never leaves a half-edited
+section — but it can leave two sections disagreeing, and naming the pairs is
+how the user avoids that.
 
-The second line is **acceptance**, and it reverses the rule. From there a
-`plan update` that moves the spec is a **403**; your text is not lost, it is
-filed for the user as a note carrying your proposal and you get back the note
-ids. Do not retry it smaller — a smaller spec edit is still a spec edit. The
-diff is right *there* because there is finally a ratified baseline for it to be
-a bounded delta against.
-
-What needs no `--why` and is never refused, in either phase, because the rule
+What is never refused, in any phase, because the rule
 compares what the document *says* and not its bytes:
 
 - ticking and unticking checkboxes as work completes — with `clawmeets plan
@@ -98,18 +94,9 @@ to have drifted.
 
 So **keep reporting progress exactly as you did before.** The schedule is yours.
 
-**Batch, don't drip.** One round of feedback folded into the document and sent
-as one `plan review` costs the user one message and one read. The same changes
-dripped out over five rounds cost them five.
-
-**Why the receipt exists.** On one real project the coordinator made 26 direct
-writes to the plan after the user's first review round closed — Goal,
-Guardrails, Sequencing and every milestone — against zero records the user could
-see. The plan was never accepted, so the accept-time refusal never engaged once.
-The failure was not that it wrote. It was that 26 acts of judgement about what
-the user's feedback "settled" left no trace. You are still not the judge of
-that — but now you do not have to be, because you say what you did and they
-answer it.
+**Batch, don't drip.** Proposals sent as one `plan review` cost the user one
+message and one read. The same changes dripped out over five rounds cost them
+five.
 
 ## The subcommands
 
@@ -264,16 +251,12 @@ asker's screen for them to dismiss. The confirm note is the one exception: reply
 to it leaves it open, because closing it releases the execution gate and
 dismissing it is the only act that means yes.
 
-**When you answer a note by editing the section yourself, edit first, then
-`--reply-to` THAT note** — the user's note, not only your own question it was
-replying to. Closing your own question leaves the user's reply open on their
-desk. The order matters: a reply records the section as it reads when you send
-it, and the *"this section changed"* warning on the user's note is measured from
-your newest reply. Reply after the edit and the warning stays quiet; reply
-before it and the user is told the section changed under them — by the very
-edit they asked for. Close the note (the default) when your edit does everything
-it asked; add `--keep-open` only when something is still unresolved — you did
-part of it, or you are asking something back.
+**Reply to THEIR note, not only your own question.** When the user answered a
+question of yours, their answer is a note addressed to you. Closing your
+question leaves their answer open on their desk; `--reply-to` their note
+instead. (Before their first review, when you may still edit the section
+directly: edit first, then reply — a reply records the section as it reads
+when you send it, and the *"this section changed"* warning is measured from it.)
 
 **Answer with the change, not just about it.** When your answer changes the
 plan, file it as a proposal (`--edit-file`) rather than prose. A proposal
@@ -415,12 +398,10 @@ more sections went down with the write and filed nothing at all.
 Two writers on two *different* sections never collide, in either order. That is
 the whole reason the unit is a section.
 
-**Once the user has reviewed this plan, a spec change here also needs
-`--why "<one changelog line>"`** — a `400` without it, and the line becomes the
-receipt they read at their next round. **Once they have ACCEPTED it**, the same
-write is a `403` and your text comes back filed as a proposal instead. A
-checkbox tick, an HTML comment, a reflow and a `## Milestones` re-cut need
-neither, in either phase. See *"Two lines, and they do different things"* at the
+**Once the user has reviewed this plan, a spec change here is a `403`** and
+your text comes back filed as a proposal instead (led by `--why`, if you passed
+one) — accepted or not. A checkbox tick, an HTML comment, a reflow and a `##
+Milestones` re-cut still land, in every phase. See *"Two lines, and they do different things"* at the
 top.
 
 ### Progress: `plan tick`, not `plan update`
@@ -679,14 +660,11 @@ into the document with `plan update` — you are the keeper — and only what ne
 the *user's* judgment (a trade-off, a scope call, two agents who disagree)
 becomes a note. For the signatures specifically:
 
-**The split survives the user's first review round; what changes is the
-paperwork.** Before they have seen anything, a settled answer goes into the
-document silently. After their first round it still goes into the document —
-you are the keeper right up to acceptance — but the write carries
-`--why "<changelog line>"`, and they read that line rather than a diff. Only
-after ACCEPTANCE does the split go away for the spec layer: from there **every**
-answer that changes what a criterion promises is a proposal, including the ones
-you are confident about.
+**The split ends at the user's first review round.** Before they have seen
+anything, a settled answer goes into the document silently. From their first
+round on, **every** answer that changes what a criterion promises is a
+proposal, including the ones you are confident about — they read diffs, not a
+document that moved.
 
 **The evidence is the exception, and it is the row that used to generate most
 of the traffic.** This table's first row once said to fold the demonstration

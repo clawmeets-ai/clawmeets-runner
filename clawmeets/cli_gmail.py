@@ -11,11 +11,11 @@ Subcommands:
   attachment   Fetch one attachment (optionally to disk).
   send         Send a plaintext email.
   archive      Archive messages (remove INBOX) by id or search query.
-  sync         Run sync_to_warehouse per --config.
   auth         Run Google OAuth (local installed-app flow).
+  revoke       Revoke the Google grant and delete the local token.
 
-Every subcommand resolves ``--config`` and ``--token`` from
-``$CLAWMEETS_AGENT_DIR/skill-hub/{configs,state}/gmail/`` via
+Every subcommand resolves ``--token`` from
+``$CLAWMEETS_AGENT_DIR/skill-hub/state/gmail/`` via
 ``clawmeets.integrations._config_resolve`` when not passed explicitly,
 so the LLM-side ``Bash: clawmeets gmail ...`` invocations stay terse.
 """
@@ -34,7 +34,7 @@ from clawmeets.integrations.gmail import _lib
 
 app = typer.Typer(
     name="gmail",
-    help="Gmail (search / get / labels / attachment / send / sync). Paired skill: gmail.",
+    help="Gmail (search / get / labels / attachment / send / archive). Paired skill: gmail.",
     no_args_is_help=True,
 )
 
@@ -173,20 +173,6 @@ def archive(
             "failed": result["failed"],
         })
     _emit_json(payload)
-
-
-@app.command()
-def sync(
-    dwh: str = typer.Option(..., "--dwh", help="Data warehouse root."),
-    config: str = typer.Option("", "--config"),
-    max_runtime: int = typer.Option(1500, "--max-runtime"),
-    token: str = typer.Option("", "--token"),
-) -> None:
-    """Sync gmail labels into the warehouse (named-slice, watermarked)."""
-    _emit_json(_lib.sync_to_warehouse(
-        _svc(token), dwh,
-        config_file=config, max_runtime_seconds=max_runtime,
-    ))
 
 
 @app.command()

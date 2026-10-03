@@ -2,7 +2,7 @@
 name: reconfigure-agent
 description: >
   Change an agent's runner settings on a DM request — its bound git repo,
-  LLM provider/model, knowledge directory, or data-warehouse directory. Use
+  LLM provider/model, or knowledge directory. Use
   when the user says things like "point backend-x at <repo>", "change your
   repo to <url>", "use o3 for the analyst", "set your model to ...", "switch
   your knowledge dir to ...". You perform the change yourself by shelling the
@@ -29,7 +29,8 @@ Settings you can change (pass any subset; an empty string clears a key):
 | `--git-url` | the bound git repo |
 | `--git-base-branch` | branch new work is cut from |
 | `--knowledge-dir` | proprietary-knowledge directory |
-| `--dwh-dir` | personal data-warehouse root |
+| `--local-storage-dir` | the agent's local storage folder (`$AGENT_LOCAL_STORAGE_DIR`; default `<agent home>/storage`) |
+| `--shared-storage-dir` | the shared storage folder (`$AGENT_SHARED_STORAGE_DIR`; default `~/.clawmeets/shared_storage`) |
 | `--llm-provider` | LLM backend (claude / openai / gemini / opencode / `antigravity` / *-api) |
 | `--llm-model` | provider-specific model |
 | `--llm-api-key` | BYO key for a `-api` provider |

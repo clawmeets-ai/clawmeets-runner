@@ -73,7 +73,7 @@ ls "$CLAWMEETS_AGENT_DIR/agents/"
 
 Read each candidate's `card.json` (`description`, `capabilities`,
 `user_teams`). The executor must be able to (a) produce the data —
-browse, search, or read its own warehouse — and (b) publish the briefing.
+browse, search, or read its own data sources — and (b) publish the briefing.
 Confirm installed skills (install state is NOT on peer cards):
 
 ```bash
@@ -116,7 +116,7 @@ is the trigger marker followed by a complete, self-contained SOP:
 ```
 <!-- clawmeets:brief-tab-trigger:<slug> -->
 Publish the briefing `<slug>` (title: "<Briefing title>").
-Source: <where to look — site, warehouse table, search scope>.
+Source: <where to look — site, data file, search scope>.
 Criteria: <exactly what qualifies — filters, price bounds, count>.
 Output: <the rows/fields the briefing should show, and any sort order>.
 ```

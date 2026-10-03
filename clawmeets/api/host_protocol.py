@@ -55,35 +55,13 @@ HOST_ACCEPTED = "host_accepted"    # auth succeeded; here is your host id
 
 # --- the allowlist ---------------------------------------------------------
 
-HostAction = Literal[
-    "start", "stop", "restart", "status", "update", "env_set", "env_unset"
-]
+HostAction = Literal["start", "stop", "restart", "status", "update"]
 
-HOST_ACTIONS: tuple[str, ...] = (
-    "start", "stop", "restart", "status", "update", "env_set", "env_unset",
-)
+HOST_ACTIONS: tuple[str, ...] = ("start", "stop", "restart", "status", "update")
 
 # Actions that address ONE agent and are meaningless without a name. `status`
 # and `update` are whole-machine.
-HOST_AGENT_ACTIONS: frozenset[str] = frozenset(
-    {"start", "stop", "restart", "env_set", "env_unset"}
-)
-
-# Actions that change one agent's env-var store and so also need a KEY — and,
-# for ``env_set``, a VALUE. The value is the only secret that ever crosses the
-# host socket: it is passed straight through (never stored, never logged, never
-# echoed in a result), and nothing on the socket can ever carry one BACK. Only
-# key names travel machine -> server, on the agent roster's ``env_keys``.
-HOST_ENV_ACTIONS: frozenset[str] = frozenset({"env_set", "env_unset"})
-
-# The env-var store's key rule, restated. The canonical copy is
-# ``clawmeets/utils/agent_processes.py`` (ENV_KEY_PATTERN / ENV_RESERVED_PREFIX);
-# the parity test pins this to it.
-ENV_KEY_PATTERN = r"^[A-Z_][A-Z0-9_]*$"
-ENV_RESERVED_PREFIX = "CLAWMEETS_"
-# A generous ceiling for one secret (a PEM key fits), small enough that a
-# pasted file cannot ride a websocket frame into someone's env.
-ENV_VALUE_MAX_BYTES = 8192
+HOST_AGENT_ACTIONS: frozenset[str] = frozenset({"start", "stop", "restart"})
 
 # What the user is told the actions are, in their words. One source, used
 # by the pairing dialog, the computer's page and the system skill, so the
@@ -95,15 +73,13 @@ HOST_ACTION_LABELS: dict[str, str] = {
     "restart": "Restart one of your agents",
     "status": "Report which of them are running",
     "update": "Update the ClawMeets software on it (clawmeets and its connection software)",
-    "env_set": "Add or replace an environment variable for one of your agents",
-    "env_unset": "Remove an environment variable from one of your agents",
 }
 
 # The refusals, also in the user's words, and also load-bearing product copy:
 # the claim "this is the complete list" is only checkable next to what is
 # excluded.
 HOST_NEVER_LABELS: tuple[str, ...] = (
-    "Read back or send the value of an environment variable",
+    "Read or change your agents' environment variables",
     "Install or change anything else",
     "Delete an agent — only you can, here in the browser",
     "Reach any other computer or account",
@@ -222,39 +198,6 @@ def validate_host_action(action: str, agent: Optional[str]) -> tuple[str, Option
     return cleaned, name
 
 
-def validate_env_change(
-    action: str, key: Optional[str], value: Optional[str]
-) -> tuple[Optional[str], Optional[str]]:
-    """``(key, value)`` for an env action, ``(None, None)`` for any other.
-
-    Raise :class:`HostCommandRejected` on a key outside the store's rule, a
-    ``CLAWMEETS_`` key (agent identity is runner-owned), an ``env_set`` with no
-    value or a value over :data:`ENV_VALUE_MAX_BYTES`. ``env_unset`` drops any
-    value it was handed so a remove can never carry a secret along.
-
-    Messages name the key and never the value — they reach logs and the page.
-    """
-    if action not in HOST_ENV_ACTIONS:
-        return None, None
-    name = (key or "").strip()
-    if not re.match(ENV_KEY_PATTERN, name):
-        raise HostCommandRejected(
-            f"{name!r} is not a valid variable name (A-Z, 0-9 and _, not "
-            f"starting with a digit)"
-        )
-    if name.startswith(ENV_RESERVED_PREFIX):
-        raise HostCommandRejected(f"the {ENV_RESERVED_PREFIX} prefix is reserved")
-    if action == "env_unset":
-        return name, None
-    if value is None:
-        raise HostCommandRejected(f"setting {name} needs a value")
-    if len(value.encode("utf-8")) > ENV_VALUE_MAX_BYTES:
-        raise HostCommandRejected(
-            f"the value for {name} is over {ENV_VALUE_MAX_BYTES // 1024} KB"
-        )
-    return name, value
-
-
 # --- frame payloads (server-side validation) -------------------------------
 
 
@@ -270,10 +213,6 @@ class HostAgentReport(BaseModel):
     name: str = ""
     state: str = "stopped"
     pid: Optional[int] = None
-    # Key NAMES in the agent's env-var store — never values. None means the
-    # machine's software predates env-var support (it cannot say), which the
-    # page reads as "needs an update" rather than "no keys".
-    env_keys: Optional[list[str]] = None
 
 
 class HostModelCLIReport(BaseModel):
@@ -327,9 +266,6 @@ class HostCommandOutcome(BaseModel):
     command_id: str = ""
     action: str = ""
     agent: Optional[str] = None
-    # The env-var key an ``env_set`` / ``env_unset`` touched. There is no value
-    # field, on purpose: nothing on this frame can carry one back.
-    key: Optional[str] = None
     ok: bool = True
     detail: str = ""
 
@@ -347,33 +283,16 @@ class HostStateFrame(BaseModel):
     runner_version: Optional[str] = None
 
 
-def command_frame(
-    command_id: str,
-    action: str,
-    agent: Optional[str] = None,
-    *,
-    key: Optional[str] = None,
-    value: Optional[str] = None,
-) -> dict:
+def command_frame(command_id: str, action: str, agent: Optional[str] = None) -> dict:
     """Build the one frame shape the server ever sends a machine.
 
-    Goes through :func:`validate_host_action` and :func:`validate_env_change`
-    so an unrepresentable command cannot be constructed, let alone sent. ``key``
-    and ``value`` appear on the frame only for the env actions.
-
-    The returned dict can hold a secret (``env_set``'s value): hand it to the
-    socket and never to a logger.
+    Goes through :func:`validate_host_action` so an unrepresentable command
+    cannot be constructed, let alone sent.
     """
     cleaned, name = validate_host_action(action, agent)
-    env_key, env_value = validate_env_change(cleaned, key, value)
-    frame = {
+    return {
         "type": HOST_COMMAND,
         "command_id": command_id,
         "action": cleaned,
         "agent": name,
     }
-    if env_key is not None:
-        frame["key"] = env_key
-    if env_value is not None:
-        frame["value"] = env_value
-    return frame

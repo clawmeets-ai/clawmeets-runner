@@ -290,7 +290,7 @@ def _build_file_tools(
     """Build per-invocation file + bash tools for this turn.
 
     READS (``read_file`` / ``list_dir`` / ``grep``) are unrestricted — they can
-    reach the synced project dir, knowledge bases, and the dwh, matching the
+    reach the synced project dir and knowledge bases, matching the
     CLI's bypass-permissions read model (and the ``bash`` tool below can already
     read anything, so guarding reads would be theater). WRITES/EDITS are
     confined to ``write_root`` (the sandbox), so the agent can only mutate its
@@ -350,7 +350,7 @@ def _build_file_tools(
         raise ValueError(f"path '{path}' is outside the writable sandbox")
 
     def read_file(path: str) -> str:
-        """Read a UTF-8 text file (project / knowledge / dwh / sandbox)."""
+        """Read a UTF-8 text file (project / knowledge / sandbox)."""
         p = _abs_read(path)
         if not p.is_file():
             return f"ERROR: not a file: {path}"

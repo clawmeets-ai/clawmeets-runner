@@ -24,8 +24,9 @@ from typing import Optional
 
 import typer
 
-from clawmeets.cli_runner import DEFAULT_DATA_DIR, _resolve_agent_dir
+from clawmeets.cli_lifecycle import DEFAULT_DATA_DIR, get_current_user
 from clawmeets.utils import env_store
+from clawmeets.utils.agent_processes import prefixed_name
 
 app = typer.Typer(
     name="env",
@@ -40,24 +41,97 @@ def _echo(payload: dict) -> None:
     typer.echo(json.dumps(payload, indent=2, ensure_ascii=False))
 
 
+def _fail(error: str) -> None:
+    """Every error this group reports is the same JSON shape on stdout, so a
+    skill parsing the output never meets a second format."""
+    _echo({"status": "error", "error": error})
+    raise typer.Exit(1)
+
+
+def _match(agents_root: Path, name: str) -> list[Path]:
+    """Directories that are exactly ``{name}-{id}``. Agent ids carry no hyphen,
+    so ``backend`` does not also match ``backend-v2-{id}``."""
+    prefix = f"{name}-"
+    return [
+        d for d in agents_root.iterdir()
+        if d.is_dir() and d.name.startswith(prefix) and "-" not in d.name[len(prefix):]
+    ]
+
+
+def _resolve_agent(data_dir: Path, agent: str) -> Path:
+    """Find an agent's directory the way ``clawmeets start --agent`` names it.
+
+    Accepted, in order: the exact directory name (what the computer connection
+    passes), the short name (``backend`` — prefixed with the signed-in user,
+    as agent directories are), or the prefixed name (``alice-backend``).
+    """
+    agents_root = Path(data_dir).expanduser() / "agents"
+    if not agents_root.is_dir():
+        _fail(f"no agents directory at {agents_root}")
+    exact = agents_root / agent
+    if exact.is_dir():
+        return exact
+    user = get_current_user(Path(data_dir).expanduser())
+    names = [prefixed_name(user, agent)] if user else []
+    names.append(agent)
+    for name in dict.fromkeys(names):
+        matches = _match(agents_root, name)
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            _fail(
+                f"multiple agents match {agent!r}: {sorted(d.name for d in matches)}. "
+                f"Pass the full directory name."
+            )
+    available = sorted(d.name for d in agents_root.iterdir() if d.is_dir())
+    _fail(f"no agent matching {agent!r} under {agents_root}. Available: {available}")
+
+
 def _resolve_base(agent: str, data_dir: Path) -> Path:
     """Resolve the agent-dir whose store to operate on.
 
-    ``--agent`` wins (resolved by name/id under ``{data_dir}/agents/``); when
-    omitted, fall back to ``$CLAWMEETS_AGENT_DIR`` so an agent can self-manage.
-    Exits with an error if neither is available.
+    ``--agent`` wins; when omitted, fall back to ``$CLAWMEETS_AGENT_DIR`` so an
+    agent can self-manage. Exits with a JSON error if neither is available.
     """
     if agent:
-        return _resolve_agent_dir(data_dir, agent)
+        return _resolve_agent(data_dir, agent)
     env_dir = os.environ.get("CLAWMEETS_AGENT_DIR")
     if env_dir:
         return Path(env_dir)
-    typer.echo(
-        "Error: no agent specified and $CLAWMEETS_AGENT_DIR is unset. "
-        "Pass --agent <name>.",
-        err=True,
-    )
-    raise typer.Exit(1)
+    _fail("no agent specified and $CLAWMEETS_AGENT_DIR is unset. Pass --agent <name>.")
+
+
+_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", '"': '"', "\\": "\\"}
+
+
+def _dotenv_value(raw: str) -> str:
+    """The value half of a dotenv line.
+
+    A quoted value runs to its MATCHING closing quote (double quotes expand
+    ``\\n``, ``\\t``, ``\\"`` and ``\\\\``; single quotes are literal) and anything
+    after it — an inline comment — is ignored. An unquoted value ends at an
+    inline `` #`` comment. Raises ``ValueError`` on an unterminated quote.
+    """
+    v = raw.strip()
+    if v[:1] in ('"', "'"):
+        quote, out, i = v[0], [], 1
+        while i < len(v):
+            ch = v[i]
+            if ch == quote:
+                return "".join(out)
+            if quote == '"' and ch == "\\" and i + 1 < len(v):
+                nxt = v[i + 1]
+                out.append(_ESCAPES.get(nxt, "\\" + nxt))
+                i += 2
+                continue
+            out.append(ch)
+            i += 1
+        raise ValueError(f"unterminated {quote} quote")
+    for marker in (" #", "\t#"):
+        cut = v.find(marker)
+        if cut != -1:
+            v = v[:cut]
+    return v.strip()
 
 
 @app.command("set")
@@ -81,20 +155,20 @@ def set_(
     typed at a hidden prompt when neither is given.
     """
     if value is not None and value_stdin:
-        _echo({"status": "error", "error": "pass the value as an argument or --value-stdin, not both"})
-        raise typer.Exit(1)
+        _fail("pass the value as an argument or --value-stdin, not both")
+    # Resolved BEFORE the prompt, so a wrong --agent fails before you type a
+    # secret into it.
+    base = _resolve_base(agent, data_dir)
     if value_stdin:
         value = sys.stdin.read()
         if value.endswith("\n"):
             value = value[:-1]
     elif value is None:
         value = typer.prompt(f"Value for {key}", hide_input=True, err=True)
-    base = _resolve_base(agent, data_dir)
     try:
         env_store.set_var(base, key, value)
     except ValueError as exc:
-        _echo({"status": "error", "error": str(exc)})
-        raise typer.Exit(1)
+        _fail(str(exc))
     _echo({"status": "ok", "key": key})
 
 
@@ -147,13 +221,12 @@ def import_(
 ) -> None:
     """Bulk-load ``KEY=VALUE`` lines (dotenv style). Values never echoed.
 
-    Skips blank lines and ``#`` comments; tolerates a leading ``export`` and
-    surrounding quotes. Invalid/reserved keys are collected under ``skipped``.
+    Skips blank lines and ``#`` comments; tolerates a leading ``export``,
+    matched quotes and inline comments (see :func:`_dotenv_value`). Invalid/reserved keys are collected under ``skipped``.
     """
     base = _resolve_base(agent, data_dir)
     if not file.exists():
-        _echo({"status": "error", "error": f"file not found: {file}"})
-        raise typer.Exit(1)
+        _fail(f"file not found: {file}")
 
     imported: list[str] = []
     skipped: list[dict] = []
@@ -166,9 +239,13 @@ def import_(
         if "=" not in line:
             skipped.append({"line": raw, "reason": "no '='"})
             continue
-        key, _, value = line.partition("=")
+        key, _, rest = line.partition("=")
         key = key.strip()
-        value = value.strip().strip('"').strip("'")
+        try:
+            value = _dotenv_value(rest)
+        except ValueError as exc:
+            skipped.append({"key": key, "reason": str(exc)})
+            continue
         try:
             env_store.set_var(base, key, value)
         except ValueError as exc:

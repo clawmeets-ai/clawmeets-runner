@@ -6,25 +6,15 @@ CalDAV calendar integration. Provider-agnostic (iCloud / Fastmail /
 Nextcloud / Radicale / SOGo / mailcow). Credentials from ``${VAR}`` in
 ``$CLAWMEETS_AGENT_DIR/skill-hub/configs/calendar.json``.
 
-Skill name remains ``calendar`` (matches the existing trigger
-``<!-- clawmeets:calendar-sync-trigger -->``).
+Paired skill: ``calendar``.
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from clawmeets.integrations._config_resolve import resolve_skill_config_path
-from clawmeets.integrations._sync_warehouse import (
-    SyncBudget,
-    expand_env,
-    run_slice_sync,
-    run_slices,
-    utcnow_iso,
-    write_howto,
-)
-from clawmeets.utils.file_io import FileUtil
+from clawmeets.integrations._config_resolve import expand_env, resolve_skill_config_path
 from clawmeets.utils.jsonc import parse_jsonc
 
 
@@ -111,13 +101,12 @@ def _select_one_calendar(client, name: str):
     return cals[0] if cals else None
 
 
-def _slice_calendar_names(slices: Any) -> Optional[list[str]]:
-    if not isinstance(slices, list) or not slices:
+def _default_calendar_names(names: Any) -> Optional[list[str]]:
+    """Config ``default_calendars``: display names searched when a command is
+    given no ``--calendar-url``. ``None`` (missing / empty) means every calendar."""
+    if not isinstance(names, list) or not names:
         return None
-    out = [
-        s["calendar"] for s in slices
-        if isinstance(s, dict) and isinstance(s.get("calendar"), str) and s["calendar"]
-    ]
+    out = [n for n in names if isinstance(n, str) and n]
     return out or None
 
 
@@ -192,83 +181,6 @@ def _ical_to_event(ical_obj, calendar_url: str, etag: Optional[str]) -> Optional
     }
 
 
-def _safe_uid(uid: str) -> str:
-    return "".join(c if c.isalnum() or c in "-_" else "_" for c in uid)
-
-
-def _sync_one_slice(*, client, slice_cfg, dwh_dir, budget,
-                    lookback_days, lookahead_days):
-    raw_name = slice_cfg.get("name") if isinstance(slice_cfg, dict) else None
-    if not isinstance(raw_name, str) or not raw_name.strip():
-        return {"name": "<unnamed>", "rows_written": 0, "watermarks": None,
-                "has_more": False, "error": "slice config missing 'name' field"}
-    try:
-        name = FileUtil.validate_fs_name(raw_name)
-    except ValueError as exc:
-        return {"name": raw_name, "rows_written": 0, "watermarks": None,
-                "has_more": False, "error": f"invalid slice name {raw_name!r}: {exc}"}
-
-    calendar_name = slice_cfg.get("calendar")
-    if not isinstance(calendar_name, str) or not calendar_name.strip():
-        return {"name": name, "rows_written": 0, "watermarks": None,
-                "has_more": False,
-                "error": "slice config missing 'calendar' field (CalDAV display name)"}
-
-    dwh_root = Path(dwh_dir).expanduser().resolve()
-    source = f"calendar/{name}"
-    base = dwh_root / "raw" / source
-
-    howto_err = write_howto(slice_cfg.get("howto"), snapshot_dir=base)
-    if howto_err:
-        return {"name": name, "rows_written": 0, "watermarks": None,
-                "has_more": False, "error": howto_err}
-
-    cal = _select_one_calendar(client, calendar_name)
-    if cal is None:
-        return {"name": name, "rows_written": 0, "watermarks": None,
-                "has_more": False,
-                "error": f"calendar {calendar_name!r} not found on the configured CalDAV account"}
-
-    now = datetime.now(timezone.utc)
-    range_start = now - timedelta(days=lookback_days)
-    range_end = now + timedelta(days=lookahead_days)
-    range_start_iso = range_start.isoformat()
-    range_end_iso = range_end.isoformat()
-
-    def fetch(_window_start: str, window_end: str, bud: SyncBudget, emit) -> bool:
-        # Full re-read of the [now-lookback, now+lookahead] window; the driver
-        # diffs against the snapshot to find changes + deletes.
-        try:
-            events = cal.search(start=range_start, end=range_end, expand=False)
-        except Exception as exc:
-            raise RuntimeError(f"calendar.search failed: {exc}") from exc
-        for ev in events:
-            if bud.should_stop():
-                return True
-            etag = getattr(ev, "etag", None)
-            envelope = _ical_to_event(ev, str(cal.url), etag)
-            if envelope is None:
-                continue
-            uid = envelope.get("uid") or ""
-            if not uid:
-                continue
-            envelope["ts"] = envelope.get("last_modified") or window_end
-            envelope["slice"] = name
-            bud.rows_written += 1
-            emit(envelope)
-        return False
-
-    def _in_scope(prior: dict) -> bool:
-        start = prior.get("start") or ""
-        return range_start_iso <= start <= range_end_iso
-
-    return run_slice_sync(
-        source=source, dwh_dir=dwh_dir, budget=budget, fetch=fetch,
-        id_field="uid", ts_field="ts", full_scan=True, snapshot_fmt="ndjson",
-        in_scope=_in_scope, volatile_fields={"etag"},
-    )
-
-
 # ---------------------------------------------------------------------------
 # Public tool bodies
 # ---------------------------------------------------------------------------
@@ -302,7 +214,7 @@ def list_events(config_file, time_min, time_max, calendar_url=None) -> list[dict
     if calendar_url:
         cals = [client.calendar(url=calendar_url)]
     else:
-        cals = _select_calendars(client, _slice_calendar_names(resolved.get("calendars_to_sync")))
+        cals = _select_calendars(client, _default_calendar_names(resolved.get("default_calendars")))
     out: list[dict] = []
     for cal in cals:
         for ev in cal.search(start=start, end=end, expand=False):
@@ -322,7 +234,7 @@ def get_event(config_file, uid, calendar_url=None) -> dict:
     if calendar_url:
         cals = [client.calendar(url=calendar_url)]
     else:
-        cals = _select_calendars(client, _slice_calendar_names(resolved.get("calendars_to_sync")))
+        cals = _select_calendars(client, _default_calendar_names(resolved.get("default_calendars")))
     for cal in cals:
         try:
             ev = cal.event_by_uid(uid)
@@ -351,7 +263,7 @@ def create_event(config_file, summary, start, end, calendar_url=None,
     if calendar_url:
         cal = client.calendar(url=calendar_url)
     else:
-        cals = _select_calendars(client, _slice_calendar_names(resolved.get("calendars_to_sync")))
+        cals = _select_calendars(client, _default_calendar_names(resolved.get("default_calendars")))
         if not cals:
             raise RuntimeError("no calendars available")
         cal = cals[0]
@@ -388,7 +300,7 @@ def update_event(config_file, uid, calendar_url=None,
     if calendar_url:
         cals = [client.calendar(url=calendar_url)]
     else:
-        cals = _select_calendars(client, _slice_calendar_names(resolved.get("calendars_to_sync")))
+        cals = _select_calendars(client, _default_calendar_names(resolved.get("default_calendars")))
     for cal in cals:
         try:
             ev = cal.event_by_uid(uid)
@@ -431,7 +343,7 @@ def delete_event(config_file, uid, calendar_url=None) -> str:
     if calendar_url:
         cals = [client.calendar(url=calendar_url)]
     else:
-        cals = _select_calendars(client, _slice_calendar_names(resolved.get("calendars_to_sync")))
+        cals = _select_calendars(client, _default_calendar_names(resolved.get("default_calendars")))
     for cal in cals:
         try:
             ev = cal.event_by_uid(uid)
@@ -440,47 +352,3 @@ def delete_event(config_file, uid, calendar_url=None) -> str:
         ev.delete()
         return uid
     raise RuntimeError(f"event UID {uid!r} not found")
-
-
-def sync_to_warehouse(dwh_dir, config_file="", max_runtime_seconds=1500) -> dict:
-    """Sync CalDAV calendars into the warehouse.
-
-    Triggered by ``<!-- clawmeets:calendar-sync-trigger -->``.
-    """
-    window_end = utcnow_iso()
-    cfg, err = load_config(config_file)
-    if err:
-        return {"status": "error", "source": "calendar", "rows_written": 0,
-                "window": [window_end, window_end], "watermarks": None,
-                "has_more": False, "error": err, "per_slice": {}}
-    if cfg is None:
-        return {"status": "noop", "source": "calendar", "rows_written": 0,
-                "window": [window_end, window_end], "watermarks": None,
-                "has_more": False, "error": None, "per_slice": {}}
-    resolved, missing = _resolve(cfg)
-    if missing:
-        return {"status": "error", "source": "calendar", "rows_written": 0,
-                "window": [window_end, window_end], "watermarks": None,
-                "has_more": False,
-                "error": f"unset env vars: {sorted(set(missing))}",
-                "per_slice": {}}
-
-    slices = resolved.get("calendars_to_sync")
-    if not isinstance(slices, list) or len(slices) == 0:
-        return {"status": "noop", "source": "calendar", "rows_written": 0,
-                "window": [window_end, window_end], "watermarks": None,
-                "has_more": False, "error": None, "per_slice": {}}
-
-    caldav_cfg = resolved.get("caldav") or {}
-    lookback = int(resolved.get("sync_lookback_days") or 90)
-    lookahead = int(resolved.get("sync_lookahead_days") or 365)
-    client = _client(caldav_cfg)
-
-    budget = SyncBudget(max_runtime_seconds)
-    return run_slices(
-        source_family="calendar", slices=slices, budget=budget,
-        dwh_dir=dwh_dir,
-        run_one=lambda sc: _sync_one_slice(
-            client=client, slice_cfg=sc, dwh_dir=dwh_dir, budget=budget,
-            lookback_days=lookback, lookahead_days=lookahead),
-    )

@@ -77,7 +77,7 @@ way to cover a role that straddles two domains.
 **Cap the list at 3, and prefer 1.** Every peer mentor is one more serial reply
 the batch waits on before turn 2 can start, and briefs from adjacent domains
 overlap more than they add. Two earns its keep when the role genuinely straddles
-two owners (a data agent needing both the warehouse conventions and the
+two owners (a data agent needing both the schema conventions and the
 compliance rules); past three you are paying latency for redundancy.
 
 **If both switches are OFF**, do not create a project. Register and start the
@@ -183,7 +183,7 @@ knows that the new agent cannot look up: the user's domain and business, house
 conventions, who owns what, the traps, the things that have already gone wrong.
 
 **When you mention more than one, give each a distinct slice in that same
-message** — `@data-eng: the warehouse conventions and the ETL traps;
+message** — `@data-eng: the schema conventions and the pipeline traps;
 @compliance: the retention rules` — because two mentors asked the same open
 question write substantially the same brief twice. Tell each to post it as their
 reply **and** save it to `onboarding-<agent_name>-from-<mentor_name>.md` in this

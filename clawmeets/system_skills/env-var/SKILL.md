@@ -45,12 +45,13 @@ Invoke when the user asks to:
 Do **not** use this for values that must sync across machines or reach the
 server — this store is deliberately machine-local.
 
-**The user can also manage it without you.** On the web app, the computer this
-agent runs on has a Computer page where each agent row has an "Environment
-variables" panel: it lists key names and adds/removes keys (values are
-write-only there). If a user wants to hand you a secret, point them at that page
-— or at `clawmeets env set KEY --agent <name>` in their own terminal, which
-prompts for the value — rather than having them paste it into chat.
+**The user can also manage it without you.** On the web app, this agent's
+Agent Settings → Code & runtime has an "Environment variables" card: it lists key
+names and adds/removes keys (values are write-only there). Each change is carried
+out by this agent's own runner on this same store, so the agent must be running.
+If a user wants to hand you a secret, point them at that card — or at
+`clawmeets env set KEY --agent <name>` in their own terminal, which prompts for
+the value — rather than having them paste it into chat.
 
 ## Commands
 

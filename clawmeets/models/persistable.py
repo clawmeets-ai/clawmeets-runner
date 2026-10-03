@@ -208,6 +208,14 @@ class PersistableParticipant(Participant, ABC):
         return self._id
 
     @property
+    def card_id(self) -> str:
+        """The id recorded in card.json. ``id`` is the id this instance was
+        looked up with, and the folder lookup matches on a name suffix, so the
+        two differ when a caller passed a trailing part of a hyphenated name
+        plus the id."""
+        return self._load_card().get("id", "")
+
+    @property
     def name(self) -> str:
         """Get name from filesystem."""
         return self._load_card().get("name", "")
@@ -282,29 +290,6 @@ class PersistableParticipant(Participant, ABC):
         """Persist a new last-reflection timestamp."""
         card = self._load_card()
         card["last_reflected_at"] = when.isoformat()
-        self._save_card(card)
-
-    @property
-    def last_synced_at(self) -> Optional[datetime]:
-        """Timestamp of the last completed DWH sync cycle (None if never).
-
-        Set when this agent replies to a ``<!-- clawmeets:<source>-sync-trigger -->``
-        DM. ETL replies do NOT touch this field — sync and ETL track separately
-        because a DWH agent can sync without doing any derivation, and the
-        assistant can derive without ever syncing.
-        """
-        ts = self._load_card().get("last_synced_at")
-        if ts:
-            try:
-                return datetime.fromisoformat(ts)
-            except ValueError:
-                pass
-        return None
-
-    def update_last_synced_at(self, when: datetime) -> None:
-        """Persist a new last-sync timestamp."""
-        card = self._load_card()
-        card["last_synced_at"] = when.isoformat()
         self._save_card(card)
 
     @property
@@ -831,7 +816,6 @@ class PersistableParticipant(Participant, ABC):
             model_configs=redact_model_configs(card.get("model_configs") or []),
             default_model_config_name=card.get("default_model_config_name"),
             last_reflected_at=self.last_reflected_at,
-            last_synced_at=self.last_synced_at,
         )
 
     def to_dict(self) -> dict:
@@ -852,7 +836,6 @@ class PersistableParticipant(Participant, ABC):
             "default_invitable_agents": self.default_invitable_agents,
             "default_invitable_teams": self.default_invitable_teams,
             "last_reflected_at": card.get("last_reflected_at"),
-            "last_synced_at": card.get("last_synced_at"),
             "role": self.role.value,
         }
 

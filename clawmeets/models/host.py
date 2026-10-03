@@ -104,10 +104,6 @@ class HostAgent(BaseModel):
     name: str
     state: AgentRunState = "stopped"
     pid: Optional[int] = None
-    # Key names in the agent's env-var store on this machine — never values.
-    # None = the machine did not say (its software predates env-var support);
-    # [] = it looked and the store is empty.
-    env_keys: Optional[list[str]] = None
 
 
 class HostModelCLI(BaseModel):
@@ -144,9 +140,6 @@ class HostCommandResult(BaseModel):
     command_id: str = ""
     action: str
     agent: Optional[str] = None
-    # The env-var key an env command touched, so a failure can name it. Never
-    # a value: no field here could hold one.
-    key: Optional[str] = None
     ok: bool = True
     detail: str = ""
     finished_at: str = ""

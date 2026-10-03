@@ -89,6 +89,9 @@ def save_user_session(
     path.parent.mkdir(parents=True, exist_ok=True)
     config = json.loads(path.read_text()) if path.exists() else {}
     config["server_url"] = server_url
+    # Agent roster written by the retired `clawmeets init` wizard; nothing
+    # reads it — agents are discovered from ~/.clawmeets/agents/.
+    config.pop("agents", None)
     user = config.setdefault("user", {})
     user["username"] = username
     user["token"] = token
@@ -253,15 +256,16 @@ def start_command(
     agent: list[str] = typer.Option(
         None, "--agent", "-a",
         help="Start only the given agent(s); repeatable. Accepts either the short "
-             "name as it appears in settings.json (e.g. 'sf-real-estate-analyst') "
-             "or the prefixed form ('chengtao-sf-real-estate-analyst'). When "
-             "omitted, starts every agent in settings.json plus the assistant.",
+             "name (e.g. 'sf-real-estate-analyst') or the prefixed form "
+             "('chengtao-sf-real-estate-analyst'). When omitted, starts every "
+             "agent the user owns under ~/.clawmeets/agents/.",
     ),
 ) -> None:
     """Start agents in the background.
 
-    Reads agent configuration from the current user's settings.json and starts
-    each agent as a background process. Pass ``--agent`` (repeatable) to start
+    Reads the server URL and username from the current user's settings.json and
+    starts each of their agents under ~/.clawmeets/agents/ as a background
+    process. Pass ``--agent`` (repeatable) to start
     a specific subset; otherwise starts everything.
 
     Example:
@@ -275,9 +279,8 @@ def start_command(
             typer.echo(f"Error: Config file not found: {config_file}", err=True)
             raise typer.Exit(1)
         config = json.loads(config_file.read_text())
-        config_path = config_file
     else:
-        config, config_path = load_user_config(Path(DEFAULT_DATA_DIR), user)
+        config, _ = load_user_config(Path(DEFAULT_DATA_DIR), user)
 
     server_url = server or config.get("server_url", DEFAULT_SERVER)
     agents_dir = _get_agents_dir()
@@ -307,28 +310,9 @@ def start_command(
             typer.echo(f"  Agent '{name}' already running (PID {existing_pid})")
             continue
 
-        # Read agent-specific config from card.json local_settings
-        # (config.json is deprecated — local_settings in card.json is the primary source)
-        knowledge_dir = ""
-        card_path = agent_dir / "card.json"
-        if card_path.exists():
-            try:
-                card_data = json.loads(card_path.read_text())
-                local_settings = card_data.get("local_settings", {})
-                knowledge_dir = local_settings.get("knowledge_dir", "")
-            except json.JSONDecodeError:
-                pass
-
-        # Build command
+        # The runner reads knowledge_dir (and every other local setting) from
+        # card.json itself, resolving relative paths against agent_dir.
         cmd = ["clawmeets", "agent", "run", "--server", server_url, "--agent-dir", str(agent_dir)]
-
-        if knowledge_dir:
-            cmd.extend(["--knowledge-dir", knowledge_dir])
-
-        # Always pass --user-config so the runner can resolve relative
-        # knowledge_dir strings against ~/.clawmeets/config/<username>/ —
-        # the same base cli_init.py used when it wrote CLAUDE.md.
-        cmd.extend(["--user-config", str(config_path)])
 
         stdout_log = agent_dir / "stdout.log"
         stderr_log = agent_dir / "stderr.log"
@@ -338,10 +322,7 @@ def start_command(
 
         pid_file.write_text(str(proc.pid))
 
-        info = f"  Started '{name}' (PID {proc.pid})"
-        if knowledge_dir:
-            info += f" [knowledge: {knowledge_dir}]"
-        typer.echo(info)
+        typer.echo(f"  Started '{name}' (PID {proc.pid})")
         typer.echo(f"    Logs: {stdout_log}")
         started += 1
 

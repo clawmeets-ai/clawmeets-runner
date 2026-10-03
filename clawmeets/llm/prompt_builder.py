@@ -11,7 +11,7 @@ Per-turn prompt layout (worker, coordinator, DM all share):
   2. Role contract       : worker / coordinator / DM behavioural guidance.    ← STATIC
   3. Operational rules   : output schema, file-sharing workflow, memory writes.← STATIC
   4. Runtime context     : knowledge_dirs, memory/, packs/, personal skills,
-                           MCP / skill configs, DWH, invitable allowlist.
+                           MCP / skill configs, invitable allowlist.
   5. Knowledge precedence: authoritative vs fallback layers + trigger markers.
   6. Synced file manifest
   7. Recent chat in this room
@@ -28,6 +28,12 @@ from enum import Enum
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+from ..utils.agent_storage import (
+    LOCAL_STORAGE_ENV,
+    SHARED_STORAGE_ENV,
+    AgentStorage,
+)
 
 from .triggers import derive_role, triggers_for
 
@@ -94,7 +100,6 @@ def _build_knowledge_precedence(
     agent_dir: Path,
     *,
     knowledge_dirs: list[Path] | None = None,
-    dwh_dir: Optional[Path] = None,
 ) -> str:
     """Compact two-layer knowledge-precedence block.
 
@@ -106,8 +111,8 @@ def _build_knowledge_precedence(
     knowledge-index contract (``clawmeets.utils.knowledge_index``): each lists
     its files with a one-line 'consult when', so the agent reads the index,
     matches, and opens only the file it needs. Indexes are surfaced only when
-    they can exist (REFERENCES.md ⇐ a knowledge_dir is configured; the dwh
-    CATALOG.md ⇐ a dwh_dir is configured) to keep the block lean.
+    they can exist (REFERENCES.md ⇐ a knowledge_dir is configured) to keep
+    the block lean.
 
     The trigger-marker list lives in its own section
     (``_build_memory_triggers``) so the precedence rule stays scannable.
@@ -120,14 +125,16 @@ def _build_knowledge_precedence(
         bullets.append(f"  - {memory_dir}/USER.md")
     bullets.append(f"  - {memory_dir}/KNOWLEDGE_PACKS.md       installed packs")
     if knowledge_dirs:
+        kd = " ".join(str(d) for d in knowledge_dirs)
+        kd_flags = " ".join(f"--knowledge-dir {d}" for d in knowledge_dirs)
         bullets.append(
             f"  - {memory_dir}/REFERENCES.md           proprietary reference "
-            "files — auto-indexed: filenames + content previews"
-        )
-    if dwh_dir is not None:
-        bullets.append(
-            f"  - {dwh_dir}/CATALOG.md                 warehouse tables — for "
-            "quantitative / data questions"
+            "files — auto-indexed: filenames + content previews.\n"
+            "    Use it for user-specific domain context (their voice, pricing,\n"
+            "    ICPs, rules, clients). When previews don't pinpoint the file, grep\n"
+            f"    the live files: `grep -ril <term> {kd}`. Read-only; never hand-edit\n"
+            "    REFERENCES.md. If the user says they added/changed files, run\n"
+            f"    `clawmeets knowledge-dir reindex {kd_flags}`."
         )
     authoritative = "\n".join(bullets)
 
@@ -166,15 +173,15 @@ def _build_runtime_context(
     agent_dir: Path,
     data_dir: Path,
     knowledge_dirs: list[Path] | None,
-    dwh_dir: Optional[Path],
     git_url: Optional[str] = None,
     roster_path: Optional[Path] = None,
+    storage: Optional[AgentStorage] = None,
 ) -> str:
     """Compact `== FILES & STATE ==` block listing all the paths the agent
     can read or write.
 
     Replaces the prior set of one-section-per-resource blocks (AGENT MEMORY,
-    KNOWLEDGE PACKS, KNOWLEDGE BASE, DATA WAREHOUSE) which together carried
+    KNOWLEDGE PACKS, KNOWLEDGE BASE) which together carried
     ~30 lines of headers + prose for what is fundamentally a path list.
 
     Per-MCP and per-skill config-file paths used to live here as
@@ -194,6 +201,18 @@ def _build_runtime_context(
         f"- Agent memory (read/write, runner-managed, NOT broadcast to chat) : {agent_dir}/memory/",
         f"- Knowledge packs (auto-synced)     : {agent_dir}/knowledge_packs/",
     ]
+    if storage is not None:
+        lines.append(
+            f"- Local storage (read/write, ${LOCAL_STORAGE_ENV}): {storage.local}  "
+            "(your own files that outlive this project — caches, downloads, datasets; "
+            "not synced to chat)"
+        )
+        lines.append(
+            f"- Shared storage (read/write, ${SHARED_STORAGE_ENV}): {storage.shared}  "
+            "(one folder every agent on this computer reads and writes — hand files to "
+            "another agent here; not synced to chat; linked at "
+            f"{agent_dir}/shared_storage)"
+        )
     if roster_path is not None:
         lines.append(
             f"- Worker-agent roster (read-only)   : {roster_path}  "
@@ -211,8 +230,6 @@ def _build_runtime_context(
         lines.append(
             f"- User-curated reference material (read-only): {kd}"
         )
-    if dwh_dir is not None:
-        lines.append(f"- Data warehouse                    : {dwh_dir}")
     return "\n".join(lines)
 
 
@@ -598,9 +615,11 @@ ever an end of it.
      plan's keeper; a correction, a clarification, a rewording, a question
      about your own reasoning are all yours to make.
      BUT THE ANSWER IS A PROPOSAL, NOT A WRITE. This batch IS the user's
-     review, so from here they decide what the plan says: file your change as
-     a note carrying it — `clawmeets plan note <project> --section <slug> --to
-     user --edit-file <f> -m "why"` — and send the batch. A `plan update` that
+     review, so from here they decide what the plan says: answer each of their
+     notes with a REPLY to it, carrying the change — `clawmeets plan note
+     <project> --reply-to <their note id> --edit-file <f> -m "why"` — and send
+     the batch. The reply closes their note; one you leave open after acting
+     on it shows them a section that changed under their comment. A `plan update` that
      moves what the plan SAYS is refused; your text is not lost, it is filed
      for the user automatically and you get back the note ids. Ticking a
      checkbox, editing an HTML comment, and rewriting `## Milestones` or any
@@ -762,6 +781,7 @@ class PromptBuilder:
     ``_role_contract`` and ``_actions``."""
 
     _git_url: Optional[str] = None
+    _storage: Optional[AgentStorage] = None
 
     def build_file_manifest(self, data_dir: Path) -> str:
         """Public alias kept for any callsite that still uses it directly."""
@@ -794,7 +814,6 @@ class PromptBuilder:
         agent_dir: Path,
         data_dir: Path,
         knowledge_dirs: list[Path] | None,
-        dwh_dir: Optional[Path],
         extra_context: str,
         from_participant_name: str,
         message_content: str,
@@ -827,8 +846,8 @@ class PromptBuilder:
             agent_dir=agent_dir,
             data_dir=data_dir,
             knowledge_dirs=knowledge_dirs,
-            dwh_dir=dwh_dir,
             git_url=self._git_url,
+            storage=self._storage,
             # Only coordinators that actually delegate need the roster path. The
             # roster is the GLOBAL agent registry at the agent root — NOT inside
             # the synced project files (a frequent prompt-vs-reality mismatch that
@@ -843,7 +862,7 @@ class PromptBuilder:
             ),
         )
         precedence = _build_knowledge_precedence(
-            name, agent_dir, knowledge_dirs=knowledge_dirs, dwh_dir=dwh_dir,
+            name, agent_dir, knowledge_dirs=knowledge_dirs,
         )
         role = derive_role(name, is_coordinator=self._is_coordinator())
         triggers = _build_memory_triggers(role)
@@ -891,10 +910,12 @@ class WorkerPromptBuilder(PromptBuilder):
         coordinator_name: str,
         capabilities: Optional[list[str]] = None,
         git_url: Optional[str] = None,
+        storage: Optional[AgentStorage] = None,
     ) -> None:
         self._coordinator_name = coordinator_name
         self._capabilities = capabilities or []
         self._git_url = git_url
+        self._storage = storage
         self._is_dm = False
         # set per-build; None on a DM and on any project with no seeded plan.
         self._plan: Optional[PlanPromptState] = None
@@ -1038,7 +1059,6 @@ you directly within your area of expertise.
         agent_dir: Path,
         knowledge_dirs: list[Path] | None = None,
         is_dm: bool = False,
-        dwh_dir: Optional[Path] = None,
         chat_history: list[tuple[str, str]] | None = None,
         plan: Optional[PlanPromptState] = None,
     ) -> str:
@@ -1065,7 +1085,6 @@ you directly within your area of expertise.
             agent_dir=agent_dir,
             data_dir=data_dir,
             knowledge_dirs=knowledge_dirs,
-            dwh_dir=dwh_dir,
             extra_context="",
             from_participant_name=from_participant_name,
             message_content=message_content,
@@ -1089,8 +1108,13 @@ class CoordinatorPromptBuilder(PromptBuilder):
         PLAN.md / milestone framing, treats each message as self-contained.
     """
 
-    def __init__(self, git_url: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        git_url: Optional[str] = None,
+        storage: Optional[AgentStorage] = None,
+    ) -> None:
         self._git_url = git_url
+        self._storage = storage
         self._is_dm = False
         # True when the DM-shaped project is the user's own assistant DM
         # (project.created_by == coordinator.registered_by). False for an
@@ -1417,50 +1441,42 @@ written in the roster (not IDs, and do not add suffixes like '-agent')."""
                 "validated with the agents or one you did not."
             )
         if plan.user_has_reviewed and plan.phase != "executing":
-            # **THE PRE-ACCEPTANCE HALF, AND ITS VERB IS NOW THE OPPOSITE ONE.**
-            # This paragraph used to say *"the user has reviewed this, so
-            # propose, do not write"* — the spec lock started at the first
-            # review round. It starts at acceptance again
-            # (`project_plan._spec_is_locked`), so the same turn that used to be
-            # refused now lands and owes a receipt instead. Saying the old thing
-            # here would tell a coordinator to file proposals the server no
-            # longer needs and to fear a refusal it will never meet.
+            # **THE PRE-ACCEPTANCE HALF.** The spec lock starts at the user's
+            # first review (`project_plan._spec_is_locked`), so from here a
+            # change to what the plan says is a proposal the user accepts — the
+            # server refuses a direct write and files it as one anyway. Saying
+            # so up front is what keeps the coordinator from meeting that
+            # refusal and inventing a reason for it.
             #
             # `phase != "executing"` is not a second copy of the server's rule —
             # it only keeps this from printing beside the ACCEPTED paragraph
             # above, which says the post-acceptance contract in its own words.
             lines.append(
-                "THE USER HAS REVIEWED THIS PLAN — and until they ACCEPT it, "
-                "you are still its writer. Do not switch to proposals.\n"
-                "Fold every agent's feedback and every remark of theirs "
-                "straight into the document: `clawmeets plan update <project> "
-                "--section <slug> --body-file <f> --why \"...\"`. The user is "
-                "reading the PLAN, not your diffs — before acceptance there is "
-                "no agreed baseline for a diff to be a change *to*, so a "
-                "half-accepted set of hunks leaves the plan in a state nobody "
-                "designed.\n"
-                "`--why` is REQUIRED on any write that moves what the plan "
-                "SAYS, and the server refuses the write without it. It is a "
-                "CHANGELOG LINE — the change and its cause, in one sentence:\n"
-                "  GOOD  \"M2 now owns auth setup, moved out of M3 — backend "
-                "flagged M3's endpoints cannot be built before it\"\n"
-                "  BAD   \"incorporated feedback from all agents\"\n"
-                "The user answers by naming one of those lines. A line they "
-                "cannot name forces them to re-read the whole document to "
-                "object to one thing, which is the cost this whole shape exists "
-                "to avoid. Each write files a receipt carrying the line; they "
-                "read the receipts as one changelog at their next round.\n"
-                "Ticking a checkbox, editing an HTML comment, reflowing text "
-                "and rewriting `## Milestones` or any other "
-                "`<!-- layer: detail -->` section need no `--why` at all — the "
-                "schedule is yours.\n"
-                "Send a `plan note --to user` only for what genuinely needs "
-                "THEIR judgment — a trade-off, a scope call, two agents who "
-                "disagree. Then `clawmeets plan review <project>`, and say in "
-                "`user-communication` what moved and ask for their acceptance.\n"
-                "Batch, don't drip: one round of feedback folded in and sent as "
-                "one review costs the user one message, where five separate "
-                "rounds cost them five."
+                "THE USER HAS REVIEWED THIS PLAN. From now on they read DIFFS "
+                "and comments, never a document that moved unnoticed — so you "
+                "no longer write what it SAYS directly. A `clawmeets plan "
+                "update` that changes a spec section is REFUSED and filed for "
+                "them as a proposal.\n"
+                "ANSWER EVERY NOTE OF THEIRS WITH A REPLY TO IT — `--reply-to "
+                "<their note id>`. The reply closes their note and reaches "
+                "them; a note of theirs left open after you acted on it reads "
+                "to them as a section that changed under their comment.\n"
+                "  - It asks for a change → propose it, as the section's WHOLE "
+                "new text: `clawmeets plan note <project> --reply-to <id> "
+                "--edit-file <section.md> -m \"what this changes\"`. They get a "
+                "diff with Accept and Reject.\n"
+                "  - It is a question, or needs nothing changed → `clawmeets "
+                "plan note <project> --reply-to <id> -m \"...\"`.\n"
+                "When one answer touches several sections, file every proposal "
+                "in the SAME turn and name the others in each `-m` (\"pairs "
+                "with the AC-2 proposal\"), so they are never left accepting "
+                "half of a change. Then `clawmeets plan review <project>` sends "
+                "them as ONE round — five notes in one round is one message, "
+                "five rounds is five.\n"
+                "Ticking a checkbox, editing an HTML comment and rewriting `## "
+                "Milestones` or any other `<!-- layer: detail -->` section "
+                "still land directly — the schedule is yours. Say in "
+                "`user-communication` that you re-planned."
             )
         if plan.phase == "spec-ing":
             lines.append(_RELAY_PROCEDURE)
@@ -2127,7 +2143,6 @@ Use @-mentions in the workroom's init_message to address invited agents.
         project_name: str,
         agent_dir: Path,
         knowledge_dirs: list[Path] | None = None,
-        dwh_dir: Optional[Path] = None,
         is_dm: bool = False,
         dm_is_owned: bool = True,
         invitable_agents: Optional[list[str]] = None,
@@ -2169,7 +2184,6 @@ Use @-mentions in the workroom's init_message to address invited agents.
             agent_dir=agent_dir,
             data_dir=data_dir,
             knowledge_dirs=knowledge_dirs,
-            dwh_dir=dwh_dir,
             extra_context=self._build_extra_context(),
             from_participant_name=from_participant_name,
             message_content=message_content,
@@ -2188,7 +2202,6 @@ Use @-mentions in the workroom's init_message to address invited agents.
         project_name: str,
         agent_dir: Path,
         knowledge_dirs: list[Path] | None = None,
-        dwh_dir: Optional[Path] = None,
         invitable_agents: Optional[list[str]] = None,
         plan_phase: Optional[str] = None,
     ) -> str:
@@ -2213,7 +2226,6 @@ Use @-mentions in the workroom's init_message to address invited agents.
             agent_dir=agent_dir,
             data_dir=data_dir,
             knowledge_dirs=knowledge_dirs,
-            dwh_dir=dwh_dir,
             extra_context=self._build_extra_context(),
             from_participant_name="user",
             message_content=message_content,
@@ -2231,6 +2243,7 @@ def create_prompt_builder(
     capabilities: Optional[list[str]] = None,
     coordinator_name: Optional[str] = None,
     git_url: Optional[str] = None,
+    storage: Optional[AgentStorage] = None,
 ) -> PromptBuilder:
     """Create a prompt builder based on operational mode.
 
@@ -2240,16 +2253,19 @@ def create_prompt_builder(
         coordinator_name: Required for WORKER mode.
         git_url: The agent's bound git repo (from card.json local_settings),
             surfaced as a one-line nudge in FILES & STATE. None when unbound.
+        storage: The agent's local + shared storage folders, listed in
+            FILES & STATE. None off the runner.
 
     Raises:
         ValueError: If mode is WORKER and ``coordinator_name`` is None.
     """
     if mode == OperationalMode.COORDINATOR:
-        return CoordinatorPromptBuilder(git_url=git_url)
+        return CoordinatorPromptBuilder(git_url=git_url, storage=storage)
     if coordinator_name is None:
         raise ValueError("coordinator_name is required for WORKER mode")
     return WorkerPromptBuilder(
         coordinator_name=coordinator_name,
         capabilities=capabilities,
         git_url=git_url,
+        storage=storage,
     )

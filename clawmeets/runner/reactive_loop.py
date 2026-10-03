@@ -15,13 +15,21 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 import httpx
 
-from clawmeets.api.control import AgentRegistryChangePayload, AgentSettingsChangePayload, AgentStatusChangePayload, CancelLLMPayload, ChangelogUpdatePayload, ControlMessageType, KnowledgePackSyncPayload, McpAuthCodePayload, McpSyncPayload, ProjectDeletedPayload, SkillAuthCodePayload, SkillSyncPayload
+from clawmeets.api.control import AgentEnvRequestPayload, AgentRegistryChangePayload, AgentSettingsChangePayload, AgentStatusChangePayload, CancelLLMPayload, ChangelogUpdatePayload, ControlMessageType, KnowledgePackSyncPayload, McpAuthCodePayload, McpSyncPayload, ProjectDeletedPayload, SkillAuthCodePayload, SkillSyncPayload
 from clawmeets.models.agent import Agent
 from clawmeets.models.context import ModelContext
+from clawmeets.runner.agent_dir_readmes import write_agent_dir_readmes
 from clawmeets.runner.references_index import build_references_index
 from clawmeets.sync.changelog import ChangelogEntry
 from clawmeets.sync.runloop_manager import ChangelogRunloopManager
 from clawmeets.sync.subscriber import ChangelogSubscriber
+from clawmeets.utils import env_store
+from clawmeets.utils.agent_storage import (
+    LOCAL_STORAGE_KEY,
+    SHARED_STORAGE_KEY,
+    ensure_storage,
+    resolve_storage,
+)
 from clawmeets.utils.file_io import FileUtil
 from clawmeets.utils.notification_center import LLM_COMPLETE, LLM_ERROR
 
@@ -96,7 +104,6 @@ class ReactiveControlLoop:
         skill_manager: "SkillManager | None" = None,
         mcp_manager: "McpManager | None" = None,
         knowledge_pack_manager: "KnowledgePackManager | None" = None,
-        user_config_dir: Optional[Path] = None,
         cli_factory: Optional[Callable[[dict], "LLMProvider"]] = None,
         owner_username: Optional[str] = None,
         agent_env: Optional[dict] = None,
@@ -111,9 +118,6 @@ class ReactiveControlLoop:
             model_ctx: Shared ModelContext for filesystem I/O (should have client configured)
             extra_subscribers: Additional changelog subscribers to insert between
                                ModelContext and ParticipantNotifier (pass [] if none)
-            user_config_dir: Base for resolving relative knowledge_dir values from
-                             local_settings (usually ~/.clawmeets/config/<username>/).
-                             Hot-update applies this base on AGENT_SETTINGS_CHANGE.
             owner_username: This runner's owner username, known at startup from
                             credential.json. Used to derive the AGENTS.md roster
                             namespace WITHOUT depending on ``participant.name`` —
@@ -130,7 +134,6 @@ class ReactiveControlLoop:
         self._skill_manager = skill_manager
         self._mcp_manager = mcp_manager
         self._knowledge_pack_manager = knowledge_pack_manager
-        self._user_config_dir = user_config_dir
         self._cli_factory = cli_factory
         # Shared with cli_factory's closure: mutating the git keys here updates
         # the env the next-built CLI captures (CLI providers copy agent_env at
@@ -395,6 +398,16 @@ class ReactiveControlLoop:
                             model_configs=payload.model_configs,
                             default_model_config_name=payload.default_model_config_name,
                         )
+
+            case ControlMessageType.AGENT_ENV_REQUEST:
+                payload: AgentEnvRequestPayload = envelope.payload
+                if payload.agent_id != self._participant.id:
+                    logger.warning(
+                        f"AGENT_ENV_REQUEST routed to wrong participant: "
+                        f"target={payload.agent_id[:8]} self={self._participant.id[:8]} — ignoring"
+                    )
+                else:
+                    await self._answer_env_request(payload)
 
             case ControlMessageType.AGENT_REGISTRY_CHANGE:
                 # A peer agent (owned by this runner's owner) was registered,
@@ -928,6 +941,51 @@ class ReactiveControlLoop:
             )
 
     # ─────────────────────────────────────────────────────────
+    # Env-var store (Agent Settings → Environment variables)
+    # ─────────────────────────────────────────────────────────
+
+    async def _answer_env_request(self, payload: AgentEnvRequestPayload) -> None:
+        """Perform one list/set/unset against this agent's env store and answer.
+
+        The same ``env_store`` calls ``clawmeets env`` makes, on the same
+        ``{agent_dir}/env.json``, so a key set from the web and one set in a
+        terminal are indistinguishable. A set takes effect on the next turn
+        (the store is read live at spawn time). The value is never logged and
+        never part of the answer — only key names go back.
+        """
+        agent_dir = self._model_ctx.participants_dir
+        ok, detail = True, ""
+        try:
+            if payload.action == "set":
+                if payload.value is None:
+                    raise ValueError(f"setting {payload.key} needs a value")
+                env_store.set_var(agent_dir, payload.key or "", payload.value)
+                detail = f"Set {payload.key}"
+            elif payload.action == "unset":
+                env_store.validate_key(payload.key or "")
+                removed = env_store.unset_var(agent_dir, payload.key or "")
+                detail = f"Removed {payload.key}" if removed else f"{payload.key} was not set"
+            elif payload.action != "list":
+                raise ValueError(f"unknown env action {payload.action!r}")
+        except (ValueError, OSError) as e:
+            ok, detail = False, str(e)
+        logger.info(
+            f"Env request {payload.action!r}"
+            f"{f' key {payload.key!r}' if payload.key else ''}: "
+            f"{'ok' if ok else 'failed'}"
+        )
+        try:
+            await self._client.post_env_request_answer(
+                self._participant.id,
+                payload.request_id,
+                ok=ok,
+                detail=detail,
+                keys=env_store.key_names(agent_dir),
+            )
+        except httpx.HTTPError as e:
+            logger.warning(f"Could not answer env request {payload.request_id[:8]}: {e}")
+
+    # ─────────────────────────────────────────────────────────
     # Self-card
     # ─────────────────────────────────────────────────────────
 
@@ -1052,6 +1110,21 @@ class ReactiveControlLoop:
                     self._agent_env.pop(env_key, None)
             self._model_ctx.update_git_url(local_settings.get("git_url") or None)
 
+        # Storage folders — same shape as the git binding: re-resolve, create,
+        # and republish $AGENT_LOCAL_STORAGE_DIR / $AGENT_SHARED_STORAGE_DIR on
+        # the shared agent_env, folded into the CLI rebuild below.
+        storage_changed = any(
+            local_settings.get(k) != prior_settings.get(k)
+            for k in (LOCAL_STORAGE_KEY, SHARED_STORAGE_KEY)
+        )
+        if storage_changed:
+            agent_dir = self._model_ctx.base_dir
+            storage = resolve_storage(agent_dir, local_settings)
+            ensure_storage(agent_dir, storage)
+            self._agent_env.update(storage.env())
+            self._model_ctx.update_storage(storage)
+            write_agent_dir_readmes(agent_dir, storage)
+
         # Hot-swap the LLM CLI if any provider-affecting setting changed (or the
         # git env changed — the rebuilt CLI re-captures the updated agent_env).
         # The factory is passed in by cli_runner.py and closes over plugin_dirs /
@@ -1069,7 +1142,7 @@ class ReactiveControlLoop:
         llm_changed = any(
             local_settings.get(k) != prior_settings.get(k) for k in llm_keys
         )
-        if self._cli_factory is not None and (llm_changed or git_changed):
+        if self._cli_factory is not None and (llm_changed or git_changed or storage_changed):
             new_provider = local_settings.get("llm_provider") or "claude"
             new_model = local_settings.get("llm_model") or None
             try:
@@ -1088,11 +1161,11 @@ class ReactiveControlLoop:
                     exc_info=True,
                 )
 
-        # Update knowledge_dirs — resolve the same way cli_runner does at
-        # startup so a hot update of `./owner` lands on the same folder as
-        # the initial load.
+        # Update knowledge_dirs — resolve against AGENT_DIR the same way
+        # cli_runner does at startup so a hot update of `./knowledge` lands
+        # on the same folder as the initial load.
         knowledge_dir = local_settings.get("knowledge_dir", "")
-        resolved = FileUtil.resolve_local_dir(knowledge_dir, self._user_config_dir)
+        resolved = FileUtil.resolve_local_dir(knowledge_dir, self._model_ctx.base_dir)
         new_dirs = [resolved] if resolved is not None else []
         self._model_ctx.update_knowledge_dirs(new_dirs)
 
@@ -1101,12 +1174,6 @@ class ReactiveControlLoop:
         # without restart (same builder cli_runner uses at startup).
         if local_settings.get("knowledge_dir") != prior_settings.get("knowledge_dir"):
             build_references_index(self._model_ctx.memory_dir, new_dirs)
-
-        # Update dwh_dir (personal data warehouse root). Same resolution as
-        # the initial load. None clears the prompt block.
-        raw_dwh_dir = local_settings.get("dwh_dir", "")
-        resolved_dwh = FileUtil.resolve_local_dir(raw_dwh_dir, self._user_config_dir) if raw_dwh_dir else None
-        self._model_ctx.update_dwh_dir(resolved_dwh)
 
         # Per-MCP config write-through. Diff against prior to avoid rewriting
         # config.json when only knowledge_dir / llm_* changed.
@@ -1137,7 +1204,6 @@ class ReactiveControlLoop:
         logger.info(
             f"Applied local_settings for {self._participant.name}: "
             f"knowledge_dir={knowledge_dir!r}, "
-            f"dwh_dir={raw_dwh_dir!r}, "
             f"llm_provider={local_settings.get('llm_provider')!r}, "
             f"llm_model={local_settings.get('llm_model')!r}"
         )
