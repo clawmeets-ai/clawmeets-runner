@@ -81,7 +81,7 @@ MAX_BODY_CHARS = 16_384
 #
 # The ``SYSTEM:`` prefix is not decoration and not an enum. Titles of the form
 # ``Prefix:Name`` group the rail into sections (``utils/sopSection.ts`` in the
-# frontend derives the section from the prefix), so the three platform SOPs land
+# frontend derives the section from the prefix), so the four platform SOPs land
 # under one SYSTEM heading and stay out of the owner's own list. The eight
 # ``SOLOPRENEUR:`` rows after them are a numbered playbook (register an investor,
 # validate the idea, ... build the product) and file under their own heading;
@@ -194,6 +194,82 @@ SEED: tuple[dict[str, str], ...] = (
             "there is no undo. Once I approve, create it with that roster and "
             "those milestones, and tell me anything you need from me that would "
             "otherwise block the work."
+        ),
+    },
+    {
+        "id": "sop-seed-convene-panel",
+        "title": "SYSTEM:Convene panel",
+        "body": (
+            "Convene a panel: have several agents answer the same question "
+            "independently, then reconcile their findings until they agree or "
+            "until the remaining disagreement is clear enough for me to "
+            "decide.\n"
+            "\n"
+            "  Question:   {{Question|text:Is NVDA a buy at today's price on a "
+            "3-year horizon? Give bull, base and bear cases with a price "
+            "target for each}}\n"
+            "  Panel:      {{Panel|agents}}\n"
+            "  Max rounds: {{Max rounds|number:3}}\n"
+            "  Consensus:  {{Consensus bar|select:unanimous,supermajority,"
+            "majority}}\n"
+            "\n"
+            "Create a project with the panel. You moderate: you run the loop "
+            "and keep the ledger, but you do not vote and do not add your own "
+            "view. Keep the ledger and each round's tracker as files in the "
+            "project.\n"
+            "\n"
+            "A. Blind round. Open one room per panelist and send every "
+            "panelist the identical brief at the same time, so they all work "
+            "in parallel. Tell each panelist to work only in its own room and "
+            "not to open another panelist's room until you publish the claim "
+            "ledger. Each answers with: a conclusion, a confidence level, the "
+            "key claims with the evidence or source behind each one, its "
+            "assumptions stated explicitly, and what would change its mind.\n"
+            "\n"
+            "B. Claim ledger. Once every answer is in, merge them into one "
+            "claim ledger: one row per claim, listing which panelists support "
+            "it, which dispute it, the evidence each side gave, and a status "
+            "(agreed or open). Publish it to the whole panel.\n"
+            "\n"
+            "C. Reconciliation loop. Repeat the following until a stop "
+            "condition is met.\n"
+            "  1. Each panelist, in its own room and in parallel with the "
+            "others, goes through every open ledger item and answers each one "
+            "with:\n"
+            "       - hold: rebut with evidence, a source, a comparable, or "
+            "first-principles reasoning;\n"
+            "       - concede: name the specific fact or reasoning step that "
+            "changed its view (\"the others agree\" is not a reason); or\n"
+            "       - refine: restate the claim more narrowly so it can be "
+            "agreed.\n"
+            "     A new claim is allowed only with evidence, and enters the "
+            "ledger as open.\n"
+            "  2. Record every answer in this round's tracker: one row per "
+            "open ledger item, one column per panelist.\n"
+            "  3. Close the round yourself by reconciling the tracker into the "
+            "ledger:\n"
+            "       - every panelist accepts the item: mark it agreed;\n"
+            "       - a factual dispute: check the source, settle it, and "
+            "record how;\n"
+            "       - the split comes from a hidden assumption: name the "
+            "assumption and split the item into one branch per assumption, "
+            "with the conclusion under each;\n"
+            "       - the facts are agreed but weighed differently: mark it a "
+            "judgment call, write both sides down, and take it out of the "
+            "loop.\n"
+            "     Publish the updated ledger to the panel.\n"
+            "  Stop when any of these is true:\n"
+            "    - the consensus bar is met on the conclusion;\n"
+            "    - the max rounds have been run;\n"
+            "    - no substantial progress: a round ends with no ledger item "
+            "changing status and no panelist changing its position.\n"
+            "\n"
+            "D. Report back with: the consensus conclusion and its confidence "
+            "(or \"no consensus\"), and which stop condition ended the loop; "
+            "the points everyone agreed on; the disputes that were settled and "
+            "how; the open disagreements side by side, each with the evidence "
+            "that would resolve it; and the final position of each panelist. "
+            "Never average the positions together, and never hide a dissent."
         ),
     },
     {

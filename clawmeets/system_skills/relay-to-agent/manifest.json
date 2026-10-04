@@ -1,0 +1,6 @@
+{
+  "audiences": ["worker", "coordinator"],
+  "surfaces": ["agent_runtime"],
+  "version": "1.0.0",
+  "description": "When the user asks you to pass something to another of their agents, write it as one self-contained reply the user hands on with the Forward button."
+}
