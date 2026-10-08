@@ -108,6 +108,7 @@ cannot drift.
 | `clawmeets plan conflicts` | Blocked writes, beside what each section says now, with the fix. |
 | `clawmeets plan consult` | Sync the specialist roster into `shared-context` so you can reach them there. |
 | `clawmeets plan create` | Create PLAN.md from `--body-file` or the one template. 409 if it exists. |
+| `clawmeets plan decision` | Record whether the project request is a decision: yes or no. |
 | `clawmeets plan list-notes` | List notes, filtered on any documented axis. `--thread` reads a thread. |
 | `clawmeets plan note` | File a note: a comment, with or without a proposal. The user and the coordinator only. |
 | `clawmeets plan resolve` | Close a note out: `--apply` / `--reject` / `--answered` / `--dismiss`. |
@@ -361,6 +362,27 @@ text rode along.**
 **The coordinator files it, not the agent that hit the problem.** A deviation is
 a plan note, so the two-party table above applies unchanged: a specialist raises
 it with the coordinator in the workroom and the coordinator files it.
+
+## Is the request a decision? `plan decision` (coordinator)
+
+When you draft the plan, record whether the project request is a DECISION:
+
+```bash
+clawmeets plan decision <project> yes|no
+```
+
+"yes" when the user ultimately has to choose (should I / which / whether /
+compare X to pick one / research that feeds a choice). "no" for build,
+produce, or ongoing-operations work. Set it once while drafting; it does not
+change the plan text and the user never sees the flag itself. It lives on the
+plan's sidecar, so it is never spec-locked and never makes a new plan version.
+A "yes" lets the Plan tab offer the user their `thought_partner` before they
+accept; a "no", or never setting it, shows nothing.
+
+Run it as-is inside your runner: your agent identity resolves the project by
+name. Passing your agent token by hand needs your agent id with it
+(`--token <agent-token> --agent-id <agent-id>`); a token alone resolves to
+nobody and the name lookup fails with `401`.
 
 ## Writing, if you may: `plan update`
 

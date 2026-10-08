@@ -1099,6 +1099,26 @@ class PlanHistoryEntry(BaseModel):
     detail: str = ""
 
 
+#: The four things the Plan tab's thought_partner nudge can report, in the
+#: order a user meets them. ``held_back`` is the line NOT shown because the
+#: viewer owns no agent named exactly ``thought_partner``.
+NUDGE_EVENTS: tuple[str, ...] = ("shown", "accepted", "dismissed", "held_back")
+
+
+class PlanNudge(BaseModel):
+    """First-occurrence stamps for the decision nudge; ``""`` = never.
+
+    Stamped only if empty (:func:`record_nudge_event`), so each one counts a
+    project, not a render. ``dismissed_at`` is also the switch that keeps the
+    line hidden for this project on every later load.
+    """
+
+    shown_at: str = ""
+    accepted_at: str = ""
+    dismissed_at: str = ""
+    held_back_at: str = ""
+
+
 class ProjectPlan(BaseModel):
     """The sidecar. It never contains the document body."""
 
@@ -1205,6 +1225,15 @@ class ProjectPlan(BaseModel):
     #: Author-agnostic on purpose: an owner-opened round means the user was IN
     #: the document, which is the same fact from the other side.
     first_offered_at: str = ""
+    #: **Is this project's request a decision?** The coordinator's yes/no,
+    #: recorded once while drafting (``clawmeets plan decision``) through
+    #: :func:`set_decision`. ``None`` = never set, which every reader treats as
+    #: no. Kept here and not in PLAN.md so it never shows in the user's text, is
+    #: never spec-locked, and setting it makes no plan revision.
+    decision: bool | None = None
+    #: The Plan tab nudge's first-occurrence stamps. Written only by
+    #: :func:`record_nudge_event`; nothing about the document reads it.
+    nudge: PlanNudge = Field(default_factory=PlanNudge)
     created_at: str = ""
     updated_at: str = ""
 
@@ -5624,6 +5653,85 @@ async def discard_draft(project: "Project", ctx: "ModelContext", *, by: str) -> 
         plan = _load(project, ctx)
         plan.draft = None
         _save(project, ctx, plan)
+
+
+# ---------------------------------------------------------------------------
+# The decision flag and its nudge — sidecar-only, never the document
+# ---------------------------------------------------------------------------
+
+
+#: The one name that makes an agent "your thought_partner" — the rule the
+#: start view and the Plan tab's ``findThoughtPartner`` use. By name, exactly:
+#: skills are never consulted, so a ``coach`` carrying ``grill-me`` does not
+#: count.
+THOUGHT_PARTNER_NAME = "thought_partner"
+
+
+def owns_thought_partner(user_id: str, ctx: "ModelContext") -> bool:
+    """Does this user own an agent whose short name is exactly
+    :data:`THOUGHT_PARTNER_NAME`? Ownership is checked on the agent itself, so
+    another user's public ``thought_partner`` never satisfies it."""
+    from clawmeets.models.user import User
+
+    if not user_id:
+        return False
+    user = User.get(user_id, ctx)
+    names = [THOUGHT_PARTNER_NAME]
+    if user is not None:
+        names.insert(0, f"{user.username}-{THOUGHT_PARTNER_NAME}")
+    for name in names:
+        agent = Agent.get_by_name(name, ctx)
+        if agent is not None and agent.registered_by == user_id:
+            return True
+    return False
+
+
+async def set_decision(
+    project: "Project", ctx: "ModelContext", *, by: str, decision: bool
+) -> bool:
+    """``PUT /plan/decision``. Record whether the project request is a decision.
+
+    The keeper (the coordinator, who drafts) or the owner; last write wins.
+    Touches ``decision`` and nothing else: no history row, no revision, no byte
+    of PLAN.md — the user never sees the flag itself, only the nudge it allows.
+    """
+    if not may_write(project, by):
+        raise PlanForbiddenError(
+            f"@{by} may not set whether this project is a decision — "
+            f"the coordinator records it while drafting."
+        )
+    async with _lock:
+        if not _body_exists(project, ctx):
+            raise PlanNotFoundError(f"Project {project.id!r} has no {PLAN_FILE}")
+        plan = _load(project, ctx)
+        plan.decision = decision
+        _save(project, ctx, plan)
+        return decision
+
+
+async def record_nudge_event(
+    project: "Project", ctx: "ModelContext", *, by: str, event: str
+) -> tuple[PlanNudge, bool]:
+    """``POST /plan/nudge``. Stamp ``<event>_at`` if it is still empty.
+
+    ``(nudge, stamped)``. Owner only — the nudge is shown to them. Idempotent:
+    a repeat changes nothing and writes nothing. Touches ``nudge`` alone, so no
+    event can move the document, the tray, the notes or the acceptance.
+    """
+    if by != OWNER:
+        raise PlanForbiddenError("The decision nudge is the owner's")
+    if event not in NUDGE_EVENTS:
+        raise PlanInputError(f"Unknown nudge event {event!r}")
+    async with _lock:
+        if not _body_exists(project, ctx):
+            raise PlanNotFoundError(f"Project {project.id!r} has no {PLAN_FILE}")
+        plan = _load(project, ctx)
+        field = f"{event}_at"
+        if getattr(plan.nudge, field):
+            return plan.nudge, False
+        setattr(plan.nudge, field, _now())
+        _save(project, ctx, plan)
+        return plan.nudge, True
 
 
 # ---------------------------------------------------------------------------

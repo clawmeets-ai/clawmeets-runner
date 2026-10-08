@@ -34,7 +34,7 @@ from ..llm.prompt_builder import (
 )
 from ..llm.triggers import derive_role
 from ..runner.invocation_registry import invoke_with_registry as _invoke_with_registry
-from ..sync.changelog import ProjectStatus
+from ..sync.changelog import ProjectStatus, is_contact_id
 from ..utils.file_io import FileUtil
 
 if TYPE_CHECKING:
@@ -1385,6 +1385,11 @@ class Agent(PersistableParticipant):
         """
         if project.is_frontdesk_project:
             sender = message.from_participant_id
+            # An outside contact is the requester of a channel thread. Named on
+            # purpose rather than left to the agent-negative fall-through, so a
+            # change to that test can't silently stop channel threads titling.
+            if is_contact_id(sender):
+                return sender
             if (
                 not sender
                 or sender == self._id
@@ -1499,6 +1504,7 @@ class Agent(PersistableParticipant):
             capabilities=self.capabilities,
             git_url=self._model_ctx.git_url,
             storage=self._model_ctx.storage,
+            extra_dirs=self._model_ctx.extra_dirs,
         )
 
         is_dm = project.is_dm_shaped  # owned DM OR Front Desk end -> DM prompt variant
@@ -1523,7 +1529,7 @@ class Agent(PersistableParticipant):
             description=self.description,
             project_id=project_id,
             chatroom_name=chatroom_name,
-            from_participant_name=message.from_participant_name or message.from_participant_id,
+            from_participant_name=message.prompt_sender_label,
             message_content=inbound_content,
             data_dir=data_dir,
             project_name=project.name,
@@ -1656,8 +1662,9 @@ class Agent(PersistableParticipant):
         invoke site.
 
         Order: the synced project data dir (only when distinct from the
-        sandbox cwd), the knowledge dirs, the agent ``memory_dir``, then the
-        local + shared storage folders (both may live outside the agent dir). The
+        sandbox cwd), the knowledge dirs, the agent ``memory_dir``, the
+        local + shared storage folders (both may live outside the agent dir),
+        then the configured extra directories. The
         memory dir is appended so every provider that gates file access on the
         allow-list (gemini ``--include-directories``, codex/claude
         ``--add-dir``) can reach ``memory/`` — the reflect/personalize
@@ -1673,6 +1680,7 @@ class Agent(PersistableParticipant):
         storage = self._model_ctx.storage
         if storage is not None:
             dirs.extend([storage.local, storage.shared])
+        dirs.extend(self._model_ctx.extra_dirs)
         return dirs
 
     async def _invoke_with_transient_retry(
@@ -2238,6 +2246,7 @@ class Agent(PersistableParticipant):
             OperationalMode.COORDINATOR,
             git_url=self._model_ctx.git_url,
             storage=self._model_ctx.storage,
+            extra_dirs=self._model_ctx.extra_dirs,
         )
         assert isinstance(coordinator_builder, CoordinatorPromptBuilder)
 
@@ -2338,6 +2347,7 @@ class Agent(PersistableParticipant):
             OperationalMode.COORDINATOR,
             git_url=self._model_ctx.git_url,
             storage=self._model_ctx.storage,
+            extra_dirs=self._model_ctx.extra_dirs,
         )
         assert isinstance(coordinator_builder, CoordinatorPromptBuilder)
 
@@ -2361,7 +2371,7 @@ class Agent(PersistableParticipant):
                 description=self.description,
                 project_id=project_id,
                 chatroom_name=chatroom_name,
-                from_participant_name=message.from_participant_name or message.from_participant_id,
+                from_participant_name=message.prompt_sender_label,
                 message_content=message.content,
                 data_dir=data_dir,
                 project_name=project.name,
@@ -2488,6 +2498,7 @@ class Agent(PersistableParticipant):
             OperationalMode.COORDINATOR,
             git_url=self._model_ctx.git_url,
             storage=self._model_ctx.storage,
+            extra_dirs=self._model_ctx.extra_dirs,
         )
         assert isinstance(prompt_builder, CoordinatorPromptBuilder)
 
@@ -2505,7 +2516,7 @@ class Agent(PersistableParticipant):
             description=self.description,
             project_id=project_id,
             chatroom_name=chatroom_name,
-            from_participant_name=message.from_participant_name or message.from_participant_id,
+            from_participant_name=message.prompt_sender_label,
             message_content=message.content,
             data_dir=data_dir,
             project_name=project.name,

@@ -43,7 +43,7 @@ The personal assistant should already exist (run
    Welcome page if uncertain): `career`, `customer_success`, `data`,
    `engineering`, `finance`, `information`, `marketing`, `memories`,
    `news`, `nyc`, `personal_data`, `restaurant`, `retail`, `sales`,
-   `shopping`, `solopreneur`, `chess`.
+   `shopping`, `solopreneur`, `thinking`, `chess`.
 
 3. **Optional: ask whether to register only a subset of the template's
    workers.** Each `setup.json` has an `agents: [...]` list with names;

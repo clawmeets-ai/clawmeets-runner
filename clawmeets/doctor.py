@@ -160,6 +160,10 @@ class ModelCLI:
     id: str
     label: str
     binary: str
+    # The ``local_settings.llm_provider`` value that shells this CLI
+    # (``openai`` drives ``codex``). ``tests/test_doctor.py`` pins it against
+    # ``cli_runner._construct_llm_provider``.
+    provider: str
     # Credential artifacts the CLI writes once signed in. Any one present is
     # taken as signed in. `~` is expanded at check time.
     login_paths: tuple[str, ...]
@@ -177,6 +181,7 @@ class ModelCLI:
 MODEL_CLIS: tuple[ModelCLI, ...] = (
     ModelCLI(
         id="claude",
+        provider="claude",
         label="Claude Code",
         binary="claude",
         # macOS keeps the OAuth token in the login keychain, so there is no file
@@ -189,6 +194,7 @@ MODEL_CLIS: tuple[ModelCLI, ...] = (
     ),
     ModelCLI(
         id="codex",
+        provider="openai",
         label="Codex",
         binary="codex",
         login_paths=("~/.codex/auth.json",),
@@ -198,6 +204,7 @@ MODEL_CLIS: tuple[ModelCLI, ...] = (
     ),
     ModelCLI(
         id="antigravity",
+        provider="antigravity",
         label="Antigravity",
         binary="agy",
         login_paths=("~/.antigravity/oauth_creds.json", "~/.config/antigravity"),
@@ -212,6 +219,7 @@ MODEL_CLIS: tuple[ModelCLI, ...] = (
     ),
     ModelCLI(
         id="gemini",
+        provider="gemini",
         label="Gemini CLI",
         binary="gemini",
         login_paths=("~/.gemini/oauth_creds.json",),
@@ -221,6 +229,7 @@ MODEL_CLIS: tuple[ModelCLI, ...] = (
     ),
     ModelCLI(
         id="opencode",
+        provider="opencode",
         label="OpenCode",
         binary="opencode",
         login_paths=("~/.local/share/opencode/auth.json", "~/.config/opencode"),
@@ -307,6 +316,19 @@ def inspect_model_clis() -> list[ModelCLIState]:
             )
         )
     return states
+
+
+def pick_provider(states: Optional[list[ModelCLIState]] = None) -> Optional[ModelCLI]:
+    """The model CLI a new agent should use on this machine: the first one in
+    :data:`MODEL_CLIS` order that is installed and signed in, or None.
+
+    Read by ``clawmeets assistant register`` when no ``--llm-provider`` is
+    given, so the provider it writes is one :func:`check_assistant_model` will
+    pass rather than a default the machine may not have.
+    """
+    states = states if states is not None else inspect_model_clis()
+    usable = {s.id for s in states if s.present and s.logged_in}
+    return next((spec for spec in MODEL_CLIS if spec.id in usable), None)
 
 
 # ---------------------------------------------------------------------------
@@ -414,6 +436,19 @@ def current_username() -> str:
         return ""
 
 
+def _assistant_dir(username: str) -> Optional[Path]:
+    """``agents/<user>-assistant-<id>/`` on this machine, or None. Archived
+    registrations are renamed ``DELETED-…`` and so never match."""
+    agents = _data_dir() / "agents"
+    prefix = f"{username}-assistant"
+    found = sorted(
+        d
+        for d in (agents.iterdir() if agents.is_dir() else [])
+        if d.is_dir() and d.name.startswith(prefix)
+    )
+    return found[0] if found else None
+
+
 def check_assistant() -> Check:
     """Does this machine hold the user's assistant?
 
@@ -432,14 +467,8 @@ def check_assistant() -> Check:
             detail="No account is signed in yet",
             fix="clawmeets user login <username>",
         )
-    agents = _data_dir() / "agents"
-    prefix = f"{username}-assistant"
-    found = [
-        d.name
-        for d in (agents.iterdir() if agents.is_dir() else [])
-        if d.is_dir() and d.name.startswith(prefix)
-    ]
-    if not found:
+    found = _assistant_dir(username)
+    if found is None:
         return Check(
             id="assistant",
             title="Your assistant is set up",
@@ -451,7 +480,7 @@ def check_assistant() -> Check:
         id="assistant",
         title="Your assistant is set up",
         ok=True,
-        detail=found[0],
+        detail=found.name,
     )
 
 
@@ -524,6 +553,103 @@ def check_model_cli(states: Optional[list[ModelCLIState]] = None) -> list[Check]
         for s in also_mention
     ]
     return [primary, *extras]
+
+
+# Providers that run in-process with an API key instead of shelling a CLI.
+# ``tests/test_doctor.py`` checks every provider the runner accepts is either
+# one of these or a ``MODEL_CLIS`` entry's ``provider``.
+IN_PROCESS_PROVIDER_SUFFIXES = ("-api", "-native")
+
+
+def check_assistant_model(
+    states: Optional[list[ModelCLIState]] = None,
+) -> Optional[Check]:
+    """Can the assistant's OWN model CLI run here?
+
+    :func:`check_model_cli` asks whether ANY CLI works; the assistant shells
+    exactly one — ``local_settings.llm_provider`` in its ``card.json``,
+    ``claude`` when unset, the same default the agent applies at start. With
+    only Codex signed in, the first passes while the assistant cannot start, so
+    this is the check that keeps a green report honest.
+
+    None when there is no assistant on this machine (``check_assistant``
+    already says so) or it uses an in-process provider (``-api`` /
+    ``-native``: no CLI to check).
+    """
+    username = current_username()
+    assistant_dir = _assistant_dir(username) if username else None
+    if assistant_dir is None:
+        return None
+    card = _read_json(assistant_dir / "card.json") or {}
+    settings = card.get("local_settings") or {}
+    provider = str(settings.get("llm_provider") or "claude").lower()
+    if provider.endswith(IN_PROCESS_PROVIDER_SUFFIXES):
+        return None
+    # `claude` pointed at a local endpoint (llm_base_url) is handed a token by
+    # the agent itself; it needs the binary, not a Claude sign-in.
+    needs_login = not (provider == "claude" and settings.get("llm_base_url"))
+
+    states = states if states is not None else inspect_model_clis()
+    by_provider = {spec.provider: spec for spec in MODEL_CLIS}
+    by_id = {s.id: s for s in states}
+    title = "Your assistant's model CLI is ready"
+    spec = by_provider.get(provider)
+    state = by_id.get(spec.id) if spec else None
+    if state and state.present and (state.logged_in or not needs_login):
+        return Check(id="assistant_model", title=title, ok=True, detail=state.label)
+
+    # The fix that works when the assistant cannot start: register writes
+    # card.json directly, whereas `agent reconfigure` goes through the server
+    # and only reaches card.json once the assistant is running.
+    alternative = pick_provider(states)
+    if alternative is not None:
+        switch = f"clawmeets assistant register --llm-provider {alternative.provider}"
+        if spec is None:
+            detail = f'Your assistant is set to an unknown model provider "{provider}"'
+        else:
+            found = "not signed in" if state and state.present else "not installed"
+            detail = (
+                f"Your assistant uses {spec.label}, which is {found} on this "
+                f"computer. {alternative.label} is ready."
+            )
+        note = f"This switches your assistant to {alternative.label}."
+        if spec and state and state.present:
+            keep = f"`{spec.login_fix}`" if spec.login_fix else spec.login_note
+            note += f" To keep {spec.label} instead: {keep}."
+        return Check(
+            id="assistant_model",
+            title=title,
+            ok=False,
+            detail=detail,
+            fix=switch,
+            fix_note=note,
+        )
+
+    if spec is None:
+        return Check(
+            id="assistant_model",
+            title=title,
+            ok=False,
+            detail=f'Your assistant is set to an unknown model provider "{provider}"',
+            fix="clawmeets assistant register --llm-provider claude",
+            fix_note="Then install and sign in to Claude Code.",
+        )
+    if state and state.present:
+        return Check(
+            id="assistant_model",
+            title=title,
+            ok=False,
+            detail=f"Your assistant uses {spec.label}, which is not signed in",
+            fix=spec.login_fix,
+            fix_note=spec.login_note,
+        )
+    return Check(
+        id="assistant_model",
+        title=title,
+        ok=False,
+        detail=f"Your assistant uses {spec.label}, which is not installed",
+        fix_note=spec.install_note,
+    )
 
 
 def check_computer(username: str = "") -> Check:
@@ -743,7 +869,8 @@ def run_checks(
 ) -> Report:
     """Every check, in the order a user hits them.
 
-    Order is install -> sign-in -> assistant -> model CLI -> computer ->
+    Order is install -> sign-in -> assistant -> model CLI -> the assistant's
+    model CLI -> computer ->
     autostart -> server, which is the order the install script performs them, so
     the FIRST failure in the list is also the earliest thing that went wrong.
     A reader who fixes top-down never fixes something that was only broken
@@ -755,11 +882,13 @@ def run_checks(
     self-answering question on a 30-second loop.
     """
     states = inspect_model_clis()
+    assistant_model = check_assistant_model(states)
     checks: list[Check] = [
         check_install(),
         check_session(),
         check_assistant(),
         *check_model_cli(states),
+        *([assistant_model] if assistant_model else []),
         check_computer(),
     ]
     if include_autostart:

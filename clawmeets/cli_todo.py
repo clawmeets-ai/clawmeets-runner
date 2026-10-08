@@ -6,15 +6,14 @@ clawmeets/cli_todo.py
 
 Paired with ``skills/desk-todo/SKILL.md``: when an agent has surfaced
 something that needs the *user's own hand* (an approval, a decision, a
-sign-off), it packages the task — a suggested recipient, a ready-to-refine
-prompt, the context that seeds a sharper request, what it already did, and
-the facts it gathered — and shells:
+sign-off), it packages the task — a title, a ready-to-refine prompt and a
+suggested recipient — and shells:
 
     clawmeets todo publish --text "Approve the Provi restock PO ($6.8k)" \\
-        --suggest api_sync --draft-prompt "Review Provi PO #4471 …" \\
-        --context-file ctx.md --fact "PO total::$6,821.40 · net-30" \\
-        --done "Reconciled every line item against the last 3 orders" \\
-        --file "PO-4471-provi.pdf::purchase order · 2pp"
+        --suggest api_sync --draft-prompt "Review Provi PO #4471 …"
+
+The suggested prompt and recipient are what the owner sees (and can edit) on
+the item; there is nothing else to package.
 
 The server pushes the task onto the owner's My Desk To-do rail (keyed by
 the publishing agent's owner) and broadcasts ``DESK_TODO_SYNC`` so the
@@ -30,7 +29,7 @@ Auth resolved from env (standard agent-runtime injection — same pattern as
 Subcommands:
   publish     Push a to-do onto the owner's plate.
   list        Show every to-do the owner currently has (filter by label, state, archived).
-  update      Edit a to-do's text / due / draft prompt / labels.
+  update      Edit a to-do's text / draft prompt / recipient / labels.
   labels      Curate the owner's label vocabulary (nested sub-app).
   archive     File a to-do away into the Archived drawer.
   unarchive   Put an archived to-do back on the open plate.
@@ -64,12 +63,15 @@ from __future__ import annotations
 import json
 import os
 import re
-from pathlib import Path
 
 import httpx
 import typer
 
-from clawmeets.cli_runner import resolve_dm_recipient, send_dm_as_owner
+from clawmeets.cli_runner import (
+    resolve_dm_recipient,
+    resolve_owned_agent,
+    send_dm_as_owner,
+)
 from clawmeets.models.desk_todo import LabelError, normalize_label
 from clawmeets.models.desk_todo_link import TICKET_STATES
 
@@ -255,14 +257,6 @@ def _label_detail(slugs: list[str], rows: list[dict]) -> list[dict]:
     return out
 
 
-def _split2(raw: str, sep: str = "::") -> tuple[str, str]:
-    """Split a ``"a::b"`` option value into ``(a, b)``; b defaults to ''."""
-    if sep in raw:
-        a, b = raw.split(sep, 1)
-        return a.strip(), b.strip()
-    return raw.strip(), ""
-
-
 def _owner_token() -> str:
     """The bearer to use for calls that need the OWNER's authority.
 
@@ -311,75 +305,17 @@ def _noop(reason: str, detail: str) -> None:
     raise typer.Exit(0)
 
 
-def _slug(s: str, n: int = 4) -> str:
-    """Name the context attachment after the linked artifact.
-
-    Ported from ``utils/todoDraft.ts::slug`` so a triggered to-do's ``.md``
-    lands with the same filename the desk take-over would have given it."""
-    cleaned = re.sub(r"['\".,()$—–:]", "", s.lower())
-    parts = [p for p in cleaned.split() if p][:n]
-    joined = re.sub(r"[^a-z0-9-]", "", "-".join(parts))
-    return joined or "context"
-
-
-def _dispatch_payload(item: dict) -> tuple[str, list[tuple[str, str]]]:
-    """The message + attachments a triggered to-do sends.
-
-    Byte-for-byte what the desk take-over sends (``todoDraft.ts``): the draft
-    prompt, then a ``Referenced:`` line naming the agent-suggested file chips
-    (they carry no bytes on either path, so naming is all either can do), with
-    the ``context`` blob attached as ``{linked-label-slug}.md``.
-    """
-    content = (item.get("draft_prompt") or "").strip()
-    refs = [
-        f.get("name", "")
-        for f in (item.get("files") or [])
-        if isinstance(f, dict) and f.get("name")
-    ]
-    if refs:
-        content = f"{content}\n\nReferenced: {', '.join(refs)}"
-
-    files: list[tuple[str, str]] = []
-    context = item.get("context")
-    if context:
-        linked = item.get("linked")
-        label = linked.get("label") if isinstance(linked, dict) else None
-        files.append(((_slug(label) if label else "context") + ".md", context))
-    return content, files
-
-
 @app.command("publish")
 def publish(
     text: str = typer.Option(..., "--text", help="The task title as it reads on the plate."),
-    due: str = typer.Option("", "--due", help='Optional due hint, e.g. "Today" or "Fri".'),
     suggest: str = typer.Option(
         "", "--suggest",
-        help="Suggested recipient agent (short or full name) — pre-selected in the take-over.",
+        help="Suggested recipient agent (short or full name) — stored as the "
+             "draft's recipient, which the owner sees and can change.",
     ),
     draft_prompt: str = typer.Option(
         "", "--draft-prompt",
-        help="A ready-to-refine request that seeds the take-over composer.",
-    ),
-    context_file: Path = typer.Option(
-        None, "--context-file",
-        exists=True, file_okay=True, dir_okay=False, readable=True,
-        help="Path to a small .md/.txt whose text becomes the attachable context chip (≤ 16 KB).",
-    ),
-    file: list[str] = typer.Option(
-        None, "--file",
-        help='Suggested reference file as "name::sub" (repeatable). Informational chip only.',
-    ),
-    done: list[str] = typer.Option(
-        None, "--done",
-        help='A step you already completed (repeatable) — shown under "What\'s been done".',
-    ),
-    fact: list[str] = typer.Option(
-        None, "--fact",
-        help='A key fact as "label::value" (repeatable) — shown under "Available & relevant".',
-    ),
-    linked: str = typer.Option(
-        "", "--linked",
-        help='A source to open as "label::icon" (e.g. "Finance briefing::chart").',
+        help="A ready-to-refine request the owner sees on the item and can edit, then send.",
     ),
     label: list[str] = typer.Option(
         None, "--label",
@@ -389,6 +325,11 @@ def publish(
 ) -> None:
     """Publish a to-do onto the owner's My Desk plate.
 
+    The suggested prompt (``--draft-prompt``) and recipient (``--suggest``) are
+    what the owner will see on the item, in the same fields they edit
+    themselves. An unresolved ``--suggest`` name is kept as the recipient name
+    with no agent id.
+
     ``--label`` uses the owner's OWN vocabulary — run ``clawmeets todo labels
     list`` first and reuse what is there. A label you invent still shows on the
     item but stays unregistered and never joins the owner's list. Every label is
@@ -396,30 +337,10 @@ def publish(
     moves the item's ``state`` — that is derived from the projects linked to it.
     """
     body: dict = {"text": text}
-    if due:
-        body["due"] = due
     if suggest:
         body["suggest"] = suggest
     if draft_prompt:
         body["draft_prompt"] = draft_prompt
-    if context_file:
-        body["context"] = context_file.read_text(encoding="utf-8")
-    if file:
-        body["files"] = [
-            {"name": n, "sub": s, "icon": "report"}
-            for n, s in (_split2(f) for f in file)
-            if n
-        ]
-    if done:
-        body["done_steps"] = [d.strip() for d in done if d.strip()]
-    if fact:
-        body["available"] = [
-            {"k": k, "v": v} for k, v in (_split2(f) for f in fact) if k
-        ]
-    if linked:
-        link_label, icon = _split2(linked)
-        if link_label:
-            body["linked"] = {"label": link_label, "icon": icon or "chart"}
     if label:
         body["labels"] = [_norm(l) for l in label if l.strip()]
 
@@ -569,9 +490,13 @@ def list_todos(
 def update(
     todo_id: str = typer.Argument(..., help="Id of the to-do to edit."),
     text: str = typer.Option("", "--text", help="New task title as it reads on the plate."),
-    due: str = typer.Option("", "--due", help='New due hint, e.g. "Today" or "Fri".'),
     draft_prompt: str = typer.Option(
         "", "--draft-prompt", help="Replace the saved draft prompt."
+    ),
+    recipient: str = typer.Option(
+        "", "--recipient",
+        help="Address the saved draft to this agent (short or full name) — "
+             "who the plate's one-click send and `todo trigger` will fire it at.",
     ),
     label: list[str] = typer.Option(
         None, "--label",
@@ -587,7 +512,7 @@ def update(
         False, "--clear-labels", help="Remove every label from this to-do.",
     ),
 ) -> None:
-    """Edit a to-do's text, due hint, draft prompt, or labels.
+    """Edit a to-do's text, draft prompt, recipient, or labels.
 
     Only the flags you actually pass are sent, so an omitted flag never clears a
     stored field — an empty string means "untouched", never "clear". Requires the
@@ -597,14 +522,22 @@ def update(
     clobber a label the owner just set in the browser, and a retried command
     cannot double-apply. Both are idempotent — adding a label the item already
     carries and removing one it does not are successes, not errors.
+
+    ``--recipient`` must name exactly one agent on the owner's roster, or the
+    command fails and sends nothing. Unlike ``publish --suggest`` there is no
+    best-effort fallback: a draft addressed to a name that resolves to nobody
+    would sit on the plate looking staffed and then refuse to fire.
     """
     body: dict = {}
     if text:
         body["text"] = text
-    if due:
-        body["due"] = due
     if draft_prompt:
         body["draft_prompt"] = draft_prompt
+        # A saved draft IS what ``drafted`` records. The desk take-over sets it
+        # on save; without it here, a draft written from the CLI is invisible on
+        # the plate — no preview, no @recipient badge — and the item reads as
+        # unstaffed even though it is ready to fire.
+        body["drafted"] = True
 
     # The wire defines a precedence for replace-then-add-then-remove so a
     # confused client still gets a defined result. The CLI refuses the
@@ -634,10 +567,31 @@ def update(
     if remove_label:
         body["remove_labels"] = [_norm(l) for l in remove_label if l.strip()]
 
+    # Resolved last, so a flag combination refused above never costs a
+    # roster read.
+    if recipient.strip():
+        client, headers = _client()
+        with client:
+            row = resolve_owned_agent(
+                client,
+                headers["Authorization"].removeprefix("Bearer "),
+                recipient.strip(),
+                agent_id=headers["X-Agent-ID"],
+            )
+        if row is None:
+            typer.echo(
+                f"Error: --recipient {recipient.strip()!r} does not match exactly "
+                f"one agent on the roster.",
+                err=True,
+            )
+            raise typer.Exit(1)
+        body["draft_recipient_id"] = row.get("id")
+        body["draft_recipient_name"] = row["name"]
+
     if not body:
         typer.echo(
-            "Error: nothing to update — pass at least one of --text / --due / "
-            "--draft-prompt / --label / --add-label / --remove-label / "
+            "Error: nothing to update — pass at least one of --text / "
+            "--draft-prompt / --recipient / --label / --add-label / --remove-label / "
             "--clear-labels.",
             err=True,
         )
@@ -833,8 +787,7 @@ def trigger(
     desk falls back to the assistant, then to any owned agent, this refuses.
     A voice-triggered send that silently redirects an addressed draft is worse
     than one that reports "nobody is on this" — so the recipient must be
-    designated on the item (``draft_recipient_*``, then ``suggest_agent_*``) or
-    supplied with ``--to``.
+    designated on the item (``draft_recipient_*``) or supplied with ``--to``.
 
     Prints one JSON object either way, and exits 0 on a no-op::
 
@@ -876,7 +829,7 @@ def trigger(
 
         if item.get("archived"):
             _noop("already_archived", "That one is already filed away.")
-        content, files = _dispatch_payload(item)
+        content = (item.get("draft_prompt") or "").strip()
         if not content:
             _noop(
                 "no_draft_prompt",
@@ -884,11 +837,7 @@ def trigger(
                 "nothing to send.",
             )
 
-        ref = (
-            to.strip()
-            or (item.get("draft_recipient_name") or "").strip()
-            or (item.get("suggest_agent_name") or "").strip()
-        )
+        ref = to.strip() or (item.get("draft_recipient_name") or "").strip()
         if not ref:
             _noop(
                 "no_recipient",
@@ -911,7 +860,6 @@ def trigger(
                 "reason": "dry_run",
                 "to": recipient,
                 "content": content,
-                "attachments": [name for name, _ in files],
                 "consume": consume,
             }, indent=2, ensure_ascii=False))
             return
@@ -921,7 +869,6 @@ def trigger(
             _owner_token(),
             recipient,
             content,
-            files=files or None,
             new_thread=True,
             # A retried trigger lands in the thread the first attempt made
             # instead of minting a second one.

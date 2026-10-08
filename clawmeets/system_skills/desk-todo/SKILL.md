@@ -9,7 +9,7 @@ description: >
   `--state new|working|completed` to filter by ticket state, `--label` to filter
   by context, `--archived`/`--no-archived` to narrow by disposal, and
   `--match-all` to require every label); (b) EDIT it — "file that one away",
-  "put that one back", "change that due date", "drop that one", "tag that one
+  "put that one back", "rename that one", "drop that one", "tag that one
   @office", "take @home off that one" (`clawmeets todo list` / `update` /
   `archive` / `unarchive` / `delete`); (c) LINK an item to the work it spawned —
   "that one's being handled in the pricing project" (`clawmeets todo associate`
@@ -47,8 +47,8 @@ clawmeets todo list                              # find the id by its text
 clawmeets todo archive <id>                      # file it away
 clawmeets todo unarchive <id>                    # put it back
 clawmeets todo update <id> --text "New title"    # rename
-clawmeets todo update <id> --due Fri             # re-date
 clawmeets todo update <id> --draft-prompt "…"    # rewrite the saved draft
+clawmeets todo update <id> --recipient analyst   # address the draft to an agent (does NOT fire it)
 clawmeets todo delete <id>                       # remove it entirely
 
 clawmeets todo list --state working              # what's actually in flight
@@ -237,10 +237,8 @@ clawmeets todo trigger <id> --dry-run            # show the message, send nothin
 clawmeets todo trigger <id> --consume delete     # remove it instead of archiving
 ```
 
-This sends the item's `draft_prompt` (plus a `Referenced:` line naming its
-file chips, with its context blob attached as a real `.md`) to the agent
-designated on the item, in a fresh DM thread — the same payload the desk's
-own one-click send produces. On success the item is **archived** by default,
+This sends the item's `draft_prompt` to the agent designated on the item
+(`draft_recipient_name`), in a fresh DM thread. On success the item is **archived** by default,
 so it stays visible in the Archived drawer and `clawmeets todo unarchive` can
 undo it; `--consume delete` removes it, `--consume keep` leaves it alone.
 
@@ -268,8 +266,7 @@ first and show them.
 
 ## § Adding a new item
 
-Not this skill. Putting something *new* on the plate — packaging a
-suggested recipient, a draft prompt, a context file, the groundwork you did
-and the facts you gathered — is `clawmeets todo publish`, documented in the
+Not this skill. Putting something *new* on the plate — a title with a
+suggested prompt and recipient — is `clawmeets todo publish`, documented in the
 **`desk-todo-publish`** skill, which you also carry. Follow that one when
 the owner asks you to capture something for later.

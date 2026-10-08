@@ -88,7 +88,6 @@ automatically, so no `--config` flag is needed.
 | `brief` | `brief` — publish briefing tabs to My Desk |
 | `todo` | `desk-todo` — My Desk todo items |
 | `knowledge-dir` | browse the agent's proprietary knowledge directory |
-| `om` | `om-stage` — OpenMontage stage handoff |
 | `ib` | `ib` — Interactive Brokers market data |
 
 Run `clawmeets <group> --help` for the subcommands of any group.

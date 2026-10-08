@@ -17,6 +17,8 @@ from typing import TYPE_CHECKING, Annotated, Literal, Union
 
 from pydantic import BaseModel, Field, TypeAdapter
 
+from clawmeets.sync.changelog import sender_label
+
 if TYPE_CHECKING:
     from clawmeets.sync.changelog import MessagePayload
 
@@ -50,6 +52,11 @@ class ChatMessage(BaseModel):
     def to_log_line(self) -> str:
         """Serialize to NDJSON line for CHATS.ndjson."""
         return self.model_dump_json()
+
+    @property
+    def prompt_sender_label(self) -> str:
+        """Who sent this, as an agent's prompt names them (see ``sender_label``)."""
+        return sender_label(self.from_participant_id, self.from_participant_name)
 
     @classmethod
     def from_log_line(cls, line: str) -> "ChatMessage":

@@ -30,6 +30,7 @@ from clawmeets.utils.agent_storage import (
     ensure_storage,
     resolve_storage,
 )
+from clawmeets.utils.extra_dirs import resolve_extra_dirs
 from clawmeets.utils.file_io import FileUtil
 from clawmeets.utils.notification_center import LLM_COMPLETE, LLM_ERROR
 
@@ -1168,6 +1169,12 @@ class ReactiveControlLoop:
         resolved = FileUtil.resolve_local_dir(knowledge_dir, self._model_ctx.base_dir)
         new_dirs = [resolved] if resolved is not None else []
         self._model_ctx.update_knowledge_dirs(new_dirs)
+
+        # Extra directories — re-resolved on every change, like knowledge_dirs,
+        # so a folder that didn't exist at startup is picked up once it does.
+        self._model_ctx.update_extra_dirs(
+            resolve_extra_dirs(self._model_ctx.base_dir, local_settings)
+        )
 
         # Rebuild the deterministic proprietary-knowledge index when the
         # knowledge_dir setting changed, so memory/REFERENCES.md stays fresh

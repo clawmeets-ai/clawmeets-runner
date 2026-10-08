@@ -92,6 +92,7 @@ INSTALL_STEPS: tuple[tuple[str, str], ...] = (
     ("install", "Installing ClawMeets"),
     ("link", "Signing in on this computer"),
     ("assistant", "Setting up your assistant"),
+    ("providers", "Connecting your model providers"),
     ("computer", "Connecting this computer"),
     ("start", "Starting your agents"),
     ("check", "Checking everything works"),

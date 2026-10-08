@@ -91,10 +91,17 @@ def _fail(message: str) -> "typer.Exit":
     return typer.Exit(1)
 
 
-def _headers(token: Optional[str]) -> dict[str, str]:
+def _headers(token: Optional[str], agent_id: Optional[str] = None) -> dict[str, str]:
     """``--token`` overrides; otherwise ``_http``'s default headers already
-    carry the per-process agent identity the runner injects."""
-    return {"Authorization": f"Bearer {token}"} if token else {}
+    carry the per-process agent identity the runner injects.
+
+    ``agent_id`` rides along only with an explicit token: an agent bearer is
+    valid only next to its own ``X-Agent-ID``, so overriding one without the
+    other authenticates as nobody (or as the wrong agent)."""
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    if token and agent_id:
+        headers["X-Agent-ID"] = agent_id
+    return headers
 
 
 def _detail(resp: httpx.Response) -> Any:
@@ -127,8 +134,10 @@ def _echo_json(payload: Any) -> None:
     typer.echo(json.dumps(payload, indent=2, ensure_ascii=False, default=str))
 
 
-def _pid(client: httpx.Client, token: Optional[str], ref: str) -> str:
-    return _resolve_project_ref(client, token, ref)
+def _pid(
+    client: httpx.Client, token: Optional[str], ref: str, agent_id: Optional[str] = None
+) -> str:
+    return _resolve_project_ref(client, token, ref, agent_id=agent_id)
 
 
 def _url(pid: str, suffix: str = "") -> str:
@@ -285,6 +294,44 @@ def create(
         _echo_json(result)
         return
     typer.echo(f"Created PLAN.md — revision {result.get('revision', 1)}")
+
+
+@app.command("decision", help="Record whether the project request is a decision: yes or no.")
+def decision(
+    project: str = PROJECT_ARG,
+    answer: str = typer.Argument(..., help="yes or no."),
+    server: str = typer.Option(DEFAULT_SERVER, "--server", "-s"),
+    token: Optional[str] = typer.Option(None, "--token", "-t"),
+    agent_id: Optional[str] = typer.Option(
+        None,
+        "--agent-id",
+        help="Agent ID (sent as X-Agent-ID; required when --token is an agent token)",
+    ),
+    json_out: bool = typer.Option(False, "--json"),
+):
+    """Set the plan's decision flag. Coordinator or owner; last write wins.
+
+    Kept on the plan sidecar, so it changes no plan text and makes no new
+    version. "yes" lets the Plan tab offer the user their thought_partner
+    before they accept.
+
+    Inside the coordinator's runner no flags are needed: the runner's agent
+    identity resolves the project by name. ``--token`` with ``--agent-id`` is
+    the same identity passed by hand, e.g. from outside the runner.
+    """
+    value = {"yes": True, "no": False}.get(answer.strip().lower())
+    if value is None:
+        raise _fail(f"expected yes or no, got {answer!r}.")
+    headers = _headers(token, agent_id)
+    with _http(server) as client:
+        pid = _pid(client, token, project, agent_id)
+        result = _ok(
+            client.put(_url(pid, "/decision"), json={"decision": value}, headers=headers)
+        )
+    if json_out:
+        _echo_json(result)
+        return
+    typer.echo(f"Decision: {'yes' if result.get('decision') else 'no'}")
 
 
 # ---------------------------------------------------------------------------

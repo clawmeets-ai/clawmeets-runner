@@ -2,10 +2,11 @@
 name: reconfigure-agent
 description: >
   Change an agent's runner settings on a DM request — its bound git repo,
-  LLM provider/model, or knowledge directory. Use
-  when the user says things like "point backend-x at <repo>", "change your
-  repo to <url>", "use o3 for the analyst", "set your model to ...", "switch
-  your knowledge dir to ...". You perform the change yourself by shelling the
+  LLM provider/model, knowledge directory, storage folders, or extra
+  directories. Use when the user says things like "point backend-x at
+  <repo>", "change your repo to <url>", "use o3 for the analyst", "set your
+  model to ...", "switch your knowledge dir to ...", "let om_assets work in
+  ~/OpenMontage", "give yourself access to <folder>". You perform the change yourself by shelling the
   clawmeets CLI and confirm the result. Two modes: reconfigure one of the
   user's OTHER agents (assistant), or reconfigure YOURSELF on the owner's
   request.
@@ -31,6 +32,8 @@ Settings you can change (pass any subset; an empty string clears a key):
 | `--knowledge-dir` | proprietary-knowledge directory |
 | `--local-storage-dir` | the agent's local storage folder (`$AGENT_LOCAL_STORAGE_DIR`; default `<agent home>/storage`) |
 | `--shared-storage-dir` | the shared storage folder (`$AGENT_SHARED_STORAGE_DIR`; default `~/.clawmeets/shared_storage`) |
+| `--add-extra-dir` / `--remove-extra-dir` | add or drop one existing folder the agent also works in, e.g. a tool checkout like `~/OpenMontage`, keeping the rest. Repeatable. Prefer these. |
+| `--extra-dir` | **replace** the whole extra-directory list (repeat for several); `--extra-dir ""` clears it |
 | `--llm-provider` | LLM backend (claude / openai / gemini / opencode / `antigravity` / *-api) |
 | `--llm-model` | provider-specific model |
 | `--llm-api-key` | BYO key for a `-api` provider |
@@ -39,6 +42,21 @@ Settings you can change (pass any subset; an empty string clears a key):
 
 Changes take effect on the target's **next** turn (existing in-flight work is
 unaffected).
+
+**Extra directories:** the agent keeps its own per-project sandbox as its
+working directory; each extra directory is added on top, the same way for every
+model provider. The agent can read and write it, the folder's own skills
+(`.agents/skills/`, `.claude/skills/`) are installed under the agent's (a
+clawmeets skill of the same name wins), and its instruction file (`AGENTS.md`,
+else `CLAUDE.md`, else `GEMINI.md`) is named in the agent's prompt. The folder
+must already exist on the agent's computer — it is never created, and one that
+is missing is skipped. Paths resolve like `--knowledge-dir` (absolute, `~`, or
+relative to the agent's home). Several agents can share one folder (e.g. one
+OpenMontage install for every stage agent): nothing is written into it.
+```bash
+clawmeets agent reconfigure om_assets --add-extra-dir ~/OpenMontage
+```
+The command echoes the resulting list.
 
 **Local model:** to point an agent at a local server, set provider + model +
 base URL together. Two routes, and the base-URL **shape differs**:

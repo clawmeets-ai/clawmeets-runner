@@ -441,7 +441,7 @@ class Chatroom(BaseModel):
             messages = [m for m in messages if m.id != exclude_message_id]
         messages = messages[-limit:]
         return [
-            (m.from_participant_name or m.from_participant_id, m.content)
+            (m.prompt_sender_label, m.content)
             for m in messages
         ]
 

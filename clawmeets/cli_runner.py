@@ -55,7 +55,7 @@ from clawmeets.api.responses import AgentRegistrationResponse
 from clawmeets.api.control import ControlEnvelope, ControlMessageType
 from clawmeets.api.fs_protocol import FS_CAPABILITY, FS_WS_MAX_SIZE
 from clawmeets.api.client import ClawMeetsClient
-from clawmeets import cli_oauth
+from clawmeets import cli_oauth, doctor
 from clawmeets.cli_lifecycle import (
     clear_user_token,
     get_current_user,
@@ -63,6 +63,7 @@ from clawmeets.cli_lifecycle import (
     save_user_session,
 )
 from clawmeets.models.chat_message import ChatMessage
+from clawmeets.utils import extra_dirs as extra_dirs_lib
 from clawmeets.utils import invoke_timeout
 from clawmeets.utils.agent_storage import (
     LOCAL_STORAGE_KEY,
@@ -81,6 +82,8 @@ from clawmeets.llm.opencode_cli import OpenCodeCLI
 from clawmeets.llm.antigravity_cli import AntigravityCLI
 from clawmeets.models.context import ModelContext
 from clawmeets.models.model_config import VALID_CONFIG_PROVIDERS
+from clawmeets.models import provider_agents
+from clawmeets.models.provider_agents import ProviderAgent
 from clawmeets.models.agent import Agent
 from clawmeets.models.user import User, NotificationConfig
 from clawmeets.sync.console_subscriber import ConsoleOutputSubscriber, ConsoleConfig
@@ -130,6 +133,11 @@ agent_team_app = typer.Typer(
     help="Bulk-register a team of worker agents from a setup.json template.",
     no_args_is_help=True,
 )
+provider_app = typer.Typer(
+    help="Model provider agents: one per model CLI or API key on this computer.",
+    no_args_is_help=True,
+)
+agent_app.add_typer(provider_app, name="provider")
 
 
 def _default_user_teams_from_env() -> list[str]:
@@ -1090,12 +1098,26 @@ def _resolve_project_ref(
     # on the wire here. Inside a runner `_http`'s default headers already carry
     # the agent identity; this override matters for the user-session path, where
     # there is no default Authorization at all.
-    resp = client.get(
-        "/projects",
-        headers={"Authorization": f"Bearer {token}"} if token else {},
-    )
+    #
+    # An explicit token with an explicit ``agent_id`` is an AGENT bearer and is
+    # only valid next to its own ``X-Agent-ID`` (``resolve_viewer``). The
+    # override has to carry both: otherwise the default header is whatever
+    # agent the shelling process happens to be, or absent outside a runner,
+    # and a coordinator's token resolves to nobody.
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    if token and agent_id:
+        headers["X-Agent-ID"] = agent_id
+    resp = client.get("/projects", headers=headers)
     if resp.status_code != 200:
-        typer.echo(f"Error: could not list projects ({resp.status_code})", err=True)
+        hint = ""
+        if resp.status_code == 401 and token and not agent_id:
+            hint = (
+                " — an agent token is accepted only together with its agent id"
+                " (--agent-id)"
+            )
+        typer.echo(
+            f"Error: could not list projects ({resp.status_code}){hint}", err=True
+        )
         raise typer.Exit(1)
     projects = resp.json()
     candidates = [p for p in projects if p["name"] == ref]
@@ -1636,6 +1658,9 @@ def agent_reconfigure(
     knowledge_dir: Optional[str] = typer.Option(None, "--knowledge-dir", help="Proprietary-knowledge dir (empty string clears)."),
     local_storage_dir: Optional[str] = typer.Option(None, "--local-storage-dir", help="Agent's local storage folder, $AGENT_LOCAL_STORAGE_DIR (empty string clears → {agent_dir}/storage)."),
     shared_storage_dir: Optional[str] = typer.Option(None, "--shared-storage-dir", help="Shared storage folder, $AGENT_SHARED_STORAGE_DIR (empty string clears → ~/.clawmeets/shared_storage)."),
+    extra_dir: Optional[list[str]] = typer.Option(None, "--extra-dir", help="Existing folder the agent also works in (e.g. a tool checkout): added to its allowed dirs for every model provider, its .agents/skills + .claude/skills installed under the agent's own, its AGENTS.md/CLAUDE.md/GEMINI.md named in the prompt. Repeatable; REPLACES the whole list. --extra-dir \"\" clears it."),
+    add_extra_dir: Optional[list[str]] = typer.Option(None, "--add-extra-dir", help="Append an extra directory, keeping the current ones. Repeatable."),
+    remove_extra_dir: Optional[list[str]] = typer.Option(None, "--remove-extra-dir", help="Drop an extra directory (exact string as listed). Repeatable."),
     llm_provider: Optional[str] = typer.Option(None, "--llm-provider", help=f"LLM backend, one of {_VALID_LLM_PROVIDERS} (empty string clears)."),
     llm_model: Optional[str] = typer.Option(None, "--llm-model", help="Provider-specific model (empty string clears)."),
     llm_api_key: Optional[str] = typer.Option(None, "--llm-api-key", help="BYO key for a '-api' provider (empty string clears). NOTE: prefer the web UI — keys typed into chat sync to the server."),
@@ -1650,7 +1675,7 @@ def agent_reconfigure(
 
     Sets/clears any of git_url,
     git_base_branch, knowledge_dir, local_storage_dir, shared_storage_dir,
-    llm_provider, llm_model, llm_api_key, llm_base_url, output_mode,
+    extra_dirs, llm_provider, llm_model, llm_api_key, llm_base_url, output_mode,
     invoke_timeout_seconds in one call.
     Only flags you pass are touched; pass an empty
     string to clear a key. Triggers AGENT_SETTINGS_CHANGE so a running runner
@@ -1683,12 +1708,13 @@ def agent_reconfigure(
     ):
         if value is not None:
             fields[key] = value
+    edits_extra_dirs = bool(extra_dir is not None or add_extra_dir or remove_extra_dir)
     if invoke_timeout_seconds is not None:
         fields[invoke_timeout.SETTINGS_KEY] = (
             "" if invoke_timeout_seconds == ""
             else _parse_invoke_timeout(invoke_timeout_seconds)
         )
-    if not fields:
+    if not fields and not edits_extra_dirs:
         typer.echo("Error: pass at least one setting flag (e.g. --git-url).", err=True)
         raise typer.Exit(1)
     if llm_provider:
@@ -1706,16 +1732,37 @@ def agent_reconfigure(
         data_dir, token, server, agent,
     )
     with _http(server_url) as client:
+        auth = {"Authorization": f"Bearer {token}"}
+        if edits_extra_dirs:
+            base = extra_dir
+            if base is None:  # add/remove edit the list already there
+                card = _ok(client.get(f"/agents/{agent_id}", headers=auth))
+                base = extra_dirs_lib.entries(card.get("local_settings") or {})
+            # An empty result clears the key (the server drops "").
+            fields[extra_dirs_lib.EXTRA_DIRS_KEY] = _edit_extra_dirs(
+                base, add_extra_dir or [], remove_extra_dir or [],
+            ) or ""
         resp = client.patch(
             f"/agents/{agent_id}/local-settings",
             json={"local_settings": fields},
-            headers={"Authorization": f"Bearer {token}"},
+            headers=auth,
         )
         _ok(resp)
     changed = ", ".join(
         f"{k}={'(cleared)' if v == '' else v!r}" for k, v in fields.items()
     )
     typer.echo(f"Reconfigured agent '{agent_name}': {changed}")
+
+
+def _edit_extra_dirs(base: list[str], add: list[str], remove: list[str]) -> list[str]:
+    """The new ``extra_dirs`` list: ``base`` with ``add`` appended and
+    ``remove`` dropped, blanks and repeats removed."""
+    result: list[str] = []
+    for d in base + add:
+        d = d.strip()
+        if d and d not in result and d not in remove:
+            result.append(d)
+    return result
 
 
 @agent_app.command("list")
@@ -2215,6 +2262,11 @@ def user_listen(
                 "content": "..."
             }
         }
+
+    The script fires for the project coordinator's messages in a
+    user-communication room, and also for an outside contact writing in over a
+    channel: then ``from_participant_id`` is ``contact:<id>`` (not a User or
+    Agent id) and ``from_participant_name`` is the name the contact gave.
     """
     logging.basicConfig(
         level=log_level.upper(),
@@ -2654,6 +2706,7 @@ async def _runner_loop(
         notification_center=notification_center,
         git_url=_git_url or None,
         storage=storage,
+        extra_dirs=extra_dirs_lib.resolve_extra_dirs(agent_dir, local_settings),
     )
     # Share the CLI factory so a per-request model_config_name override can build
     # a one-turn provider from a non-default named config (same factory the
@@ -2960,20 +3013,34 @@ def resolve_dm_recipient(
     ``GET /agents`` resolves an agent credential to its owner only with the
     accompanying ``X-Agent-ID``.
     """
+    row = resolve_owned_agent(client, token, ref, agent_id=agent_id)
+    return row["name"] if row else None
+
+
+def resolve_owned_agent(
+    client: httpx.Client,
+    token: str,
+    ref: str,
+    *,
+    agent_id: Optional[str] = None,
+) -> Optional[dict]:
+    """The owner's roster row (``id``, ``name``, …) for a short or full name.
+
+    The resolution behind ``resolve_dm_recipient``, for callers that need the
+    agent's id as well as its name (``todo update --recipient`` stores both).
+    Same tiers, same None-on-miss-or-ambiguous contract.
+    """
     headers = {"Authorization": f"Bearer {token}"}
     if agent_id:
         headers["X-Agent-ID"] = agent_id
     resp = client.get("/agents", headers=headers)
     if resp.status_code != 200:
         return None
-    names = [
-        a.get("name", "")
-        for a in resp.json()
-        if isinstance(a, dict) and a.get("name")
-    ]
-    if ref in names:
-        return ref
-    matches = [n for n in names if n.endswith(f"-{ref}")]
+    rows = [a for a in resp.json() if isinstance(a, dict) and a.get("name")]
+    for a in rows:
+        if a["name"] == ref:
+            return a
+    matches = [a for a in rows if a["name"].endswith(f"-{ref}")]
     return matches[0] if len(matches) == 1 else None
 
 
@@ -4071,6 +4138,29 @@ def _archive_stale_agent_dirs(agents_dir: Path, registered_name: str, keep: Path
             typer.echo(f"  Warning: could not archive {sibling.name}: {e}", err=True)
 
 
+def _detect_llm_provider() -> dict:
+    """``{"llm_provider": ...}`` for the first model CLI signed in on this
+    machine (``doctor.pick_provider``), or ``{}`` when none is.
+
+    Without this, an assistant registered with no ``--llm-provider`` falls back
+    to ``claude`` at start, so a machine with only Codex signed in passes
+    ``clawmeets doctor``'s any-CLI check and still has an assistant that cannot
+    run. Empty leaves that default in place; doctor then names the fix.
+    """
+    picked = doctor.pick_provider()
+    if picked is None:
+        typer.echo(
+            "  Model: no signed-in model CLI found on this computer; "
+            "defaulting to Claude Code (run `clawmeets doctor` for the fix)."
+        )
+        return {}
+    typer.echo(
+        f"  Model: {picked.label} (--llm-provider {picked.provider}), "
+        "detected on this computer."
+    )
+    return {"llm_provider": picked.provider}
+
+
 def _register_one_assistant(
     client: httpx.Client,
     token: str,
@@ -4267,6 +4357,15 @@ def assistant_register(
         )
         agent_id = result["agent_id"]
         agent_name = result.get("agent_name") or f"{username}-assistant"
+        agents_dir = Path(data_dir).expanduser() / "agents"
+        assistant_dir = agents_dir / f"{agent_name}-{agent_id}"
+
+        # Re-registering (the installer is safe to re-run) rewrites card.json,
+        # so carry the settings already on it forward; flags passed now win.
+        existing_card = FileUtil.read(assistant_dir / "card.json", "json") or {}
+        local_settings = {**(existing_card.get("local_settings") or {}), **local_settings}
+        if not local_settings.get("llm_provider"):
+            local_settings.update(_detect_llm_provider())
 
         # local_settings is set via a follow-up PUT because /agents/register
         # doesn't accept it. Skip when no settings to send.
@@ -4284,8 +4383,6 @@ def assistant_register(
                     err=True,
                 )
 
-        agents_dir = Path(data_dir).expanduser() / "agents"
-        assistant_dir = agents_dir / f"{agent_name}-{agent_id}"
         assistant_dir.mkdir(parents=True, exist_ok=True)
         new_token = result.get("token")
         if new_token:
@@ -4341,9 +4438,15 @@ def _register_one_worker(
     *,
     llm_provider_override: Optional[str],
     llm_base_url_override: Optional[str] = None,
+    llm_api_key: Optional[str] = None,
 ) -> Optional[dict]:
     """Register one worker from a setup.json `agents[]` entry. Returns the
     server response on success, None on failure.
+
+    ``llm_api_key`` (for a keyed ``-api`` provider) is stored the way Agent
+    Settings stores it: on a named model config made the default, which the
+    server hides from every read. It is never put in a setup.json entry, and
+    never echoed: a 422 body would quote it back.
     """
     name = agent.get("name")
     description = agent.get("description", "")
@@ -4409,7 +4512,16 @@ def _register_one_worker(
     if base_url_for_agent:
         local_settings["llm_base_url"] = base_url_for_agent
 
-    if local_settings:
+    if llm_api_key and local_settings.get("llm_provider"):
+        if not _put_keyed_model_config(
+            client, token, agent_id, local_settings["llm_provider"], llm_api_key
+        ):
+            typer.echo(
+                f"  Warning: failed to save the API key for '{registered_name}'",
+                err=True,
+            )
+        local_settings["llm_api_key"] = llm_api_key
+    elif local_settings:
         put_resp = client.put(
             f"/agents/{agent_id}",
             json={"local_settings": local_settings},
@@ -4462,6 +4574,202 @@ def _register_one_worker(
 
     typer.echo(f"  Registered '{registered_name}' ({agent_id[:8]}...)")
     return result
+
+
+def _put_keyed_model_config(
+    client: httpx.Client, token: str, agent_id: str, provider: str, api_key: str,
+) -> bool:
+    """Store ``api_key`` on a model config named after ``provider`` and make it
+    the default — the route Agent Settings uses, so the key is hidden from every
+    read and mirrored to the runner. Re-runs replace the key on the existing
+    config. Returns False on any failure; never echoes a response body, because a
+    validation error quotes the request (and so the key) back."""
+    headers = {"Authorization": f"Bearer {token}"}
+    resp = client.post(
+        f"/agents/{agent_id}/model-configs",
+        json={"name": provider, "provider": provider, "api_key": api_key},
+        headers=headers,
+    )
+    if resp.status_code == 409:
+        resp = client.patch(
+            f"/agents/{agent_id}/model-configs/{provider}",
+            json={"api_key": api_key},
+            headers=headers,
+        )
+    if resp.status_code >= 400:
+        return False
+    resp = client.put(
+        f"/agents/{agent_id}/model-configs/default",
+        json={"name": provider},
+        headers=headers,
+    )
+    return resp.status_code < 400
+
+
+# ---------------------------------------------------------------------------
+# agent provider register / list
+# ---------------------------------------------------------------------------
+
+
+def _stdin_is_terminal() -> bool:
+    return sys.stdin.isatty()
+
+
+def _ask_provider_key(agent: ProviderAgent) -> Optional[str]:
+    """Ask for one provider's API key; Enter skips. When one of its usual env
+    vars is already set, offer that instead of a blank prompt. Hidden input."""
+    for env in agent.key_env:
+        if os.environ.get(env):
+            if typer.confirm(f"  Use ${env} for {agent.label}?", default=True):
+                return os.environ[env]
+            break
+    key = typer.prompt(
+        f"  Paste your {agent.label} key (Enter to skip)",
+        default="", show_default=False, hide_input=True,
+    )
+    return key.strip() or None
+
+
+def _owned_agents_by_name(client: httpx.Client, token: str) -> tuple[dict[str, dict], str]:
+    """The caller's own agents keyed by full name (``{username}-<name>``), and
+    the caller's username."""
+    headers = {"Authorization": f"Bearer {token}"}
+    me = _ok(client.get("/auth/user/me", headers=headers))
+    agents = _ok(client.get("/agents", headers=headers))
+    return {a["name"]: a for a in agents if a.get("registered_by") == me["id"]}, me["username"]
+
+
+def _relabel_legacy_provider_teams(
+    client: httpx.Client, token: str, owned: dict[str, dict], username: str,
+) -> None:
+    """Swap an earlier team name for ``PROVIDER_TEAM`` on every model agent the
+    caller already has, keeping the other labels and their order. Only the
+    team label moves; the description is the owner's and is left alone."""
+    legacy = set(provider_agents.LEGACY_PROVIDER_TEAMS)
+    for agent in provider_agents.PROVIDER_AGENTS:
+        existing = owned.get(f"{username}-{agent.name}")
+        teams = list((existing or {}).get("user_teams") or [])
+        if not legacy.intersection(teams):
+            continue
+        relabeled: list[str] = []
+        for team in teams:
+            team = provider_agents.PROVIDER_TEAM if team in legacy else team
+            if team not in relabeled:
+                relabeled.append(team)
+        _put_user_teams_op(client, token, existing["id"], user_teams=relabeled)
+        typer.echo(f"  ✓ {agent.name}: moved to the {provider_agents.PROVIDER_TEAM!r} team")
+
+
+@provider_app.command("register")
+def agent_provider_register(
+    ask_keys: bool = typer.Option(
+        True, "--ask-keys/--no-ask-keys",
+        help="Ask for an Anthropic, OpenAI, Gemini and OpenRouter API key (Enter "
+             "skips each). Only asked when this runs in a terminal.",
+    ),
+    server: Optional[str] = typer.Option(None, "--server", "-s"),
+    data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir", help="Root data directory"),
+    as_user: Optional[str] = typer.Option(
+        None, "--as-user", help="Username whose saved session to use (defaults to current_user).",
+    ),
+):
+    """Register one agent per model provider this computer can reach.
+
+    One for each model CLI that is installed AND signed in (claude, codex,
+    antigravity, gemini, opencode), and one for each API key you paste
+    (claude_api, openai_api, gemini_api, openrouter). Names are fixed, so a
+    re-run finds the same agents: one already on the same provider is left as
+    it is, and one with the same name on a different provider is warned about
+    and left alone. An existing one still filed under an earlier team name
+    ("Model providers") is moved to "Model agents". Run by the one-line
+    installer; safe to run again any time.
+    """
+    server_url, token = _resolve_user_session(data_dir, None, server, as_user=as_user)
+
+    wanted: list[tuple[ProviderAgent, Optional[str]]] = []
+    specs = {spec.id: spec for spec in doctor.MODEL_CLIS}
+    states = {state.id: state for state in doctor.inspect_model_clis()}
+    for agent in provider_agents.cli_agents():
+        state = states.get(agent.name)
+        if state is None or not state.present:
+            continue
+        if not state.logged_in:
+            spec = specs[agent.name]
+            fix = f"run `{spec.login_fix}`" if spec.login_fix else spec.login_note
+            typer.echo(f"  ! {agent.name}: {agent.label} is not signed in; {fix}, then run this again.")
+            continue
+        wanted.append((agent, None))
+
+    if ask_keys and _stdin_is_terminal():
+        typer.echo("  API keys add one agent per provider. Press Enter to skip any.")
+        for agent in provider_agents.key_agents():
+            key = _ask_provider_key(agent)
+            if key:
+                wanted.append((agent, key))
+
+    if not wanted:
+        typer.echo("  No model providers to connect. Sign in to a model CLI, then run "
+                   "`clawmeets agent provider register`.")
+        return
+
+    agents_dir = Path(data_dir).expanduser() / "agents"
+    failed: list[str] = []
+    with _http(server_url) as client:
+        owned, username = _owned_agents_by_name(client, token)
+        _relabel_legacy_provider_teams(client, token, owned, username)
+        for agent, key in wanted:
+            existing = owned.get(f"{username}-{agent.name}")
+            if existing is not None:
+                current = (existing.get("local_settings") or {}).get("llm_provider") or "claude"
+                if current == agent.provider:
+                    typer.echo(f"  ✓ {agent.name}: already connected")
+                else:
+                    typer.echo(
+                        f"  ! {agent.name}: you already have an agent with this name on "
+                        f"'{current}'; left it as it is."
+                    )
+                continue
+            result = _register_one_worker(
+                client,
+                token,
+                {
+                    "name": agent.name,
+                    "description": provider_agents.description(agent),
+                    "user_teams": [provider_agents.PROVIDER_TEAM],
+                    "llm_provider": agent.provider,
+                },
+                agents_dir,
+                llm_provider_override=None,
+                llm_api_key=key,
+            )
+            if result is None:
+                failed.append(agent.name)
+    if failed:
+        typer.echo(f"  Could not register: {', '.join(failed)}", err=True)
+        raise typer.Exit(1)
+
+
+@provider_app.command("list")
+def agent_provider_list(
+    server: Optional[str] = typer.Option(None, "--server", "-s"),
+    data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir", help="Root data directory"),
+    as_user: Optional[str] = typer.Option(
+        None, "--as-user", help="Username whose saved session to use (defaults to current_user).",
+    ),
+):
+    """Show every model provider agent: registered, available on this computer, or not."""
+    server_url, token = _resolve_user_session(data_dir, None, server, as_user=as_user)
+    with _http(server_url) as client:
+        owned, username = _owned_agents_by_name(client, token)
+    usable = {s.id for s in doctor.inspect_model_clis() if s.present and s.logged_in}
+    for agent in provider_agents.PROVIDER_AGENTS:
+        if f"{username}-{agent.name}" in owned:
+            status = "registered"
+        elif agent.kind == "cli":
+            status = "available here" if agent.name in usable else "not available"
+        else:
+            status = "needs an API key"
+        typer.echo(f"  {agent.name:12s} {agent.label:16s} {status}")
 
 
 @agent_team_app.command("register")

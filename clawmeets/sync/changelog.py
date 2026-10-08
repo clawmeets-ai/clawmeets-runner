@@ -100,6 +100,47 @@ class ChatroomPayload(BaseModel):
     chatroom_name: str
 
 
+# ---------------------------------------------------------------------------
+# Contact senders
+# ---------------------------------------------------------------------------
+
+# A person outside ClawMeets (reached over a channel such as Telegram or email)
+# posts into a Front Desk thread as ``from_participant_id = "contact:<id>"``.
+# That id is neither a User nor an Agent: ``Participant.get`` returns None for
+# it, and the runner never has the contact's record — only the id and the
+# ``from_participant_name`` stored on the message. Code that decides who sent a
+# message by elimination ("not an agent, so the user") must ask this first.
+# This is the ONLY place that knows the prefix; never test for it by hand.
+CONTACT_ID_PREFIX = "contact:"
+
+
+def is_contact_id(participant_id: str | None) -> bool:
+    """True when ``participant_id`` names an outside contact, not a User or Agent."""
+    return bool(participant_id) and participant_id.startswith(CONTACT_ID_PREFIX)
+
+
+def make_contact_id(opaque: str) -> str:
+    """The participant id for a contact whose record id is ``opaque``.
+
+    ``opaque`` is a server-minted id (a uuid), never the provider's own user id
+    or phone number: the id rides on every message the agent reads.
+    """
+    return f"{CONTACT_ID_PREFIX}{opaque}"
+
+
+def sender_label(participant_id: str | None, name: str | None) -> str:
+    """Who sent a message, as an agent reads it (prompt, chat history, reflection).
+
+    An outside contact chooses their own display name, so it could match the
+    owner's or read "System". The label says what they are, so an agent never
+    mistakes a contact for the owner or a teammate.
+    """
+    label = name or participant_id or ""
+    if is_contact_id(participant_id):
+        return f"{label} (outside contact)"
+    return label
+
+
 class MessagePayload(ChatroomPayload):
     """Payload for MESSAGE entries in unified changelog.
 
@@ -127,6 +168,13 @@ class MessagePayload(ChatroomPayload):
     # turn only. Resolved runner-side against the agent's stored configs;
     # unknown ⇒ silent fallback to the default (never errors).
     model_config_name: Optional[str] = None
+    # Set ONLY by the two write paths that produce an ordinary message in a
+    # channel thread's user-communication room: the agent's own post and the
+    # owner's own post (server/channels). The channel outbox sends a message
+    # only when this is True, so acks, plan/review notes, init/invite messages,
+    # system notices and mirrors — several of them written AS the coordinator —
+    # can never go out to the outside contact by being mistaken for a reply.
+    channel_outbound: bool = False
 
 
 class FilePayload(ChatroomPayload):

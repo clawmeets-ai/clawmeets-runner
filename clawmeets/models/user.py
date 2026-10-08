@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Optional
 import bcrypt
 
 from .participant import Participant, ParticipantRole
+from clawmeets.sync.changelog import is_contact_id
 from clawmeets.utils.file_io import FileUtil
 
 if TYPE_CHECKING:
@@ -1029,7 +1030,9 @@ class User(Participant):
         - Skip if no notification config
         - Skip acknowledgment messages (is_ack=True)
         - Skip non-user-communication chatrooms
-        - Skip messages not from the project coordinator
+        - Skip messages not from the project coordinator, except an outside
+          contact's (``contact:<id>``): someone writing in to the owner's agent
+          over a channel is news to the owner, the same as the agent's reply
         """
         from .chatroom import Chatroom
         from .project import Project
@@ -1047,9 +1050,12 @@ class User(Participant):
         if not chatroom or not chatroom.is_user_communication_room:
             return
 
-        # Skip messages not from coordinator
+        # Skip messages not from coordinator (or an outside contact)
         project = Project.get(project_id, self._model_ctx)
-        if not project or message.from_participant_id != project.coordinator_id:
+        if not project:
+            return
+        sender = message.from_participant_id
+        if sender != project.coordinator_id and not is_contact_id(sender):
             return
 
         # Build notification payload

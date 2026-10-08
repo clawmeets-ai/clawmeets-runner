@@ -34,6 +34,7 @@ from ..utils.agent_storage import (
     SHARED_STORAGE_ENV,
     AgentStorage,
 )
+from ..utils.extra_dirs import instruction_file
 
 from .triggers import derive_role, triggers_for
 
@@ -176,6 +177,7 @@ def _build_runtime_context(
     git_url: Optional[str] = None,
     roster_path: Optional[Path] = None,
     storage: Optional[AgentStorage] = None,
+    extra_dirs: list[Path] | None = None,
 ) -> str:
     """Compact `== FILES & STATE ==` block listing all the paths the agent
     can read or write.
@@ -230,7 +232,28 @@ def _build_runtime_context(
         lines.append(
             f"- User-curated reference material (read-only): {kd}"
         )
+    for d in extra_dirs or []:
+        lines.append(_extra_dir_line(d))
     return "\n".join(lines)
+
+
+def _extra_dir_line(extra_dir: Path) -> str:
+    """One FILES & STATE line for an extra directory. The instruction-file
+    pointer is what carries the folder's own instructions to every provider
+    (only Claude auto-loads ``CLAUDE.md`` from an added dir); the folder's
+    skills are already in the agent's skill list, layered under its own."""
+    line = (
+        f"- Extra directory (read/write; the owner's own folder — not synced to chat): {extra_dir}  "
+        "(its skills are installed alongside yours"
+    )
+    guide = instruction_file(extra_dir)
+    if guide is None:
+        return line + ")"
+    return line + (
+        f"; before working with it, read its instructions at {guide} — relative paths "
+        "in them resolve against that folder, and where they conflict with your role "
+        "and output contract here, this prompt wins)"
+    )
 
 
 def _build_output_contract(actions: list[str], is_coordinator: bool) -> str:
@@ -782,6 +805,7 @@ class PromptBuilder:
 
     _git_url: Optional[str] = None
     _storage: Optional[AgentStorage] = None
+    _extra_dirs: "list[Path] | tuple[()]" = ()
 
     def build_file_manifest(self, data_dir: Path) -> str:
         """Public alias kept for any callsite that still uses it directly."""
@@ -848,6 +872,7 @@ class PromptBuilder:
             knowledge_dirs=knowledge_dirs,
             git_url=self._git_url,
             storage=self._storage,
+            extra_dirs=self._extra_dirs,
             # Only coordinators that actually delegate need the roster path. The
             # roster is the GLOBAL agent registry at the agent root — NOT inside
             # the synced project files (a frequent prompt-vs-reality mismatch that
@@ -911,11 +936,13 @@ class WorkerPromptBuilder(PromptBuilder):
         capabilities: Optional[list[str]] = None,
         git_url: Optional[str] = None,
         storage: Optional[AgentStorage] = None,
+        extra_dirs: Optional[list[Path]] = None,
     ) -> None:
         self._coordinator_name = coordinator_name
         self._capabilities = capabilities or []
         self._git_url = git_url
         self._storage = storage
+        self._extra_dirs = list(extra_dirs or [])
         self._is_dm = False
         # set per-build; None on a DM and on any project with no seeded plan.
         self._plan: Optional[PlanPromptState] = None
@@ -1112,9 +1139,11 @@ class CoordinatorPromptBuilder(PromptBuilder):
         self,
         git_url: Optional[str] = None,
         storage: Optional[AgentStorage] = None,
+        extra_dirs: Optional[list[Path]] = None,
     ) -> None:
         self._git_url = git_url
         self._storage = storage
+        self._extra_dirs = list(extra_dirs or [])
         self._is_dm = False
         # True when the DM-shaped project is the user's own assistant DM
         # (project.created_by == coordinator.registered_by). False for an
@@ -1939,6 +1968,12 @@ burns the turn's token budget and the project never starts.
 - Plan should accomplish EXACTLY what the user asked — no more, no less.
 - If you think additional work would be valuable, propose it to the user
   rather than silently adding milestones.
+- When you draft the plan, record whether the project request is a DECISION:
+    clawmeets plan decision <project> yes|no
+  "yes" when the user ultimately has to choose (should I / which / whether /
+  compare X to pick one / research that feeds a choice). "no" for build,
+  produce, or ongoing-operations work. Set it once while drafting; it does not
+  change the plan text and the user never sees the flag itself.
 
 == STEP 3: UPDATE project files ==
 - First READ the worker-agent roster (its absolute path is listed under
@@ -2244,6 +2279,7 @@ def create_prompt_builder(
     coordinator_name: Optional[str] = None,
     git_url: Optional[str] = None,
     storage: Optional[AgentStorage] = None,
+    extra_dirs: Optional[list[Path]] = None,
 ) -> PromptBuilder:
     """Create a prompt builder based on operational mode.
 
@@ -2255,12 +2291,14 @@ def create_prompt_builder(
             surfaced as a one-line nudge in FILES & STATE. None when unbound.
         storage: The agent's local + shared storage folders, listed in
             FILES & STATE. None off the runner.
+        extra_dirs: Existing folders the agent works in alongside its
+            sandbox, each listed in FILES & STATE with its instruction file.
 
     Raises:
         ValueError: If mode is WORKER and ``coordinator_name`` is None.
     """
     if mode == OperationalMode.COORDINATOR:
-        return CoordinatorPromptBuilder(git_url=git_url, storage=storage)
+        return CoordinatorPromptBuilder(git_url=git_url, storage=storage, extra_dirs=extra_dirs)
     if coordinator_name is None:
         raise ValueError("coordinator_name is required for WORKER mode")
     return WorkerPromptBuilder(
@@ -2268,4 +2306,5 @@ def create_prompt_builder(
         capabilities=capabilities,
         git_url=git_url,
         storage=storage,
+        extra_dirs=extra_dirs,
     )

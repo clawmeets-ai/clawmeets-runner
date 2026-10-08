@@ -3,12 +3,13 @@
 clawmeets/models/desk_todo.py
 
 Desk to-do store — the My Desk right-rail "plate": tasks that still sit
-with the manager. Two origins land here:
-
-  * ``self``  — the user captured a quick snippet in the rail.
-  * ``agent`` — an agent team member pushed it (off a briefing / a decision
-    it surfaced) WITH context, a suggested recipient, a ready-to-refine
-    prompt, "what's been done", and "available facts".
+with the manager. Every field on a to-do is one the owner can edit in the
+web UI: the text, labels, a draft prompt and its recipient, and stored
+attachments. Items arrive two ways — the owner captures one in the rail, or
+an agent publishes one (``clawmeets todo publish``) carrying a suggested
+prompt and recipient, written into the same ``draft_*`` fields the owner's
+recipient picker writes. Nothing an agent publishes is shown in a place the
+owner cannot edit it.
 
 Clicking a to-do opens the Task take-over (a guided dispatch surface); the
 plate is an *ordered* list the manager drags to reorder, so — unlike the
@@ -26,6 +27,9 @@ Storage::
     {data_dir}/desk-todos/
       <owner_user_id>.json     # ordered list[DeskTodo], newest capture first
                                # ABSENT => the SEED, not an empty plate
+    {data_dir}/desk-seed-state/
+      <owner_user_id>.json     # {"given": [seed id, ...]} — every starter row
+                               # this account was EVER given; only ever grows
 
 Mutations are broadcast to the owner via ``DESK_TODO_SYNC`` (see
 ``server/routes/desk_todos.py``) so the desk refetches ``GET /me/desk/todos``.
@@ -39,12 +43,15 @@ import re
 import secrets
 import shutil
 import unicodedata
+from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
 
+from clawmeets.models.desk_sop import CONVENE_PROCEDURE
+from clawmeets.models.provider_agents import MODEL_AGENT_DEFINITION, provider_agent_names
 from clawmeets.utils.file_io import FileUtil
 
 logger = logging.getLogger("clawmeets.models.desk_todo")
@@ -52,6 +59,13 @@ logger = logging.getLogger("clawmeets.models.desk_todo")
 _lock = asyncio.Lock()
 
 TODOS_DIR = "desk-todos"
+
+# The seeded-items record: which starter rows this account has EVER been given,
+# kept apart from the plate so that deleting a row cannot erase the fact that
+# it was given. It is what lets ``backfill_starter_todos`` add a NEW starter row
+# to old plates without ever re-adding one the owner already threw away.
+# Written by the first plate save and by the backfill; nothing removes an entry.
+SEED_STATE_DIR = "desk-seed-state"
 
 # Real attachment bytes, one directory per to-do::
 #
@@ -110,12 +124,11 @@ MAX_SLUG_LEN = 32
 # plate, which is the one case where the owner's rows are still on disk and most
 # need not to be written over.
 #
-# ``origin`` is ``"self"``, not ``"agent"``: no agent published this, and an
-# agent-origin row with a null ``by_agent_name`` would be a claim about
-# provenance that nothing backs. ``drafted`` IS true, because the row genuinely
-# arrives carrying a ready prompt — that is the field the plate reads to show a
-# preview of it and the toast reads to say "edit it, then command" rather than
-# telling the owner to write a draft that is already there.
+# ``by_agent_id`` is null: no agent published this. ``drafted`` IS true,
+# because the row genuinely arrives carrying a ready prompt — that is the field
+# the plate reads to show a preview of it and the toast reads to say "edit it,
+# then command" rather than telling the owner to write a draft that is already
+# there.
 #
 # The recipient pair is left null on purpose. A null recipient already resolves
 # to ``{username}-assistant`` (``utils/todoDraft.ts``), which is exactly who
@@ -126,25 +139,256 @@ MAX_SLUG_LEN = 32
 # to store.
 SEED_TIMESTAMP = "1970-01-01T00:00:00+00:00"
 
+# The step 2 template lives between two marker lines so tests (and anyone
+# editing it) can address it without parsing prose. It is shown to the owner
+# filled in as its own to-do on their plate, and THEY fire it — the assistant
+# never runs it on its own.
+STEP2_TEMPLATE_START = "--- STEP 2 PROMPT TEMPLATE ---"
+STEP2_TEMPLATE_END = "--- END TEMPLATE ---"
+
+_ONBOARDING_STEP2_TEMPLATE = """\
+Staff a team for my priorities. Run it as ONE project that you coordinate,
+so registering, onboarding and handing off all happen under one plan.
+You staff my to-dos; you never start them. I fire each one myself.
+
+About me: <2-3 lines from USER.md: role, company, industry, how I work>
+
+My priorities, in order (to-do id · title · success · status · next step):
+1. <id> · <title> · <success> · <status> · <next step>
+2. ...
+
+Max new agents: 3.
+(Edit the list or this setting before firing this to-do if you like.)
+
+1. Design the team. Reuse agents I already have whenever one fits; propose
+   a new one only when nothing on my roster can do the job well, and no more
+   than the max above. Priorities beyond that stay with you; say why. Each
+   new agent gets a name, an industry matched to mine, expertise specific to
+   the priorities it owns ("B2B SaaS pricing analyst", not "Researcher"),
+   and mentors: you alone by default, since you now hold what every model
+   agent told you about me. Add one of my existing agents only when
+   the role genuinely overlaps its domain, and give each mentor a distinct
+   part of the brain dump. One agent can own several priorities. Prefer
+   fewer, sharper agents.
+
+2. Create the project (your create-project skill) with --agent-pool owned,
+   one --agent per EXISTING agent you're reusing, and --spawned-from <the id
+   of this conversation>. The new agents don't exist yet; you add them to
+   the roster as you register them. Its plan must contain:
+   - A team table: agent | new or existing | mentors | to-dos it owns (id +
+     title) | the agent's one-line job.
+   - Milestones:
+     Register: register each approved new agent, with a role description
+       built from its industry and expertise. Make sure it is running, and
+       add it to this project (clawmeets project allowlist <project> --agent
+       <name>). Register the top-priority agent first.
+     Onboard <agent>: one per new agent, each in its own workroom, in
+       priority order, run in parallel:
+       a. Brain dump. Each mentor writes its part: everything proprietary,
+          hard-won or non-obvious that touches this agent's industry and
+          expertise. That covers my profile above, the priorities it will own,
+          our conventions and stack, decisions already made and why, what we
+          tried that failed, the people and systems involved, and anything a
+          competent outsider would get wrong about how we work.
+       b. Deep research. The new agent researches its industry and expertise
+          to practitioner depth: the state of the art, the standard tools and
+          their trade-offs, common failure modes, and where the field is
+          heading. It then reconciles that against the brain dump and flags
+          every place our practice contradicts it.
+       c. Memorize. The new agent reflects and commits the brain dump and
+          its research to memory. Done when it posts a short inventory of
+          what it now knows, plus every conflict or gap it flagged.
+     Hand off: for each priority, update its to-do in place (never publish
+       a duplicate):
+         clawmeets todo update <id> --recipient <agent> \\
+           --draft-prompt "<first assignment>"
+       The first assignment states the goal, the current status, and the
+       very next deliverable and what makes it good enough, written so I
+       could fire it without editing. If the to-do already has
+       a draft, keep it and put your first assignment above it. Priorities
+       that stay with you get a draft addressed to you. Skip any to-do that's
+       no longer open. Hand off each to-do as soon as ITS agent finishes
+       onboarding; don't wait for the others. Do not fire any to-do.
+   - Acceptance criteria I can check: every priority on my desk has an agent
+     and a first assignment I could fire without editing; every new agent
+     can say what it knows about me and its domain, and what it flagged.
+   - Not Authorized: register no agent beyond what the accepted plan names.
+     Fire no to-do, ever. I start each one myself.
+
+3. Wait for me to accept the plan. Register nothing before that. If I edit
+   the team, update the plan to match.
+
+4. Run the milestones. When they're done, complete the project with a
+   report: the team (name, one-line job, what it now knows, what it
+   flagged), and my staffed to-dos in priority order (title, agent, the
+   first deliverable it will produce), each ready for me to fire. Don't
+   archive this to-do; it follows the project.
+"""
+
+ONBOARDING_SEED_ID = "t-seed-onboarding-know-me"
+THINKING_PARTNER_SEED_ID = "t-seed-thinking-partner"
+CONVENE_SEED_ID = "t-seed-convene-models"
+
+# The second starter row's prompt, inline and word for word as the product plan
+# wrote it. Deliberately NOT a pointer to the "Register new agent" SOP in
+# ``models/desk_sop.py``: that SOP is the owner's to edit or delete, and this
+# to-do has to keep working after they do. ``thought_partner`` is load-bearing —
+# the thinking template's starter messages are tied to that exact agent name.
+THINKING_PARTNER_PROMPT = (
+    'Register a new agent for me and bring it to full working standard before it takes on any real work.\n'
+    '\n'
+    '  Name:      thought_partner  (keep this exact name; its starter messages are tied to it)\n'
+    '  Industry:  decision-making and strategic thinking for my work and life\n'
+    '  Expertise: consultant-style interviewing that finds the real question behind a request; structured brainstorming (analogies, constraint flips, assumption reversal, pre-mortems, perspective shifts) followed by narrowing to 2–3 options with cheap tests\n'
+    '  Mentors:   my assistant (already briefed by my model agents)\n'
+    '\n'
+    # Knowledge flows model agents -> assistant -> everyone else, and the
+    # owner can fire this row before onboarding. Without this line
+    # thought_partner would inherit a brain dump the model agents never fed.
+    "If my model agents haven't briefed you yet (step 1 of my onboarding "
+    "to-do), do that briefing first, then come back to this.\n"
+    '\n'
+    'Run these five steps in order and do not skip one:\n'
+    '\n'
+    '1. Register the agent, with a role description built from the industry and expertise above, and install the `grill-me` and `broaden-options` skills on it.\n'
+    "2. Brain dump. My assistant writes down what a thinking partner needs to know about me: decisions I've made and why, bets that held up or didn't, assumptions I keep making, and the questions I tend to avoid. Hand it to the new agent.\n"
+    '3. Deep research. Have the new agent research interviewing and brainstorming practice to practitioner depth (how good consultants and coaches question people, which ideation methods work and when each fails), then reconcile that against the brain dump.\n'
+    '4. Memorize. Have the new agent reflect and commit both to memory.\n'
+    "5. Confirm it's in my sidebar.\n"
+    '\n'
+    'Report back with what it now knows about how I decide, and every gap it flagged.'
+)
+
+# The third starter row's prompt: a model-agent panel, the demo of what several
+# models together give that one model alone does not. Inline, like the row
+# above, rather than a pointer to the "SYSTEM:Convene panel" SOP the owner may
+# delete; the moderation steps are that SOP's own ``CONVENE_PROCEDURE``, so the
+# two cannot drift. Capped at 2 rounds so the demo stays cheap (about 9 agent
+# turns with three model agents).
+CONVENE_PROMPT = (
+    f"{MODEL_AGENT_DEFINITION}\n"
+    "\n"
+    "Show me what my model agents can do together. From my USER.md and my "
+    "plate, propose 3 judgment questions I really face (not lookups), one "
+    "sentence each. I pick one or write my own.\n"
+    "\n"
+    "Then convene a panel on it:\n"
+    "  Panel:      every model agent on my roster\n"
+    "  Max rounds: 2\n"
+    "  Consensus:  majority\n"
+    # The assistant moderates and never votes (CONVENE_PROCEDURE), so the
+    # fallback panel is made of other agents, never the assistant itself.
+    "If I have fewer than 2 model agents, tell me, and offer the model agent I "
+    "do have plus thought_partner (or another of my agents) as the panel "
+    "instead, saying plainly that they may run on the same model, so the "
+    "panel is less diverse.\n"
+    "Don't create the project until I've picked the question.\n"
+    "\n"
+    f"{CONVENE_PROCEDURE}\n"
+    "\n"
+    "Also report the one claim a single model alone would have got wrong, and "
+    "which model agent caught it."
+)
+
 SEED: tuple[dict[str, object], ...] = (
     {
-        "id": "t-seed-personalize-assistant",
+        "id": ONBOARDING_SEED_ID,
         # Phrased for the OWNER reading their own plate: the row names the
         # thing that needs doing, not the party doing it. Clicking it loads
         # ``draft_prompt`` into the composer already addressed to
         # ``{username}-assistant``, which is where the second person belongs.
-        "text": "Personalize & bootstrap assistant",
-        "origin": "self",
+        "text": "Get to know me & staff my priorities",
         "drafted": True,
-        # A POINTER, not a copy. The SOP body lives once, in
-        # ``desk_sop.SEED``, and it carries typed blanks only the SOP surfaces
-        # know how to fill — so this names it by the exact title that seed
-        # ships and lets the assistant read it out of the library.
+        # Self-contained rather than a pointer to an SOP: step 2 is a template
+        # the assistant fills from what step 1 produced, so the two have to
+        # travel together. Step 1 is the one place a new account's USER.md gets
+        # written; there is no separate personalize item any more.
+        #
+        # PRODUCT RULE, pinned in tests/test_desk_todo_seed.py: onboarding
+        # staffs to-dos and never starts them. Nothing here may tell the
+        # assistant to run ``todo trigger`` — the owner's own first click on a
+        # staffed to-do is the activation event.
         "draft_prompt": (
-            "Please personalize yourself using my “SYSTEM:Personalize "
-            "assistant” SOP — read it out of my SOP library, ask me "
-            "for whatever blanks it carries, then run it end to end."
+            "Help me get set up. There are two steps. Do step 1 now. For step "
+            "2 you only prepare a to-do; it starts when I fire it.\n"
+            "\n"
+            "Step 1. Get to know me.\n"
+            # The model agents (models/provider_agents.py) are plain agents in
+            # code; mentoring the assistant is written down here and nowhere
+            # else. Knowledge flows one way: model agents -> assistant ->
+            # thought_partner and every agent "Staff my priorities" creates.
+            f"{MODEL_AGENT_DEFINITION}\n"
+            "First, have my model agents mentor you. Their names come from "
+            "this fixed list, and only the ones on my roster exist: "
+            f"{', '.join(provider_agent_names())}. Send each one on my roster "
+            "the same request with your direct-message skill: \"Brief my "
+            "assistant on me as a mentor would. Cover what your model has "
+            "seen of my work on this computer: instruction files and saved "
+            "memories; the projects and repos I've worked in; my conventions "
+            "and stack; decisions I made and why; what I tried that failed; "
+            "and the topics I keep coming back to. Summaries only; leave out "
+            "secrets.\" While they answer, start the interview below. Before "
+            "your next question, read their replies (`clawmeets dm history "
+            "<agent>`), use them to pre-fill USER.md, and skip any question "
+            "they already answered. Commit everything else they told you to "
+            "your own memory, noting which model agent said what. Then show "
+            "me a short inventory of what you learned, which facts came from "
+            "which agent, and every place two model agents disagree, so I can "
+            "correct them.\n"
+            "Write my USER.md with your personalize skill: ask for the easiest "
+            "input first (a resume, a pasted bio, a link), then ask only what "
+            "is still missing and important. Keep it quick: never ask for due "
+            "dates, and don't ask what success looks like; propose it and let "
+            "me correct it. If USER.md already exists, read it and fill only "
+            "the gaps. Make sure it covers my role, company, industry, how I "
+            "like to work, and my top priorities, ranked.\n"
+            "Then put each priority on my plate. Run `clawmeets todo list "
+            "--no-archived` first and reuse a to-do that already covers it; "
+            "publish one only when none does, with its success outcome, "
+            "current status and very next step in the draft (`clawmeets todo "
+            "publish --text \"<title>\" --draft-prompt \"Success: ... "
+            "Status: ... Next step: ...\"`).\n"
+            "Show me what you wrote and the priority list, and let me correct "
+            "both before you go on.\n"
+            "\n"
+            "Step 2. Staff my priorities.\n"
+            "Once I confirm, fill in the About me line and my priorities in the "
+            "template below from my USER.md and my plate. Leave the rest as "
+            "written, including `<the id of this conversation>`: that is "
+            "filled in when the to-do runs. Put the result on my plate as ONE "
+            "new to-do titled \"Staff my priorities\", with the filled-in "
+            "template as its draft prompt (`clawmeets todo publish --text "
+            "\"Staff my priorities\" --draft-prompt \"<filled template>\"`). "
+            "If an open to-do with that title is already on my plate, update "
+            "its draft instead (`clawmeets todo update <id> --draft-prompt "
+            "\"<filled template>\"`). Then tell me step 1 is done and that "
+            "\"Staff my priorities\" is waiting on my plate: I can edit it "
+            "there and fire it next. Do not fire it yourself.\n"
+            "\n"
+            f"{STEP2_TEMPLATE_START}\n"
+            f"{_ONBOARDING_STEP2_TEMPLATE}"
+            f"{STEP2_TEMPLATE_END}"
         ),
+    },
+    {
+        # Right after onboarding, which is what writes the USER.md the brain
+        # dump in step 2 of this prompt draws on. Same shape as the row above:
+        # a ready prompt, and a null recipient that resolves to the owner's own
+        # assistant — the one agent that can register another.
+        "id": THINKING_PARTNER_SEED_ID,
+        "text": "Add a thinking partner for big decisions",
+        "drafted": True,
+        "draft_prompt": THINKING_PARTNER_PROMPT,
+    },
+    {
+        # Third: it proposes questions from USER.md and the plate, which
+        # onboarding writes. Same shape as the rows above. Like them it never
+        # fires anything; it creates the panel project only after the owner
+        # picks the question.
+        "id": CONVENE_SEED_ID,
+        "text": "Get the best answer from all my models combined",
+        "drafted": True,
+        "draft_prompt": CONVENE_PROMPT,
     },
 )
 
@@ -448,35 +692,15 @@ class AttachmentError(ValueError):
         self.sentence = sentence
 
 
-class DeskTodoSource(BaseModel):
-    """The external nudge a self-captured task came from (Slack/Email/…)."""
-
-    label: str
-    icon: str
-
-
-class DeskTodoFileRef(BaseModel):
-    """An agent-suggested reference file — name/sub only, no bytes. Rendered
-    as an informational chip in the take-over composer; on dispatch its name
-    is appended to the message so the agent knows what to consult."""
-
-    name: str
-    sub: str = ""
-    icon: str = "report"
-
-
 class DeskTodoAttachment(BaseModel):
     """One real, stored file on a to-do. The bytes live on disk at
     ``{data_dir}/desk-todo-files/<owner>/<todo_id>/<id>``; this row is the ONLY
     thing that names them, and a blob the plate does not name is garbage by
     definition.
 
-    A **sibling** of ``DeskTodoFileRef``, never a widening of it: that one is an
-    agent-authored suggestion chip carrying no bytes, published over the CLI
-    wire by ``clawmeets todo publish``. A discriminated union across the two
-    would let any agent's publish payload *claim* bytes it does not have, and
-    force every renderer to branch per element forever. Separate field,
-    separate lifecycle, separate writer — the owner, on save, and nobody else.
+    Written by the owner, on save, and nobody else — ``clawmeets todo
+    publish`` carries no attachments, so an agent can never park bytes on its
+    owner's plate.
 
     ``name`` is the original filename, DISPLAY ONLY. It never becomes a path
     segment: the file on disk is named by ``id``, which is why traversal is
@@ -491,27 +715,22 @@ class DeskTodoAttachment(BaseModel):
     created_at: str
 
 
-class DeskTodoFact(BaseModel):
-    """One key/value in the take-over's "Available & relevant" list."""
-
-    k: str
-    v: str
-
-
-class DeskTodoLink(BaseModel):
-    """A source/briefing the take-over can open."""
-
-    label: str
-    icon: str
-
-
 class DeskTodo(BaseModel):
-    """A single item on the manager's plate."""
+    """A single item on the manager's plate.
+
+    Only fields the owner can edit in the web UI live here (plus ids,
+    timestamps and the hidden ``by_agent_id``). Rows written by older servers
+    may carry keys that have since been removed — ``origin``, ``source``,
+    ``due``, ``by_agent_name``, ``suggest_agent_*``, ``context``, ``files``,
+    ``done_steps``, ``available``, ``linked``. They are not declared, so
+    pydantic's default ``extra="ignore"`` drops them on load and the next
+    ``_save`` persists the slim shape — the same strategy
+    ``_archived_read_shim`` describes for ``status``. No migration pass.
+    """
 
     id: str
     owner_user_id: str
     text: str
-    origin: str = "self"  # "self" | "agent"
     # The owner filed it away. A DISPOSAL, never a lifecycle state — nothing
     # project-driven writes it and nothing reads it as "the work finished".
     # A bool rather than a renamed two-value string on purpose: a string is
@@ -534,10 +753,6 @@ class DeskTodo(BaseModel):
     # imports this one and is never imported by it.
     project_ids: list[str] = Field(default_factory=list)
 
-    # self-capture
-    source: DeskTodoSource | None = None
-    due: str | None = None
-
     # Bare normalized slugs — the owner's GTD contexts and states. Presentation
     # (display name, colour, which axis) lives in the SEPARATE registry document
     # (``models/desk_label.py``); this list is NOT a foreign key into it. A slug
@@ -547,31 +762,28 @@ class DeskTodo(BaseModel):
     # migration script.
     labels: list[str] = Field(default_factory=list)
 
-    # agent-published extras
-    by_agent_id: str | None = None
-    by_agent_name: str | None = None
-    suggest_agent_id: str | None = None
-    suggest_agent_name: str | None = None
     draft_prompt: str | None = None
-    # Recipient the manager picked in the take-over composer, stored alongside
-    # the draft. Both id and name are persisted so the plate pill still labels
-    # correctly after a rename/removal; the frontend re-resolves against the
-    # live roster and falls back if the agent is gone. Null until set.
+    # Recipient of the draft — picked in the take-over composer, or resolved
+    # from an agent publish's ``--suggest``. Both id and name are persisted so
+    # the plate pill still labels correctly after a rename/removal; the
+    # frontend re-resolves against the live roster and falls back if the agent
+    # is gone. A suggested name that resolved to nobody stores the name with a
+    # null id. Null until set.
     draft_recipient_id: str | None = None
     draft_recipient_name: str | None = None
-    context: str | None = None
-    files: list[DeskTodoFileRef] = Field(default_factory=list)
-    # Real stored bytes the OWNER parked on this item, distinct from the
-    # name-only ``files`` chips above and from the ``context`` text blob. Always
-    # a list, never null — ``default_factory`` means every plate row written
-    # before attachments existed validates unchanged, so there is no migration.
+    # Real stored bytes the OWNER parked on this item. Always a list, never
+    # null — ``default_factory`` means every plate row written before
+    # attachments existed validates unchanged, so there is no migration.
     attachments: list[DeskTodoAttachment] = Field(default_factory=list)
-    done_steps: list[str] = Field(default_factory=list)
-    available: list[DeskTodoFact] = Field(default_factory=list)
-    linked: DeskTodoLink | None = None
 
-    # set when the manager saves a draft in the take-over
+    # True once the item carries a ready draft: set when the manager saves one
+    # in the take-over, or when an agent publishes with a draft prompt.
     drafted: bool = False
+
+    # Hidden provenance, never displayed: the agent that published this item,
+    # kept ONLY so ``DELETE /me/desk/todos/{id}`` can let the publishing agent
+    # retract its own item. Null for anything the owner captured.
+    by_agent_id: str | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -598,10 +810,6 @@ class DeskTodo(BaseModel):
 
         The shim is also what makes the change loadable in both directions
         during a rollout: a row already carrying ``archived`` is untouched here.
-
-        NAMING TRAP, adjacent and unrelated: ``done_steps`` is the agent's
-        groundwork list ("what's already been done") and has nothing whatever to
-        do with archiving. It is not read or written here.
         """
         if not isinstance(data, dict):
             return data
@@ -675,11 +883,160 @@ def _load(data_dir: Path, owner_user_id: str) -> list[DeskTodo]:
 
 
 def _save(data_dir: Path, owner_user_id: str, todos: list[DeskTodo]) -> None:
+    """Every write ends here. The FIRST one — no plate file yet — is the moment
+    the in-memory seed becomes real, so it also records every ``SEED`` id as
+    given. All of them, not just the ones still in ``todos``: the owner was
+    shown the whole seed, and a first write that deletes a starter row must
+    still count it as given or the backfill would hand it straight back."""
+    path = _path(data_dir, owner_user_id)
+    first_save = not path.exists()
+    FileUtil.write(path, [t.model_dump() for t in todos], "json")
+    if first_save:
+        record_given_seed_ids(data_dir, owner_user_id, (row["id"] for row in SEED))
+
+
+# --- the seeded-items record ------------------------------------------------
+
+
+def _seed_state_path(data_dir: Path, owner_user_id: str) -> Path:
+    return Path(data_dir) / SEED_STATE_DIR / f"{owner_user_id}.json"
+
+
+def given_seed_ids(data_dir: Path, owner_user_id: str) -> set[str]:
+    """Seed ids this account has ever been given. A missing or unreadable
+    record reads as the empty set."""
+    raw = FileUtil.read(_seed_state_path(data_dir, owner_user_id), "json")
+    given = raw.get("given") if isinstance(raw, dict) else None
+    if not isinstance(given, list):
+        return set()
+    return {g for g in given if isinstance(g, str)}
+
+
+def record_given_seed_ids(
+    data_dir: Path, owner_user_id: str, ids: Iterable[str],
+) -> None:
+    """Union ``ids`` into the record. Never removes an entry, and skips the
+    write when nothing is new."""
+    have = given_seed_ids(data_dir, owner_user_id)
+    merged = have | set(ids)
+    if merged == have:
+        return
     FileUtil.write(
-        _path(data_dir, owner_user_id),
-        [t.model_dump() for t in todos],
+        _seed_state_path(data_dir, owner_user_id),
+        {"given": sorted(merged)},
         "json",
     )
+
+
+# --- the one-time starter backfill ------------------------------------------
+
+
+class BackfillReport(BaseModel):
+    """Per-account outcome of ``backfill_starter_todos``, by user id.
+
+    ``would_add`` and ``added`` name the same accounts; ``added`` is filled
+    only when the run applied. ``skipped_unreadable`` is a plate file that
+    exists but is not a JSON list — it is left alone rather than written over,
+    and unlike a missing plate the new-account seed will NOT reach it."""
+
+    would_add: list[str] = Field(default_factory=list)
+    added: list[str] = Field(default_factory=list)
+    skipped_already_given: list[str] = Field(default_factory=list)
+    skipped_no_plate: list[str] = Field(default_factory=list)
+    skipped_unreadable: list[str] = Field(default_factory=list)
+
+    @property
+    def skipped(self) -> int:
+        return (
+            len(self.skipped_already_given)
+            + len(self.skipped_no_plate)
+            + len(self.skipped_unreadable)
+        )
+
+
+# Starter rows added after launch, each given once to every existing plate by
+# ``backfill_starter_todos``. Each is decided on its own: an owner who deleted
+# one still gets the next.
+BACKFILL_SEED_IDS: tuple[str, ...] = (THINKING_PARTNER_SEED_ID, CONVENE_SEED_ID)
+
+
+def _seed_row(seed_id: str, owner_user_id: str) -> dict[str, Any]:
+    (row,) = (r for r in SEED if r["id"] == seed_id)
+    return DeskTodo(
+        owner_user_id=owner_user_id,
+        created_at=SEED_TIMESTAMP,
+        updated_at=SEED_TIMESTAMP,
+        **row,
+    ).model_dump()
+
+
+def backfill_starter_todos(
+    data_dir: Path, user_ids: Iterable[str], *, apply: bool,
+) -> BackfillReport:
+    """Give every existing saved plate each ``BACKFILL_SEED_IDS`` row, once.
+
+    OFFLINE ONLY: plate writes are serialized by the in-process ``_lock``, which
+    this cannot share with a running server — the CLI wrapper refuses
+    ``apply=True`` while the server is up. Per account:
+
+    - no plate file          -> skipped_no_plate (the new seed covers it)
+    - plate not a JSON list  -> skipped_unreadable (never written over)
+
+    and then per starter row, each decided on its own:
+
+    - id in the given record -> left out (deleted stays deleted)
+    - id already on the plate-> left out (and recorded, on apply)
+    - otherwise              -> inserted right after the nearest earlier
+                                ``SEED`` row still on the plate, or at the top
+                                if none is; on apply the record gains it and
+                                the onboarding id (a pre-feature plate was
+                                given onboarding at its first save)
+
+    The account lands in would_add (and added, on apply) if any row went in,
+    otherwise in skipped_already_given. The plate is edited as raw JSON rows so
+    every other row is written back exactly as it was read, including rows the
+    model would reject.
+    """
+    seed_order = [str(r["id"]) for r in SEED]
+    report = BackfillReport()
+    for uid in user_ids:
+        path = _path(data_dir, uid)
+        if not path.exists():
+            report.skipped_no_plate.append(uid)
+            continue
+        raw = FileUtil.read(path, "json")
+        if not isinstance(raw, list):
+            report.skipped_unreadable.append(uid)
+            continue
+        given = given_seed_ids(data_dir, uid)
+        inserted: list[str] = []
+        already_there: list[str] = []
+        for seed_id in BACKFILL_SEED_IDS:
+            if seed_id in given:
+                continue
+            ids = [r.get("id") if isinstance(r, dict) else None for r in raw]
+            if seed_id in ids:
+                already_there.append(seed_id)
+                continue
+            earlier = seed_order[: seed_order.index(seed_id)]
+            at = 0
+            for prev in reversed(earlier):
+                if prev in ids:
+                    at = ids.index(prev) + 1
+                    break
+            raw.insert(at, _seed_row(seed_id, uid))
+            inserted.append(seed_id)
+        if apply and already_there:
+            record_given_seed_ids(data_dir, uid, already_there)
+        if not inserted:
+            report.skipped_already_given.append(uid)
+            continue
+        report.would_add.append(uid)
+        if apply:
+            FileUtil.write(path, raw, "json")
+            record_given_seed_ids(data_dir, uid, [ONBOARDING_SEED_ID, *inserted])
+            report.added.append(uid)
+    return report
 
 
 # --- the attachment blob store ----------------------------------------------
@@ -920,11 +1277,9 @@ async def add_todo(
     owner_user_id: str,
     text: str,
     *,
-    source: DeskTodoSource | None = None,
-    due: str | None = None,
     labels: object = None,
 ) -> DeskTodo:
-    """Capture a self-origin task; prepended to the plate (newest first).
+    """Capture an owner task; prepended to the plate (newest first).
 
     ``labels`` is normalized and capped BEFORE the row is built, so a rejected
     capture never reaches the document."""
@@ -939,11 +1294,8 @@ async def add_todo(
             id=gen_id(),
             owner_user_id=owner_user_id,
             text=text,
-            origin="self",
             created_at=now,
             updated_at=now,
-            source=source,
-            due=due,
             labels=slugs,
         )
         todos.insert(0, todo)
@@ -956,20 +1308,17 @@ async def publish_agent_todo(
     owner_user_id: str,
     *,
     by_agent_id: str,
-    by_agent_name: str,
     text: str,
-    due: str | None = None,
-    suggest_agent_id: str | None = None,
-    suggest_agent_name: str | None = None,
     draft_prompt: str | None = None,
-    context: str | None = None,
-    files: list[DeskTodoFileRef] | None = None,
-    done_steps: list[str] | None = None,
-    available: list[DeskTodoFact] | None = None,
-    linked: DeskTodoLink | None = None,
+    draft_recipient_id: str | None = None,
+    draft_recipient_name: str | None = None,
     labels: object = None,
 ) -> DeskTodo:
-    """Push an agent-origin task onto the owner's plate (prepended).
+    """Push an agent-published task onto the owner's plate (prepended).
+
+    The suggested prompt and recipient land in the same ``draft_*`` fields the
+    owner's take-over writes, so what the agent suggests is exactly what the
+    owner sees and edits. The caller (the route) resolves the recipient.
 
     ``labels`` is validated identically to ``add_todo``. Note what does NOT
     happen here: no auto-registration. The item is the agent's to write; the
@@ -985,20 +1334,13 @@ async def publish_agent_todo(
             id=gen_id(),
             owner_user_id=owner_user_id,
             text=text,
-            origin="agent",
             created_at=now,
             updated_at=now,
-            due=due,
             by_agent_id=by_agent_id,
-            by_agent_name=by_agent_name,
-            suggest_agent_id=suggest_agent_id,
-            suggest_agent_name=suggest_agent_name,
-            draft_prompt=draft_prompt,
-            context=context,
-            files=files or [],
-            done_steps=done_steps or [],
-            available=available or [],
-            linked=linked,
+            draft_prompt=draft_prompt or None,
+            draft_recipient_id=draft_recipient_id,
+            draft_recipient_name=draft_recipient_name,
+            drafted=bool(draft_prompt),
             labels=slugs,
         )
         todos.insert(0, todo)
@@ -1105,7 +1447,6 @@ async def patch_todo(
     *,
     archived: bool | None = None,
     text: str | None = None,
-    due: str | None = None,
     draft_prompt: str | None = None,
     draft_recipient_id: str | None = _UNSET,  # _UNSET → leave untouched
     draft_recipient_name: str | None = _UNSET,  # None → clear, str → set
@@ -1178,8 +1519,6 @@ async def patch_todo(
             text = text.strip()
             if text:
                 target.text = text
-        if due is not None:
-            target.due = due or None
         if draft_prompt is not None:
             target.draft_prompt = draft_prompt
         if draft_recipient_id is not _UNSET:

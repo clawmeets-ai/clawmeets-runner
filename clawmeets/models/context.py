@@ -49,8 +49,10 @@ from clawmeets.sync.changelog import (
     RoomCreatedPayload,
     RoomDeletedPayload,
     ParticipantAddedPayload,
+    is_contact_id,
 )
 from clawmeets.sync.subscriber import ChangelogSubscriber
+from clawmeets.utils import extra_dirs as extra_dirs_lib
 from clawmeets.utils.file_io import FileUtil
 from .project import Project, ProjectState
 from .participant import Participant, ParticipantRole
@@ -106,6 +108,7 @@ class ModelContext:
         claude_plugin_dirs: Optional[list[Path]] = None,
         git_url: Optional[str] = None,
         storage: Optional["AgentStorage"] = None,
+        extra_dirs: Optional[list[Path]] = None,
     ) -> None:
         """Initialize context with a single base directory.
 
@@ -130,6 +133,11 @@ class ModelContext:
         (``clawmeets.utils.agent_storage``), listed in the prompt and exposed
         to the LLM as $AGENT_LOCAL_STORAGE_DIR / $AGENT_SHARED_STORAGE_DIR.
 
+        ``extra_dirs`` are existing folders the agent works in alongside its
+        sandbox (``clawmeets.utils.extra_dirs``): added to every invocation's
+        allowed dirs, their own skills layered under the agent's, and their
+        instruction file named in the prompt.
+
         Args:
             base_dir: Base directory for all data
             cli: LLM provider for invocation (optional, for agent runtime)
@@ -148,6 +156,7 @@ class ModelContext:
         self._invocation_registry: Optional["InvocationRegistry"] = None
         self._git_url = git_url or None
         self._storage = storage
+        self._extra_dirs = list(extra_dirs or [])
         # Optional factory (local_settings dict -> LLMProvider), shared with the
         # reactive loop's hot-swap path. Set on the runner so the per-request
         # model override (model_config_name) can build a one-turn provider from a
@@ -203,6 +212,15 @@ class ModelContext:
     def update_storage(self, storage: Optional["AgentStorage"]) -> None:
         """Replace the storage folders. Takes effect on the next LLM invocation."""
         self._storage = storage
+
+    @property
+    def extra_dirs(self) -> list[Path]:
+        """Existing folders the agent works in alongside its sandbox."""
+        return self._extra_dirs
+
+    def update_extra_dirs(self, dirs: list[Path]) -> None:
+        """Replace the extra directories. Takes effect on the next LLM invocation."""
+        self._extra_dirs = list(dirs)
 
     @property
     def claude_plugin_dirs(self) -> list[Path]:
@@ -318,8 +336,10 @@ class ModelContext:
         ``system-skill-hub/skills-<role>/`` tree is prepended as the
         BASE layer so a user-installed (skill-hub) or agent-authored
         (personal-skill-hub) skill of the same name overrides it.
+        The extra directories' own skills sit below even that, so a
+        tool checkout can add skills but never shadow a clawmeets one.
         Runner-only path."""
-        dirs: list[Path] = []
+        dirs: list[Path] = extra_dirs_lib.skill_roots(self._extra_dirs)
         if role is not None:
             dirs.append(self._base_dir / "system-skill-hub" / f"skills-{role}")
         dirs.extend([
@@ -784,8 +804,13 @@ class ModelContextChangelogSubscriber(ChangelogSubscriber):
         treated as a response (agent-side) so a stray message never mislabels a
         user request. Callers must already have excluded ``mirrored_from``
         entries (see ``_handle_message``) — this resolves the *native* author.
+
+        An outside contact (``contact:<id>``) has no Participant record but is
+        the person asking, so their message is a request, never a response.
         """
         payload: MessagePayload = entry.payload  # type: ignore[assignment]
+        if is_contact_id(payload.from_participant_id):
+            return True
         participant = Participant.get(payload.from_participant_id, self._model_ctx)
         if participant is None:
             return False

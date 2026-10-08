@@ -56,7 +56,6 @@ from clawmeets.cli_todo import app as todo_app
 from clawmeets.cli_sop import app as sop_app
 from clawmeets.cli_plan import app as plan_app
 from clawmeets.cli_knowledge_dir import app as knowledge_dir_app
-from clawmeets.cli_om import app as om_app
 from clawmeets.cli_ib import app as ib_app
 
 app = typer.Typer(
@@ -146,7 +145,6 @@ app.add_typer(todo_app, name="todo")
 app.add_typer(sop_app, name="sop")
 app.add_typer(plan_app, name="plan")
 app.add_typer(knowledge_dir_app, name="knowledge-dir")
-app.add_typer(om_app, name="om")
 app.add_typer(ib_app, name="ib")
 
 

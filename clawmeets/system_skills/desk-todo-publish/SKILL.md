@@ -8,14 +8,15 @@ description: >
   (2) the user or coordinator asks you to "add this to my to-do / plate",
   "flag this to me", or "put this on my desk"; (3) you surfaced something
   mid-task that needs the *user's own hand* — an approval, a sign-off, a
-  decision only they can make — and want to hand it back with context.
+  decision only they can make — and want to hand it back ready to act on.
   Package the task and shell `clawmeets todo publish`, tagging it with the
   owner's OWN labels via `--label` (e.g. `--label office`) so it lands in the
   right group on their rail: run `clawmeets todo labels list` first and reuse
   what is there — none of it is built in, and a label you invent still shows
   but stays unregistered.
-  The item appears on the owner's To-do rail, agent-badged, and clicking it
-  opens a guided take-over pre-loaded with your suggested prompt + files. You
+  The item appears on the owner's To-do rail; what they see is your title,
+  your suggested prompt and your suggested recipient, all of which they can
+  edit before sending. You
   may retract only an item YOU published. Managing or firing what is already on
   the plate — and renaming, merging, recolouring or deleting the labels
   themselves — is the owner's assistant's job, the `desk-todo` skill.
@@ -55,31 +56,18 @@ Triggers:
 
 ## § What to package
 
-Everything is optional except `--text`. The more you supply, the sharper
-the take-over the manager opens.
+Everything is optional except `--text`. What you pass is exactly what the
+owner sees on the item — the suggested prompt and recipient land in the same
+fields the owner edits themselves, so write them ready to send.
 
 - `--text` (required) — the task as it reads on the plate, e.g.
   `"Approve the Provi restock PO ($6.8k) waiting on your sign-off"`.
-- `--suggest <agent>` — the agent you'd hand it to (short or full name).
-  Pre-selected as the recipient in the take-over.
-- `--draft-prompt "…"` — a ready-to-refine request that seeds the
-  take-over composer. Write it as the message you'd send the suggested
-  agent, so the manager edits rather than composes.
-- `--context-file ctx.md` — a small `.md`/`.txt` (≤ 16 KB) of supporting
-  detail. Becomes an attachable context chip on the composer, so the
-  recipient can consult it. Write it to your sandbox first with `Write`.
-- `--file "name::sub"` (repeatable) — a reference file you gathered, shown
-  as an informational chip (name + a short sub-label). Chip only — no
-  bytes are uploaded; the name rides along so the recipient knows to
-  consult it.
-- `--done "step"` (repeatable) — a step you already completed, listed
-  under **What's been done** so the manager sees the groundwork.
-- `--fact "label::value"` (repeatable) — a key fact, listed under
-  **Available & relevant** (e.g. `"PO total::$6,821.40 · net-30"`).
-- `--due "Today"` / `--due "Fri"` — an optional due hint (`Today` renders
-  urgent).
-- `--linked "label::icon"` — a source to open from the take-over (e.g.
-  `"Finance briefing::chart"`).
+- `--draft-prompt "…"` — the suggested prompt. Write it as the message
+  you'd send the suggested agent, self-contained (put the key facts — amounts,
+  ids, dates, what you already checked — in it), so the owner edits rather
+  than composes.
+- `--suggest <agent>` — the suggested recipient (short or full name). It
+  becomes the draft's recipient, which the owner can change.
 - `--label <name>` (repeatable) — a GTD context the owner files this under,
   e.g. `--label office`. Write `office` or `@office`; both land as the same
   label. Use the owner's **existing** vocabulary — run `clawmeets todo labels
@@ -99,32 +87,25 @@ the take-over the manager opens.
   (`clawmeets todo associate <id> <project_id>`), which is true rather than
   decorative.
 
-Keep provenance honest — only list steps you actually did and facts you
-actually verified.
+There are no other flags — no context file, file chips, due date, facts or
+"what's been done" list. Anything the owner needs to know goes in the
+`--draft-prompt`. Keep it honest — only state what you actually did and
+verified.
 
 ## § Publish
 
-1. If you have supporting detail, `Write` it to `ctx.md` in your sandbox.
-2. Shell (one invocation, one to-do):
+1. Shell (one invocation, one to-do):
    ```bash
    clawmeets todo publish \
      --text "Approve the Provi restock PO ($6.8k) waiting on your sign-off" \
      --suggest api_sync \
      --label office \
-     --draft-prompt "Review Provi restock PO #4471 ($6,821.40, net-30). If the line items and pricing check out against the last order, approve it and confirm the delivery window with Provi." \
-     --context-file ctx.md \
-     --due Fri \
-     --linked "Finance briefing::chart" \
-     --done "Reconciled every line item against the last 3 Provi orders — pricing matched" \
-     --done "Confirmed it covers the Etna Rosso + Sancerre low-stock flags" \
-     --fact "PO total::$6,821.40 · net-30" \
-     --fact "Budget::Within Q3 F&B — 62% used" \
-     --file "PO-4471-provi.pdf::purchase order · 2pp"
+     --draft-prompt "Review Provi restock PO #4471 ($6,821.40, net-30, due Fri). I reconciled every line item against the last 3 orders and pricing matched. If it checks out, approve it and confirm the delivery window with Provi."
    ```
    The CLI resolves your agent id + token + server URL from the env the
    runner injects (`CLAWMEETS_AGENT_ID`, `CLAWMEETS_AGENT_TOKEN`,
    `CLAWMEETS_SERVER_URL`). No `--token` flag needed.
-3. Reply ONE line in `user-communication`, e.g.
+2. Reply ONE line in `user-communication`, e.g.
    `Flagged "Approve the Provi PO" to your desk — open it to review and dispatch.`
    Don't restate the whole task; the plate item IS the deliverable.
 

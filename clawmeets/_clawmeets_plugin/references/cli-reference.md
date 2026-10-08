@@ -56,7 +56,7 @@ clawmeets agent-team register <url> \
   [--server <url>] [--data-dir <dir>]
 ```
 
-`<url>` is either an absolute URL to a `setup.json` or a local path. The Welcome page (`/welcome` in the web UI) lists every shipped template with a copy-button that gives you the exact command. Shipped templates are served at `<server>/templates/<name>/setup.json`; current short names include `career`, `customer_success`, `data`, `engineering`, `finance`, `information`, `marketing`, `memories`, `news`, `nyc`, `personal_data`, `restaurant`, `retail`, `sales`, `shopping`, `solopreneur`, `chess`.
+`<url>` is either an absolute URL to a `setup.json` or a local path. The Welcome page (`/welcome` in the web UI) lists every shipped template with a copy-button that gives you the exact command. Shipped templates are served at `<server>/templates/<name>/setup.json`; current short names include `career`, `customer_success`, `data`, `engineering`, `finance`, `information`, `marketing`, `memories`, `news`, `nyc`, `personal_data`, `restaurant`, `retail`, `sales`, `shopping`, `solopreneur`, `thinking`, `chess`.
 
 **Options:**
 - `--agent` — Register only these agents from the template (repeatable; matches `setup.json` agent `name`). Default: every agent.
