@@ -317,6 +317,53 @@ def get_pack(data_dir: Path, username: str, slug: str) -> KnowledgePack | None:
     return _load_pack(pack_dir, validate_slug(slug))
 
 
+# Longest ``have`` query value a runner sends. Past this (dozens of packs) it
+# sends none and gets the full payload, so the URL stays well under proxy
+# request-line limits (nginx defaults to 8 KiB).
+MAX_PACK_VERSIONS_PARAM = 6000
+
+
+def encode_pack_versions(versions: dict[str, str]) -> str | None:
+    """``{slug: updated_at}`` → the ``have`` query value for
+    ``GET /agents/{id}/knowledge-packs`` (base64url JSON), or None when it
+    would be empty or too long — the caller then omits the parameter."""
+    if not versions:
+        return None
+    raw = json.dumps(versions, sort_keys=True, separators=(",", ":")).encode()
+    encoded = base64.urlsafe_b64encode(raw).decode("ascii")
+    return encoded if len(encoded) <= MAX_PACK_VERSIONS_PARAM else None
+
+
+def decode_pack_versions(param: str) -> dict[str, str]:
+    """Inverse of :func:`encode_pack_versions`. Anything malformed or oversized
+    decodes to ``{}``, which means "send everything" — a runner is never
+    refused over this hint."""
+    if not param or len(param) > MAX_PACK_VERSIONS_PARAM:
+        return {}
+    try:
+        data = json.loads(base64.urlsafe_b64decode(param.encode("ascii")))
+    except (ValueError, UnicodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {k: v for k, v in data.items() if isinstance(k, str) and isinstance(v, str)}
+
+
+def get_pack_updated_at(data_dir: Path, username: str, slug: str) -> str | None:
+    """The pack's ``updated_at`` from its ``_meta.json`` alone — no file reads.
+
+    Lets runner catch-up decide a pack is unchanged without loading (and
+    base64-encoding) every file in it. Same value ``get_pack`` reports, except
+    a legacy meta with no timestamp at all gives None rather than "now", so it
+    never matches and that pack is always sent in full. None if not a pack.
+    """
+    pack_dir = _pack_dir(data_dir, username, slug)
+    if not pack_dir.is_dir():
+        return None
+    meta = _read_meta(pack_dir)
+    return meta.get("updated_at") or meta.get("created_at") or None
+
+
 async def create_pack(
     data_dir: Path,
     username: str,

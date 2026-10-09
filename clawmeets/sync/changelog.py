@@ -175,6 +175,11 @@ class MessagePayload(ChatroomPayload):
     # system notices and mirrors — several of them written AS the coordinator —
     # can never go out to the outside contact by being mistaken for a reply.
     channel_outbound: bool = False
+    # The Idempotency-Key of the request that wrote this entry, so a retry
+    # that arrives after core died between this append and the stored
+    # response finds the entry instead of appending a second copy
+    # (ChangelogRunloop.find_recent_by_request_id).
+    client_request_id: Optional[str] = None
 
 
 class FilePayload(ChatroomPayload):
@@ -190,6 +195,7 @@ class FilePayload(ChatroomPayload):
     sha256: str       # SHA256 hash of the content (required)
     from_participant_id: str = ""  # Uploader's participant ID (empty = unknown / legacy)
     from_participant_name: str = ""  # Uploader's display name
+    client_request_id: Optional[str] = None  # see MessagePayload.client_request_id
 
 
 class RoomCreatedParticipant(BaseModel):
@@ -694,6 +700,39 @@ def read_tip_version(path: Path) -> int:
     """
     result = read_tip_version_and_stat(path)
     return 0 if result is None else result[0]
+
+
+def recent_entries_containing(path: Path, needle: bytes, max_bytes: int) -> list[ChangelogEntry]:
+    """Entries within the last ``max_bytes`` of the file whose raw line
+    contains ``needle``, oldest first.
+
+    One bounded read and a substring test; lines are parsed only when they
+    match, so the usual answer — nothing — costs no JSON parsing at all.
+    A line cut by the window's start is skipped.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+    try:
+        size = os.fstat(fd).st_size
+        start = max(0, size - max_bytes)
+        window = _read_exactly(fd, start, size - start)
+    finally:
+        os.close(fd)
+    if needle not in window:
+        return []
+    lines = window.split(b"\n")
+    if start > 0:
+        lines = lines[1:]
+    found = []
+    for line in lines:
+        if needle in line:
+            try:
+                found.append(ChangelogEntry.from_log_line(line.decode("utf-8")))
+            except ValueError:
+                continue
+    return found
 
 
 def iter_entries(path: Path) -> Iterator[ChangelogEntry]:

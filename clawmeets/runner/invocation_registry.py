@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -26,13 +28,44 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class InFlightTurn:
+    """One live LLM turn, as reported to the server in the WS auth frame.
+
+    ``trigger_version`` is the changelog entry the turn is answering and
+    ``started_at`` when it began, so a restarted server can rebuild the
+    turn's pending batch with the original timeout clock
+    (``server/in_flight_restore.py``).
+    """
+    project_id: str
+    chatroom_name: str
+    trigger_version: int
+    started_at: datetime
+
+    def to_wire(self) -> dict:
+        return {
+            "project_id": self.project_id,
+            "chatroom_name": self.chatroom_name,
+            "trigger_version": self.trigger_version,
+            "started_at": self.started_at.isoformat(),
+        }
+
+
 class InvocationRegistry:
     """In-memory map of active LLM tasks for one runner."""
 
     def __init__(self) -> None:
         self._tasks: dict[tuple[str, str], asyncio.Task] = {}
+        # Same keys as _tasks; None when the caller supplied no trigger_version.
+        self._turns: dict[tuple[str, str], InFlightTurn | None] = {}
 
-    def register(self, project_id: str, chatroom_name: str, task: asyncio.Task) -> None:
+    def register(
+        self,
+        project_id: str,
+        chatroom_name: str,
+        task: asyncio.Task,
+        trigger_version: int | None = None,
+    ) -> None:
         key = (project_id, chatroom_name)
         existing = self._tasks.get(key)
         if existing is not None and not existing.done():
@@ -42,9 +75,27 @@ class InvocationRegistry:
                 "(prior invocation still running — concurrent dispatch?)"
             )
         self._tasks[key] = task
+        self._turns[key] = (
+            InFlightTurn(project_id, chatroom_name, trigger_version, datetime.now(UTC))
+            if trigger_version is not None else None
+        )
 
     def unregister(self, project_id: str, chatroom_name: str) -> None:
         self._tasks.pop((project_id, chatroom_name), None)
+        self._turns.pop((project_id, chatroom_name), None)
+
+    def in_flight(self) -> list[InFlightTurn]:
+        """Snapshot of live (not done) turns that carry a trigger_version.
+
+        Read synchronously on the event loop while the WS auth frame is
+        built, so no lock is needed.
+        """
+        return [
+            turn for key, turn in self._turns.items()
+            if turn is not None
+            and (task := self._tasks.get(key)) is not None
+            and not task.done()
+        ]
 
     def cancel(self, project_id: str, chatroom_name: str) -> bool:
         """Cancel the task for the given (project, chatroom). Returns True if a
@@ -110,7 +161,7 @@ async def invoke_with_registry(
         return await coro
 
     task = asyncio.create_task(coro)
-    registry.register(project_id, chatroom_name, task)
+    registry.register(project_id, chatroom_name, task, trigger_version=trigger_version)
     try:
         return await task
     finally:

@@ -38,7 +38,8 @@ There is no portable, non-interactive way to ask ``claude`` / ``codex`` /
 ``gemini`` / ``agy`` "are you signed in?" — the credential lives in an OS
 keychain on one platform and a dotfile on another, and running the CLI for real
 costs a token and a network round-trip. So :data:`MODEL_CLIS` looks for the
-credential artifacts each CLI is known to write, plus the API-key environment
+credential artifacts each CLI is known to write (a file, or on macOS a named
+login-keychain item probed by existence only), plus the API-key environment
 variables that bypass login entirely. A false "not logged in" costs the user one
 redundant ``claude login``; a false "logged in" costs them a silent agent, so
 the checks are deliberately biased toward reporting trouble. ``detail`` names
@@ -47,6 +48,7 @@ mysterious.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -170,6 +172,9 @@ class ModelCLI:
     # Environment variables that make the CLI usable WITHOUT an interactive
     # login. Any one set skips the login check entirely.
     login_env: tuple[str, ...]
+    # macOS login-keychain items (service, account) the CLI stores its token in
+    # instead of a file. Probed by existence only; the secret is never read.
+    login_keychain: tuple[tuple[str, str], ...] = ()
     login_fix: str = ""
     login_note: str = ""
     install_fix: str = ""
@@ -209,6 +214,10 @@ MODEL_CLIS: tuple[ModelCLI, ...] = (
         binary="agy",
         login_paths=("~/.antigravity/oauth_creds.json", "~/.config/antigravity"),
         login_env=("GEMINI_API_KEY", "GOOGLE_API_KEY"),
+        # On macOS `agy` keeps its Google token in the keychain and writes no
+        # credential file. `~/.gemini/antigravity-cli/` exists from install
+        # onward, so it does not prove a sign-in.
+        login_keychain=(("gemini", "antigravity"),),
         # No non-interactive login verb: `agy` completes a Google sign-in in a
         # browser the first time it runs, so the fix is to run it once.
         login_note="Run `agy` once on this computer and complete the Google sign-in",
@@ -224,6 +233,8 @@ MODEL_CLIS: tuple[ModelCLI, ...] = (
         binary="gemini",
         login_paths=("~/.gemini/oauth_creds.json",),
         login_env=("GEMINI_API_KEY", "GOOGLE_API_KEY"),
+        # An API key entered at the `gemini` prompt lands in the keychain.
+        login_keychain=(("gemini-cli-api-key", "default-api-key"),),
         login_note="Run `gemini` once on this computer and complete the sign-in",
         install_note="Install Gemini CLI: https://github.com/google-gemini/gemini-cli",
     ),
@@ -292,7 +303,23 @@ def _looks_logged_in(spec: ModelCLI) -> bool:
     """
     if any(os.environ.get(name) for name in spec.login_env):
         return True
-    return any(Path(p).expanduser().exists() for p in spec.login_paths)
+    if any(Path(p).expanduser().exists() for p in spec.login_paths):
+        return True
+    return sys.platform == "darwin" and any(
+        _keychain_has(service, account) for service, account in spec.login_keychain
+    )
+
+
+def _keychain_has(service: str, account: str) -> bool:
+    """Does the macOS login keychain hold this item? Never reads the secret (no ``-w``)."""
+    try:
+        return subprocess.run(
+            ["security", "find-generic-password", "-s", service, "-a", account],
+            capture_output=True,
+            timeout=PROBE_TIMEOUT_SECONDS,
+        ).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 def inspect_model_clis() -> list[ModelCLIState]:
@@ -381,8 +408,11 @@ def check_install() -> Check:
     )
 
 
-def check_session() -> Check:
+def check_session(username: str = "") -> Check:
     """Is an account signed in and remembered on this machine?
+
+    ``username`` checks that account instead of the computer's default one —
+    the installer sets up an account that need not be the default.
 
     Reads the same ``config/<user>/settings.json`` the CLI writes, directly
     rather than through ``cli_lifecycle``, so the check survives a broken
@@ -390,12 +420,7 @@ def check_session() -> Check:
     exactly the state ``clawmeets user logout`` leaves behind.
     """
     data_dir = _data_dir()
-    current = data_dir / "config" / "current_user"
-    username = ""
-    try:
-        username = current.read_text().strip()
-    except OSError:
-        pass
+    username = username or current_username()
 
     if not username:
         return Check(
@@ -449,7 +474,7 @@ def _assistant_dir(username: str) -> Optional[Path]:
     return found[0] if found else None
 
 
-def check_assistant() -> Check:
+def check_assistant(username: str = "") -> Check:
     """Does this machine hold the user's assistant?
 
     Presence is a directory under ``agents/`` whose name is
@@ -458,7 +483,7 @@ def check_assistant() -> Check:
     a fact about a socket the server owns, the web checklist reads it from the
     server, and a local process check would answer a different question.
     """
-    username = current_username()
+    username = username or current_username()
     if not username:
         return Check(
             id="assistant",
@@ -563,6 +588,7 @@ IN_PROCESS_PROVIDER_SUFFIXES = ("-api", "-native")
 
 def check_assistant_model(
     states: Optional[list[ModelCLIState]] = None,
+    username: str = "",
 ) -> Optional[Check]:
     """Can the assistant's OWN model CLI run here?
 
@@ -576,7 +602,7 @@ def check_assistant_model(
     already says so) or it uses an in-process provider (``-api`` /
     ``-native``: no CLI to check).
     """
-    username = current_username()
+    username = username or current_username()
     assistant_dir = _assistant_dir(username) if username else None
     if assistant_dir is None:
         return None
@@ -751,16 +777,22 @@ def autostart_artifact(username: str = "") -> Optional[Path]:
     A PATH, not a verdict: whether the entry is also switched on is the daemon's
     own question, answered by ``clawmeets computer autostart status``.
     """
+    # A non-default data dir gets a short tag, so the same username in test,
+    # staging and prod each keeps its own login entry.
+    data_dir = _data_dir().resolve()
+    tag = (
+        ""
+        if data_dir == (Path.home() / ".clawmeets").resolve()
+        else hashlib.sha1(str(data_dir).encode()).hexdigest()[:8]
+    )
     if sys.platform == "darwin":
         label = f"ai.clawmeets.computer.{username}" if username else "ai.clawmeets.computer"
+        label = f"{label}.{tag}" if tag else label
         return Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
     if sys.platform == "linux":
-        unit = (
-            f"clawmeets-computer-{username}.service"
-            if username
-            else "clawmeets-computer.service"
-        )
-        return Path.home() / ".config" / "systemd" / "user" / unit
+        unit = f"clawmeets-computer-{username}" if username else "clawmeets-computer"
+        unit = f"{unit}-{tag}" if tag else unit
+        return Path.home() / ".config" / "systemd" / "user" / f"{unit}.service"
     return None
 
 
@@ -866,6 +898,7 @@ def run_checks(
     server_url: str = "",
     include_server: bool = True,
     include_autostart: bool = True,
+    username: str = "",
 ) -> Report:
     """Every check, in the order a user hits them.
 
@@ -880,19 +913,21 @@ def run_checks(
     reports this on every check-in: it already knows it reached the server (it
     is talking to it over a socket) and re-probing on a timer would be a
     self-answering question on a 30-second loop.
+
+    ``username`` checks that account; empty means the computer's default one.
     """
     states = inspect_model_clis()
-    assistant_model = check_assistant_model(states)
+    assistant_model = check_assistant_model(states, username)
     checks: list[Check] = [
         check_install(),
-        check_session(),
-        check_assistant(),
+        check_session(username),
+        check_assistant(username),
         *check_model_cli(states),
         *([assistant_model] if assistant_model else []),
-        check_computer(),
+        check_computer(username),
     ]
     if include_autostart:
-        checks.append(check_autostart())
+        checks.append(check_autostart(username))
     if include_server:
         checks.append(check_server(server_url))
     return Report(checks=checks)

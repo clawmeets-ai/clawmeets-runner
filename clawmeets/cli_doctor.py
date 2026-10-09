@@ -40,6 +40,10 @@ def doctor_command(
     skip_server: bool = typer.Option(
         False, "--skip-server", help="Don't test reachability (offline check)."
     ),
+    user: str = typer.Option(
+        "", "--user", "-u",
+        help="Account to check (defaults to this computer's default account).",
+    ),
     model_clis: bool = typer.Option(
         False, "--model-clis",
         help="Only the model-CLI findings, as JSON. Used by this computer's "
@@ -68,7 +72,9 @@ def doctor_command(
         typer.echo(json.dumps(doctor.model_cli_wire()))
         raise typer.Exit(0)
 
-    report = doctor.run_checks(server_url=server, include_server=not skip_server)
+    report = doctor.run_checks(
+        server_url=server, include_server=not skip_server, username=user,
+    )
 
     if as_json:
         typer.echo(report.to_json())

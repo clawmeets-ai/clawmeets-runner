@@ -50,6 +50,7 @@ import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from clawmeets.models.knowledge_pack import encode_pack_versions
 from clawmeets.runner.agent_dir_readmes import README_FILENAME
 from clawmeets.utils.knowledge_index import file_preview, render_index_entry
 
@@ -80,6 +81,29 @@ def _safe_path_parts(path: str) -> list[str] | None:
         if not seg or seg == ".." or not _SEGMENT_RE.match(seg):
             return None
     return parts
+
+
+def _meta_entry(
+    name: str,
+    description: str,
+    files: dict[str, dict],
+    written: list[str],
+    updated_at: str | None,
+) -> dict:
+    """One pack's row in the local ``_meta.json``."""
+    entry = {
+        "name": name,
+        "description": description,
+        "files": sorted(written),
+        "file_descriptions": {
+            path: str((files.get(path) or {}).get("description") or "")
+            for path in written
+            if str((files.get(path) or {}).get("description") or "").strip()
+        },
+    }
+    if updated_at:
+        entry["updated_at"] = updated_at
+    return entry
 
 
 class KnowledgePackManager:
@@ -116,8 +140,12 @@ class KnowledgePackManager:
         name: str,
         description: str,
         files: dict[str, dict],
+        updated_at: str | None = None,
     ) -> None:
         """Rewrite a pack's directory + meta + index from the given files dict.
+
+        ``updated_at`` is the server's version of the pack these files are; it
+        is recorded so the next catch-up can skip re-downloading it.
 
         ``files`` is ``{relative_path: {"content_b64": <base64>}}``. Paths may
         contain ``/`` for nested files.
@@ -157,16 +185,7 @@ class KnowledgePackManager:
             written.append(path)
 
         meta = self._read_meta()
-        meta[slug] = {
-            "name": name,
-            "description": description,
-            "files": sorted(written),
-            "file_descriptions": {
-                path: str((files.get(path) or {}).get("description") or "")
-                for path in written
-                if str((files.get(path) or {}).get("description") or "").strip()
-            },
-        }
+        meta[slug] = _meta_entry(name, description, files, written, updated_at)
         self._write_meta(meta)
         self._rebuild_index(meta)
         logger.info(
@@ -193,18 +212,20 @@ class KnowledgePackManager:
     async def sync_from_server(self, client: "ClawMeetsClient", agent_id: str) -> None:
         """Reconcile local installed packs with the server's authoritative list.
 
-        Fetches the full installed-packs payload (slug + name + description +
-        files dict + updated_at) and rewrites the local knowledge-packs
-        directory and index from scratch. Adds new packs, refreshes existing
-        ones, and removes packs the server no longer reports.
+        Sends the version (``updated_at``) of every pack held locally; the
+        server answers unchanged packs with a file-less stub, so only new or
+        edited packs are downloaded and rewritten. Removes packs the server no
+        longer reports. Against an older server (no stubs) every pack comes
+        back in full and is rewritten, as before.
         """
-        try:
-            resp = await client._http.get(f"/agents/{agent_id}/knowledge-packs")
-            resp.raise_for_status()
-            data = resp.json()
-            server_packs = data.get("installed_packs") or []
-        except Exception as e:
-            logger.warning("Failed to fetch installed knowledge packs from server: %s", e)
+        local_meta = self._read_meta()
+        held = {
+            slug: entry["updated_at"]
+            for slug, entry in local_meta.items()
+            if entry.get("updated_at") and self._pack_dir(slug).is_dir()
+        }
+        server_packs = await self._fetch_installed(client, agent_id, held)
+        if server_packs is None:
             return
 
         pdir = self._packs_dir()
@@ -212,25 +233,31 @@ class KnowledgePackManager:
 
         server_slugs: set[str] = set()
         meta: dict[str, dict] = {}
+        rewritten = 0
         for pack in server_packs:
             slug = pack.get("slug")
             if not slug:
                 continue
             server_slugs.add(slug)
+            if pack.get("unchanged"):
+                # Same version as the folder on disk: keep it untouched. The
+                # server only stubs slugs we named in ``have``, so the local
+                # entry exists; the guard just keeps a bad stub from wiping it.
+                if slug in held:
+                    meta[slug] = local_meta[slug]
+                continue
             files = pack.get("files") or {}
             if not isinstance(files, dict):
                 files = {}
             written = self._write_pack_dir(slug, files)
-            meta[slug] = {
-                "name": pack.get("name") or slug,
-                "description": pack.get("description") or "",
-                "files": sorted(written),
-                "file_descriptions": {
-                    path: str((files.get(path) or {}).get("description") or "")
-                    for path in written
-                    if str((files.get(path) or {}).get("description") or "").strip()
-                },
-            }
+            meta[slug] = _meta_entry(
+                pack.get("name") or slug,
+                pack.get("description") or "",
+                files,
+                written,
+                pack.get("updated_at") or None,
+            )
+            rewritten += 1
 
         # Drop local pack dirs (and the legacy <slug>.md flat files) the
         # server no longer reports.
@@ -248,7 +275,28 @@ class KnowledgePackManager:
 
         self._write_meta(meta)
         self._rebuild_index(meta)
-        logger.info("Synced %d knowledge pack(s) from server", len(server_slugs))
+        logger.info(
+            "Synced %d knowledge pack(s) from server (%d downloaded, %d unchanged)",
+            len(server_slugs), rewritten, len(server_slugs) - rewritten,
+        )
+
+    async def _fetch_installed(
+        self, client: "ClawMeetsClient", agent_id: str, held: dict[str, str],
+    ) -> list[dict] | None:
+        """``GET /agents/{id}/knowledge-packs`` with the held versions; None on failure."""
+        params = {}
+        have = encode_pack_versions(held)
+        if have:
+            params["have"] = have
+        try:
+            resp = await client._http.get(
+                f"/agents/{agent_id}/knowledge-packs", params=params,
+            )
+            resp.raise_for_status()
+            return resp.json().get("installed_packs") or []
+        except Exception as e:
+            logger.warning("Failed to fetch installed knowledge packs from server: %s", e)
+            return None
 
     # ─────────────────────────────────────────────────────────
     # Internals

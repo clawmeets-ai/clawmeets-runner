@@ -86,7 +86,9 @@ MAX_BODY_CHARS = 16_384
 # ``SOLOPRENEUR:`` rows after them are a numbered playbook (register an investor,
 # validate the idea, ... build the product) and file under their own heading;
 # the rail orders a section by display name with numeric collation, so the
-# ``1.``..``8.`` in each title is what keeps them in playbook order. An owner who
+# ``1.``..``8.`` in each title is what keeps them in playbook order. The two
+# ``OPEN MONTAGE:`` rows are a second, two-step playbook (set up the video crew,
+# then produce a video) built the same way. An owner who
 # renames one
 # to ``Ops:Register new agent`` moves it to an Ops section; that is the whole
 # mechanism, and there is no server-side registry of section names to keep in
@@ -163,6 +165,59 @@ CONVENE_PROCEDURE = (
     "how; the open disagreements side by side, each with the evidence "
     "that would resolve it; and the final position of each panelist. "
     "Never average the positions together, and never hide a dissent."
+)
+
+
+# The OpenMontage crew: one agent per stage across every pipeline in
+# ``pipeline_defs/`` of an OpenMontage install, plus the executive producer.
+# Shared by both ``OPEN MONTAGE:`` seeds below, so Set up registers exactly the
+# agents Produce staffs. The stage names are OpenMontage's own (a stage's
+# sub-stages, e.g. proposal's ``sample``, belong to the parent's agent);
+# ``tests/test_desk_sops.py`` pins that every stage in the install has an owner.
+# Roles are derived, not written out: each pipeline names a director skill per
+# stage, and that skill is the agent's real instructions.
+OM_CREW: tuple[tuple[str, str], ...] = (
+    ("om_ep", "executive producer"),
+    ("om_idea", "idea"),
+    ("om_research", "research"),
+    ("om_proposal", "proposal"),
+    ("om_script", "script"),
+    ("om_scene", "scene_plan"),
+    ("om_chardesign", "character_design"),
+    ("om_rigplan", "rig_plan"),
+    ("om_assets", "assets"),
+    ("om_edit", "edit"),
+    ("om_compose", "compose"),
+    ("om_publish", "publish"),
+)
+
+OM_CREW_TABLE = "\n".join(f"  {agent:<14} {stage}" for agent, stage in OM_CREW)
+
+# Written into each om agent's CLAUDE.md by Set up. Only what the install does
+# NOT already say lives here: how the clawmeets crew shares one project folder,
+# spends, and stops for the owner.
+OM_ROLE_TEMPLATE = (
+    "  You are <agent>, the OpenMontage <stage> agent. The install is "
+    "<install>. Read its AGENT_GUIDE.md once per project and run its tools "
+    "from the install root.\n"
+    "  For each project, open pipeline_defs/<pipeline>.yaml and load the skill "
+    "it names for your stage (skills/<skill>/SKILL.md); that skill is your "
+    "full instructions, including any sub-stage under your stage. If the "
+    "pipeline has no such stage, say so and do nothing.\n"
+    "  Rules on every project:\n"
+    "  - The install is read-only. Write only inside projects/<slug>/: "
+    "checkpoints with pipeline_dir=\"projects/<slug>/pipeline\", media under "
+    "assets/ and renders/.\n"
+    "  - Before you start, open the previous stage's checkpoint on disk and "
+    "confirm it exists and is complete; if not, stop and say what is "
+    "missing. Before redoing your stage, copy your old checkpoint into "
+    "pipeline/history/.\n"
+    "  - Record every paid call in pipeline/cost_log.json, and stop before the "
+    "project's budget would be exceeded.\n"
+    "  - Stop at every approval point the coordinator names. Never publish or "
+    "upload anything without the owner's explicit yes.\n"
+    "  - Hand off paths, not attachments. When you finish, post the checkpoint "
+    "path, status, cost so far and open questions."
 )
 
 
@@ -474,6 +529,151 @@ SEED: tuple[dict[str, str], ...] = (
             "iterate further. If there are multiple products say ios, android, "
             "website need to be built, we should prioritize the milestones to "
             "build website first, ios second, and android last."
+        ),
+    },
+    {
+        "id": "sop-seed-open-montage-1-set-up",
+        "title": "OPEN MONTAGE:1. Set up",
+        "body": (
+            "Install OpenMontage on this computer and register its video "
+            "production crew, so \"OPEN MONTAGE:2. Produce video\" can run.\n"
+            "\n"
+            "  Install path: {{Install path|text:~/OpenMontage}}\n"
+            "\n"
+            "1. Install. If the folder is already an OpenMontage checkout (it has "
+            "AGENT_GUIDE.md and pipeline_defs/), reuse it. If it exists and is "
+            "anything else, stop and ask me. Otherwise clone "
+            "https://github.com/calesthio/OpenMontage.git into it and run `make "
+            "setup` there. Check that python3, ffmpeg and Node.js with npx are on "
+            "the PATH; for anything missing, give me the install command and "
+            "wait. Setup creates .env from .env.example: tell me which provider "
+            "keys it lists and ask me to fill them in myself. Never ask me to "
+            "paste a key into chat, and never read or store one.\n"
+            "\n"
+            "2. Shared project folder. Create "
+            "$AGENT_SHARED_STORAGE_DIR/openmontage/projects. If the install's "
+            "projects/ is a real folder, move its contents into the shared "
+            "folder (stop and ask me on any name clash), then replace projects/ "
+            "with a link to the shared folder, so every om agent sees the same "
+            "project files.\n"
+            "\n"
+            "3. Register the crew below: one agent per OpenMontage stage across "
+            "all pipelines, plus the executive producer, each on this computer "
+            "under the team label om. Describe each one as \"OpenMontage <stage> "
+            "agent\". An agent that already exists keeps its settings; just make "
+            "sure it has the label. Skip the \"SYSTEM:Register new agent\" "
+            "onboarding: their expertise lives in the install. Give each new "
+            "agent its own knowledge folder holding a CLAUDE.md written from "
+            "this template, with <agent>, <stage> and <install> filled in:\n"
+            "\n"
+            f"{OM_ROLE_TEMPLATE}\n"
+            "\n"
+            "  For om_ep, replace the second paragraph with: for each project, "
+            "load the skill pipeline_defs/<pipeline>.yaml names under "
+            "orchestration; write the vision memo under creative/ before "
+            "research starts, review the creative work at each approval point "
+            "and do a final review before publish; never run a stage yourself.\n"
+            "\n"
+            "  Crew (agent, stage):\n"
+            f"{OM_CREW_TABLE}\n"
+            "\n"
+            "4. Give every om agent the install as an extra directory, start any "
+            "that is not running, and confirm all of them are online on this "
+            "computer. Shared storage is shared only between agents on one "
+            "computer, so if any om agent runs elsewhere, stop and tell me.\n"
+            "\n"
+            "5. Smoke test. Create a small project with om_research and om_script "
+            "that runs the framework-smoke pipeline under the slug "
+            "smoke-<today's date>, following the same file rules. It only proves "
+            "the crew can pass checkpoints to each other, so settle everything "
+            "up front and ask me nothing unless a stage fails: the topic is "
+            "\"what OpenMontage is\"; the budget is $0 with no web access; the "
+            "research brief's sources and data points cite the install's own "
+            "files (AGENT_GUIDE.md, pipeline_defs/framework-smoke.yaml, "
+            "lib/checkpoint.py and the like) as file:// URLs, its other sections "
+            "come from general knowledge, and its metadata says no web research "
+            "was done; I approve both stages' approval points in advance.\n"
+            "\n"
+            "Report back with the install path and commit, which .env keys are "
+            "set (names only), each om agent and whether it is online, and the "
+            "smoke test's checkpoint paths and cost."
+        ),
+    },
+    {
+        "id": "sop-seed-open-montage-2-produce-video",
+        "title": "OPEN MONTAGE:2. Produce video",
+        "body": (
+            "Coordinate a new OpenMontage video production as a multi-agent "
+            "project. Nothing is spent until I approve your plan.\n"
+            "\n"
+            "  Project slug:    {{Project slug|text:my-video-v1}}\n"
+            "  Kind of video:   {{Pipeline|select:pick for me,cinematic,"
+            "animated-explainer,animation,character-animation,"
+            "documentary-montage,talking-head,avatar-spokesperson,screen-demo,"
+            "podcast-repurpose,clip-factory,localization-dub,hybrid}}\n"
+            "  Goal:            {{Goal|text:a 30-second cinematic trade spot for "
+            "our new release}}\n"
+            "  Audience:        {{Audience|text:licensed retail and on-premise "
+            "buyers}}\n"
+            "  Viewing context: {{Viewing context|select:muted at a desk,with "
+            "sound,mixed}}\n"
+            "  Length (s):      {{Length (s)|number:30}}\n"
+            "  Budget (USD):    {{Budget USD|number:10}}\n"
+            "  Fact source:     {{Fact source|text:the producer's own page}}\n"
+            "  Reference:       {{Reference project|text:none}}\n"
+            "  Formats:         {{Formats|text:a 9:16 master plus native 1:1 and "
+            "16:9, re-composed not cropped}}\n"
+            "  Audio versions:  {{Audio versions|select:scored and silent,scored "
+            "only,silent only}}\n"
+            "  Hard rules:      {{Hard constraints|text:none}}\n"
+            "\n"
+            "PIPELINE AND CREW. The om agents all have the OpenMontage install as "
+            "an extra directory; if there are none, tell me to run \"OPEN "
+            "MONTAGE:1. Set up\" first. If I asked you to pick, read the "
+            "descriptions in pipeline_defs/ and choose the pipeline that fits "
+            "the goal, saying why. Then read that pipeline's stages and staff "
+            "the project with om_ep plus the agent that owns each stage, and no "
+            "one else (a sub-stage, like proposal's sample, belongs to its "
+            "parent stage's agent):\n"
+            f"{OM_CREW_TABLE}\n"
+            "In the plan, list the stages in order with their agents, and flag "
+            "any stage with no agent and any agent that is offline.\n"
+            "\n"
+            "HOW FILES MOVE. One folder per project: "
+            "$AGENT_SHARED_STORAGE_DIR/openmontage/projects/<slug>/, which is "
+            "projects/<slug>/ inside the install. If it already exists, stop and "
+            "ask me. Every agent reads AGENT_GUIDE.md once, runs tools from the "
+            "install root, treats the install as read-only and writes only "
+            "inside the project folder. Each stage saves its checkpoint with "
+            "pipeline_dir=\"projects/<slug>/pipeline\"; media goes under assets/ "
+            "and renders/, om_ep writes to creative/. Before redoing a stage, "
+            "copy the old checkpoint into pipeline/history/. When a stage "
+            "finishes, its agent posts the checkpoint path, status, cost so far "
+            "and open questions; before starting the next stage, open that "
+            "checkpoint on disk and confirm it exists and is complete. Hand-offs "
+            "carry paths, not attachments.\n"
+            "\n"
+            "REFERENCE, NOT TEMPLATE. If a reference project is named, read its "
+            "research, proposal, decision log and reports for lessons and "
+            "constraints only. Do not reuse its concept.\n"
+            "\n"
+            "LIMITS. Facts come only from the fact source; invent nothing. Every "
+            "format and audio version is a deliverable. At most 3 revisions per "
+            "stage and 3 send-backs. Track cumulative spend in "
+            "pipeline/cost_log.json and stop and ask me before going past the "
+            "budget.\n"
+            "\n"
+            "STOP FOR ME after you draft the plan (pipeline, crew, milestones, "
+            "budget) and before anything starts; after the proposal, so I can "
+            "pick the concept; after the script; after the scene plan; and "
+            "before publish, when I review the renders and om_ep's final review. "
+            "At that last stop, check om_publish is online. Publish uploads "
+            "nothing without my explicit yes.\n"
+            "\n"
+            "DONE MEANS every format and audio version exists under renders/, "
+            "the render report honestly lists any defects, the cost log shows "
+            "the total, and the publish pack is waiting for my yes. Finish with "
+            "a short summary listing the file paths."
         ),
     },
 )

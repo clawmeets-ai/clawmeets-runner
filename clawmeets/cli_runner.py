@@ -52,9 +52,10 @@ import typer
 import websockets
 
 from clawmeets.api.responses import AgentRegistrationResponse
-from clawmeets.api.control import ControlEnvelope, ControlMessageType
+from clawmeets.api.control import RESYNC_CAPABILITY, ControlEnvelope, ControlMessageType
 from clawmeets.api.fs_protocol import FS_CAPABILITY, FS_WS_MAX_SIZE
 from clawmeets.api.client import ClawMeetsClient
+from clawmeets.api.retry_transport import RetryingTransport, SyncRetryingTransport
 from clawmeets import cli_oauth, doctor
 from clawmeets.cli_lifecycle import (
     clear_user_token,
@@ -94,6 +95,7 @@ from clawmeets.runner.knowledge_pack_manager import KnowledgePackManager
 from clawmeets.runner.home_fs_handler import FsJob, HomeFsRequestHandler, is_fs_frame
 from clawmeets.runner.agent_dir_readmes import write_agent_dir_readmes
 from clawmeets.runner.references_index import build_references_index
+from clawmeets.runner.resync import ResyncScheduler
 from clawmeets.runner.personal_skill_manager import PersonalSkillManager
 from clawmeets.runner.skill_manager import SkillManager
 from clawmeets.runner.system_skill_manager import SystemSkillManager
@@ -340,6 +342,7 @@ def _http(server: str, *, as_user: bool = False) -> httpx.Client:
         base_url=_server_url(server),
         timeout=30,
         headers=_env_identity_headers(as_user=as_user),
+        transport=SyncRetryingTransport(),
     )
 
 
@@ -916,6 +919,17 @@ def agent_register(
 # ---------------------------------------------------------------------------
 
 
+def _load_saved_session(data_dir: Path, username: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+    """(server_url, token) from ``config/<username>/settings.json``, or (None, None)."""
+    if not username:
+        return None, None
+    cfg_path = get_user_config_path(Path(data_dir).expanduser(), username)
+    if not cfg_path.exists():
+        return None, None
+    cfg = json.loads(cfg_path.read_text())
+    return cfg.get("server_url") or None, cfg.get("user", {}).get("token") or None
+
+
 def _resolve_user_session(
     data_dir: Path,
     explicit_token: Optional[str],
@@ -926,31 +940,42 @@ def _resolve_user_session(
     when not given explicitly. Mirrors what `agent register` does so the
     tag commands follow the same UX.
 
-    Resolution order for the token:
-      1. --token (explicit_token)
-      2. $CLAWMEETS_ASSISTANT_TOKEN env var (set by the runner when the
-         user's `{username}-assistant` agent shells these admin commands)
-      3. $CLAWMEETS_USER_TOKEN env var (escape hatch for scripted callers)
-      4. Saved user config (created by `clawmeets user login`, which saves by default)
+    Resolution order:
+      1. --token / --server (explicit_token / explicit_server)
+      2. --as-user's saved session, when one exists — an account named on the
+         command line beats identity left in the shell. Except inside an
+         agent's own process ($CLAWMEETS_AGENT_ID set), where the runner's
+         token is the identity and --as-user only ever names its owner.
+      3. $CLAWMEETS_ASSISTANT_TOKEN / $CLAWMEETS_USER_TOKEN env var (set by the
+         runner when the user's `{username}-assistant` agent shells these
+         admin commands; an escape hatch for scripted callers), with
+         $CLAWMEETS_SERVER_URL
+      4. current_user's saved session (created by `clawmeets user login` /
+         `clawmeets user link`)
+
+    The token and server come from the SAME source unless one was passed
+    explicitly: an env server is never paired with a saved token, which is
+    how a shell pointed at one server used to send another server's token.
     """
-    token = explicit_token
-    server = explicit_server
+    data_dir_p = Path(data_dir).expanduser()
+    env_token = os.environ.get("CLAWMEETS_ASSISTANT_TOKEN") or os.environ.get(
+        "CLAWMEETS_USER_TOKEN"
+    )
+    in_runner = bool(os.environ.get("CLAWMEETS_AGENT_ID"))
+
+    server: Optional[str] = None
+    token: Optional[str] = None
+    if as_user and not (env_token and in_runner):
+        server, token = _load_saved_session(data_dir_p, as_user)
+    if not token and env_token:
+        server, token = os.environ.get("CLAWMEETS_SERVER_URL") or None, env_token
     if not token:
-        token = os.environ.get("CLAWMEETS_ASSISTANT_TOKEN") or os.environ.get(
-            "CLAWMEETS_USER_TOKEN"
+        server, token = _load_saved_session(
+            data_dir_p, as_user or get_current_user(data_dir_p)
         )
-    if not server:
-        server = os.environ.get("CLAWMEETS_SERVER_URL") or None
-    if not token or not server:
-        data_dir_p = Path(data_dir).expanduser()
-        resolved_user = as_user or get_current_user(data_dir_p)
-        if resolved_user:
-            cfg_path = get_user_config_path(data_dir_p, resolved_user)
-            if cfg_path.exists():
-                cfg = json.loads(cfg_path.read_text())
-                token = token or cfg.get("user", {}).get("token")
-                server = server or cfg.get("server_url")
-    server = server or DEFAULT_SERVER
+
+    token = explicit_token or token
+    server = explicit_server or server or DEFAULT_SERVER
     if not token:
         typer.echo(
             "Error: not logged in. Run `clawmeets user login <user> <pass>` "
@@ -2081,6 +2106,15 @@ def user_link(
     token: str = typer.Argument(..., help="The one-time token from the install command."),
     server: str = typer.Option(DEFAULT_SERVER, "--server", "-s"),
     data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir"),
+    make_default: Optional[bool] = typer.Option(
+        None, "--make-default/--keep-default",
+        help="Make this account the computer's default. Default: only when "
+             "the computer has no default account yet.",
+    ),
+    replace: bool = typer.Option(
+        False, "--replace",
+        help="Overwrite a saved session for the same username on a different server.",
+    ),
 ) -> None:
     """Sign in on this computer with a one-time install token.
 
@@ -2127,19 +2161,45 @@ def user_link(
         )
         raise typer.Exit(1)
     access = _require_access_token(result)
+    data_dir_p = Path(data_dir).expanduser()
+    # Prefer the server's own idea of its public URL: a deployment behind a
+    # proxy knows its external address better than the URL the installer
+    # happened to be fetched from.
+    session_server = _server_url(result.get("server_url") or url)
 
+    # Sessions, computer keys and agent folders are all keyed by username
+    # alone, so `alice` on staging and `alice` on prod cannot share one data
+    # dir: the second would silently repoint the first's agents. Refuse, and
+    # say how to keep both.
+    saved_server, _ = _load_saved_session(data_dir_p, username)
+    if saved_server and _server_url(saved_server) != session_server and not replace:
+        typer.echo(
+            f"Error: {username} is already set up on this computer for "
+            f"{_server_url(saved_server)}, not {session_server}.\n"
+            f"To keep both, re-run the install with a separate folder, e.g. "
+            f"CLAWMEETS_DATA_DIR=~/.clawmeets-<env> in front of `sh`. "
+            f"To move {username} to {session_server} instead, run "
+            f"`clawmeets user link <token> --server {session_server} --replace`. "
+            f"Either way, get a fresh command from your browser: this one is used up.",
+            err=True,
+        )
+        raise typer.Exit(3)
+
+    if make_default is None:
+        make_default = get_current_user(data_dir_p) in (None, "", username)
     path = save_user_session(
-        Path(data_dir).expanduser(),
+        data_dir_p,
         username,
-        # Prefer the server's own idea of its public URL: a deployment behind a
-        # proxy knows its external address better than the URL the installer
-        # happened to be fetched from.
-        _server_url(result.get("server_url") or url),
+        session_server,
         access,
         refresh_token=result.get("refresh_token"),
         auth_method="install-token",
+        make_current=make_default,
     )
     typer.echo(f"Signed in as {username}. Session saved to {path}.")
+    # Last line, machine-readable: the installer passes this account to every
+    # later step instead of relying on the computer's default account.
+    typer.echo(f"account={username}")
 
 
 @user_app.command("logout")
@@ -2357,6 +2417,7 @@ async def _user_listen_loop(
             "X-User-ID": user_id,
         },
         timeout=30.0,
+        transport=RetryingTransport(),
     )
 
     # Create ClawMeetsClient wrapper
@@ -2392,13 +2453,22 @@ async def _user_listen_loop(
     handle_exception = _create_dispatch_callback()
     reconnect_delay = 2.0
 
+    # A user listener holds no skills / MCPs / packs / turns, so both RESYNC
+    # scopes are the changelog catch-up.
+    resync = ResyncScheduler(
+        on_full=loop_obj.catch_up, on_changelog=loop_obj.catch_up,
+        name=f"user={user_id[:8]} resync",
+    )
+
     while True:
         try:
             async with websockets.connect(ws_connect_url) as ws:
                 logging.getLogger("clawmeets").info(f"WebSocket connected to {ws_url}")
 
-                # Send auth message
-                await ws.send(json.dumps({"token": token}))
+                # Send auth message. RESYNC_CAPABILITY: behind the websocket
+                # edge this socket survives a core restart, and the server
+                # asks for the catch-up with RESYNC instead of a close.
+                await ws.send(json.dumps({"token": token, "capabilities": [RESYNC_CAPABILITY]}))
 
                 reconnect_delay = 2.0  # reset on success
 
@@ -2417,12 +2487,16 @@ async def _user_listen_loop(
                                 f"[ws-recv] user={user_id} type={env.type} "
                                 f"proj={proj_id}"
                             )
+                            if env.type == ControlMessageType.RESYNC:
+                                resync.request(env.payload)
+                                continue
                             task = asyncio.create_task(loop_obj.dispatch(env))
                             task.add_done_callback(handle_exception)
                         except Exception as e:
                             logging.warning(f"Bad envelope: {e}")
                 finally:
                     hb_task.cancel()
+                    resync.cancel()
 
         except (websockets.WebSocketException, OSError) as e:
             # Covers ConnectionClosed, InvalidStatus (HTTP 4xx/5xx on WS
@@ -2678,6 +2752,7 @@ async def _runner_loop(
             "X-Agent-ID": agent_id,
         },
         timeout=30.0,
+        transport=RetryingTransport(),
     )
 
     # Create ClawMeetsClient wrapper
@@ -2770,6 +2845,45 @@ async def _runner_loop(
     # Do not move this call inside the loop.
     runner_version: Optional[str] = installed_clawmeets_version()
 
+    async def _post_connect_sync(scope: str, *, report_turns: bool) -> None:
+        """The catch-up a (re)connect runs, also run on RESYNC.
+
+        ``scope`` "full" is everything; "changelog" is the changelog catch-up
+        alone. ``report_turns`` re-reports the in-flight turns over HTTP — on
+        a connect they already rode the auth frame. Raises httpx errors; the
+        connect path backs off on them, ResyncScheduler swallows them.
+        """
+        if scope == "full":
+            if report_turns:
+                registry = model_ctx.invocation_registry
+                in_flight = registry.in_flight() if registry is not None else []
+                await client.put_in_flight_turns(agent_id, [t.to_wire() for t in in_flight])
+
+            # Sync installed skills from server (catch-up on connect/reconnect)
+            await skill_manager.sync_from_server(client, agent_id)
+
+            # Sync installed MCP servers from server (catch-up on connect/reconnect)
+            await mcp_manager.sync_from_server(client, agent_id)
+
+            # Sync installed knowledge packs from server (catch-up on connect/reconnect)
+            await knowledge_pack_manager.sync_from_server(client, agent_id)
+
+            # Kick off auto-OAuth for any MCP server that landed via
+            # sync_from_server above but doesn't yet have a token (e.g.
+            # user clicked Install while this runner was offline).
+            loop_obj.auto_auth_pending_mcps()
+
+        # HTTP-based catch-up on connect
+        await loop_obj.catch_up()
+
+    # RESYNC: behind the websocket edge a core restart keeps the socket open,
+    # so the server asks for the catch-up a reconnect would have run.
+    resync = ResyncScheduler(
+        on_full=lambda: _post_connect_sync("full", report_turns=True),
+        on_changelog=lambda: _post_connect_sync("changelog", report_turns=False),
+        name=f"agent={agent_id[:8]} resync",
+    )
+
     while True:
         close_code: Optional[int] = None
         try:
@@ -2788,33 +2902,29 @@ async def _runner_loop(
                 #
                 # `capabilities` tells the server which optional frames this
                 # runner answers; a server never sends an fs_request to a
-                # socket that did not list FS_CAPABILITY.
+                # socket that did not list FS_CAPABILITY, nor a RESYNC to one
+                # that did not list RESYNC_CAPABILITY (it closes that socket
+                # with 1012 instead, and the reconnect catches up).
+                #
+                # `in_flight_turns` lists the LLM turns still running here, so
+                # a server that restarted mid-turn rebuilds their pending
+                # batches (server/in_flight_restore.py) and the desk keeps
+                # showing Working instead of misfiling the project as Review.
+                registry = model_ctx.invocation_registry
+                in_flight = registry.in_flight() if registry is not None else []
                 await ws.send(json.dumps({
                     "token": token,
                     "clawmeets_version": runner_version,  # str | None
-                    "capabilities": [FS_CAPABILITY],
+                    "capabilities": [FS_CAPABILITY, RESYNC_CAPABILITY],
+                    "in_flight_turns": [t.to_wire() for t in in_flight],
                 }))
 
                 reconnect_delay = 2.0  # reset on success
                 # Uploads half-received on a previous socket died with it.
                 fs_handler.socket_closed()
 
-                # Sync installed skills from server (catch-up on connect/reconnect)
-                await skill_manager.sync_from_server(client, agent_id)
-
-                # Sync installed MCP servers from server (catch-up on connect/reconnect)
-                await mcp_manager.sync_from_server(client, agent_id)
-
-                # Sync installed knowledge packs from server (catch-up on connect/reconnect)
-                await knowledge_pack_manager.sync_from_server(client, agent_id)
-
-                # Kick off auto-OAuth for any MCP server that landed via
-                # sync_from_server above but doesn't yet have a token (e.g.
-                # user clicked Install while this runner was offline).
-                loop_obj.auto_auth_pending_mcps()
-
-                # HTTP-based catch-up on connect
-                await loop_obj.catch_up()
+                # Turns rode the auth frame above.
+                await _post_connect_sync("full", report_turns=False)
 
                 hb_task = asyncio.create_task(
                     _ws_heartbeat_task(ws, agent_id, loop_obj)
@@ -2839,12 +2949,19 @@ async def _runner_loop(
                                 f"[ws-recv] agent={agent_id} type={env.type} "
                                 f"proj={proj_id}"
                             )
+                            # Answered here, never by the reactive loop: it is
+                            # about this socket, not about any project.
+                            if env.type == ControlMessageType.RESYNC:
+                                resync.request(env.payload)
+                                continue
                             task = asyncio.create_task(loop_obj.dispatch(env))
                             task.add_done_callback(handle_exception)
                         except Exception as e:
                             logging.warning(f"Bad envelope: {e}")
                 finally:
                     hb_task.cancel()
+                    # The reconnect runs the full catch-up itself.
+                    resync.cancel()
                 close_code = ws.close_code
 
         except websockets.ConnectionClosed as e:
@@ -4245,7 +4362,10 @@ def assistant_register(
         None, "--password", "-p",
         help="Your ClawMeets password (only needed when no saved session exists).",
     ),
-    server: str = typer.Option(DEFAULT_SERVER, "--server", "-s"),
+    server: Optional[str] = typer.Option(
+        None, "--server", "-s",
+        help="Server URL (defaults to the server your saved session was made on).",
+    ),
     data_dir: Path = typer.Option(
         DEFAULT_DATA_DIR, "--data-dir",
         help="Root data directory (assistant saved to {data_dir}/agents/)",
@@ -4331,9 +4451,12 @@ def assistant_register(
     )
 
     if username and password:
+        server = _server_url(server or DEFAULT_SERVER)
         token = _login_for_jwt(server, username, password)
     else:
-        _, token = _resolve_user_session(data_dir, None, server, as_user=username)
+        # The server comes back with the token: a session saved for server B
+        # must be used on B, whatever $CLAWMEETS_SERVER_URL says.
+        server, token = _resolve_user_session(data_dir, None, server, as_user=username)
         if not username:
             username = get_current_user(Path(data_dir).expanduser())
         if not username:
@@ -4439,9 +4562,14 @@ def _register_one_worker(
     llm_provider_override: Optional[str],
     llm_base_url_override: Optional[str] = None,
     llm_api_key: Optional[str] = None,
+    backed_by_cli: Optional[str] = None,
 ) -> Optional[dict]:
     """Register one worker from a setup.json `agents[]` entry. Returns the
     server response on success, None on failure.
+
+    ``backed_by_cli`` names the model CLI the agent runs on (e.g. "Claude
+    Code CLI"); when set, the closing line says the CLI was detected and
+    backs the agent.
 
     ``llm_api_key`` (for a keyed ``-api`` provider) is stored the way Agent
     Settings stores it: on a named model config made the default, which the
@@ -4572,7 +4700,11 @@ def _register_one_worker(
             if added:
                 typer.echo(f"    {kind} installed: {', '.join(added)}")
 
-    typer.echo(f"  Registered '{registered_name}' ({agent_id[:8]}...)")
+    registered = f"Registered '{registered_name}' ({agent_id[:8]}...)"
+    if backed_by_cli:
+        typer.echo(f"  Detected {backed_by_cli}: {registered} backed by {backed_by_cli}")
+    else:
+        typer.echo(f"  {registered}")
     return result
 
 
@@ -4686,7 +4818,9 @@ def agent_provider_register(
     """
     server_url, token = _resolve_user_session(data_dir, None, server, as_user=as_user)
 
-    wanted: list[tuple[ProviderAgent, Optional[str]]] = []
+    # Model CLIs first: they need no input, so they are detected and registered
+    # before the API key prompts start.
+    cli_wanted: list[ProviderAgent] = []
     specs = {spec.id: spec for spec in doctor.MODEL_CLIS}
     states = {state.id: state for state in doctor.inspect_model_clis()}
     for agent in provider_agents.cli_agents():
@@ -4698,26 +4832,18 @@ def agent_provider_register(
             fix = f"run `{spec.login_fix}`" if spec.login_fix else spec.login_note
             typer.echo(f"  ! {agent.name}: {agent.label} is not signed in; {fix}, then run this again.")
             continue
-        wanted.append((agent, None))
-
-    if ask_keys and _stdin_is_terminal():
-        typer.echo("  API keys add one agent per provider. Press Enter to skip any.")
-        for agent in provider_agents.key_agents():
-            key = _ask_provider_key(agent)
-            if key:
-                wanted.append((agent, key))
-
-    if not wanted:
-        typer.echo("  No model providers to connect. Sign in to a model CLI, then run "
-                   "`clawmeets agent provider register`.")
-        return
+        cli_wanted.append(agent)
 
     agents_dir = Path(data_dir).expanduser() / "agents"
     failed: list[str] = []
+    connected = 0
     with _http(server_url) as client:
         owned, username = _owned_agents_by_name(client, token)
         _relabel_legacy_provider_teams(client, token, owned, username)
-        for agent, key in wanted:
+
+        def connect(agent: ProviderAgent, key: Optional[str]) -> None:
+            nonlocal connected
+            connected += 1
             existing = owned.get(f"{username}-{agent.name}")
             if existing is not None:
                 current = (existing.get("local_settings") or {}).get("llm_provider") or "claude"
@@ -4728,7 +4854,7 @@ def agent_provider_register(
                         f"  ! {agent.name}: you already have an agent with this name on "
                         f"'{current}'; left it as it is."
                     )
-                continue
+                return
             result = _register_one_worker(
                 client,
                 token,
@@ -4741,12 +4867,34 @@ def agent_provider_register(
                 agents_dir,
                 llm_provider_override=None,
                 llm_api_key=key,
+                backed_by_cli=_cli_display_name(agent.label) if agent.kind == "cli" else None,
             )
             if result is None:
                 failed.append(agent.name)
+
+        for agent in cli_wanted:
+            connect(agent, None)
+
+        if ask_keys and _stdin_is_terminal():
+            typer.echo("  API keys add one agent per provider. Press Enter to skip any.")
+            for agent in provider_agents.key_agents():
+                key = _ask_provider_key(agent)
+                if key:
+                    connect(agent, key)
+
+    if not connected:
+        typer.echo("  No model providers to connect. Sign in to a model CLI, then run "
+                   "`clawmeets agent provider register`.")
+        return
     if failed:
         typer.echo(f"  Could not register: {', '.join(failed)}", err=True)
         raise typer.Exit(1)
+
+
+def _cli_display_name(label: str) -> str:
+    """A model CLI's label as a product name ending in "CLI": "Claude Code" ->
+    "Claude Code CLI", while "Gemini CLI" stays as it is."""
+    return label if label.endswith("CLI") else f"{label} CLI"
 
 
 @provider_app.command("list")
@@ -4783,7 +4931,10 @@ def agent_team_register(
         None, "--password", "-p",
         help="Your ClawMeets password (only needed when no saved session exists).",
     ),
-    server: str = typer.Option(DEFAULT_SERVER, "--server", "-s"),
+    server: Optional[str] = typer.Option(
+        None, "--server", "-s",
+        help="Server URL (defaults to the server your saved session was made on).",
+    ),
     data_dir: Path = typer.Option(
         DEFAULT_DATA_DIR, "--data-dir",
         help="Root data directory (agents saved to {data_dir}/agents/)",
@@ -4869,9 +5020,10 @@ def agent_team_register(
         )
 
     if username and password:
+        server = _server_url(server or DEFAULT_SERVER)
         token = _login_for_jwt(server, username, password)
     else:
-        _, token = _resolve_user_session(data_dir, None, server, as_user=username)
+        server, token = _resolve_user_session(data_dir, None, server, as_user=username)
         if not username:
             username = get_current_user(Path(data_dir).expanduser())
         if not username:

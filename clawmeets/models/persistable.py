@@ -174,12 +174,17 @@ class PersistableParticipant(Participant, ABC):
         ]
         return matches[0] / "card.json" if matches else None
 
+    # Set only while ``to_response`` runs; see there.
+    _card_snapshot: Optional[dict] = None
+
     def _load_card(self) -> dict:
         """Load card.json from filesystem.
 
         Returns:
             Dict of card data, or empty dict if not found
         """
+        if self._card_snapshot is not None:
+            return self._card_snapshot
         path = self.card_path
         if path is None:
             return {}
@@ -308,6 +313,24 @@ class PersistableParticipant(Participant, ABC):
         return _clean_str_list(self._load_card().get("user_teams"))
 
     @property
+    def public_chat(self) -> dict:
+        """How the agent presents on its owner's public agent pages
+        (``card.json`` ``public_chat``): ``display_name`` (None → the short
+        name), ``takes_direct_requests`` (default True) and
+        ``starter_questions`` (at most 4; empty → the page's generic ones).
+        No settings UI yet — absent or malformed keys take the defaults."""
+        raw = self._load_card().get("public_chat")
+        raw = raw if isinstance(raw, dict) else {}
+        display_name = raw.get("display_name")
+        takes = raw.get("takes_direct_requests")
+        return {
+            "display_name": (display_name.strip() or None)
+            if isinstance(display_name, str) else None,
+            "takes_direct_requests": takes if isinstance(takes, bool) else True,
+            "starter_questions": _clean_str_list(raw.get("starter_questions"))[:4],
+        }
+
+    @property
     def default_invitable_agents(self) -> list[str]:
         """Defaults seeded into the ``agent_names`` allowlist of new
         FD-tunnel DM projects coordinated by this agent. Empty = no
@@ -426,7 +449,8 @@ class PersistableParticipant(Participant, ABC):
         """
         result = []
         for entry in cls._list_dirs(ctx):
-            data = FileUtil.read(entry / "card.json", "json")
+            # Stat-checked cache: an unchanged roster parses no card.json.
+            data = ctx.file_cache.read_json(entry / "card.json")
             if not data:
                 continue
             participant_id = data.get("id")
@@ -792,31 +816,38 @@ class PersistableParticipant(Participant, ABC):
             AgentResponse DTO for API serialization
         """
         card = self._load_card()
-        # Redact every write-only secret from this read path: strip any legacy
-        # agent-level ``llm_api_key`` from local_settings, and strip each
-        # per-config raw ``api_key`` from model_configs (exposed only as
-        # ``api_key_set``). The raw per-config key still reaches the runner via
-        # the AGENT_SETTINGS_CHANGE broadcast, which is NOT redacted.
-        safe_local_settings = _strip_legacy_llm_api_key(card.get("local_settings", {}))
-        return AgentResponse(
-            id=self._id,
-            name=self.name,
-            description=self.description,
-            capabilities=self.capabilities,
-            status=self.status,
-            registered_at=self.registered_at or datetime.now(UTC),
-            last_heartbeat=self.last_heartbeat,
-            discoverable_through_registry=self.is_discoverable,
-            registered_by=self.registered_by,
-            is_verified=self.is_verified,
-            user_teams=self.user_teams,
-            default_invitable_agents=self.default_invitable_agents,
-            default_invitable_teams=self.default_invitable_teams,
-            local_settings=safe_local_settings,
-            model_configs=redact_model_configs(card.get("model_configs") or []),
-            default_model_config_name=card.get("default_model_config_name"),
-            last_reflected_at=self.last_reflected_at,
-        )
+        # Every property below re-reads card.json (a folder glob plus a parse
+        # each). Pin this one read for the duration so a roster of N agents
+        # costs N card reads, not ~17·N.
+        self._card_snapshot = card
+        try:
+            # Redact every write-only secret from this read path: strip any legacy
+            # agent-level ``llm_api_key`` from local_settings, and strip each
+            # per-config raw ``api_key`` from model_configs (exposed only as
+            # ``api_key_set``). The raw per-config key still reaches the runner via
+            # the AGENT_SETTINGS_CHANGE broadcast, which is NOT redacted.
+            safe_local_settings = _strip_legacy_llm_api_key(card.get("local_settings", {}))
+            return AgentResponse(
+                id=self._id,
+                name=self.name,
+                description=self.description,
+                capabilities=self.capabilities,
+                status=self.status,
+                registered_at=self.registered_at or datetime.now(UTC),
+                last_heartbeat=self.last_heartbeat,
+                discoverable_through_registry=self.is_discoverable,
+                registered_by=self.registered_by,
+                is_verified=self.is_verified,
+                user_teams=self.user_teams,
+                default_invitable_agents=self.default_invitable_agents,
+                default_invitable_teams=self.default_invitable_teams,
+                local_settings=safe_local_settings,
+                model_configs=redact_model_configs(card.get("model_configs") or []),
+                default_model_config_name=card.get("default_model_config_name"),
+                last_reflected_at=self.last_reflected_at,
+            )
+        finally:
+            self._card_snapshot = None
 
     def to_dict(self) -> dict:
         """Serialize to dictionary (reads from filesystem)."""

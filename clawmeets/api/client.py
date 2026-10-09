@@ -306,6 +306,25 @@ class ClawMeetsClient:
         resp.raise_for_status()
         return [AgentResponse.model_validate(item) for item in resp.json()]
 
+    async def list_agents_if_changed(
+        self, etag: Optional[str],
+    ) -> tuple[Optional[list[AgentResponse]], Optional[str]]:
+        """``GET /agents`` revalidated against the roster tag the caller last applied.
+
+        Returns ``(None, etag)`` when the server answers 304 (roster unchanged),
+        else ``(agents, new_etag)``. ``new_etag`` is None against a server that
+        sends no ETag, which makes every call a full fetch — today's behaviour.
+        The caller stores the tag only once it has applied the roster, so a
+        failed apply is retried in full next time.
+        """
+        headers = {"If-None-Match": etag} if etag else {}
+        resp = await self._http.get(f"{self._base_url}/agents", headers=headers)
+        if resp.status_code == 304:
+            return None, etag
+        resp.raise_for_status()
+        agents = [AgentResponse.model_validate(item) for item in resp.json()]
+        return agents, resp.headers.get("ETag")
+
     async def list_projects(self, participant_id: str) -> list[ParticipantProjectResponse]:
         """
         List projects for a participant.
@@ -378,6 +397,22 @@ class ClawMeetsClient:
             url, json={"ok": ok, "detail": detail, "keys": keys}
         )
         resp.raise_for_status()
+
+    async def put_in_flight_turns(
+        self,
+        agent_id: str,
+        turns_wire: list[dict[str, Any]],
+    ) -> int:
+        """Report the LLM turns still running on this runner; return how many
+        the server restored.
+
+        Same list as the WS auth frame's ``in_flight_turns``, for a RESYNC that
+        arrives on a socket that never reconnected. Idempotent server-side.
+        """
+        url = f"{self._base_url}/agents/{agent_id}/in-flight-turns"
+        resp = await self._http.put(url, json={"turns": turns_wire})
+        resp.raise_for_status()
+        return int(resp.json().get("restored", 0))
 
     async def get_changelog(
         self,

@@ -786,7 +786,12 @@ class Agent(PersistableParticipant):
         """
         if ctx.client is None:
             raise ValueError("ModelContext.client must be configured for sync_from_server")
-        agents = await ctx.client.list_agents()
+        agents, etag = await ctx.client.list_agents_if_changed(ctx.peer_roster_etag)
+        if agents is None:
+            # 304: the roster is exactly what the local peer cards and
+            # AGENTS.md were last written from — nothing to rewrite.
+            logger.info("Agent roster unchanged on server; skipped peer-card sync")
+            return 0
         server_ids: set[str] = set()
         synced_count = 0
         owner_user_id: Optional[str] = None
@@ -832,6 +837,9 @@ class Agent(PersistableParticipant):
             ctx, owner_username=owner_username, owner_user_id=owner_user_id
         )
 
+        # Only now that the roster is fully applied: a sync that failed halfway
+        # must be refetched in full next time, not answered 304.
+        ctx.peer_roster_etag = etag
         return synced_count
 
     @classmethod

@@ -36,6 +36,7 @@ import os
 from pathlib import Path
 
 import httpx
+from clawmeets.api.retry_transport import SyncRetryingTransport
 import typer
 
 from clawmeets.models.brief_tab import MAX_BRIEF_HTML_BYTES
@@ -65,7 +66,7 @@ def _client() -> tuple[httpx.Client, dict[str, str]]:
         "Authorization": f"Bearer {_env('CLAWMEETS_AGENT_TOKEN')}",
         "X-Agent-ID": _env("CLAWMEETS_AGENT_ID"),
     }
-    return httpx.Client(base_url=server, timeout=30), headers
+    return httpx.Client(base_url=server, timeout=30, transport=SyncRetryingTransport()), headers
 
 
 def _read_html(path: Path) -> str:

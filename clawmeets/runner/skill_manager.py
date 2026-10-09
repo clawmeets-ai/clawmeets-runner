@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from clawmeets.models.knowledge_pack import validate_filepath
+from clawmeets.utils.file_io import FileUtil
 
 if TYPE_CHECKING:
     from clawmeets.api.client import ClawMeetsClient
@@ -46,20 +47,33 @@ class SkillManager:
         (self.skill_hub_dir / "skills").mkdir(parents=True, exist_ok=True)
 
     async def sync_from_server(self, client: "ClawMeetsClient", agent_id: str) -> None:
-        """Catch-up: fetch installed skills from server, download missing ones, remove extras."""
+        """Catch-up: fetch installed skills from server, download missing and
+        changed ones, remove extras.
+
+        "Changed" means the server's content version differs from the one
+        recorded at install (``versions.json``). A skill with no recorded
+        version is refetched once. An older server sends no versions, and then
+        only missing skills are downloaded, as before. A re-download keeps the
+        skill's config and OAuth state, which live outside the skill folder.
+        """
         try:
             resp = await client._http.get(f"/agents/{agent_id}/skills")
             resp.raise_for_status()
             data = resp.json()
             server_skills = set(data.get("installed_skills", []))
+            server_versions: dict[str, str] = data.get("versions") or {}
         except Exception as e:
             logger.warning(f"Failed to fetch installed skills from server: {e}")
             return
 
         local_skills = set(self.installed_skills())
+        local_versions = self._read_versions()
+        changed = {
+            name for name in server_skills & local_skills
+            if name in server_versions and server_versions[name] != local_versions.get(name)
+        }
 
-        # Download missing skills
-        for skill_name in server_skills - local_skills:
+        for skill_name in sorted((server_skills - local_skills) | changed):
             try:
                 resp = await client._http.get(f"/skills/{skill_name}")
                 resp.raise_for_status()
@@ -67,8 +81,13 @@ class SkillManager:
                 content = skill_data.get("content")
                 files = _decode_skill_files(skill_data.get("files") or {})
                 if content:
-                    self.install_skill(skill_name, content, files=files)
-                    logger.info(f"Synced skill: {skill_name}")
+                    self.install_skill(
+                        skill_name, content, files=files, version=skill_data.get("version"),
+                    )
+                    logger.info(
+                        f"Synced skill: {skill_name}"
+                        + (" (changed on server)" if skill_name in changed else "")
+                    )
             except Exception as e:
                 logger.warning(f"Failed to sync skill {skill_name}: {e}")
 
@@ -86,6 +105,7 @@ class SkillManager:
         skill_name: str,
         skill_md: str,
         files: dict[str, bytes] | None = None,
+        version: str | None = None,
     ) -> None:
         """Write SKILL.md plus optional sibling files (template.html, render.py, …)
         to ``{agent_dir}/skill-hub/skills/{skill_name}/`` so SKILL.md procedures
@@ -93,6 +113,8 @@ class SkillManager:
 
         Wipes the skill directory before rewriting so a re-install (e.g. after a
         skill author renames a sibling) does not leave stale files behind.
+        Records ``version`` (the server's content version) for catch-up; None
+        clears it, so the next catch-up refetches the skill once.
         """
         skill_dir = self.skill_hub_dir / "skills" / skill_name
         if skill_dir.exists():
@@ -104,6 +126,7 @@ class SkillManager:
             dest = skill_dir / normalized
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_bytes(body)
+        self._record_version(skill_name, version)
         logger.info(
             f"Installed skill: {skill_name} ({len(files or {})} sibling files)"
         )
@@ -139,6 +162,23 @@ class SkillManager:
         if skill_dir.exists():
             shutil.rmtree(skill_dir)
             logger.info(f"Uninstalled skill: {skill_name}")
+        self._record_version(skill_name, None)
+
+    def _versions_path(self) -> Path:
+        return self.skill_hub_dir / "versions.json"
+
+    def _read_versions(self) -> dict[str, str]:
+        """``{skill_name: server content version}`` recorded at install."""
+        data = FileUtil.read(self._versions_path(), "json")
+        return data if isinstance(data, dict) else {}
+
+    def _record_version(self, skill_name: str, version: str | None) -> None:
+        versions = self._read_versions()
+        if version:
+            versions[skill_name] = version
+        elif versions.pop(skill_name, None) is None:
+            return
+        FileUtil.write(self._versions_path(), versions, "json")
 
     def installed_skills(self) -> list[str]:
         """List installed skill names."""

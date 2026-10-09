@@ -72,8 +72,13 @@ def save_user_session(
     token: str,
     refresh_token: str | None = None,
     auth_method: str = "password",
+    make_current: bool = True,
 ) -> Path:
     """Upsert a user's settings.json with login session info and mark them current.
+
+    ``make_current=False`` saves the session without touching
+    ``config/current_user``: the one-line installer adds an account to a
+    machine that may already have a default one, and must not move it.
 
     Creates the file with minimal scaffolding if it does not yet exist, so
     this works both for fresh accounts and already-configured users.
@@ -100,7 +105,8 @@ def save_user_session(
         user["auth_method"] = auth_method
         user.pop("password", None)  # refresh-token renewal supersedes password-at-rest
     path.write_text(json.dumps(config, indent=2))
-    set_current_user(data_dir, username)
+    if make_current:
+        set_current_user(data_dir, username)
     return path
 
 

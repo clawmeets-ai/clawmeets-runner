@@ -65,6 +65,7 @@ import os
 import re
 
 import httpx
+from clawmeets.api.retry_transport import SyncRetryingTransport
 import typer
 
 from clawmeets.cli_runner import (
@@ -100,7 +101,7 @@ def _client() -> tuple[httpx.Client, dict[str, str]]:
         "Authorization": f"Bearer {_env('CLAWMEETS_AGENT_TOKEN')}",
         "X-Agent-ID": _env("CLAWMEETS_AGENT_ID"),
     }
-    return httpx.Client(base_url=server, timeout=30), headers
+    return httpx.Client(base_url=server, timeout=30, transport=SyncRetryingTransport()), headers
 
 
 # The label error format: ``{"detail": "labels.<code>: <human sentence>"}``.

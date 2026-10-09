@@ -51,7 +51,13 @@ from typing import Any
 from pydantic import BaseModel, Field, model_validator
 
 from clawmeets.models.desk_sop import CONVENE_PROCEDURE
+from clawmeets.models.onboarding_plan import (
+    ONBOARDING_PLAN_TEMPLATE,
+    PLAN_TEMPLATE_END,
+    PLAN_TEMPLATE_START,
+)
 from clawmeets.models.provider_agents import MODEL_AGENT_DEFINITION, provider_agent_names
+from clawmeets.models.thinking_partner_plan import THINKING_PARTNER_PLAN_TEMPLATE
 from clawmeets.utils.file_io import FileUtil
 
 logger = logging.getLogger("clawmeets.models.desk_todo")
@@ -139,124 +145,52 @@ MAX_SLUG_LEN = 32
 # to store.
 SEED_TIMESTAMP = "1970-01-01T00:00:00+00:00"
 
-# The step 2 template lives between two marker lines so tests (and anyone
-# editing it) can address it without parsing prose. It is shown to the owner
-# filled in as its own to-do on their plate, and THEY fire it — the assistant
-# never runs it on its own.
-STEP2_TEMPLATE_START = "--- STEP 2 PROMPT TEMPLATE ---"
-STEP2_TEMPLATE_END = "--- END TEMPLATE ---"
-
-_ONBOARDING_STEP2_TEMPLATE = """\
-Staff a team for my priorities. Run it as ONE project that you coordinate,
-so registering, onboarding and handing off all happen under one plan.
-You staff my to-dos; you never start them. I fire each one myself.
-
-About me: <2-3 lines from USER.md: role, company, industry, how I work>
-
-My priorities, in order (to-do id · title · success · status · next step):
-1. <id> · <title> · <success> · <status> · <next step>
-2. ...
-
-Max new agents: 3.
-(Edit the list or this setting before firing this to-do if you like.)
-
-1. Design the team. Reuse agents I already have whenever one fits; propose
-   a new one only when nothing on my roster can do the job well, and no more
-   than the max above. Priorities beyond that stay with you; say why. Each
-   new agent gets a name, an industry matched to mine, expertise specific to
-   the priorities it owns ("B2B SaaS pricing analyst", not "Researcher"),
-   and mentors: you alone by default, since you now hold what every model
-   agent told you about me. Add one of my existing agents only when
-   the role genuinely overlaps its domain, and give each mentor a distinct
-   part of the brain dump. One agent can own several priorities. Prefer
-   fewer, sharper agents.
-
-2. Create the project (your create-project skill) with --agent-pool owned,
-   one --agent per EXISTING agent you're reusing, and --spawned-from <the id
-   of this conversation>. The new agents don't exist yet; you add them to
-   the roster as you register them. Its plan must contain:
-   - A team table: agent | new or existing | mentors | to-dos it owns (id +
-     title) | the agent's one-line job.
-   - Milestones:
-     Register: register each approved new agent, with a role description
-       built from its industry and expertise. Make sure it is running, and
-       add it to this project (clawmeets project allowlist <project> --agent
-       <name>). Register the top-priority agent first.
-     Onboard <agent>: one per new agent, each in its own workroom, in
-       priority order, run in parallel:
-       a. Brain dump. Each mentor writes its part: everything proprietary,
-          hard-won or non-obvious that touches this agent's industry and
-          expertise. That covers my profile above, the priorities it will own,
-          our conventions and stack, decisions already made and why, what we
-          tried that failed, the people and systems involved, and anything a
-          competent outsider would get wrong about how we work.
-       b. Deep research. The new agent researches its industry and expertise
-          to practitioner depth: the state of the art, the standard tools and
-          their trade-offs, common failure modes, and where the field is
-          heading. It then reconciles that against the brain dump and flags
-          every place our practice contradicts it.
-       c. Memorize. The new agent reflects and commits the brain dump and
-          its research to memory. Done when it posts a short inventory of
-          what it now knows, plus every conflict or gap it flagged.
-     Hand off: for each priority, update its to-do in place (never publish
-       a duplicate):
-         clawmeets todo update <id> --recipient <agent> \\
-           --draft-prompt "<first assignment>"
-       The first assignment states the goal, the current status, and the
-       very next deliverable and what makes it good enough, written so I
-       could fire it without editing. If the to-do already has
-       a draft, keep it and put your first assignment above it. Priorities
-       that stay with you get a draft addressed to you. Skip any to-do that's
-       no longer open. Hand off each to-do as soon as ITS agent finishes
-       onboarding; don't wait for the others. Do not fire any to-do.
-   - Acceptance criteria I can check: every priority on my desk has an agent
-     and a first assignment I could fire without editing; every new agent
-     can say what it knows about me and its domain, and what it flagged.
-   - Not Authorized: register no agent beyond what the accepted plan names.
-     Fire no to-do, ever. I start each one myself.
-
-3. Wait for me to accept the plan. Register nothing before that. If I edit
-   the team, update the plan to match.
-
-4. Run the milestones. When they're done, complete the project with a
-   report: the team (name, one-line job, what it now knows, what it
-   flagged), and my staffed to-dos in priority order (title, agent, the
-   first deliverable it will produce), each ready for me to fire. Don't
-   archive this to-do; it follows the project.
-"""
-
 ONBOARDING_SEED_ID = "t-seed-onboarding-know-me"
 THINKING_PARTNER_SEED_ID = "t-seed-thinking-partner"
 CONVENE_SEED_ID = "t-seed-convene-models"
 
-# The second starter row's prompt, inline and word for word as the product plan
-# wrote it. Deliberately NOT a pointer to the "Register new agent" SOP in
+# The second starter row's prompt. Same shape as onboarding's: the assistant
+# fills the one ``<…>`` line of a ready-made plan
+# (``models/thinking_partner_plan.py``), creates one project with it and sends a
+# quiet review round, so the owner's only click is dismissing the start gate.
+# Inline rather than a pointer to the "Register new agent" SOP in
 # ``models/desk_sop.py``: that SOP is the owner's to edit or delete, and this
-# to-do has to keep working after they do. ``thought_partner`` is load-bearing —
-# the thinking template's starter messages are tied to that exact agent name.
+# to-do has to keep working after they do.
+#
+# The to-do registers NOTHING. thought_partner is registered by the plan's
+# first milestone, after the owner has dismissed the gate, exactly as
+# onboarding registers its team. ``--agent thought_partner`` at create is safe
+# before the agent exists: the allowlist is stored as names and matched against
+# the roster every turn.
 THINKING_PARTNER_PROMPT = (
-    'Register a new agent for me and bring it to full working standard before it takes on any real work.\n'
-    '\n'
-    '  Name:      thought_partner  (keep this exact name; its starter messages are tied to it)\n'
-    '  Industry:  decision-making and strategic thinking for my work and life\n'
-    '  Expertise: consultant-style interviewing that finds the real question behind a request; structured brainstorming (analogies, constraint flips, assumption reversal, pre-mortems, perspective shifts) followed by narrowing to 2–3 options with cheap tests\n'
-    '  Mentors:   my assistant (already briefed by my model agents)\n'
-    '\n'
-    # Knowledge flows model agents -> assistant -> everyone else, and the
-    # owner can fire this row before onboarding. Without this line
-    # thought_partner would inherit a brain dump the model agents never fed.
-    "If my model agents haven't briefed you yet (step 1 of my onboarding "
-    "to-do), do that briefing first, then come back to this.\n"
-    '\n'
-    'Run these five steps in order and do not skip one:\n'
-    '\n'
-    '1. Register the agent, with a role description built from the industry and expertise above, and install the `grill-me` and `broaden-options` skills on it.\n'
-    "2. Brain dump. My assistant writes down what a thinking partner needs to know about me: decisions I've made and why, bets that held up or didn't, assumptions I keep making, and the questions I tend to avoid. Hand it to the new agent.\n"
-    '3. Deep research. Have the new agent research interviewing and brainstorming practice to practitioner depth (how good consultants and coaches question people, which ideation methods work and when each fails), then reconcile that against the brain dump.\n'
-    '4. Memorize. Have the new agent reflect and commit both to memory.\n'
-    "5. Confirm it's in my sidebar.\n"
-    '\n'
-    'Report back with what it now knows about how I decide, and every gap it flagged.'
+    "Add a thinking partner for me as ONE project that you coordinate, using "
+    "the ready-made plan below.\n"
+    "\n"
+    # Knowledge flows model agents -> assistant -> everyone else. Without
+    # USER.md the brain dump would be all "unknown", so this row waits for
+    # onboarding rather than running a second briefing of its own.
+    "First: if my USER.md does not exist yet, stop and tell me to run \"Get to "
+    "know me & staff my priorities\" first: the brain dump is built from it.\n"
+    "1. Fill in the plan. Replace only the <...> line under Goal with my areas "
+    "from USER.md. Leave everything else word for word, and save it as "
+    "./thinking-partner-plan.md.\n"
+    "2. Create the project with your create-project skill, passing the plan, "
+    "thought_partner, and the id of this conversation:\n"
+    "   clawmeets project create add-thought-partner \"$CLAWMEETS_AGENT_ID\" "
+    "\"<request>\" --display-name \"Add a thinking partner for big "
+    "decisions\" --agent-pool owned --agent thought_partner --spawned-from "
+    "<the id of this conversation> --plan-file ./thinking-partner-plan.md\n"
+    "   The request reads: \"The plan is predefined. Do not redraft it and do "
+    "not consult anyone on it. Run `clawmeets plan review <project>` once so "
+    "the start gate goes up, tell me to dismiss it to begin, and stop.\"\n"
+    "3. Tell me, in one line, that dismissing the project's start gate "
+    "registers thought_partner and begins its onboarding. Do not register "
+    "thought_partner or install anything here; the plan's first milestone "
+    "does that. Do nothing else here.\n"
+    "\n"
+    f"{PLAN_TEMPLATE_START}\n"
+    f"{THINKING_PARTNER_PLAN_TEMPLATE}"
+    f"{PLAN_TEMPLATE_END}"
 )
 
 # The third starter row's prompt: a model-agent panel, the demo of what several
@@ -299,82 +233,65 @@ SEED: tuple[dict[str, object], ...] = (
         # ``{username}-assistant``, which is where the second person belongs.
         "text": "Get to know me & staff my priorities",
         "drafted": True,
-        # Self-contained rather than a pointer to an SOP: step 2 is a template
-        # the assistant fills from what step 1 produced, so the two have to
-        # travel together. Step 1 is the one place a new account's USER.md gets
-        # written; there is no separate personalize item any more.
+        # Self-contained rather than a pointer to an SOP: the plan travels
+        # inside the prompt, so the to-do keeps working if the owner deletes
+        # every SOP. The project it creates is the one place a new account's
+        # USER.md gets written; there is no separate personalize item.
+        #
+        # One click by design: the assistant creates the project with the plan
+        # already written (``--plan-file``) and sends a quiet review round, so
+        # the only thing on the owner's screen is the start gate. Dismissing it
+        # is the acceptance that starts the work.
         #
         # PRODUCT RULE, pinned in tests/test_desk_todo_seed.py: onboarding
         # staffs to-dos and never starts them. Nothing here may tell the
         # assistant to run ``todo trigger`` — the owner's own first click on a
         # staffed to-do is the activation event.
         "draft_prompt": (
-            "Help me get set up. There are two steps. Do step 1 now. For step "
-            "2 you only prepare a to-do; it starts when I fire it.\n"
+            "Get me set up as ONE project that you coordinate, using the "
+            "ready-made plan below. You staff my to-dos; you never start them. "
+            "I fire each one myself.\n"
             "\n"
-            "Step 1. Get to know me.\n"
             # The model agents (models/provider_agents.py) are plain agents in
-            # code; mentoring the assistant is written down here and nowhere
-            # else. Knowledge flows one way: model agents -> assistant ->
-            # thought_partner and every agent "Staff my priorities" creates.
+            # code; mentoring the assistant is written down in the plan and
+            # nowhere else. Knowledge flows one way: model agents -> assistant
+            # -> thought_partner and every agent the plan registers.
             f"{MODEL_AGENT_DEFINITION}\n"
-            "First, have my model agents mentor you. Their names come from "
-            "this fixed list, and only the ones on my roster exist: "
-            f"{', '.join(provider_agent_names())}. Send each one on my roster "
-            "the same request with your direct-message skill: \"Brief my "
-            "assistant on me as a mentor would. Cover what your model has "
-            "seen of my work on this computer: instruction files and saved "
-            "memories; the projects and repos I've worked in; my conventions "
-            "and stack; decisions I made and why; what I tried that failed; "
-            "and the topics I keep coming back to. Summaries only; leave out "
-            "secrets.\" While they answer, start the interview below. Before "
-            "your next question, read their replies (`clawmeets dm history "
-            "<agent>`), use them to pre-fill USER.md, and skip any question "
-            "they already answered. Commit everything else they told you to "
-            "your own memory, noting which model agent said what. Then show "
-            "me a short inventory of what you learned, which facts came from "
-            "which agent, and every place two model agents disagree, so I can "
-            "correct them.\n"
-            "Write my USER.md with your personalize skill: ask for the easiest "
-            "input first (a resume, a pasted bio, a link), then ask only what "
-            "is still missing and important. Keep it quick: never ask for due "
-            "dates, and don't ask what success looks like; propose it and let "
-            "me correct it. If USER.md already exists, read it and fill only "
-            "the gaps. Make sure it covers my role, company, industry, how I "
-            "like to work, and my top priorities, ranked.\n"
-            "Then put each priority on my plate. Run `clawmeets todo list "
-            "--no-archived` first and reuse a to-do that already covers it; "
-            "publish one only when none does, with its success outcome, "
-            "current status and very next step in the draft (`clawmeets todo "
-            "publish --text \"<title>\" --draft-prompt \"Success: ... "
-            "Status: ... Next step: ...\"`).\n"
-            "Show me what you wrote and the priority list, and let me correct "
-            "both before you go on.\n"
             "\n"
-            "Step 2. Staff my priorities.\n"
-            "Once I confirm, fill in the About me line and my priorities in the "
-            "template below from my USER.md and my plate. Leave the rest as "
-            "written, including `<the id of this conversation>`: that is "
-            "filled in when the to-do runs. Put the result on my plate as ONE "
-            "new to-do titled \"Staff my priorities\", with the filled-in "
-            "template as its draft prompt (`clawmeets todo publish --text "
-            "\"Staff my priorities\" --draft-prompt \"<filled template>\"`). "
-            "If an open to-do with that title is already on my plate, update "
-            "its draft instead (`clawmeets todo update <id> --draft-prompt "
-            "\"<filled template>\"`). Then tell me step 1 is done and that "
-            "\"Staff my priorities\" is waiting on my plate: I can edit it "
-            "there and fire it next. Do not fire it yourself.\n"
+            "1. Fill in the plan. Replace only the <...> lines under Goal:\n"
+            "   - Model agents: the ones on my roster from this fixed list: "
+            f"{', '.join(provider_agent_names())}. If I have none, write "
+            "\"none\".\n"
+            "   - Existing agents: my other agents, one line each (name - "
+            "job).\n"
+            "   Leave everything else word for word, and save it as "
+            "./onboarding-plan.md.\n"
+            "2. Create the project with your create-project skill, passing the "
+            "plan, every model agent on my roster, and the id of this "
+            "conversation:\n"
+            "   clawmeets project create get-to-know-me \"$CLAWMEETS_AGENT_ID\" "
+            "\"<request>\" --display-name \"Get to know me & staff my "
+            "priorities\" --agent-pool owned --agent <model agent> "
+            "--spawned-from <the id of this conversation> --plan-file "
+            "./onboarding-plan.md\n"
+            "   The request reads: \"The plan is predefined. Do not redraft it "
+            "and do not consult anyone on it. Run `clawmeets plan review "
+            "<project>` once so the start gate goes up, tell me to dismiss it "
+            "to begin, and stop.\"\n"
+            "3. Tell me, in one line, that the project is ready and that "
+            "dismissing its start gate begins it. Do nothing else here.\n"
             "\n"
-            f"{STEP2_TEMPLATE_START}\n"
-            f"{_ONBOARDING_STEP2_TEMPLATE}"
-            f"{STEP2_TEMPLATE_END}"
+            f"{PLAN_TEMPLATE_START}\n"
+            f"{ONBOARDING_PLAN_TEMPLATE}"
+            f"{PLAN_TEMPLATE_END}"
         ),
     },
     {
         # Right after onboarding, which is what writes the USER.md the brain
-        # dump in step 2 of this prompt draws on. Same shape as the row above:
-        # a ready prompt, and a null recipient that resolves to the owner's own
-        # assistant — the one agent that can register another.
+        # dump in this row's plan draws on. Same shape as the row above: a
+        # ready prompt whose plan rides in the project create, and a null
+        # recipient that resolves to the owner's own assistant — the one agent
+        # that can register another.
         "id": THINKING_PARTNER_SEED_ID,
         "text": "Add a thinking partner for big decisions",
         "drafted": True,

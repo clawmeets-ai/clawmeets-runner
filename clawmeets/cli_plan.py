@@ -1409,6 +1409,32 @@ def review(
             only=tuple(only or []),
             sections=tuple(section or []),
         )
+        # **THE QUIET ROUND.** Nothing to carry, but the plan has never been
+        # offered: no round yet and the confirm note still open, so it still
+        # reads "drafting". The server's empty send is what rewrites it into the
+        # start gate (`_sync_go_note_locked`), and returning here instead left a
+        # coordinator with nothing to ask unable to put its plan in front of the
+        # user at all. A narrowed batch (--from-notes/--only/--section) that
+        # comes up empty is still nothing to send.
+        if not chosen and not (from_notes or only or section) and not rounds and any(
+            n.bootstrap and n.status == "open" for n in notes
+        ):
+            if dry_run:
+                typer.echo("# would send a quiet round: the start gate goes up for the owner")
+                return
+            result = _ok(client.post(
+                _url(pid, "/review"),
+                json={"note_ids": [], "room": room, "batch_comment": batch_comment},
+                headers=headers,
+            ))
+            if json_out:
+                _echo_json(result)
+            else:
+                typer.echo(
+                    f"{result['round_id']} — quiet round: nothing open for anyone, "
+                    f"so the start gate is now up for the owner."
+                )
+            return
         if not chosen:
             typer.echo("Nothing to send — no open note is waiting on an addressee.")
             return

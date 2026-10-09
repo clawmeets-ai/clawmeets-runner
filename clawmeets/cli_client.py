@@ -122,6 +122,11 @@ def project_create(
              "gains this project too, so it keeps reading Working against the work "
              "that continued. Omit it and nothing happens.",
     ),
+    plan_file: Optional[Path] = typer.Option(
+        None, "--plan-file", exists=True, dir_okay=False, readable=True,
+        help="PLAN.md v1, written exactly as given. Omit it and the project "
+             "starts from the blank plan template.",
+    ),
 ):
     """Create a new project.
 
@@ -153,6 +158,8 @@ def project_create(
             payload["agent_names"] = agent
         if spawned_from:
             payload["spawned_from"] = spawned_from
+        if plan_file:
+            payload["plan_body"] = plan_file.read_text(encoding="utf-8")
         resp = client.post("/projects", json=payload, headers=headers)
         # STDOUT STAYS BYTE-IDENTICAL. The mirror reports itself on stderr and
         # nowhere else, so anything piping `project create` into `jq` keeps
@@ -292,7 +299,8 @@ def _agent_http():
         "Authorization": f"Bearer {_agent_env('CLAWMEETS_AGENT_TOKEN')}",
         "X-Agent-ID": _agent_env("CLAWMEETS_AGENT_ID"),
     }
-    return httpx.Client(base_url=server, timeout=30), headers
+    from clawmeets.api.retry_transport import SyncRetryingTransport
+    return httpx.Client(base_url=server, timeout=30, transport=SyncRetryingTransport()), headers
 
 
 def _read_json(path: Path) -> dict | list:

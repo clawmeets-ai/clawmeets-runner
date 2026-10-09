@@ -32,7 +32,7 @@ import unicodedata
 from datetime import UTC, datetime
 from pathlib import Path
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, Literal, Optional
+from typing import TYPE_CHECKING, Callable, Literal, Optional
 
 from pydantic import BaseModel, Field, PrivateAttr, computed_field
 
@@ -333,7 +333,9 @@ class Project(BaseModel):
         Returns:
             ProjectStatus.ACTIVE or ProjectStatus.COMPLETED or ProjectStatus.FAILED
         """
-        data = FileUtil.read(self.meta_path, "json")
+        # Through the stat-checked cache: still fresh on every access, but a
+        # project list no longer re-parses meta.json once more per project.
+        data = self.ctx.file_cache.read_json(self.meta_path)
         return ProjectStatus(data["status"])
 
     @computed_field
@@ -808,15 +810,35 @@ class Project(BaseModel):
         Returns:
             List of Project objects
         """
-        result = []
+        return cls.list_where(ctx, lambda meta: True)
+
+    @classmethod
+    def list_where(
+        cls,
+        ctx: "ModelContext",
+        keep: Callable[[dict], bool],
+    ) -> list["Project"]:
+        """Projects whose raw ``meta.json`` dict passes ``keep``, in directory order.
+
+        Every ``meta.json`` is read through ``ctx.file_cache``, so a scan where
+        nothing changed is one ``stat`` per project and no JSON parsing. Only
+        the projects ``keep`` accepts are validated into models — validating
+        all ~1,300 to then throw most away was the other half of the cost.
+        ``keep`` gets the cached dict and must not mutate it.
+        """
+        result: list[Project] = []
         if not ctx.metadata_dir.exists():
             return result
-        for entry in sorted(ctx.metadata_dir.iterdir()):
-            if not entry.is_dir():
-                continue
-            meta_path = entry / "meta.json"
-            data = FileUtil.read(meta_path, "json")
-            if data:
+        with os.scandir(ctx.metadata_dir) as it:
+            # Sorted by dir name, matching the old `sorted(iterdir())` order.
+            # `DirEntry.is_dir()` comes from the dirent, so no stat per entry.
+            dirs = sorted(entry.name for entry in it if entry.is_dir())
+        # Plain string paths: at ~1,300 projects per call, building a `Path`
+        # per project costs more than the stat behind the cache check.
+        base = os.fspath(ctx.metadata_dir)
+        for dir_name in dirs:
+            data = ctx.file_cache.read_json(f"{base}/{dir_name}/meta.json")
+            if data and keep(data):
                 instance = cls.model_validate(data)
                 object.__setattr__(instance, "_ctx", ctx)
                 result.append(instance)
@@ -864,11 +886,9 @@ class Project(BaseModel):
         Returns:
             List of Project objects where the agent is a participant
         """
-        result: list[Project] = []
-        for proj in cls.list_all(ctx):
-            if agent_id in proj.participating_agents:
-                result.append(proj)
-        return result
+        return cls.list_where(
+            ctx, lambda meta: agent_id in (meta.get("participating_agents") or ())
+        )
 
     # -------------------------------------------------------------------------
     # State Access (for write operations)

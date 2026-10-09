@@ -73,6 +73,14 @@ work. If two corrected attempts still fail, stop and report the exact command
 and error to your user in the DM — that is a bug worth their attention, not
 something to brute-force around.
 
+## `--plan-file`: when the plan is already written
+
+Some prompts hand you a finished plan (the onboarding to-do does). Save it and
+pass `--plan-file ./plan.md`: it becomes PLAN.md v1 exactly as given, instead
+of the blank template. Your kickoff turn then has nothing to draft — run
+`clawmeets plan review <project>` once with nothing open, which puts the start
+gate in front of your user, tell them to dismiss it to begin, and stop.
+
 ## `--spawned-from`: keep your user's to-do pointing at the work
 
 You are almost always creating this project *from somewhere* — the DM thread

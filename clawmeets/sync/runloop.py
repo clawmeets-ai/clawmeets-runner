@@ -28,6 +28,7 @@ from .changelog import (
     iter_entries,
     ndjson_safe,
     read_tip_version_and_stat,
+    recent_entries_containing,
 )
 from .subscriber import ChangelogSubscriber
 from clawmeets.utils.file_io import FileUtil
@@ -401,6 +402,30 @@ class ChangelogRunloop:
             e for e in iter_entries(changelog_path)
             if e.source_version == source_version
         ]
+
+    def find_recent_by_request_id(
+        self,
+        sender_id: str,
+        client_request_id: str,
+        max_bytes: int = 4 * 1024 * 1024,
+    ) -> Optional[ChangelogEntry]:
+        """The entry ``sender_id`` already wrote under this Idempotency-Key, if
+        it is near the tip.
+
+        Closes the one window the idempotency middleware cannot: core died
+        after the append and before the stored response. A retry lands
+        seconds later, so the entry is among the last few; the window is
+        bounded in bytes because FILE entries carry their content inline.
+        """
+        path = self._changelog_dir / "changelog.ndjson"
+        for entry in reversed(recent_entries_containing(path, client_request_id.encode(), max_bytes)):
+            payload = entry.payload
+            if (
+                getattr(payload, "client_request_id", None) == client_request_id
+                and getattr(payload, "from_participant_id", None) == sender_id
+            ):
+                return entry
+        return None
 
     def get_current_version(self) -> int:
         """Latest version number, or 0 when there are no entries.

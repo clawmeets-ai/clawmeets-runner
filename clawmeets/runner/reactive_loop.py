@@ -280,6 +280,11 @@ class ReactiveControlLoop:
                 agent = Agent.get(payload.agent_id, self._model_ctx)
                 if agent is not None:
                     agent.update_card(status=payload.new_status)
+                    # Local cards now differ from the roster they were synced
+                    # from, so the next catch-up must not accept a 304: an
+                    # opposite flip missed while disconnected would otherwise
+                    # leave this status stale.
+                    self._model_ctx.peer_roster_etag = None
                     logger.debug(f"Updated local card for {payload.agent_name}: status={payload.new_status}")
                     # Re-render AGENTS.md so the roster's status column reflects
                     # the flip. update_card only touches the peer card.json;
@@ -312,6 +317,7 @@ class ReactiveControlLoop:
                             payload.skill_name,
                             payload.skill_content,
                             files=sibling_files,
+                            version=payload.skill_version,
                         )
                         # If the skill declares OAuth and the token isn't on
                         # disk yet, fire auto-auth so the user doesn't have to
@@ -365,6 +371,7 @@ class ReactiveControlLoop:
                             name=payload.pack_name or payload.pack_slug,
                             description=payload.pack_description or "",
                             files=payload.pack_files,
+                            updated_at=payload.pack_updated_at,
                         )
                     elif payload.action == "uninstall":
                         self._knowledge_pack_manager.uninstall_pack(payload.pack_slug)
@@ -424,6 +431,7 @@ class ReactiveControlLoop:
                         removed = Agent.prune_peer_card(
                             payload.changed_agent_id, self._model_ctx
                         )
+                        self._model_ctx.peer_roster_etag = None
                         logger.debug(
                             f"AGENT_REGISTRY_CHANGE (delete) "
                             f"{payload.changed_agent_name}: "

@@ -228,6 +228,64 @@ class WorkTracker:
             project_id, chatroom_name, participant_id, admit_if_absent=True
         )
 
+    async def restore_in_flight(
+        self,
+        *,
+        message_id: str,
+        message_version: int,
+        project_id: str,
+        project_name: str,
+        chatroom_name: str,
+        coordinator_id: str,
+        participant_id: str,
+        started_at: datetime,
+        timeout_seconds: int = 1800,
+    ) -> PendingWork:
+        """Record that ``participant_id`` is mid-turn in this room. Idempotent.
+
+        Called when a runner reconnects and reports a turn the server has no
+        record of — the tracker is in-memory, so a server restart forgets every
+        open batch while the runners keep working.
+
+          * no open batch                 -> open one expecting only
+            ``participant_id``, with ``created_at = started_at`` so the restart
+            does not reset the turn's timeout clock;
+          * open batch already expects it -> no-op (the normal path, or a
+            duplicate report from a second reconnect);
+          * open batch does not expect it -> add it to
+            ``expected_participants`` only, NOT ``responded_participants``, so
+            the batch now also waits for its reply.
+
+        One lock acquisition, like ``record_response``.
+        """
+        key = (project_id, chatroom_name)
+        async with self._lock:
+            work = self._pending.get(key)
+            if work is not None and participant_id in work.expected_participants:
+                return work
+            if work is None:
+                work = PendingWork(
+                    message_id=message_id,
+                    message_version=message_version,
+                    project_id=project_id,
+                    project_name=project_name,
+                    chatroom_name=chatroom_name,
+                    coordinator_id=coordinator_id,
+                    expected_participants=[participant_id],
+                    created_at=started_at,
+                    timeout_seconds=timeout_seconds,
+                )
+            else:
+                work = work.model_copy(update={
+                    "expected_participants":
+                        work.expected_participants + [participant_id],
+                })
+            self._pending[key] = work
+        await self._emit_change(
+            project_id, chatroom_name, work.timed_out_participants
+        )
+        return work
+
     async def remap_expected(
         self, project_id: str, chatroom_name: str, mapping: dict[str, str]
     ) -> None:

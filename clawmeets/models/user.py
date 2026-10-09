@@ -949,6 +949,35 @@ class User(Participant):
             data["users"] = users
             self._save_passwd(data)
 
+    def desk_tour_seen_at(self) -> Optional[str]:
+        """When this account first closed the My Desk welcome tour, or None.
+
+        Kept on the passwd row rather than in the browser so "seen" follows
+        the account to every device — a second laptop must not replay the
+        tour to someone who already dismissed it.
+        """
+        return self._load_passwd_entry().get("desk_tour_seen_at")
+
+    async def mark_desk_tour_seen(self) -> str:
+        """Stamp the welcome tour as seen. Idempotent: the FIRST stamp wins,
+        so replaying the tour from the ⓘ never moves it.
+
+        Returns:
+            The stored ISO timestamp.
+        """
+        async with _passwd_lock:
+            data = self._load_passwd()
+            users = data.get("users", {})
+            if self._id not in users:
+                raise KeyError(f"User {self._id!r} not found")
+            seen = users[self._id].get("desk_tour_seen_at")
+            if not seen:
+                seen = _now().isoformat()
+                users[self._id]["desk_tour_seen_at"] = seen
+                data["users"] = users
+                self._save_passwd(data)
+            return seen
+
     async def delete(self) -> None:
         """Delete this user."""
         async with _passwd_lock:

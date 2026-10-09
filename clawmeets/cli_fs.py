@@ -58,6 +58,7 @@ import httpx
 import typer
 
 from clawmeets.api.fs_protocol import FS_MAX_CONTENT_BYTES, FS_TRANSFER_TIMEOUT_SECONDS
+from clawmeets.api.retry_transport import SyncRetryingTransport
 from clawmeets.cli_runner import DEFAULT_DATA_DIR, DEFAULT_SERVER, _resolve_user_session, _server_url
 
 app = typer.Typer(
@@ -235,7 +236,7 @@ def resolve_agent(agents: list[dict], ref: str) -> dict:
 
 
 def _open_client(server: str) -> httpx.Client:
-    return httpx.Client(base_url=server, timeout=_HTTP_TIMEOUT)
+    return httpx.Client(base_url=server, timeout=_HTTP_TIMEOUT, transport=SyncRetryingTransport())
 
 
 def _target(ctx: typer.Context) -> _Target:

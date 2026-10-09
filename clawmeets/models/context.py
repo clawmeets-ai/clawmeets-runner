@@ -54,6 +54,7 @@ from clawmeets.sync.changelog import (
 from clawmeets.sync.subscriber import ChangelogSubscriber
 from clawmeets.utils import extra_dirs as extra_dirs_lib
 from clawmeets.utils.file_io import FileUtil
+from .file_cache import ParsedFileCache
 from .project import Project, ProjectState
 from .participant import Participant, ParticipantRole
 from .chatroom import Chatroom, ChatroomState
@@ -162,6 +163,11 @@ class ModelContext:
         # model override (model_config_name) can build a one-turn provider from a
         # non-default config. None off the runner ⇒ no override (default cli).
         self._cli_factory: Optional["Callable[[dict], LLMProvider]"] = None
+        self._file_cache = ParsedFileCache()
+        # Runner only: the ETag of the ``GET /agents`` roster the local peer
+        # cards + AGENTS.md were last written from (``Agent.sync_from_server``).
+        # In memory on purpose — a restarted runner refetches in full once.
+        self.peer_roster_etag: Optional[str] = None
 
     @property
     def cli(self) -> Optional["LLMProvider"]:
@@ -172,6 +178,12 @@ class ModelContext:
         """Replace the LLM provider. Takes effect on the next LLM invocation;
         in-flight invocations hold the prior reference and finish on it."""
         self._cli = cli
+
+    @property
+    def file_cache(self) -> ParsedFileCache:
+        """Stat-validated cache of parsed ``meta.json`` / ``card.json`` dicts,
+        shared by every scan through this context (see ``models/file_cache``)."""
+        return self._file_cache
 
     @property
     def cli_factory(self) -> Optional["Callable[[dict], LLMProvider]"]:

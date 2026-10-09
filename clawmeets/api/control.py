@@ -9,7 +9,7 @@ Defines the WebSocket protocol types used between runner and server.
 from __future__ import annotations
 
 from enum import Enum
-from typing import Union
+from typing import Literal, Union
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -106,6 +106,13 @@ class ControlMessageType(str, Enum):
     # reach a browser or another participant.
     AGENT_ENV_REQUEST = "agent_env_request"
 
+    # Server -> every runner, browser and CLI listener that advertised
+    # RESYNC_CAPABILITY: "catch up as if you had just reconnected". With the
+    # websocket edge in front of core (``clawmeets server ws-edge``), a core
+    # restart no longer drops sockets, so the catch-up a reconnect used to
+    # trigger has to be asked for. Never sent to computers.
+    RESYNC = "resync"
+
 
 class ChangelogUpdatePayload(BaseModel):
     """Payload for CHANGELOG_UPDATE messages.
@@ -150,6 +157,10 @@ class SkillSyncPayload(BaseModel):
     # [...], "token_file": "token.json"}``. The runner reads this on install
     # to fire ``_spawn_auto_auth_skill``; consumers without an interest skip it.
     auth: dict | None = None
+    # Content version (``models/skill_version``) of the skill on install. The
+    # runner records it so catch-up can tell when the server's copy changed.
+    # None from older servers → the runner refetches the skill once.
+    skill_version: str | None = None
 
 
 class McpSyncPayload(BaseModel):
@@ -307,6 +318,10 @@ class KnowledgePackSyncPayload(BaseModel):
     # {relative_path: {"content_b64": <base64-encoded bytes>}}. Empty on
     # uninstall — runner gates on ``action``.
     pack_files: dict[str, dict] = Field(default_factory=dict)
+    # The pack version these files are. The runner records it so its next
+    # catch-up can tell the server it already holds this version. None from
+    # older servers → the runner records nothing and refetches once.
+    pack_updated_at: str | None = None
 
 
 class AgentRegistryChangePayload(BaseModel):
@@ -629,6 +644,27 @@ class AgentEnvRequestPayload(BaseModel):
     value: str | None = None
 
 
+# Advertised in a socket's auth frame (``capabilities``) by clients that act on
+# RESYNC. A client without it is closed with 1012 instead, and reconnects.
+RESYNC_CAPABILITY = "resync"
+
+
+class ResyncPayload(BaseModel):
+    """Payload for RESYNC — see the enum member.
+
+    ``scope`` ``full`` is everything a reconnect does (in-flight turns, skill /
+    MCP / knowledge-pack sync, changelog catch-up); ``changelog`` is the
+    changelog catch-up alone, for when only changelog / active-work notices
+    were lost. The client first waits ``uniform(0, jitter_s)`` so a whole
+    deployment does not catch up in the same second. ``scope`` and ``reason``
+    have no defaults, which keeps this member distinguishable in
+    ``ControlEnvelope.payload``'s non-discriminated Union.
+    """
+    scope: Literal["full", "changelog"]
+    reason: Literal["core_restart", "outbox_overflow"]
+    jitter_s: float = 15.0
+
+
 class ControlEnvelope(BaseModel):
     """Lightweight WebSocket notification - never carries file content.
 
@@ -648,7 +684,7 @@ class ControlEnvelope(BaseModel):
     would need a real discriminator first.
     """
     type: ControlMessageType
-    payload: Union[ChangelogUpdatePayload, AgentStatusChangePayload, ProjectDeletedPayload, SkillSyncPayload, McpSyncPayload, AgentSettingsChangePayload, CancelLLMPayload, ActiveWorkChangePayload, McpAuthUrlForUserPayload, McpAuthCodePayload, SkillAuthUrlForUserPayload, SkillAuthCodePayload, KnowledgePackSyncPayload, AgentRegistryChangePayload, AgentCardUpdatePayload, BriefTabSyncPayload, ProjectReportSyncPayload, ProjectPlanSyncPayload, DeskTodoSyncPayload, DeskReadStateSyncPayload, DeskSopSyncPayload, DeskLabelSyncPayload, RunnerVersionsPayload, HostSyncPayload, InstallSyncPayload, AgentEnvRequestPayload, dict] = Field(default_factory=dict)
+    payload: Union[ChangelogUpdatePayload, AgentStatusChangePayload, ProjectDeletedPayload, SkillSyncPayload, McpSyncPayload, AgentSettingsChangePayload, CancelLLMPayload, ActiveWorkChangePayload, McpAuthUrlForUserPayload, McpAuthCodePayload, SkillAuthUrlForUserPayload, SkillAuthCodePayload, KnowledgePackSyncPayload, AgentRegistryChangePayload, AgentCardUpdatePayload, BriefTabSyncPayload, ProjectReportSyncPayload, ProjectPlanSyncPayload, DeskTodoSyncPayload, DeskReadStateSyncPayload, DeskSopSyncPayload, DeskLabelSyncPayload, RunnerVersionsPayload, HostSyncPayload, InstallSyncPayload, AgentEnvRequestPayload, ResyncPayload, dict] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_required_fields_for_type(self) -> "ControlEnvelope":
@@ -731,4 +767,7 @@ class ControlEnvelope(BaseModel):
         elif self.type == ControlMessageType.AGENT_ENV_REQUEST:
             if not isinstance(self.payload, AgentEnvRequestPayload):
                 raise ValueError(f"control message type {self.type} requires AgentEnvRequestPayload")
+        elif self.type == ControlMessageType.RESYNC:
+            if not isinstance(self.payload, ResyncPayload):
+                raise ValueError(f"control message type {self.type} requires ResyncPayload")
         return self
