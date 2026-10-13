@@ -140,6 +140,15 @@ class ParticipantNotifier(ChangelogSubscriber):
         if self._is_external_in(project_id, payload.chatroom_name):
             return
 
+        # A managed job's progress lines wake nobody; only its closing line,
+        # addressed to the job's owner, starts a turn. Without this a
+        # coordinator ran a full turn per progress line.
+        if (
+            payload.managed_job_id
+            and self._participant.id not in payload.expects_response_from
+        ):
+            return
+
         # Check for first user message in user-communication (coordinator only)
         # Lazy check: ModelContext (priority 0) writes message before this runs (priority 200)
         # So count == 1 means this is the first message

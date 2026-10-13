@@ -52,7 +52,9 @@ class ManagedJob(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     lease_expires_at: datetime
-    deadline_at: datetime
+    #: None = no absolute deadline. The heartbeat lease still applies, so a
+    #: job whose process died is still reported as stalled.
+    deadline_at: datetime | None = None
     heartbeat_timeout_seconds: int
     attempt: int = 1
     event_sequence: int = 0
@@ -61,10 +63,24 @@ class ManagedJob(BaseModel):
     def is_terminal(self) -> bool:
         return self.status in TERMINAL_STATUSES
 
+    def deadline_passed(self, now: datetime | None = None) -> bool:
+        if self.deadline_at is None:
+            return False
+        return (now or datetime.now(UTC)) >= self.deadline_at
+
+    def _capped_lease(self, now: datetime) -> datetime:
+        lease = now + timedelta(seconds=self.heartbeat_timeout_seconds)
+        return lease if self.deadline_at is None else min(self.deadline_at, lease)
+
     @property
     def has_healthy_lease(self) -> bool:
         now = datetime.now(UTC)
-        return not self.is_terminal and now < self.lease_expires_at and now < self.deadline_at
+        return (
+            not self.is_terminal
+            and self.status != ManagedJobStatus.STALLED
+            and now < self.lease_expires_at
+            and not self.deadline_passed(now)
+        )
 
 
 class ManagedJobError(ValueError):
@@ -106,16 +122,17 @@ class ManagedJobStore:
         pending_message_version: int,
         coordinator_id: str,
         owner_agent_id: str,
-        deadline_at: datetime,
+        deadline_at: datetime | None,
         heartbeat_timeout_seconds: int,
         step: str | None = None,
     ) -> ManagedJob:
         now = datetime.now(UTC)
-        if deadline_at.tzinfo is None:
-            raise ManagedJobError("deadline_at must include a timezone")
-        deadline_at = deadline_at.astimezone(UTC)
-        if deadline_at <= now:
-            raise ManagedJobError("deadline_at must be in the future")
+        if deadline_at is not None:
+            if deadline_at.tzinfo is None:
+                raise ManagedJobError("deadline_at must include a timezone")
+            deadline_at = deadline_at.astimezone(UTC)
+            if deadline_at <= now:
+                raise ManagedJobError("deadline_at must be in the future")
         if heartbeat_timeout_seconds < 10:
             raise ManagedJobError("heartbeat_timeout_seconds must be at least 10")
         async with self._lock:
@@ -137,8 +154,10 @@ class ManagedJobStore:
                 coordinator_id=coordinator_id,
                 owner_agent_id=owner_agent_id,
                 deadline_at=deadline_at,
-                lease_expires_at=min(
-                    deadline_at, now + timedelta(seconds=heartbeat_timeout_seconds)
+                lease_expires_at=(
+                    now + timedelta(seconds=heartbeat_timeout_seconds)
+                    if deadline_at is None
+                    else min(deadline_at, now + timedelta(seconds=heartbeat_timeout_seconds))
                 ),
                 heartbeat_timeout_seconds=heartbeat_timeout_seconds,
                 step=step,
@@ -158,6 +177,11 @@ class ManagedJobStore:
                 if job.project_id == project_id and job.chatroom_name == room and not job.is_terminal
             ]
             return max(candidates, key=lambda job: job.created_at, default=None)
+
+    async def list_active(self) -> list[ManagedJob]:
+        """Every non-terminal job, STALLED included (startup restore)."""
+        async with self._lock:
+            return [job for job in self._load() if not job.is_terminal]
 
     async def update(
         self,
@@ -202,11 +226,15 @@ class ManagedJobStore:
                 raise ManagedJobError(f"invalid transition: {job.status.value} -> {status.value}")
 
             now = datetime.now(UTC)
-            if now >= job.deadline_at and target not in TERMINAL_STATUSES:
+            if job.deadline_passed(now) and target not in TERMINAL_STATUSES:
                 raise ManagedJobError("job deadline has passed")
+            if job.status == ManagedJobStatus.STALLED and target == ManagedJobStatus.STALLED:
+                # Its open request was already reported as timed out; a late
+                # heartbeat must not quietly revive it.
+                raise ManagedJobError("job is stalled")
             lease = job.lease_expires_at
             if renew_lease:
-                lease = min(job.deadline_at, now + timedelta(seconds=job.heartbeat_timeout_seconds))
+                lease = job._capped_lease(now)
             updated = job.model_copy(update={
                 "status": target,
                 "progress": progress if progress is not None else job.progress,
@@ -230,14 +258,36 @@ class ManagedJobStore:
                 return None
             job = jobs[index]
             now = datetime.now(UTC)
-            if job.is_terminal or (now < job.lease_expires_at and now < job.deadline_at):
+            if job.is_terminal or (now < job.lease_expires_at and not job.deadline_passed(now)):
                 return job
             if job.status == ManagedJobStatus.STALLED:
                 return job
             updated = job.model_copy(update={
                 "status": ManagedJobStatus.STALLED,
-                "failure_reason": "absolute deadline reached" if now >= job.deadline_at else "heartbeat lease expired",
+                "failure_reason": "absolute deadline reached" if job.deadline_passed(now) else "heartbeat lease expired",
                 "updated_at": now,
+                "event_sequence": job.event_sequence + 1,
+            })
+            jobs[index] = updated
+            self._save(jobs)
+            return updated
+
+    async def cancel_by_server(self, job_id: str, reason: str) -> ManagedJob | None:
+        """Cancel a non-terminal job on the server's own authority (the owner
+        cancelled the request it is attached to). No sequence check: the
+        supervisor learns of it from its next refused event."""
+        async with self._lock:
+            jobs = self._load()
+            index = next((i for i, job in enumerate(jobs) if job.id == job_id), None)
+            if index is None:
+                return None
+            job = jobs[index]
+            if job.is_terminal:
+                return job
+            updated = job.model_copy(update={
+                "status": ManagedJobStatus.CANCELLED,
+                "failure_reason": reason,
+                "updated_at": datetime.now(UTC),
                 "event_sequence": job.event_sequence + 1,
             })
             jobs[index] = updated

@@ -184,6 +184,10 @@ class MessagePayload(ChatroomPayload):
     # response finds the entry instead of appending a second copy
     # (ChangelogRunloop.find_recent_by_request_id).
     client_request_id: Optional[str] = None
+    # Set only on the server-written lines of a managed background job
+    # (server/managed_job_events.post_job_line). A runner does not wake on
+    # such a line unless it is addressed to it, so progress lines cost no turn.
+    managed_job_id: Optional[str] = None
     # The owner's agent whose credential posted this user-authored message
     # (the assistant writing on the user's behalf). A room-bridge relay of it
     # is signed "sent by their agent" and charged to that agent's send caps.

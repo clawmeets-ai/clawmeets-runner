@@ -45,6 +45,10 @@ class PendingWork(BaseModel):
     timer_started_at: Optional[datetime] = None
     managed_job_id: str | None = None
     managed_job_lease_expires_at: datetime | None = None
+    #: The agent that owns the attached job. While a job is attached, that
+    #: agent's ordinary replies do not answer this batch; the job's closing
+    #: event does (``record_response(from_managed_job=True)``).
+    managed_job_owner_id: str | None = None
 
     @property
     def is_complete(self) -> bool:
@@ -151,8 +155,14 @@ class WorkTracker:
         participant_id: str,
         *,
         admit_if_absent: bool = False,
+        from_managed_job: bool = False,
     ) -> Optional[PendingWork]:
         """Credit ``participant_id``'s reply against the room's open batch.
+
+        While a managed job is attached, a reply from the job's owner is not
+        credited (the batch comes back unchanged) unless ``from_managed_job``:
+        the agent says "started" and ends its turn, and the request must stay
+        open until the job itself closes, exactly once.
 
         Returns ``None`` when there is no open batch, or when the replier is
         not one of its ``expected_participants`` — "this reply belongs to no
@@ -179,6 +189,12 @@ class WorkTracker:
             work = self._pending.get(key)
             if work is None:
                 return None
+            if (
+                work.managed_job_id
+                and participant_id == work.managed_job_owner_id
+                and not from_managed_job
+            ):
+                return work
             if participant_id not in work.expected_participants:
                 if not admit_if_absent:
                     return None
@@ -406,6 +422,7 @@ class WorkTracker:
         *,
         message_id: str,
         job_id: str,
+        owner_id: str,
         lease_expires_at: datetime,
     ) -> PendingWork:
         """Attach a server-authenticated job lease to the matching open batch."""
@@ -418,6 +435,7 @@ class WorkTracker:
                 raise ValueError("pending work already has a managed job")
             work = work.model_copy(update={
                 "managed_job_id": job_id,
+                "managed_job_owner_id": owner_id,
                 "managed_job_lease_expires_at": lease_expires_at,
             })
             self._pending[key] = work
