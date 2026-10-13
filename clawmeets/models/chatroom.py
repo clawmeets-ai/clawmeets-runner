@@ -30,12 +30,13 @@ import json
 import logging
 import os
 import re
+from dataclasses import dataclass
 import shutil
 import threading
 from collections import OrderedDict
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar, Optional
+from typing import TYPE_CHECKING, Annotated, ClassVar, Literal, Optional
 
 from pydantic import BaseModel, Field, PrivateAttr, computed_field
 
@@ -62,9 +63,65 @@ if TYPE_CHECKING:
 # skips a domain/TLD suffix like `@clawmeets.ai` — can never clip a real
 # handle. The name class is possessive (`*+`, 3.11+) so the engine can't
 # backtrack into a truncated match (`clawmeet` out of `@clawmeets.ai`).
-_MENTION_RE = re.compile(r'(?:^|(?<=[^a-zA-Z0-9_]))@([a-zA-Z][a-zA-Z0-9_-]*+)(?!\.[a-zA-Z])')
+#
+# ``@name@deployment`` addresses a retained hub agent on another server
+# (plan-agent-access 4.2). It is parsed FIRST (``_QUALIFIED_MENTION_RE``), and
+# the bare form's lookahead also refuses an ``@`` so a bare match never stops
+# before one: ``@alice-researcher@acme`` can never wake a local
+# ``alice-researcher``.
+_QUALIFIED_MENTION_RE = re.compile(
+    r'(?:^|(?<=[^a-zA-Z0-9_]))@([a-z0-9][a-z0-9._-]{0,62})@([a-z0-9][a-z0-9-]*)\b'
+)
+_MENTION_RE = re.compile(r'(?:^|(?<=[^a-zA-Z0-9_]))@([a-zA-Z][a-zA-Z0-9_-]*+)(?![.@][a-zA-Z0-9])')
+
+
+@dataclass(frozen=True)
+class Mentions:
+    """``local``: bare @handles (this server's agents). ``qualified``:
+    ``(name, deployment)`` pairs addressing retained hub agents."""
+
+    local: list[str]
+    qualified: list[tuple[str, str]]
+
+
+def parse_mentions(text: Optional[str]) -> Mentions:
+    """Split a message's @mentions into local handles and qualified
+    ``name@deployment`` references, each deduplicated in order. The qualified
+    spans are removed before the bare pass, so their name part is never also
+    read as a local handle."""
+    if not text:
+        return Mentions([], [])
+    qualified: list[tuple[str, str]] = []
+    for m in _QUALIFIED_MENTION_RE.finditer(text):
+        pair = (m.group(1), m.group(2))
+        if pair not in qualified:
+            qualified.append(pair)
+    stripped = _QUALIFIED_MENTION_RE.sub(" ", text)
+    local: list[str] = []
+    for name in _MENTION_RE.findall(stripped):
+        if name not in local:
+            local.append(name)
+    return Mentions(local, qualified)
 
 logger = logging.getLogger(__name__)
+
+#: The stand-in's identity fields kept on its membership row.
+_HUB_FIELDS = ("hub_agent_id", "name", "deployment_name", "deployment_fingerprint")
+
+
+def _stand_in_row(participant: dict) -> dict:
+    """The extra PARTICIPANTS.ndjson fields of a hub stand-in member
+    (``kind``, ``bridge_state``, ``inactive_reason``, ``hub``); {} for
+    every other member, so their rows are unchanged."""
+    if participant.get("kind") != "hub_stand_in":
+        return {}
+    hub = participant.get("hub") or {}
+    return {
+        "kind": "hub_stand_in",
+        "bridge_state": participant.get("bridge_state") or "active",
+        "inactive_reason": participant.get("inactive_reason"),
+        "hub": {k: hub.get(k) for k in _HUB_FIELDS},
+    }
 
 
 class _ChatLogCache:
@@ -150,6 +207,57 @@ class _ChatLogCache:
 _chat_log_cache = _ChatLogCache()
 
 
+class RoomFlow(BaseModel):
+    """A room's inbound flow of outside messages (hub, channel, cross-account
+    and Front Desk requester messages).
+
+    ``stopped``: every outside message for the room is held, not stored,
+    until the owner reopens it; local users and agents keep talking. Written
+    to the room's meta.json by CHATROOM_FLOW_CHANGED. ``held_count`` is not
+    stored here: the server fills it in from its held-message table when it
+    answers a chatroom request (0 on a runner).
+    """
+    model_config = {"frozen": True}
+
+    inbound_flow: Literal["open", "stopped"] = "open"
+    stopped_by: Optional[Literal["owner", "inspector"]] = None
+    stopped_at: Optional[Annotated[float, Field(json_schema_extra={"format": "epoch-seconds"})]] = None
+    reason: Optional[str] = None
+    held_count: int = 0
+
+
+class ParticipantHub(BaseModel):
+    """``participant_info[].hub``: the remote agent a hub stand-in member
+    bridges to, and the state of that bridge."""
+    model_config = {"frozen": True, "extra": "forbid"}
+
+    hub_agent_id: Optional[str] = None
+    name: Optional[str] = None
+    deployment_name: Optional[str] = None
+    deployment_fingerprint: Optional[str] = None
+    bridge_state: Literal["active", "inactive"] = "active"
+    inactive_reason: Optional[str] = None
+
+
+class ParticipantInfo(BaseModel):
+    """One room member, or one non-member who has posted in the room, as
+    chatroom responses list it (``participant_info``).
+
+    ``kind`` is ``user`` for any person (the owner, a person of another
+    account, a channel contact); it does not mean "you". ``outside`` is false
+    only for an author positively identified as inside (models/provenance.py:
+    the owner and the owner's own agents). Fail-closed rule for renderers: a
+    message whose sender is not ``system``, not the project's ``created_by``
+    and not listed here with ``outside: false`` is outside content. ``hub`` is
+    set for a stand-in only."""
+    model_config = {"frozen": True, "extra": "forbid"}
+
+    id: str
+    kind: Literal["agent", "user", "hub_stand_in"]
+    outside: bool
+    hub: Optional[ParticipantHub] = None
+
+
 class Chatroom(BaseModel):
     """Chatroom metadata with persistence and association methods.
 
@@ -166,6 +274,7 @@ class Chatroom(BaseModel):
     project_id: str
     project_name: str  # Required for path construction
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    flow: RoomFlow = Field(default_factory=RoomFlow)
 
     # Private runtime state (not serialized)
     _ctx: Optional["ModelContext"] = PrivateAttr(default=None)
@@ -243,6 +352,81 @@ class Chatroom(BaseModel):
             return []
         entries = FileUtil.read(self.participants_path, "ndjson")
         return [entry["agent_id"] for entry in entries]
+
+    @computed_field
+    @property
+    def participant_info(self) -> list[ParticipantInfo]:
+        """One ``ParticipantInfo`` per participant, in ``participants`` order,
+        then one per non-member sender who is not inside (a mirrored host
+        owner, a requester, another account's agent), in first-post order."""
+        from .project import Project
+        from .provenance import STAND_IN_SEPARATOR, SYSTEM_AUTHORS, outside_author
+        from .user import User
+
+        ids = self.participants
+        ctx = self._ctx
+        try:
+            project = Project.get(self.project_id, ctx) if ctx is not None else None
+        except ValueError:
+            project = None
+
+        def describe(pid: str) -> tuple[str, bool]:
+            if STAND_IN_SEPARATOR in pid:
+                kind = "hub_stand_in"
+            elif (project is not None and pid == project.created_by) or pid.startswith("contact:") or (
+                ctx is not None and User.get(pid, ctx) is not None
+            ):
+                kind = "user"
+            else:
+                kind = "agent"
+            # Fail closed: without the project nobody is known to be inside.
+            outside = project is None or outside_author(project, pid, ctx) is not None
+            return kind, outside
+
+        rows = self.participant_rows() if ids else {}
+        out = []
+        for pid in ids:
+            kind, outside = describe(pid)
+            row = rows.get(pid) or {}
+            hub = None
+            if kind == "hub_stand_in" and isinstance(row.get("hub"), dict):
+                hub = ParticipantHub(
+                    **{k: row["hub"].get(k) for k in _HUB_FIELDS},
+                    bridge_state="inactive" if row.get("bridge_state") == "inactive" else "active",
+                    inactive_reason=row.get("inactive_reason"),
+                )
+            out.append(ParticipantInfo(id=pid, kind=kind, outside=outside, hub=hub))
+        seen = set(ids) | SYSTEM_AUTHORS
+        for message in self.get_messages():
+            pid = message.from_participant_id
+            if pid in seen:
+                continue
+            seen.add(pid)
+            kind, outside = describe(pid)
+            if outside:
+                out.append(ParticipantInfo(id=pid, kind=kind, outside=True))
+        return out
+
+    def participant_rows(self) -> dict[str, dict]:
+        """PARTICIPANTS.ndjson rows by participant id (the last row wins)."""
+        if not self.participants_path.exists():
+            return {}
+        return {e["agent_id"]: e for e in FileUtil.read(self.participants_path, "ndjson") or []
+                if isinstance(e, dict) and "agent_id" in e}
+
+    def stand_in_member(self, name: str, deployment: str) -> Optional[str]:
+        """The id of the stand-in member a qualified ``@name@deployment``
+        mention addresses, or None. Matched on the row's hub name and
+        deployment name, case-insensitively."""
+        name, deployment = name.lower(), deployment.lower()
+        for pid, row in self.participant_rows().items():
+            hub = row.get("hub") if row.get("kind") == "hub_stand_in" else None
+            if not isinstance(hub, dict):
+                continue
+            if str(hub.get("name", "")).lower() == name and \
+                    str(hub.get("deployment_name", "")).lower() == deployment:
+                return pid
+        return None
 
     def is_external_member(self, agent_id: str) -> bool:
         """True if ``agent_id`` is in PARTICIPANTS.ndjson with ``external=true``.
@@ -359,15 +543,7 @@ class Chatroom(BaseModel):
         and a bare ``@x.com`` (domain/TLD) are rejected, while ``**@agent**``
         is accepted. Valid handles never contain a dot (see ``_MENTION_RE``).
         """
-        if not content:
-            return []
-        seen: set[str] = set()
-        result: list[str] = []
-        for m in _MENTION_RE.findall(content):
-            if m not in seen:
-                seen.add(m)
-                result.append(m)
-        return result
+        return parse_mentions(content).local
 
     def resolve_mention(self, name: str) -> Optional["Agent"]:
         """Resolve an @mention name to an Agent in this room's namespace.
@@ -441,9 +617,33 @@ class Chatroom(BaseModel):
             messages = [m for m in messages if m.id != exclude_message_id]
         messages = messages[-limit:]
         return [
-            (m.prompt_sender_label, m.content)
+            (m.prompt_sender_label, self.prompt_content(m))
             for m in messages
         ]
+
+    def prompt_content(self, message) -> str:
+        """A message's text as a turn's context shows it: fenced as outside
+        content when its author is outside (a hub stand-in, another
+        account's agent or person, or the requester of a host conversation)."""
+        from .project import Project
+        from .provenance import fence_untrusted, row_outside_kind
+
+        ctx = self._ctx
+        try:
+            project = Project.get(self.project_id, ctx)
+        except ValueError:
+            return message.content
+        kind = row_outside_kind(project, message, ctx)
+        if kind is None:
+            return message.content
+        label = message.prompt_sender_label
+        if kind in ("other_account_agent", "other_account_user"):
+            label = f"{label} (another account)"
+        elif kind == "requester":
+            label = f"{label} (the person this conversation serves)"
+        elif kind == "owner_isolated_agent":
+            label = f"{label} (runs without the sandbox and talks to outside visitors)"
+        return fence_untrusted(message.content, source_label=label, fingerprint=None)
 
     def count_messages(self) -> int:
         """Count messages in this chatroom.
@@ -470,8 +670,8 @@ class Chatroom(BaseModel):
         Returns:
             File content as bytes, or None if not found
         """
-        file_path = self.files_dir / filename
-        return FileUtil.read(file_path, "bytes")
+        file_path = self._contained(filename)
+        return FileUtil.read(file_path, "bytes") if file_path is not None else None
 
     def file_exists(self, filename: str) -> bool:
         """Check if a file exists in this chatroom.
@@ -482,7 +682,24 @@ class Chatroom(BaseModel):
         Returns:
             True if file exists, False otherwise
         """
-        return (self.files_dir / filename).exists()
+        file_path = self._contained(filename)
+        return file_path is not None and file_path.exists()
+
+    def _contained(self, filename: str) -> Optional[Path]:
+        """``files_dir / filename`` when the name stays inside ``files_dir``, else
+        None. A name is relative, has no ``..`` part and no NUL, and resolves
+        under ``files_dir`` (symlinks included) -- so a caller-supplied name can
+        never read, or learn about, a file outside this room."""
+        if not filename or "\x00" in filename or "\\" in filename:
+            return None
+        rel = Path(filename)
+        if rel.is_absolute() or ".." in rel.parts:
+            return None
+        root = self.files_dir.resolve()
+        file_path = (self.files_dir / rel).resolve()
+        if root not in file_path.parents:
+            return None
+        return file_path
 
     # -------------------------------------------------------------------------
     # Active Record: Persistence Methods
@@ -511,6 +728,8 @@ class Chatroom(BaseModel):
         """
         from .project import Project
 
+        if not FileUtil.is_safe_id(chatroom_name):
+            return None                # "..", "." or a path: not a room name
         # Load project first to get project_name. Project.get raises ValueError
         # for an unknown project — fold that into the None contract here.
         try:
@@ -558,6 +777,8 @@ class Chatroom(BaseModel):
         Returns:
             Chatroom, or None when the room doesn't exist.
         """
+        if not FileUtil.is_safe_id(chatroom_name):
+            return None
         ctx = project.ctx
         meta_path = (
             ctx.metadata_dir
@@ -685,6 +906,7 @@ class ChatroomState:
                 "agent_name": participant["name"],
                 "invited_at": created_at.isoformat() if created_at else None,
                 "external": bool(participant.get("external", False)),
+                **_stand_in_row(participant),
             }
             FileUtil.write(
                 participants_path,
@@ -707,6 +929,7 @@ class ChatroomState:
         timestamp: datetime,
         *,
         external: bool = False,
+        stand_in: Optional[dict] = None,
     ) -> None:
         """Add a participant to an existing chatroom's PARTICIPANTS.ndjson.
 
@@ -727,6 +950,7 @@ class ChatroomState:
             "agent_name": participant_name,
             "invited_at": timestamp.isoformat() if timestamp else None,
             "external": bool(external),
+            **_stand_in_row(stand_in or {}),
         }
         FileUtil.write(
             self._chatroom.participants_path,
@@ -736,6 +960,24 @@ class ChatroomState:
             ensure_dir=True,
             atomic=False,
         )
+
+    def update_participant(
+        self, participant_id: str, *, bridge_state: str, inactive_reason: Optional[str],
+    ) -> bool:
+        """Rewrite one member's bridge state (PARTICIPANT_UPDATED). False when
+        the participant is not a member. The file is rewritten atomically."""
+        path = self._chatroom.participants_path
+        rows = FileUtil.read(path, "ndjson") or [] if path.exists() else []
+        found = False
+        for row in rows:
+            if isinstance(row, dict) and row.get("agent_id") == participant_id:
+                row["bridge_state"] = bridge_state
+                row["inactive_reason"] = inactive_reason
+                found = True
+        if found:
+            text = "".join(json.dumps(r) + "\n" for r in rows)
+            FileUtil.write(path, text, "text", atomic=True)
+        return found
 
     def append_message(self, message: ChatMessage) -> None:
         """Append a message to CHATS.ndjson.
@@ -843,4 +1085,24 @@ class ChatroomState:
         meta = FileUtil.read(self._chatroom.meta_path, "json", default=None) or {}
         meta["last_cleared_at"] = cleared_at.isoformat()
         meta["last_cleared_through_version"] = cleared_through_version
+        FileUtil.write(self._chatroom.meta_path, meta, "json", atomic=True)
+
+    def set_flow(
+        self,
+        inbound_flow: str,
+        *,
+        stopped_by: Optional[str],
+        reason: Optional[str],
+        at: datetime,
+    ) -> None:
+        """Record the room's inbound flow (CHATROOM_FLOW_CHANGED) in meta.json,
+        preserving every other field. Reopening clears who stopped it and why."""
+        stopped = inbound_flow == "stopped"
+        meta = FileUtil.read(self._chatroom.meta_path, "json", default=None) or {}
+        meta["flow"] = {
+            "inbound_flow": "stopped" if stopped else "open",
+            "stopped_by": stopped_by if stopped else None,
+            "stopped_at": at.timestamp() if stopped else None,
+            "reason": reason if stopped else None,
+        }
         FileUtil.write(self._chatroom.meta_path, meta, "json", atomic=True)

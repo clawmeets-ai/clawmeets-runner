@@ -72,6 +72,8 @@ clawmeets fs --json ls /                        # the server's JSON, for parsing
 | `[no access]` | You may see that it exists, nothing more (e.g. logs, for agents). | Nothing. |
 | `[link: ...]` | A symlink. It is never followed, and its target is not shown. | Only `rm`. |
 
+`shared_storage/` at the home root is the exception: it lists as a folder (the computer-wide shared storage) and you can `ls`, `cat`, `write`, `mkdir` and `rm` inside it like any open folder. The link itself cannot be removed.
+
 To change skill or MCP settings, use the `update-skill-config` /
 `update-mcp-config` skills. Do not edit those files through `fs`; it refuses
 anyway.

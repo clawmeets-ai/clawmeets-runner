@@ -136,6 +136,10 @@ class ReactiveControlLoop:
         self._mcp_manager = mcp_manager
         self._knowledge_pack_manager = knowledge_pack_manager
         self._cli_factory = cli_factory
+        # isolated_turns.v1 (plan 4.3): attached by the runner after start.
+        self._capability = None
+        self._capability_recheck = None
+        self._capability_task: "Optional[asyncio.Task]" = None
         # Shared with cli_factory's closure: mutating the git keys here updates
         # the env the next-built CLI captures (CLI providers copy agent_env at
         # construction, so a git_url change must rebuild the CLI to take effect).
@@ -1057,6 +1061,29 @@ class ReactiveControlLoop:
     # Local Settings
     # ─────────────────────────────────────────────────────────
 
+    # Settings whose change can change what the provider CLI loads or which
+    # login it uses: the capability must be re-earned (plan 4.3).
+    _ISOLATION_KEYS = ("llm_provider", "llm_model", "llm_api_key", "llm_base_url")
+
+    def attach_isolation_capability(self, capability, recheck) -> None:
+        """``capability``: runner/turn_capability.IsolatedTurnsCapability;
+        ``recheck(local_settings)``: coroutine re-running the start canaries."""
+        self._capability = capability
+        self._capability_recheck = recheck
+
+    def _on_isolation_settings(self, new: dict, prior: dict) -> None:
+        """Withdraw ``isolated_turns.v1`` NOW on a provider / model / login
+        change and re-run the canaries in the background; the capability comes
+        back only if they pass."""
+        capability = getattr(self, "_capability", None)
+        recheck = getattr(self, "_capability_recheck", None)
+        if capability is None or recheck is None:
+            return
+        if not any(new.get(k) != prior.get(k) for k in self._ISOLATION_KEYS):
+            return
+        capability.withdraw()
+        self._capability_task = asyncio.create_task(recheck(dict(new)))
+
     async def _apply_local_settings(
         self,
         local_settings: dict,
@@ -1146,7 +1173,8 @@ class ReactiveControlLoop:
         # change it without a restart is to rebuild.
         llm_keys = (
             "llm_provider", "llm_model", "llm_api_key", "llm_base_url", "output_mode",
-            "invoke_timeout_seconds",
+            "invoke_timeout_seconds", "smart_routes", "smart_max_attempts",
+            "smart_cooldown_seconds",
         )
         llm_changed = any(
             local_settings.get(k) != prior_settings.get(k) for k in llm_keys
@@ -1169,6 +1197,8 @@ class ReactiveControlLoop:
                     f"Keeping previous CLI in service.",
                     exc_info=True,
                 )
+
+        self._on_isolation_settings(local_settings, prior_settings)
 
         # Update knowledge_dirs — resolve against AGENT_DIR the same way
         # cli_runner does at startup so a hot update of `./knowledge` lands

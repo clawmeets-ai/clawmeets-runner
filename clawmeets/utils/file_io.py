@@ -10,6 +10,7 @@ with optional atomic writes and base64 encoding.
 from __future__ import annotations
 
 import base64
+import glob
 import hashlib
 import json
 import logging
@@ -345,6 +346,42 @@ class FileUtil:
             Hex-encoded SHA256 hash
         """
         return hashlib.sha256(content).hexdigest()
+
+    @staticmethod
+    def is_safe_id(entity_id: str) -> bool:
+        """True when ``entity_id`` can name exactly one path component.
+
+        Ids reach the filesystem from URLs and headers; one that is empty,
+        ``.``/``..`` or carries a path separator could address a directory
+        other than the one it names.
+        """
+        return (
+            bool(entity_id)
+            and entity_id not in (".", "..")
+            and "/" not in entity_id
+            and "\\" not in entity_id
+        )
+
+    @staticmethod
+    def id_suffix_dirs(parent: Path, entity_id: str, id_file: str) -> list[Path]:
+        """The ``{name}-{entity_id}`` entries under ``parent`` whose ``id_file``
+        (``card.json``, ``meta.json``) records exactly ``entity_id``, sorted.
+
+        The id is matched literally: it is ``glob.escape``d, so an id like
+        ``*`` or ``2*`` from a request cannot match some other entity's
+        directory. And it is matched whole: names are hyphenated, so a trailing
+        part of a name plus the id (``public-<id>`` for ``owner-public-<id>``)
+        or the last groups of a uuid also end the directory name, and only the
+        recorded id tells them apart. An unsafe id (see :meth:`is_safe_id`)
+        matches nothing.
+        """
+        if not FileUtil.is_safe_id(entity_id):
+            return []
+        def records_id(d: Path) -> bool:
+            data = FileUtil.read(d / id_file, "json")
+            return isinstance(data, dict) and data.get("id") == entity_id
+
+        return [d for d in sorted(parent.glob(f"*-{glob.escape(entity_id)}")) if records_id(d)]
 
     @staticmethod
     def exists(path: Path) -> bool:

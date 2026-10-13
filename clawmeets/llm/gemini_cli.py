@@ -37,7 +37,9 @@ from .base import (
     SubprocessLLMProvider,
     link_mcp_config_into,
     materialize_skill_tree,
+    scratch_dir,
 )
+from ..utils import nofollow_fs
 from .pricing import price_usd
 
 logger = logging.getLogger(__name__)
@@ -80,6 +82,7 @@ class GeminiCLI(SubprocessLLMProvider):
     _provider_name = "Gemini"
     _log_tag = "gemini-invoke"
     _install_hint = "Install Gemini CLI: https://github.com/google-gemini/gemini-cli"
+    _turn_provider = "gemini"
 
     def __init__(
         self,
@@ -115,6 +118,9 @@ class GeminiCLI(SubprocessLLMProvider):
         self._model = model
         self._agent_env = dict(agent_env)
         self._skill_dirs = list(skill_dirs or [])
+
+    def _scoped_env_extra(self, turn) -> dict[str, str]:
+        return {"GEMINI_CLI_TRUST_WORKSPACE": "true"}
 
     def _build_env(self) -> dict[str, str]:
         env = super()._build_env()
@@ -177,10 +183,7 @@ class GeminiCLI(SubprocessLLMProvider):
         # Symlink it from the agent's pre-rendered dist so installed MCP
         # servers appear under `mcpServers`.
         if mcp_config_dir is not None:
-            link_mcp_config_into(
-                mcp_config_dir / ".gemini" / "settings.json",
-                working_dir / ".gemini" / "settings.json",
-            )
+            link_mcp_config_into(mcp_config_dir / ".gemini" / "settings.json", working_dir, ".gemini/settings.json")
 
         # Gemini auto-discovers `.agents/skills/<name>/SKILL.md` from cwd
         # (workspace tier, Agent Skills open-standard alias). Materialize
@@ -190,16 +193,11 @@ class GeminiCLI(SubprocessLLMProvider):
         # sandbox so following a symlink to its absolute target doesn't
         # trip the allow-list.
         if skill_source_dirs is not None:
-            materialize_skill_tree(
-                working_dir / ".agents" / "skills",
-                skill_source_dirs,
-            )
+            materialize_skill_tree(working_dir, ".agents/skills", skill_source_dirs)
 
         full_prompt = prompt + _JSON_ONLY_SUFFIX
 
-        prompt_file = working_dir / ".agent-prompt.txt"
-        prompt_file.write_text(full_prompt, encoding="utf-8")
-        prompt_file_abs = str(prompt_file.resolve())
+        prompt_file_abs = str(nofollow_fs.write_text(scratch_dir(working_dir), ".agent-prompt.txt", full_prompt))
         gemini_cwd = str(working_dir)
 
         cmd = [

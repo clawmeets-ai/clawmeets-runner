@@ -145,6 +145,12 @@ def set_(
         False, "--value-stdin",
         help="Read the value from stdin (one trailing newline stripped) instead of argv.",
     ),
+    scoped_turns: bool = typer.Option(
+        False, "--scoped-turns",
+        help="Also expose this key to scoped turns (conversations for someone other "
+             "than the owner). Off by default; re-setting a key without the flag "
+             "withdraws it from scoped turns.",
+    ),
     agent: str = typer.Option("", "--agent", "-a", help="Agent name/dir; default $CLAWMEETS_AGENT_DIR."),
     data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir"),
 ) -> None:
@@ -167,9 +173,15 @@ def set_(
         value = typer.prompt(f"Value for {key}", hide_input=True, err=True)
     try:
         env_store.set_var(base, key, value)
+        env_store.set_scoped(base, key, scoped_turns)
     except ValueError as exc:
         _fail(str(exc))
-    _echo({"status": "ok", "key": key})
+    out: dict = {"status": "ok", "key": key, "scoped_turns": scoped_turns}
+    if scoped_turns:
+        out["note"] = (
+            "This value is now readable by turns that serve people other than the owner."
+        )
+    _echo(out)
 
 
 @app.command("get")
@@ -198,7 +210,10 @@ def list_(
     store = env_store.read_raw(base)
     keys = sorted(store)
     values = {k: (store[k] if show_values else _MASK) for k in keys}
-    _echo({"status": "ok", "keys": keys, "values": values})
+    _echo({
+        "status": "ok", "keys": keys, "values": values,
+        "scoped_turns": env_store.scoped_keys(base),
+    })
 
 
 @app.command("unset")

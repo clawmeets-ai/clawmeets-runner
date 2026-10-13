@@ -13,6 +13,7 @@ Centralizes all HTTP endpoint interactions in one place:
 """
 from __future__ import annotations
 
+import contextvars
 import logging
 from typing import Any, Optional
 
@@ -26,6 +27,21 @@ from .responses import (
 
 logger = logging.getLogger(__name__)
 
+
+#: The scoped turn's grant id while the action executor runs that turn's
+#: actions; ``ClawMeetsClient`` sends it as ``X-Clawmeets-Turn-Grant`` on every
+#: request (the server's isolation gate requires it for writes in an isolated
+#: project). Never shown to the model.
+CURRENT_TURN_GRANT: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "clawmeets_turn_grant", default=None,
+)
+TURN_GRANT_HEADER = "X-Clawmeets-Turn-Grant"
+
+
+async def _add_turn_grant(request: httpx.Request) -> None:
+    grant = CURRENT_TURN_GRANT.get()
+    if grant:
+        request.headers[TURN_GRANT_HEADER] = grant
 
 class ClawMeetsClient:
     """
@@ -53,6 +69,9 @@ class ClawMeetsClient:
         """
         self._http = http_client
         self._base_url = server_url.rstrip("/")
+        hooks = getattr(http_client, "event_hooks", None)
+        if isinstance(hooks, dict) and _add_turn_grant not in hooks.get("request", []):
+            http_client.event_hooks = {**hooks, "request": [*hooks.get("request", []), _add_turn_grant]}
 
     # ─────────────────────────────────────────────────────────────────────────
     # Message Operations
@@ -325,6 +344,20 @@ class ClawMeetsClient:
         agents = [AgentResponse.model_validate(item) for item in resp.json()]
         return agents, resp.headers.get("ETag")
 
+    async def list_retained(self) -> Optional[list[dict]]:
+        """``GET /api/hub/retained``: the owner's retained hub agents (plain
+        dicts, read by the AGENTS.md roster). None when the server has no
+        such route or refuses (an older server, the hub off): the caller
+        keeps what it had."""
+        try:
+            resp = await self._http.get(f"{self._base_url}/api/hub/retained")
+        except Exception:  # noqa: BLE001 — the roster never fails on this
+            return None
+        if resp.status_code != 200:
+            return None
+        agents = (resp.json() or {}).get("agents")
+        return [a for a in agents if isinstance(a, dict)] if isinstance(agents, list) else None
+
     async def list_projects(self, participant_id: str) -> list[ParticipantProjectResponse]:
         """
         List projects for a participant.
@@ -439,3 +472,56 @@ class ClawMeetsClient:
         resp = await self._http.get(url, params=params)
         resp.raise_for_status()
         return ChangelogBatch.model_validate(resp.json())
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Turn tokens (scoped turns, plan 4.3). Kept at the END of the class.
+    # ─────────────────────────────────────────────────────────────────────────
+
+    async def mint_turn_token(
+        self,
+        agent_id: str,
+        project_id: str,
+        scope: str,
+        host: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """Mint a turn token for one scoped turn.
+
+        ``host`` is this turn's fresh host report (plan-owner-isolation 5a);
+        the server decides the turn's ``sandbox`` mode from it alone.
+
+        ``POST /agents/{agent_id}/turn-tokens`` with this client's full agent
+        bearer token. ``scope`` is ``"project"`` or ``"requester"``; the server
+        computes ``allowed_project_ids`` itself. Returns
+        ``{"token", "grant_id", "expires_at", "allowed_project_ids"}``.
+        Raises ``httpx.HTTPStatusError`` on refusal (the caller fails closed).
+        """
+        if scope not in ("project", "requester"):
+            raise ValueError(f"invalid turn scope {scope!r}")
+        url = f"{self._base_url}/agents/{agent_id}/turn-tokens"
+        body: dict[str, Any] = {"project_id": project_id, "scope": scope}
+        if host is not None:
+            body["host"] = host
+        resp = await self._http.post(url, json=body)
+        resp.raise_for_status()
+        data = resp.json()
+        for key in ("token", "grant_id"):
+            if not data.get(key):
+                raise ValueError(f"turn-token response missing {key!r}")
+        return data
+
+    async def revoke_turn_token(self, agent_id: str, grant_id: str) -> None:
+        """Revoke a turn grant at turn end (``DELETE …/turn-tokens/{grant_id}``).
+
+        A 404 means the grant is already gone (expired or revoked) and is not
+        an error.
+        """
+        url = f"{self._base_url}/agents/{agent_id}/turn-tokens/{grant_id}"
+        resp = await self._http.delete(url)
+        if resp.status_code == 404:
+            return
+        resp.raise_for_status()
+
+    @property
+    def base_url(self) -> str:
+        """The server base URL (what a scoped turn gets as CLAWMEETS_SERVER_URL)."""
+        return self._base_url

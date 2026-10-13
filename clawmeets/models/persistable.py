@@ -169,7 +169,7 @@ class PersistableParticipant(Participant, ABC):
         if not search_dir.exists():
             return None
         matches = [
-            m for m in search_dir.glob(f"*-{self._id}")
+            m for m in FileUtil.id_suffix_dirs(search_dir, self._id, "card.json")
             if not m.name.startswith(DELETED_DIR_PREFIX)
         ]
         return matches[0] / "card.json" if matches else None
@@ -301,6 +301,14 @@ class PersistableParticipant(Participant, ABC):
     def is_discoverable(self) -> bool:
         """Whether this participant appears in the public registry."""
         return self._load_card().get("discoverable_through_registry", True)
+
+    @property
+    def owner_isolated(self) -> bool:
+        """The owner's stored choice "this agent runs in its own isolated
+        environment that I set up" (plan-owner-isolation section 2). A
+        top-level card field, never in local_settings (which the agent's own
+        token may write): only the owner's user JWT sets it."""
+        return bool(self._load_card().get("owner_isolated", False))
 
     @property
     def user_teams(self) -> list[str]:
@@ -728,7 +736,7 @@ class PersistableParticipant(Participant, ABC):
         if not search_dir.exists():
             return False
         matches = [
-            m for m in search_dir.glob(f"*-{participant_id}")
+            m for m in FileUtil.id_suffix_dirs(search_dir, participant_id, "card.json")
             if not m.name.startswith(DELETED_DIR_PREFIX)
         ]
         if not matches:
@@ -836,6 +844,8 @@ class PersistableParticipant(Participant, ABC):
                 registered_at=self.registered_at or datetime.now(UTC),
                 last_heartbeat=self.last_heartbeat,
                 discoverable_through_registry=self.is_discoverable,
+                owner_isolated=bool(card.get("owner_isolated", False)),
+                blocked_by_exposed_host=card.get("blocked_by_exposed_host"),
                 registered_by=self.registered_by,
                 is_verified=self.is_verified,
                 user_teams=self.user_teams,

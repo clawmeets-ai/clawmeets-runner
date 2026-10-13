@@ -48,6 +48,9 @@ class ChatMessage(BaseModel):
     version: int | None = None  # This entry's changelog version
     source_version: int | None = None  # Version of the entry that triggered this message
     model_config_name: str | None = None  # Per-request model override (spec #3)
+    #: Written by an owner-isolated agent outside its own conversations
+    #: (MessagePayload.outside_isolated): fenced for good.
+    outside_isolated: bool = False
 
     def to_log_line(self) -> str:
         """Serialize to NDJSON line for CHATS.ndjson."""
@@ -92,6 +95,7 @@ class ChatMessage(BaseModel):
             version=version,
             source_version=source_version,
             model_config_name=payload.model_config_name,
+            outside_isolated=payload.outside_isolated,
         )
 
 
@@ -114,6 +118,7 @@ class ChatFileEvent(BaseModel):
     filename: str
     version: int | None = None  # This entry's changelog version
     source_version: int | None = None  # Message entry this file belongs to
+    outside_isolated: bool = False  # see ChatMessage.outside_isolated
 
 
 class ChatBatchTimeoutEvent(BaseModel):
@@ -148,6 +153,9 @@ class ChatBatchTimeoutEvent(BaseModel):
     responded_participants: list[str] = Field(default_factory=list)
     timed_out_participants: list[str] = Field(default_factory=list)
     offline_participants: list[str] = Field(default_factory=list)
+    #: Why the server closed the slot early (``BatchTimeoutPayload.reason``);
+    #: None for an ordinary timeout.
+    reason: str | None = None
     version: int | None = None
     source_version: int | None = None
 

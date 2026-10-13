@@ -111,12 +111,17 @@ def save_user_session(
 
 
 def clear_user_token(data_dir: Path, username: str) -> Path:
-    """Remove the saved JWT token from a user's settings.json. No-op if absent."""
+    """Remove every saved credential from a user's settings.json: the JWT,
+    the refresh token and any legacy password, each of which can get a fresh
+    owner login. Keeps ``server_url`` and the username, which is all
+    ``clawmeets start`` reads. No-op if absent (plan-owner-isolation 5a)."""
     path = get_user_config_path(data_dir, username)
     if not path.exists():
         return path
     config = json.loads(path.read_text())
-    config.get("user", {}).pop("token", None)
+    user = config.get("user", {})
+    for key in ("token", "refresh_token", "password", "auth_method"):
+        user.pop(key, None)
     path.write_text(json.dumps(config, indent=2))
     return path
 

@@ -38,7 +38,7 @@ import json
 import logging
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import AsyncIterator, Optional, Union
+from typing import AsyncIterator, Callable, Optional, Union
 
 from pydantic import ValidationError
 
@@ -136,8 +136,16 @@ class _Upload:
 class HomeFsRequestHandler:
     """Answers ``fs_request`` frames for one runner's home folder."""
 
-    def __init__(self, home: Path, *, max_concurrent: int = FS_MAX_CONCURRENT) -> None:
+    def __init__(
+        self,
+        home: Path,
+        *,
+        max_concurrent: int = FS_MAX_CONCURRENT,
+        shared_storage: Optional[Callable[[], Optional[Path]]] = None,
+    ) -> None:
         self._home = Path(home)
+        # The runner's current shared-storage folder; see HomeFs.
+        self._shared_storage = shared_storage
         self._fs: Optional[HomeFs] = None
         self._max_concurrent = max_concurrent
         self._in_flight = 0
@@ -154,6 +162,7 @@ class HomeFsRequestHandler:
                 max_entries=FS_MAX_ENTRIES,
                 max_read_bytes=FS_MAX_CONTENT_BYTES,
                 max_write_bytes=FS_MAX_CONTENT_BYTES,
+                shared_storage=self._shared_storage,
             )
         return self._fs
 

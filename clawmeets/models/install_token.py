@@ -91,6 +91,7 @@ StepState = Literal["started", "ok", "failed", "skipped"]
 INSTALL_STEPS: tuple[tuple[str, str], ...] = (
     ("install", "Installing ClawMeets"),
     ("link", "Signing in on this computer"),
+    ("model", "Choosing your default model"),
     ("assistant", "Setting up your assistant"),
     ("providers", "Connecting your model providers"),
     ("computer", "Connecting this computer"),

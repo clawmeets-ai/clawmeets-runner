@@ -35,7 +35,10 @@ from clawmeets.cli_lifecycle import start_command, stop_command, status_command
 from clawmeets.cli_skill import skill_app, schedule_app
 from clawmeets.cli_env import app as env_app
 from clawmeets.cli_fs import app as fs_app
+from clawmeets.cli_hub import app as hub_app
 from clawmeets.cli_doctor import doctor_command
+from clawmeets.cli_job import app as job_app
+from clawmeets.cli_model_config import model_config_app, model_default_app
 from clawmeets.cli_daemon import app as computer_app
 from clawmeets.cli_client import proj_app, room_app, msg_app, file_app
 
@@ -111,6 +114,10 @@ app.add_typer(schedule_app,       name="schedule")
 app.add_typer(skill_app,          name="skill")
 app.add_typer(env_app,            name="env")
 app.add_typer(fs_app,             name="fs")
+app.add_typer(hub_app,            name="hub")
+app.add_typer(job_app,            name="job")
+app.add_typer(model_config_app,   name="model-config")
+app.add_typer(model_default_app,  name="model-default")
 
 # `clawmeets computer …` — a passthrough to the separate `clawmeets-daemon`
 # distribution (see clawmeets/cli_daemon.py for why it is not bundled). It must

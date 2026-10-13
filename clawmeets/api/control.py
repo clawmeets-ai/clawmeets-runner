@@ -112,6 +112,17 @@ class ControlMessageType(str, Enum):
     # restart no longer drops sockets, so the catch-up a reconnect used to
     # trigger has to be asked for. Never sent to computers.
     RESYNC = "resync"
+    # Server -> the ONE user it concerns (browser only), payload a plain dict
+    # shaped by the server's hub browser contract: a requester's message
+    # changed delivery state ({project_id, delivery}), or an agent owner's
+    # Hub channel changed ({agent_full_name, channel}).
+    HUB_DELIVERY_STATE = "hub_delivery_state"
+    HUB_CHANNEL_STATUS = "hub_channel_status"
+    # Server -> the project owner's browser sockets, payload a plain dict
+    # ``{project_id, chatroom_name, flow: RoomFlow}``: a room's inbound flow
+    # of outside messages was stopped or reopened (server/room_flow.py).
+    CHATROOM_FLOW_CHANGED = "chatroom_flow_changed"
+    HUB_BRIDGE_DELIVERY = "hub_bridge_delivery"   # Server→owner browser: a room-bridge relay changed state
 
 
 class ChangelogUpdatePayload(BaseModel):
@@ -344,7 +355,7 @@ class AgentRegistryChangePayload(BaseModel):
     """
     changed_agent_id: str
     changed_agent_name: str
-    action: str  # "register" | "update" | "delete"
+    action: str  # "register" | "update" | "delete"; "retain" | "unretain" | "retain_state" (hub roster)
 
 
 class AgentCardUpdatePayload(BaseModel):

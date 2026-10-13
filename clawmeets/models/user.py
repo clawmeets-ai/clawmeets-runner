@@ -1079,12 +1079,15 @@ class User(Participant):
         if not chatroom or not chatroom.is_user_communication_room:
             return
 
-        # Skip messages not from coordinator (or an outside contact)
+        # Skip messages not from the coordinator, a requester end's counterpart
+        # (its coordinator is the user: plan-owner-isolation) or an outside contact
         project = Project.get(project_id, self._model_ctx)
         if not project:
             return
         sender = message.from_participant_id
-        if sender != project.coordinator_id and not is_contact_id(sender):
+        if sender == self._id:
+            return                            # never the user's own message
+        if sender not in (project.coordinator_id, project.counterpart_id) and not is_contact_id(sender):
             return
 
         # Build notification payload

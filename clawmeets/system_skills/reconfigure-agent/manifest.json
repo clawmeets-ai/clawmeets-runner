@@ -1,6 +1,6 @@
 {
   "audiences": ["worker", "coordinator", "assistant"],
   "surfaces": ["agent_runtime"],
-  "version": "1.0.0",
-  "description": "Change an agent's runner settings (git repo, model, knowledge dir, storage, extra directories) on a DM request."
+  "version": "1.1.0",
+  "description": "Change an agent's runner settings (git repo, model configs + smart routing, the owner's default model, knowledge dir, storage, extra directories) on a DM request."
 }

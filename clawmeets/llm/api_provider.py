@@ -37,7 +37,7 @@ from typing import Annotated, Any, Literal, Optional, Union
 from pydantic import BaseModel, Field, model_validator
 
 from ..api.actions import ActionBlock, COORDINATOR_ACTION_SCHEMA
-from ..utils import env_store
+from ..utils import env_store, nofollow_fs
 from ..utils.notification_center import LLM_COMPLETE, LLM_ERROR, NotificationCenter
 from .base import (
     LLMInvocationError,
@@ -46,6 +46,8 @@ from .base import (
     LLMRateLimitError,
     LLMTimeoutError,
     LLMUsage,
+    kill_turn_leftovers,
+    kill_turn_process_group,
 )
 
 logger = logging.getLogger(__name__)
@@ -286,6 +288,8 @@ def _build_file_tools(
     env: dict[str, str],
     read_roots: Optional[list[Path]] = None,
     write_roots: Optional[list[Path]] = None,
+    *,
+    turn: Any = None,
 ) -> list:
     """Build per-invocation file + bash tools for this turn.
 
@@ -312,8 +316,22 @@ def _build_file_tools(
     deliberately NOT writable, so user reference material stays read-only. Every
     other write stays sandbox-only (``_abs`` + ``_guard_write``).
     The sandbox (``write_root``) is always included.
+
+    ``turn`` (a scoped turn, plan 4.3) confines READS too: every read tool
+    checks ``turn.is_readable`` on the real path (the same roots and denies the
+    CLI providers' OS sandbox enforces), writes check ``turn.is_writable``, and
+    ``bash`` runs under ``turn.wrap`` (the OS sandbox) with the turn's
+    allowlisted ``env``. A path is checked and then used at the same real
+    path; below a turn write root (which the turn's own ``bash`` can change
+    between the two) it is read and written one component at a time from the
+    root pinned at turn start (``utils.nofollow_fs``), so a directory swapped
+    for a symlink after the check is not followed. ``None`` (every full turn)
+    keeps the behaviour above.
     """
-    write_root = write_root.resolve()
+    if turn is not None and turn.write_roots:
+        write_root = turn.write_roots[0]  # real already; never resolved again
+    else:
+        write_root = write_root.resolve()
     extra_read_roots = [
         r.resolve() for r in (read_roots or []) if r.resolve() != write_root
     ]
@@ -321,6 +339,8 @@ def _build_file_tools(
         r.resolve() for r in (write_roots or []) if r.resolve() != write_root
     ]
     glob_roots = [write_root] + extra_read_roots
+    if turn is not None:
+        glob_roots = [write_root] + [r for r in extra_read_roots if turn.is_readable(r)]
 
     def _abs(path: str) -> Path:
         p = Path(path)
@@ -344,17 +364,63 @@ def _build_file_tools(
 
     def _guard_write(path: str) -> Path:
         p = _abs(path).resolve()
+        if turn is not None:
+            if turn.is_writable(p):
+                return p
+            raise ValueError(f"path '{path}' is outside the writable sandbox")
         for root in (write_root, *extra_write_roots):
             if p == root or root in p.parents:
                 return p
         raise ValueError(f"path '{path}' is outside the writable sandbox")
 
+    def _denied(p: Path) -> bool:
+        return turn is not None and not turn.is_readable(p)
+
+    def _under_write_root(real: Path) -> Optional[tuple[Path, str]]:
+        """``(write root, path below it)`` when ``real`` is in a turn write
+        root, the only places a scoped turn can swap a directory."""
+        for root in turn.write_roots:
+            if real == root or root in real.parents:
+                return root, "" if real == root else str(real.relative_to(root))
+        return None
+
+    def _read(p: Path) -> Optional[str]:
+        """Text of the regular file ``p``, else ``None``. Raises
+        ``PermissionError`` when a scoped turn may not read it."""
+        if turn is None:
+            return p.read_text(encoding="utf-8", errors="replace") if p.is_file() else None
+        real = Path(os.path.realpath(p))
+        if not turn.is_readable(real):
+            raise PermissionError(str(p))
+        below = _under_write_root(real)
+        if below is None:  # a read root: the turn cannot write there
+            return real.read_text(encoding="utf-8", errors="replace") if real.is_file() else None
+        root, rel = below
+        if not rel:
+            return None
+        return nofollow_fs.read_text(root, rel, pin=turn.pin_for(root), errors="replace")
+
+    def _write(p: Path, text: str) -> None:
+        """Write ``p``, the real path ``_guard_write`` checked."""
+        below = _under_write_root(p) if turn is not None else None
+        if below is None:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(text, encoding="utf-8")
+            return
+        root, rel = below
+        if not rel:
+            raise IsADirectoryError(str(p))
+        nofollow_fs.write_text(root, rel, text, pin=turn.pin_for(root))
+
     def read_file(path: str) -> str:
         """Read a UTF-8 text file (project / knowledge / sandbox)."""
-        p = _abs_read(path)
-        if not p.is_file():
+        try:
+            text = _read(_abs_read(path))
+        except PermissionError:
+            return f"ERROR: not readable in this turn: {path}"
+        if text is None:
             return f"ERROR: not a file: {path}"
-        return _clip(p.read_text(encoding="utf-8", errors="replace"))
+        return _clip(text)
 
     def write_file(path: str, content: str) -> str:
         """Create or overwrite a UTF-8 text file in the sandbox."""
@@ -364,8 +430,7 @@ def _build_file_tools(
             # Recoverable: let the model retry with a sandbox-relative path
             # instead of crashing the turn.
             return f"ERROR: {e}. Write under the sandbox working dir (a relative path)."
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(content, encoding="utf-8")
+        _write(p, content)
         # Trace the ABSOLUTE path actually written so we can reconcile against the
         # action executor's sandbox_dir when update_file later reports "not found".
         logger.debug("[api-write] wrote %d chars to %s", len(content), p)
@@ -377,23 +442,33 @@ def _build_file_tools(
             p = _guard_write(path)
         except ValueError as e:
             return f"ERROR: {e}. Edit a file under the sandbox working dir."
-        if not p.is_file():
+        try:
+            text = _read(p)
+        except PermissionError:
+            text = None
+        if text is None:
             return f"ERROR: not a file: {path}"
-        text = p.read_text(encoding="utf-8")
         if old not in text:
             return "ERROR: `old` text not found; no change made"
-        p.write_text(text.replace(old, new, 1), encoding="utf-8")
+        _write(p, text.replace(old, new, 1))
         return f"edited {path}"
 
     def list_dir(path: str = ".") -> str:
         """List entries of a directory (relative paths resolve against the
         sandbox first, then the project/knowledge read roots)."""
         p = _abs_read(path)
-        if not p.is_dir():
+        if turn is not None:
+            p = Path(os.path.realpath(p))
+        if _denied(p):
+            return f"ERROR: not readable in this turn: {path}"
+        below = _under_write_root(p) if turn is not None else None
+        if below is not None:
+            entries = nofollow_fs.list_dir(below[0], below[1], pin=turn.pin_for(below[0]))
+        else:
+            entries = [(e.name, e.is_dir()) for e in p.iterdir()] if p.is_dir() else None
+        if entries is None:
             return f"ERROR: not a directory: {path}"
-        names = sorted(
-            e.name + ("/" if e.is_dir() else "") for e in p.iterdir()
-        )
+        names = sorted(n + ("/" if is_dir else "") for n, is_dir in entries)
         return _clip("\n".join(names) or "(empty)")
 
     def glob(pattern: str) -> str:
@@ -402,6 +477,7 @@ def _build_file_tools(
         project files and reference material, not just its sandbox."""
         matches = sorted(
             str(m) for root in glob_roots for m in root.glob(pattern)
+            if not _denied(m)
         )
         return _clip("\n".join(matches) or "(no matches)")
 
@@ -409,6 +485,8 @@ def _build_file_tools(
         """Regex-search files under a directory; returns matching `file:line: text`.
         Relative paths resolve against the sandbox first, then the read roots."""
         root = _abs_read(path)
+        if _denied(root):
+            return f"ERROR: not readable in this turn: {path}"
         try:
             rx = re.compile(pattern)
         except re.error as e:
@@ -416,29 +494,41 @@ def _build_file_tools(
         out: list[str] = []
         files = [root] if root.is_file() else root.rglob("*")
         for f in files:
-            if not f.is_file():
-                continue
             try:
-                for i, line in enumerate(
-                    f.read_text(encoding="utf-8", errors="replace").splitlines(), 1
-                ):
-                    if rx.search(line):
-                        out.append(f"{f}:{i}: {line.strip()}")
-                        if len(out) >= 500:
-                            return _clip("\n".join(out))
-            except OSError:
+                text = _read(f)
+            except OSError:  # PermissionError: denied in this turn
                 continue
+            if text is None:
+                continue
+            for i, line in enumerate(text.splitlines(), 1):
+                if rx.search(line):
+                    out.append(f"{f}:{i}: {line.strip()}")
+                    if len(out) >= 500:
+                        return _clip("\n".join(out))
         return _clip("\n".join(out) or "(no matches)")
 
     async def bash(command: str) -> str:
         """Run a shell command in the sandbox (cwd = sandbox, agent env)."""
-        proc = await asyncio.create_subprocess_shell(
-            command,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            cwd=str(write_root),
-            env=env,
-        )
+        if turn is None:
+            proc = await asyncio.create_subprocess_shell(
+                command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                cwd=str(write_root),
+                env=env,
+            )
+        else:
+            # Scoped turn: the same OS sandbox the CLI providers run under.
+            argv = turn.wrap(["/bin/sh", "-c", command], cwd=write_root)
+            # Its own session, killed below, so nothing it backgrounds lives on.
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                cwd=str(write_root),
+                env=env,
+                start_new_session=True,
+            )
         try:
             out_b, _ = await asyncio.wait_for(
                 proc.communicate(), timeout=_BASH_TIMEOUT
@@ -450,6 +540,9 @@ def _build_file_tools(
             except Exception:
                 pass
             return f"ERROR: command timed out after {_BASH_TIMEOUT}s"
+        finally:
+            if turn is not None:
+                kill_turn_process_group(proc)
         rc = proc.returncode
         out = out_b.decode("utf-8", errors="replace")
         return _clip(f"(exit {rc})\n{out}")
@@ -543,6 +636,9 @@ class ApiLLMProvider(LLMProvider):
     """In-process, BYO-key provider for Anthropic / OpenAI / Gemini via Pydantic AI."""
 
     _log_tag = "api-invoke"
+    # Scoped turns: file tools confined to the turn's roots, bash under the OS
+    # sandbox (see _build_file_tools(turn=...)).
+    supports_scoped_turns = True
     _install_hint = "pydantic-ai not importable — reinstall clawmeets"
 
     def __init__(
@@ -944,6 +1040,7 @@ class ApiLLMProvider(LLMProvider):
         mcp_config_dir: Optional[Path] = None,
         skill_source_dirs: Optional[list[Path]] = None,
         memory_dir: Optional[Path] = None,
+        turn: Any = None,
     ) -> tuple[ActionBlock, LLMUsage]:
         from pydantic_ai import Agent, NativeOutput
 
@@ -969,7 +1066,15 @@ class ApiLLMProvider(LLMProvider):
 
         web_caps = self._web_capabilities(is_coordinator)
 
-        env = self._build_env()
+        if turn is not None:
+            # Scoped turn (plan 4.3): the turn's roots, its allowlisted env built
+            # from {}, its opted-in MCP render, and no memory write root.
+            additional_dirs = turn.additional_dirs(working_dir)
+            mcp_config_dir = turn.mcp_dir
+            memory_dir = None
+            env = turn.environment()
+        else:
+            env = self._build_env()
         # additional_dirs (synced project dir + knowledge dirs + memory) become
         # first-class read roots so glob can span them — CLI `--add-dir` parity.
         # memory_dir is additionally passed as a writable root so reflect /
@@ -980,6 +1085,7 @@ class ApiLLMProvider(LLMProvider):
             env,
             read_roots=additional_dirs,
             write_roots=[memory_dir] if memory_dir else None,
+            turn=turn,
         )
         tools.append(_build_skill_tool(skill_source_dirs or []))
         # All non-Anthropic providers (openai/gemini/openrouter) get the local
@@ -987,9 +1093,17 @@ class ApiLLMProvider(LLMProvider):
         # native or stock-local capability — so a research turn can't blow the
         # cumulative token cap or crash on a bad fetch. Anthropic keeps its native
         # web search (it honors max_uses server-side).
-        if self._provider != "anthropic" and self._enable_web:
+        # A scoped turn's local web tools run in the runner, so they must go
+        # through the turn's egress proxy (public addresses only). The proxy is
+        # reachable from the runner only as a loopback port (macOS); elsewhere
+        # the local web tools are left out of scoped turns.
+        scoped_proxy = _scoped_web_proxy(turn)
+        if self._provider != "anthropic" and self._enable_web and (turn is None or scoped_proxy):
             tools.append(_build_web_search_tool(self._resolve_web_budget(is_coordinator)))
-            tools.append(_build_web_fetch_tool(self._resolve_web_fetch_budget(is_coordinator)))
+            tools.append(_build_web_fetch_tool(
+                self._resolve_web_fetch_budget(is_coordinator),
+                fetch_fn=_proxied_fetch(scoped_proxy) if scoped_proxy else None,
+            ))
         toolsets = self._build_mcp_toolsets(mcp_config_dir, env)
 
         prompt = self._augment_prompt(prompt, skill_source_dirs)
@@ -1055,6 +1169,11 @@ class ApiLLMProvider(LLMProvider):
                     usage=self._map_usage(run_usage, time.time() - start, messages=captured),
                 )
                 raise error from e
+            finally:
+                # Each bash call kills only its own group (others may still be
+                # running); what left a group dies with the turn.
+                if turn is not None:
+                    kill_turn_leftovers(turn)
 
         self._write_trace(result.all_messages(), log_dir)
         usage = self._map_usage(
@@ -1324,6 +1443,35 @@ def _build_web_search_tool(max_uses: int, *, search_fn=None):
         return _clip("\n".join(lines))
 
     return web_search
+
+
+def _scoped_web_proxy(turn: Any) -> Optional[str]:
+    """The egress proxy URL the runner itself can use for a scoped turn's local
+    web tools, or None (full turn, or a Unix-socket-only proxy)."""
+    if turn is None:
+        return None
+    home = getattr(turn, "home", None)
+    if home is None or getattr(home, "egress_port", None) is None:
+        return None
+    return home.egress_url
+
+
+def _proxied_fetch(proxy_url: str):
+    def _fetch(url: str) -> str:
+        import httpx
+        import markdownify
+
+        resp = httpx.get(
+            url,
+            follow_redirects=True,
+            timeout=20,
+            proxy=proxy_url,
+            headers={"User-Agent": "Mozilla/5.0 (clawmeets research bot)"},
+        )
+        resp.raise_for_status()
+        return markdownify.markdownify(resp.text)
+
+    return _fetch
 
 
 def _build_web_fetch_tool(max_uses: int, *, fetch_fn=None):

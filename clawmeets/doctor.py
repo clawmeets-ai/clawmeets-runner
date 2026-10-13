@@ -582,8 +582,9 @@ def check_model_cli(states: Optional[list[ModelCLIState]] = None) -> list[Check]
 
 # Providers that run in-process with an API key instead of shelling a CLI.
 # ``tests/test_doctor.py`` checks every provider the runner accepts is either
-# one of these or a ``MODEL_CLIS`` entry's ``provider``.
+# one of these, a meta-provider, or a ``MODEL_CLIS`` entry's ``provider``.
 IN_PROCESS_PROVIDER_SUFFIXES = ("-api", "-native")
+META_PROVIDER_IDS = ("smart",)
 
 
 def check_assistant_model(
@@ -600,7 +601,8 @@ def check_assistant_model(
 
     None when there is no assistant on this machine (``check_assistant``
     already says so) or it uses an in-process provider (``-api`` /
-    ``-native``: no CLI to check).
+    ``-native``: no CLI to check). A ``smart`` assistant passes when ANY of
+    its routes can run here (:func:`_check_smart_assistant`).
     """
     username = username or current_username()
     assistant_dir = _assistant_dir(username) if username else None
@@ -609,13 +611,15 @@ def check_assistant_model(
     card = _read_json(assistant_dir / "card.json") or {}
     settings = card.get("local_settings") or {}
     provider = str(settings.get("llm_provider") or "claude").lower()
+    states = states if states is not None else inspect_model_clis()
+    if provider in META_PROVIDER_IDS:
+        return _check_smart_assistant(settings.get("smart_routes") or [], states)
     if provider.endswith(IN_PROCESS_PROVIDER_SUFFIXES):
         return None
     # `claude` pointed at a local endpoint (llm_base_url) is handed a token by
     # the agent itself; it needs the binary, not a Claude sign-in.
     needs_login = not (provider == "claude" and settings.get("llm_base_url"))
 
-    states = states if states is not None else inspect_model_clis()
     by_provider = {spec.provider: spec for spec in MODEL_CLIS}
     by_id = {s.id: s for s in states}
     title = "Your assistant's model CLI is ready"
@@ -675,6 +679,57 @@ def check_assistant_model(
         ok=False,
         detail=f"Your assistant uses {spec.label}, which is not installed",
         fix_note=spec.install_note,
+    )
+
+
+def _route_ready(route: dict, states: list[ModelCLIState]) -> Optional[bool]:
+    """Can one smart-routing route run here? True/False for a model CLI, None
+    for anything doctor cannot judge (an in-process route: its key is checked
+    when it is saved, not here)."""
+    provider = str(route.get("provider") or "").lower()
+    if provider.endswith(IN_PROCESS_PROVIDER_SUFFIXES):
+        return None
+    spec = next((m for m in MODEL_CLIS if m.provider == provider), None)
+    if spec is None:
+        return False
+    state = next((s for s in states if s.id == spec.id), None)
+    needs_login = not (provider == "claude" and route.get("base_url"))
+    return bool(state and state.present and (state.logged_in or not needs_login))
+
+
+def _check_smart_assistant(routes: list, states: list[ModelCLIState]) -> Check:
+    """Smart routing tries its routes in order and skips one that cannot run,
+    so the assistant works when ANY route can. With none, the fix is the
+    first route's sign-in, or switching to a CLI that is ready."""
+    title = "Your assistant's model CLI is ready"
+    routes = [r for r in routes if isinstance(r, dict)]
+    verdicts = [_route_ready(r, states) for r in routes]
+    if any(v is not False for v in verdicts) and routes:
+        ready = [str(r.get("name") or r.get("provider"))
+                 for r, v in zip(routes, verdicts) if v is not False]
+        return Check(id="assistant_model", title=title, ok=True,
+                     detail="Smart routing: " + ", ".join(ready))
+    names = ", ".join(str(r.get("provider")) for r in routes) or "no routes"
+    detail = f"Your assistant uses smart routing ({names}), and none of them can run here"
+    alternative = pick_provider(states)
+    if alternative is not None:
+        return Check(
+            id="assistant_model", title=title, ok=False, detail=detail,
+            fix=f"clawmeets assistant register --llm-provider {alternative.provider}",
+            fix_note=f"This switches your assistant to {alternative.label}.",
+        )
+    first = next((m for m in MODEL_CLIS for r in routes if m.provider == r.get("provider")), None)
+    if first is not None:
+        state = next((s for s in states if s.id == first.id), None)
+        if state and state.present:
+            return Check(id="assistant_model", title=title, ok=False, detail=detail,
+                         fix=first.login_fix, fix_note=first.login_note)
+        return Check(id="assistant_model", title=title, ok=False, detail=detail,
+                     fix_note=first.install_note)
+    return Check(
+        id="assistant_model", title=title, ok=False, detail=detail,
+        fix="clawmeets assistant register --llm-provider claude",
+        fix_note="Then install and sign in to Claude Code.",
     )
 
 
@@ -889,6 +944,83 @@ def check_server(server_url: str = "") -> Check:
 
 
 # ---------------------------------------------------------------------------
+# Isolated turns (plan 4.3): is there an OS sandbox?
+# ---------------------------------------------------------------------------
+
+# Provider keys that should live with the model-auth proxy, not in the
+# environment every process on this computer inherits.
+PROVIDER_KEY_ENV = (
+    "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "OPENAI_API_KEY",
+    "GEMINI_API_KEY", "GOOGLE_API_KEY", "OPENROUTER_API_KEY",
+)
+
+
+def _sandbox_works(argv: list[str]) -> bool:
+    try:
+        r = subprocess.run(argv, capture_output=True, timeout=PROBE_TIMEOUT_SECONDS)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return r.returncode == 0
+
+
+def check_isolated_turns() -> Check:
+    """Can this computer run a conversation for someone other than the owner?
+
+    Those conversations run inside an OS sandbox (sandbox-exec on macOS,
+    bubblewrap on Linux) and are refused, never run unprotected, without one.
+    Non-blocking: the owner's own work does not need it.
+    """
+    title = "Your computer can safely serve people other than you"
+    if sys.platform == "darwin":
+        path = "/usr/bin/sandbox-exec"
+        if os.path.exists(path) and _sandbox_works(
+            [path, "-p", "(version 1)(allow default)", "/usr/bin/true"]
+        ):
+            return Check(id="isolated_turns", title=title, ok=True, detail="sandbox-exec works", blocking=False)
+        return Check(
+            id="isolated_turns", title=title, ok=False, blocking=False,
+            detail="sandbox-exec is missing or refused to run",
+            fix_note="macOS ships /usr/bin/sandbox-exec; check that it is present and not blocked by device management.",
+        )
+    if sys.platform.startswith("linux"):
+        bwrap = _which("bwrap")
+        if bwrap and _sandbox_works([
+            bwrap, "--unshare-user", "--unshare-pid", "--unshare-net", "--die-with-parent",
+            "--ro-bind", "/", "/", "--proc", "/proc", "--dev", "/dev", "true",
+        ]):
+            return Check(id="isolated_turns", title=title, ok=True, detail="bubblewrap works", blocking=False)
+        if not bwrap:
+            return Check(
+                id="isolated_turns", title=title, ok=False, blocking=False,
+                detail="bubblewrap (bwrap) is not installed",
+                fix="sudo apt-get install -y bubblewrap",
+            )
+        return Check(
+            id="isolated_turns", title=title, ok=False, blocking=False,
+            detail="bwrap is installed but cannot create user namespaces",
+            fix="sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0",
+        )
+    return Check(
+        id="isolated_turns", title=title, ok=False, blocking=False,
+        detail=f"no supported sandbox on {sys.platform}",
+        fix_note="Conversations for other people are held until a macOS or Linux computer with a sandbox connects.",
+    )
+
+
+def check_provider_keys_in_env() -> Check:
+    """Warn when model API keys sit in this computer's ambient environment."""
+    found = [k for k in PROVIDER_KEY_ENV if os.environ.get(k)]
+    title = "Model API keys are not in every program's environment"
+    if not found:
+        return Check(id="provider_keys_env", title=title, ok=True, blocking=False)
+    return Check(
+        id="provider_keys_env", title=title, ok=True, blocking=False,
+        detail="set in the environment: " + ", ".join(found),
+        fix_note="Store them with `clawmeets env set KEY VALUE --agent <name>` instead of exporting them in your shell profile.",
+    )
+
+
+# ---------------------------------------------------------------------------
 # The whole report
 # ---------------------------------------------------------------------------
 
@@ -926,6 +1058,8 @@ def run_checks(
         *([assistant_model] if assistant_model else []),
         check_computer(username),
     ]
+    checks.append(check_isolated_turns())
+    checks.append(check_provider_keys_in_env())
     if include_autostart:
         checks.append(check_autostart(username))
     if include_server:

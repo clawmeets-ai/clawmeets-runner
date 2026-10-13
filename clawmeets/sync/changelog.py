@@ -15,7 +15,7 @@ import re
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Iterator, Optional, Union
+from typing import TYPE_CHECKING, Iterator, Literal, Optional, Union
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -73,6 +73,10 @@ class ChangelogEntryType(str, Enum):
     DISPLAY_NAME_CHANGED = "display_name_changed"  # Project-scoped rename (dm thread auto-title)
     PROJECT_PLAN_STATE = "project_plan_state"  # Plan lifecycle projection (phase inputs + open-note count) fanned to runners
     AGENT_OFFLINE = "agent_offline"  # Targets had no live runner at dispatch time — we did not wait, nobody was there
+    PROJECT_FLAGS_CHANGED = "project_flags_changed"  # Server-emitted isolation flags on an existing project; never cleared
+    CHATROOM_FLOW_CHANGED = "chatroom_flow_changed"  # A room's inbound flow of outside messages stopped or reopened
+    PARTICIPANT_UPDATED = "participant_updated"  # A room member's bridge state changed (a retained hub agent's stand-in)
+    PROJECT_COORDINATOR_REASSIGNED = "project_coordinator_reassigned"  # Server-emitted; the own-coordinator migration only
 
 
 class ProjectStatus(str, Enum):
@@ -180,6 +184,14 @@ class MessagePayload(ChatroomPayload):
     # response finds the entry instead of appending a second copy
     # (ChangelogRunloop.find_recent_by_request_id).
     client_request_id: Optional[str] = None
+    # The owner's agent whose credential posted this user-authored message
+    # (the assistant writing on the user's behalf). A room-bridge relay of it
+    # is signed "sent by their agent" and charged to that agent's send caps.
+    via_agent_id: Optional[str] = None
+    # Stamped by the server when an owner-isolated agent writes outside its
+    # own serving conversations and owner DMs (plan-owner-isolation 5d): the
+    # row stays outside content even after the setting is turned off.
+    outside_isolated: bool = False
 
 
 class FilePayload(ChatroomPayload):
@@ -196,9 +208,22 @@ class FilePayload(ChatroomPayload):
     from_participant_id: str = ""  # Uploader's participant ID (empty = unknown / legacy)
     from_participant_name: str = ""  # Uploader's display name
     client_request_id: Optional[str] = None  # see MessagePayload.client_request_id
+    outside_isolated: bool = False  # see MessagePayload.outside_isolated
 
 
-class RoomCreatedParticipant(BaseModel):
+class StandInFields(BaseModel):
+    """What a membership row carries for a retained hub agent's stand-in
+    (plan-agent-access 4.2): a ghost member with no runner and no changelog,
+    reached through the room bridge. Absent on every other member."""
+    kind: Optional[Literal["hub_stand_in"]] = None
+    bridge_state: Optional[Literal["active", "inactive"]] = None
+    #: ``unretained`` | ``agent_unlisted`` | ``identity_changed`` | ``hub_off``
+    inactive_reason: Optional[str] = None
+    #: ``{hub_agent_id, name, deployment_name, deployment_fingerprint}``
+    hub: Optional[dict] = None
+
+
+class RoomCreatedParticipant(StandInFields):
     """Participant info for room creation."""
     id: str
     name: str
@@ -265,12 +290,18 @@ class BatchTimeoutPayload(ChatroomPayload):
     row that already timed out. The sibling distinction — "never received the
     message at all" — is a separate :class:`AgentOfflinePayload` row, not a
     flavour of this one, because only that case is fixed by resending.
+
+    ``reason`` says why a slot closed early, when the server closed it rather
+    than the clock: ``blocked`` (the inspection hook blocked a hub reply),
+    ``unretained`` or a relay failure code (room bridge). None for an
+    ordinary timeout and for every row written before it existed.
     """
     message_id: str
     coordinator_id: str
     responded_participants: list[str]
     timed_out_participants: list[str]
     offline_participants: list[str] = Field(default_factory=list)
+    reason: Optional[str] = None
 
 
 class AgentOfflinePayload(ChatroomPayload):
@@ -305,7 +336,7 @@ class AgentOfflinePayload(ChatroomPayload):
     dispatched_participants: list[str]   # Agent ids the batch actually opened for
 
 
-class ParticipantAddedPayload(ChatroomPayload):
+class ParticipantAddedPayload(ChatroomPayload, StandInFields):
     """Payload for PARTICIPANT_ADDED entries in unified changelog.
 
     Used when adding a participant to an existing chatroom (e.g., auto-adding
@@ -314,6 +345,15 @@ class ParticipantAddedPayload(ChatroomPayload):
     participant_id: str
     participant_name: str
     external: bool = False  # True ⇒ foreign agent; their runner's notifier skips processing this membership
+
+
+class ParticipantUpdatedPayload(ChatroomPayload):
+    """Payload for PARTICIPANT_UPDATED: a stand-in member's bridge state
+    changed (unretain, delisting, identity change). Rewrites that member's
+    PARTICIPANTS row; membership itself is unchanged."""
+    participant_id: str
+    bridge_state: Literal["active", "inactive"]
+    inactive_reason: Optional[str] = None
 
 
 class ChatroomClearedPayload(ChatroomPayload):
@@ -426,6 +466,62 @@ class ProjectCreatedPayload(BaseModel):
     agent_names: list[str] = Field(default_factory=list)  # Hard allowlist by agent display name (id, full name, or owner-relative short name); pairs with agent_teams. OR semantics across both lists.
     surface: str = "regular"  # "regular" | "dm" — explicit project shape
     display_name: Optional[str] = None  # model-set label; "New chat" placeholder for a fresh dm thread. Optional/default for wire compat.
+    # Isolation (see models/project.is_isolated). Optional/default for wire compat.
+    requester_key: Optional[str] = None  # "hub:{root_fp}/{user_id}" | "account:{user_id}" | "channel:{conn}/{user_key}" | "project:{id}"
+    memory_excluded: bool = False
+    remote_content: bool = False
+    # The outside party of a requester end (a hub stand-in, or another account's
+    # agent), which the own-coordinator rule keeps out of the coordinator slot
+    # (plan-owner-isolation section 4). Optional/default for wire compat.
+    counterpart_id: Optional[str] = None
+    counterpart_name: Optional[str] = None
+
+
+class ProjectCoordinatorReassignedPayload(BaseModel):
+    """Payload for PROJECT_COORDINATOR_REASSIGNED: the one-time own-coordinator
+    migration moves a requester end's outside coordinator to ``counterpart_*``
+    and makes the owning user the coordinator. Server-emitted only, and the
+    server's append guard checks it like PROJECT_CREATED.
+
+    Project-level entry - no chatroom_name field.
+    """
+    coordinator_id: str
+    coordinator_name: str
+    counterpart_id: str
+    counterpart_name: str
+    reason: str
+
+
+class ProjectFlagsChangedPayload(BaseModel):
+    """Payload for PROJECT_FLAGS_CHANGED: isolation flags set on a project that
+    already exists. Server-emitted only. Flags are only ever SET: a field left
+    None changes nothing, ``requester_key`` is applied only to a project that
+    has none, and nothing here can clear a flag.
+
+    ``reason``: ``requester_key_migration`` (the one-time pass over host
+    projects that predate requester scoping) | ``hub_thread`` |
+    ``created_from_scoped_turn``.
+
+    Project-level entry - no chatroom_name field.
+    """
+    requester_key: Optional[str] = None
+    memory_excluded: Optional[Literal[True]] = None
+    remote_content: Optional[Literal[True]] = None
+    reason: str
+
+
+class ChatroomFlowChangedPayload(ChatroomPayload):
+    """Payload for CHATROOM_FLOW_CHANGED: the room's inbound flow of outside
+    messages (hub, channel, cross-account and Front Desk requester messages)
+    was stopped or reopened. Server-emitted only (``server/room_flow.py``).
+
+    ``stopped_by``: ``owner`` | ``inspector`` while stopped, None once open.
+    ``reason``: the owner's or the inspector's short reason, or None. The
+    entry's own timestamp is the ``stopped_at`` of a stop.
+    """
+    inbound_flow: Literal["open", "stopped"]
+    stopped_by: Optional[str] = None
+    reason: Optional[str] = None
 
 
 # Union type for changelog payloads
@@ -445,6 +541,10 @@ ChangelogPayload = Union[
     ProjectAllowlistUpdatedPayload,
     DisplayNameChangedPayload,
     ProjectPlanStatePayload,
+    ProjectFlagsChangedPayload,
+    ChatroomFlowChangedPayload,
+    ParticipantUpdatedPayload,
+    ProjectCoordinatorReassignedPayload,
 ]
 
 
@@ -521,6 +621,10 @@ class ChangelogEntry(BaseModel):
                 "chatroom_cleared": ChatroomClearedPayload,
                 "project_allowlist_updated": ProjectAllowlistUpdatedPayload,
                 "display_name_changed": DisplayNameChangedPayload,
+                "project_flags_changed": ProjectFlagsChangedPayload,
+                "project_coordinator_reassigned": ProjectCoordinatorReassignedPayload,
+                "chatroom_flow_changed": ChatroomFlowChangedPayload,
+                "participant_updated": ParticipantUpdatedPayload,
             }
 
             payload_cls = payload_types.get(entry_type)
@@ -550,6 +654,10 @@ class ChangelogEntry(BaseModel):
             ChangelogEntryType.PROJECT_ALLOWLIST_UPDATED: ProjectAllowlistUpdatedPayload,
             ChangelogEntryType.DISPLAY_NAME_CHANGED: DisplayNameChangedPayload,
             ChangelogEntryType.PROJECT_PLAN_STATE: ProjectPlanStatePayload,
+            ChangelogEntryType.PROJECT_FLAGS_CHANGED: ProjectFlagsChangedPayload,
+            ChangelogEntryType.CHATROOM_FLOW_CHANGED: ChatroomFlowChangedPayload,
+            ChangelogEntryType.PARTICIPANT_UPDATED: ParticipantUpdatedPayload,
+            ChangelogEntryType.PROJECT_COORDINATOR_REASSIGNED: ProjectCoordinatorReassignedPayload,
         }
         expected = expected_types[self.entry_type]
         if not isinstance(self.payload, expected):

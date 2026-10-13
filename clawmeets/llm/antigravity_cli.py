@@ -56,6 +56,7 @@ from .base import (
     SubprocessLLMProvider,
     materialize_skill_tree,
 )
+from ..utils import nofollow_fs
 from .pricing import price_usd
 
 logger = logging.getLogger(__name__)
@@ -200,10 +201,7 @@ class AntigravityCLI(SubprocessLLMProvider):
         # so the load-bearing mechanism here is the prompt's absolute SKILL.md
         # paths plus the `--add-dir` entries below; the tree is parity, not proof.
         if skill_source_dirs is not None:
-            materialize_skill_tree(
-                working_dir / ".agents" / "skills",
-                skill_source_dirs,
-            )
+            materialize_skill_tree(working_dir, ".agents/skills", skill_source_dirs)
 
         # MCP is deferred for antigravity in this version, by the user's
         # decision: `agy mcp add|remove|list` exists, but the on-disk format of
@@ -218,9 +216,7 @@ class AntigravityCLI(SubprocessLLMProvider):
                 "MCP is not plumbed for antigravity in this version"
             )
 
-        prompt_file = working_dir / ".agent-prompt.txt"
-        prompt_file.write_text(prompt, encoding="utf-8")
-        prompt_file_abs = str(prompt_file.resolve())
+        prompt_file_abs = str(nofollow_fs.write_text(working_dir, ".agent-prompt.txt", prompt))
         cwd = str(working_dir)
 
         cmd = [
@@ -241,9 +237,7 @@ class AntigravityCLI(SubprocessLLMProvider):
         # rejects an empty schema, so the flag is omitted entirely.
         schema_file_abs: Optional[str] = None
         if action_schema:
-            schema_file = working_dir / ".agent-schema.json"
-            schema_file.write_text(json.dumps(action_schema), encoding="utf-8")
-            schema_file_abs = str(schema_file.resolve())
+            schema_file_abs = str(nofollow_fs.write_text(working_dir, ".agent-schema.json", json.dumps(action_schema)))
             cmd.extend(["--json-schema", schema_file_abs])
 
         if self._model:

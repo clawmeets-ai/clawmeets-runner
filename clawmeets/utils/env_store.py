@@ -39,10 +39,21 @@ VALUE_MAX_BYTES = 8192
 
 _STORE_FILENAME = "env.json"
 
+# Sidecar listing the keys an owner opted into scoped (non-owner) turns with
+# ``clawmeets env set KEY VALUE --scoped-turns``. Kept apart from env.json so the
+# store stays a flat ``{KEY: value}`` object every existing reader understands.
+# Absent / unreadable => no key reaches a scoped turn (fail closed).
+_SCOPED_FILENAME = "env.scoped-turns.json"
+
 
 def store_path(agent_dir: Path) -> Path:
     """Path to the store file for an agent (``{agent_dir}/env.json``)."""
     return Path(agent_dir) / _STORE_FILENAME
+
+
+def scoped_store_path(agent_dir: Path) -> Path:
+    """Path to the scoped-turns key list (``{agent_dir}/env.scoped-turns.json``)."""
+    return Path(agent_dir) / _SCOPED_FILENAME
 
 
 def validate_key(key: str) -> None:
@@ -102,12 +113,49 @@ def set_var(agent_dir: Path, key: str, value: str) -> None:
     _write(agent_dir, data)
 
 
+def scoped_keys(agent_dir: Path) -> list[str]:
+    """Sorted names of the stored keys marked for scoped turns.
+
+    Only names that are still in the effective store count, so unsetting a key
+    can never leave a stale opt-in behind.
+    """
+    data = FileUtil.read(scoped_store_path(agent_dir), "json")
+    if not isinstance(data, list):
+        return []
+    present = load(agent_dir)
+    return sorted({str(k) for k in data if str(k) in present})
+
+
+def load_scoped(agent_dir: Path) -> dict[str, str]:
+    """The env overlay for a scoped turn: only keys marked ``--scoped-turns``."""
+    store = load(agent_dir)
+    return {k: store[k] for k in scoped_keys(agent_dir) if k in store}
+
+
+def set_scoped(agent_dir: Path, key: str, scoped: bool) -> None:
+    """Mark (or unmark) ``key`` as visible to scoped turns."""
+    path = scoped_store_path(agent_dir)
+    data = FileUtil.read(path, "json")
+    keys = {str(k) for k in data} if isinstance(data, list) else set()
+    if scoped:
+        validate_key(key)
+        keys.add(key)
+    else:
+        keys.discard(key)
+    if keys:
+        FileUtil.write(path, sorted(keys), "json", atomic=True)
+        os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+    else:
+        FileUtil.delete(path)
+
+
 def unset_var(agent_dir: Path, key: str) -> bool:
     """Remove ``key`` from the store. Return ``True`` if it existed.
 
     The store file is unlinked when it becomes empty so ``env list`` on a
     cleared agent shows nothing rather than an empty ``{}`` artifact.
     """
+    set_scoped(agent_dir, key, False)
     data = read_raw(agent_dir)
     if key not in data:
         return False

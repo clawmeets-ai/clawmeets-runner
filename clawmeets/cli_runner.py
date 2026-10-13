@@ -18,6 +18,7 @@ Commands
 from __future__ import annotations
 
 import asyncio
+import functools
 import base64
 import json
 import logging
@@ -46,6 +47,7 @@ async def _sleep_backoff(delay: float) -> float:
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import List, Optional
+from urllib.parse import quote
 
 import httpx
 import typer
@@ -54,6 +56,9 @@ import websockets
 from clawmeets.api.responses import AgentRegistrationResponse
 from clawmeets.api.control import RESYNC_CAPABILITY, ControlEnvelope, ControlMessageType
 from clawmeets.api.fs_protocol import FS_CAPABILITY, FS_WS_MAX_SIZE
+from clawmeets.runner.model_auth_proxy import DefaultCredentials, ModelAuthProxy
+from clawmeets.runner.turn_capability import CanaryReport, IsolatedTurnsCapability, run_canaries_for
+from clawmeets.runner.turn_session import get_egress_proxy, open_turn
 from clawmeets.api.client import ClawMeetsClient
 from clawmeets.api.retry_transport import RetryingTransport, SyncRetryingTransport
 from clawmeets import cli_oauth, doctor
@@ -82,7 +87,7 @@ from clawmeets.llm.gemini_cli import GeminiCLI
 from clawmeets.llm.opencode_cli import OpenCodeCLI
 from clawmeets.llm.antigravity_cli import AntigravityCLI
 from clawmeets.models.context import ModelContext
-from clawmeets.models.model_config import VALID_CONFIG_PROVIDERS
+from clawmeets.models.model_config import VALID_CONFIG_PROVIDERS, routing_settings
 from clawmeets.models import provider_agents
 from clawmeets.models.provider_agents import ProviderAgent
 from clawmeets.models.agent import Agent
@@ -94,6 +99,8 @@ from clawmeets.runner.knowledge_dir_migration import migrate_legacy_knowledge_di
 from clawmeets.runner.knowledge_pack_manager import KnowledgePackManager
 from clawmeets.runner.home_fs_handler import FsJob, HomeFsRequestHandler, is_fs_frame
 from clawmeets.runner.agent_dir_readmes import write_agent_dir_readmes
+from clawmeets.api.turn_protocol import OWNER_ISOLATED_TURNS_CAPABILITY
+from clawmeets.runner.host_report import collect_host_report
 from clawmeets.runner.references_index import build_references_index
 from clawmeets.runner.resync import ResyncScheduler
 from clawmeets.runner.personal_skill_manager import PersonalSkillManager
@@ -499,6 +506,9 @@ def _build_llm_provider(
     api_caps: Optional[dict] = None,
     base_url: Optional[str] = None,
     invoke_timeout: Optional[int] = None,
+    smart_routes: Optional[list[dict]] = None,
+    smart_max_attempts: int = 3,
+    smart_cooldown_seconds: float = 300.0,
 ) -> LLMProvider:
     """Construct a fresh CLI for the given provider+model, with its kill window.
 
@@ -519,6 +529,9 @@ def _build_llm_provider(
         api_key=api_key,
         api_caps=api_caps,
         base_url=base_url,
+        smart_routes=smart_routes,
+        smart_max_attempts=smart_max_attempts,
+        smart_cooldown_seconds=smart_cooldown_seconds,
     )
     if invoke_timeout is not None:
         cli._invoke_timeout = invoke_timeout
@@ -535,6 +548,9 @@ def _construct_llm_provider(
     api_key: Optional[str] = None,
     api_caps: Optional[dict] = None,
     base_url: Optional[str] = None,
+    smart_routes: Optional[list[dict]] = None,
+    smart_max_attempts: int = 3,
+    smart_cooldown_seconds: float = 300.0,
 ) -> LLMProvider:
     """Dispatch provider name → constructed provider instance.
 
@@ -557,6 +573,44 @@ def _construct_llm_provider(
     hold a reference to McpManager.
     """
     normalized = (provider or "claude").lower()
+
+    if normalized == "smart":
+        from clawmeets.llm.smart_router import SmartRoute, SmartRouterProvider
+
+        routes: list[SmartRoute] = []
+        for route in smart_routes or []:
+            route_provider = str(route.get("provider") or "").lower()
+            if not route_provider or route_provider == "smart":
+                continue
+            route_settings = dict(route)
+
+            def build(settings=route_settings, route_name=route_provider):
+                key = settings.get("api_key") or (
+                    _resolve_api_key(route_name, {"llm_api_key": None})
+                    if _is_inprocess_provider(route_name) else None
+                )
+                return _construct_llm_provider(
+                    route_name,
+                    settings.get("model") or None,
+                    plugin_dirs=plugin_dirs,
+                    skill_dirs=skill_dirs,
+                    agent_env=agent_env,
+                    api_key=key,
+                    api_caps=api_caps,
+                    base_url=settings.get("base_url") or None,
+                )
+
+            routes.append(SmartRoute(
+                name=str(route.get("name") or route_provider),
+                provider=route_provider,
+                model=route.get("model") or None,
+                build=build,
+            ))
+        return SmartRouterProvider(
+            routes,
+            max_attempts=int(smart_max_attempts),
+            cooldown_seconds=float(smart_cooldown_seconds),
+        )
 
     # Native OpenRouter harness: in-process, BYO-key, owns its own OpenAI-compatible
     # tool-calling loop (no Pydantic-AI). Sits beside the untouched ``openrouter-api``
@@ -855,6 +909,10 @@ def agent_register(
     }
     if user_teams:
         register_payload["user_teams"] = user_teams
+    # An explicit --llm-provider means "this model", not a copy of the owner's
+    # default model config; it is sent to the server just below.
+    if llm_provider:
+        register_payload["seed_model_default"] = False
     with _http(server) as client:
         resp = client.post(
             "/agents/register",
@@ -862,6 +920,17 @@ def agent_register(
             headers={"Authorization": f"Bearer {token}"},
         )
         result = _ok(resp)
+        if llm_provider:
+            llm_settings = _build_initial_local_settings(
+                llm_provider, llm_model, llm_base_url=llm_base_url,
+            )
+            if llm_api_key:
+                if not _put_keyed_model_config(
+                    client, token, result["agent_id"], llm_settings["llm_provider"], llm_api_key,
+                ):
+                    typer.echo("  Warning: failed to save the API key on the server.", err=True)
+            else:
+                _sync_llm_settings(client, token, result["agent_id"], llm_settings)
     _print_json(result)
 
     # Use server-returned name (may be prefixed with username)
@@ -1753,11 +1822,25 @@ def agent_reconfigure(
             raise typer.Exit(1)
         fields["llm_provider"] = normalized
 
+    # The model lives in named model configs; the flat llm_* settings only
+    # mirror the one that answers. Non-empty --llm-* flags therefore edit the
+    # configs (the same calls `clawmeets model-config` makes), so smart routing
+    # is never switched off without saying so. Empty strings keep the old clear.
+    llm_edits = {
+        k: fields.pop(k) for k in ("llm_provider", "llm_model", "llm_base_url", "llm_api_key")
+        if fields.get(k)
+    }
+
     server_url, token, agent_id, agent_name = _resolve_session_for_config(
         data_dir, token, server, agent,
     )
     with _http(server_url) as client:
         auth = {"Authorization": f"Bearer {token}"}
+        if llm_edits:
+            for line in _reconfigure_llm_via_configs(client, auth, agent_id, agent, llm_edits):
+                typer.echo(line)
+            if not fields and not edits_extra_dirs:
+                return
         if edits_extra_dirs:
             base = extra_dir
             if base is None:  # add/remove edit the list already there
@@ -1777,6 +1860,70 @@ def agent_reconfigure(
         f"{k}={'(cleared)' if v == '' else v!r}" for k, v in fields.items()
     )
     typer.echo(f"Reconfigured agent '{agent_name}': {changed}")
+
+
+def _reconfigure_llm_via_configs(
+    client: httpx.Client, auth: dict, agent_id: str, agent_ref: str, edits: dict,
+) -> list[str]:
+    """Apply ``agent reconfigure``'s non-empty --llm-* flags to the agent's
+    named model configs and return what to tell the user: the equivalent
+    ``clawmeets model-config`` command, and a note when smart routing ended.
+
+    --llm-provider P: the config for P (matching --llm-model when given, else
+    a new one) becomes the default; other flags patch it. Without
+    --llm-provider the flags patch the config that answers — refused under
+    smart routing, where there is no single config to mean."""
+    base = f"/agents/{agent_id}/model-configs"
+    listing = _ok(client.get(base, headers=auth))
+    configs = listing.get("configs") or []
+    default = next((c for c in configs if c["name"] == listing.get("default")), None)
+    smart_was_on = bool(default and default["provider"] == "smart")
+    patch = {k: edits[v] for k, v in (("model", "llm_model"), ("base_url", "llm_base_url"),
+                                       ("api_key", "llm_api_key")) if v in edits}
+    flags = " ".join(
+        f"--{k.replace('_', '-')} {'***' if k == 'api_key' else v}" for k, v in patch.items()
+    )
+    lines: list[str] = []
+
+    provider = edits.get("llm_provider")
+    if provider:
+        target = next(
+            (c for c in configs if c["provider"] == provider
+             and (not patch.get("model") or c.get("model") == patch["model"])),
+            None,
+        )
+        if target is None:
+            taken = {c["name"].lower() for c in configs}
+            name, i = provider, 2
+            while name.lower() in taken:
+                name, i = f"{provider}-{i}", i + 1
+            _ok(client.post(base, json={"name": name, "provider": provider, **patch}, headers=auth))
+            lines.append(f"Ran: clawmeets model-config add {agent_ref} {name} --provider {provider}"
+                         f"{' ' + flags if flags else ''} --default")
+        else:
+            name = target["name"]
+            if patch:
+                _ok(client.patch(f"{base}/{quote(name, safe='')}", json=patch, headers=auth))
+                lines.append(f"Ran: clawmeets model-config edit {agent_ref} {name!r} {flags}")
+            lines.append(f"Ran: clawmeets model-config default {agent_ref} {name!r}")
+        _ok(client.put(f"{base}/default", json={"name": name}, headers=auth))
+        if smart_was_on:
+            lines.append(f"Smart routing is now OFF; {name} answers every message. "
+                         f"Turn it back on: clawmeets model-config smart {agent_ref} on")
+        return lines
+
+    if default is None:
+        typer.echo("Error: this agent has no model config yet; pass --llm-provider.", err=True)
+        raise typer.Exit(1)
+    if smart_was_on:
+        typer.echo(
+            "Error: this agent uses smart routing, so there is no single model to change. "
+            f"Name a route: clawmeets model-config edit {agent_ref} <route> {flags}",
+            err=True,
+        )
+        raise typer.Exit(1)
+    _ok(client.patch(f"{base}/{quote(default['name'], safe='')}", json=patch, headers=auth))
+    return [f"Ran: clawmeets model-config edit {agent_ref} {default['name']!r} {flags}"]
 
 
 def _edit_extra_dirs(base: list[str], add: list[str], remove: list[str]) -> list[str]:
@@ -2709,6 +2856,8 @@ async def _runner_loop(
             else (settings.get("llm_api_key") or None)
         )
         base_url = settings.get("llm_base_url") or None
+        # Defaults + the 0-is-valid cooldown are owned by model_config.
+        routing = routing_settings({"local_settings": settings})
         return _build_llm_provider(
             provider,
             model,
@@ -2719,6 +2868,9 @@ async def _runner_loop(
             api_caps=_api_caps_from_settings(settings),
             base_url=base_url,
             invoke_timeout=window,
+            smart_routes=settings.get("smart_routes") or [],
+            smart_max_attempts=routing["max_attempts"],
+            smart_cooldown_seconds=float(routing["cooldown_seconds"]),
         )
 
     try:
@@ -2787,6 +2939,13 @@ async def _runner_loop(
     # a one-turn provider from a non-default named config (same factory the
     # reactive loop uses for the AGENT_SETTINGS_CHANGE hot-swap).
     model_ctx.set_cli_factory(cli_factory)
+    # Scoped turns (plan 4.3): the runner's turn opener (sandbox + turn home +
+    # turn token). agent.py reads it via getattr so the server tree, which
+    # ships models/agent.py without runner code, stays import-closed.
+    egress_proxy = get_egress_proxy()
+    model_auth = ModelAuthProxy(DefaultCredentials(agent_dir, local_settings))
+    egress_proxy.local_handler = model_auth
+    model_ctx.turn_opener = functools.partial(open_turn, egress=egress_proxy, model_auth=model_auth)
 
     participant = Agent(id=agent_id, model_ctx=model_ctx)
 
@@ -2821,8 +2980,35 @@ async def _runner_loop(
         owner_username=owner_username,
     )
 
+    # isolated_turns.v1: advertised only after the start canaries pass for the
+    # configured provider; withdrawn on a provider/model/login change until
+    # they pass again (plan 4.3 item 9). One real scoped run of the provider
+    # CLI is part of the canaries.
+    isolation = IsolatedTurnsCapability()
+    # The runner's own client says it runs isolated turns; see stamp_request.
+    http_client.event_hooks = {
+        **http_client.event_hooks,
+        "request": [*http_client.event_hooks.get("request", []), isolation.stamp_request],
+    }
+
+    def _run_isolation_canaries(settings: dict) -> CanaryReport:
+        model_auth._credentials = DefaultCredentials(agent_dir, settings)
+        cli_now = model_ctx.cli
+        key = getattr(cli_now, "_turn_provider", None)
+        if key is None:
+            return CanaryReport(str(settings.get("llm_provider") or "claude"), False,
+                                ["provider cannot run isolated turns"])
+        return run_canaries_for(key, model_auth=model_auth, egress=egress_proxy, cli=cli_now)
+
+    def _recheck_isolation(settings: dict):
+        return isolation.recheck(lambda: _run_isolation_canaries(settings))
+
+    loop_obj.attach_isolation_capability(isolation, _recheck_isolation)
+
     # Start the loop
     await loop_obj.start()
+    isolation_start = asyncio.create_task(_recheck_isolation(dict(local_settings or {})))
+    isolation_start.add_done_callback(lambda t: t.cancelled() or t.exception())
 
     # Convert http:// → ws://
     ws_url = server_http.replace("https://", "wss://").replace("http://", "ws://")
@@ -2833,8 +3019,12 @@ async def _runner_loop(
 
     # Answers the server's home-folder requests (the agent home-folder
     # browser). Always this runner's own agent_dir — never a root or agent id
-    # taken from a request.
-    fs_handler = HomeFsRequestHandler(agent_dir)
+    # taken from a request. The shared_storage link opens as the folder the
+    # runner's live settings name (model_ctx.storage follows settings changes).
+    fs_handler = HomeFsRequestHandler(
+        agent_dir,
+        shared_storage=lambda: model_ctx.storage.shared if model_ctx.storage else None,
+    )
 
     # Resolved ONCE, here, before the reconnect loop — deliberately not
     # per-connect. importlib.metadata reads *.dist-info off disk at call time,
@@ -2884,6 +3074,15 @@ async def _runner_loop(
         name=f"agent={agent_id[:8]} resync",
     )
 
+    current_ws: dict = {"ws": None}
+
+    def _capability_changed(_ok: bool) -> None:
+        ws_now = current_ws.get("ws")
+        if ws_now is not None:
+            asyncio.ensure_future(ws_now.close(code=1012, reason="capabilities changed"))
+
+    isolation.on_change(_capability_changed)
+
     while True:
         close_code: Optional[int] = None
         try:
@@ -2910,16 +3109,30 @@ async def _runner_loop(
                 # a server that restarted mid-turn rebuilds their pending
                 # batches (server/in_flight_restore.py) and the desk keeps
                 # showing Working instead of misfiling the project as Review.
+                #
+                # `host` says what an unsandboxed turn on this host could read
+                # (plan-owner-isolation 5a): the server's co-host check for
+                # owner-isolated agents and the exposed-host record use it.
                 registry = model_ctx.invocation_registry
                 in_flight = registry.in_flight() if registry is not None else []
-                await ws.send(json.dumps({
+                auth_frame: dict = {
                     "token": token,
                     "clawmeets_version": runner_version,  # str | None
-                    "capabilities": [FS_CAPABILITY, RESYNC_CAPABILITY],
+                    "capabilities": [FS_CAPABILITY, RESYNC_CAPABILITY, OWNER_ISOLATED_TURNS_CAPABILITY,
+                                     *isolation.capabilities()],
                     "in_flight_turns": [t.to_wire() for t in in_flight],
-                }))
+                }
+                try:
+                    auth_frame["host"] = collect_host_report(model_ctx.base_dir).model_dump(mode="json")
+                except Exception:  # noqa: BLE001 — no report: the server assumes the worst
+                    logging.getLogger("clawmeets").warning("host report failed", exc_info=True)
+                await ws.send(json.dumps(auth_frame))
 
                 reconnect_delay = 2.0  # reset on success
+                # A capability change (canaries passed, or a provider switch
+                # withdrew it) closes this socket; the reconnect re-sends the
+                # auth frame with the new set, the only way to change it.
+                current_ws["ws"] = ws
                 # Uploads half-received on a previous socket died with it.
                 fs_handler.socket_closed()
 
@@ -3014,8 +3227,24 @@ async def _runner_loop(
             await http_client.aclose()
             return
 
+        # 4403 = this host ran an owner-isolated agent's unsandboxed turns and
+        # the owner has not confirmed it was wiped (plan-owner-isolation 5e).
+        # Retrying sooner cannot help; do not self-destruct either.
+        if close_code == HOST_EXPOSED_CLOSE_CODE:
+            logging.getLogger("clawmeets").warning(
+                f"Agent '{agent_name}' refused: this computer is marked exposed by an agent that ran "
+                f"without the sandbox here. Retrying in {HOST_EXPOSED_RETRY_S // 60} minutes."
+            )
+            await asyncio.sleep(HOST_EXPOSED_RETRY_S)
+            continue
+
         logging.warning(f"Reconnecting in {reconnect_delay}s…")
         reconnect_delay = await _sleep_backoff(reconnect_delay)
+
+
+#: Socket close code for an owner's non-isolated agent on an exposed host.
+HOST_EXPOSED_CLOSE_CODE = 4403
+HOST_EXPOSED_RETRY_S = 600
 
 
 # ---------------------------------------------------------------------------
@@ -3279,7 +3508,7 @@ def send_dm_as_owner(
 
 @dm_app.command("send")
 def dm_send(
-    agent_name: str = typer.Argument(..., help="Full agent name to message (e.g. 'alice-researcher')"),
+    agent_name: str = typer.Argument(..., help="Full agent name to message (e.g. 'alice-researcher'), or name@deployment for a hub agent"),
     message: str = typer.Argument(..., help="Message content"),
     username: Optional[str] = typer.Option(None, "-u", "--username", help="Username (with -p; optional — defaults to token/session auth)"),
     password: Optional[str] = typer.Option(None, "-p", "--password", help="Password (with -u)"),
@@ -3302,7 +3531,21 @@ def dm_send(
     Examples:
         clawmeets dm send alice-researcher "Can you help me?"
         clawmeets dm send alice-researcher "Can you help me?" -u alice -p mypassword
+        clawmeets dm send alice-researcher@acme "Can you help me?"   # via the hub
+
+    A target containing ``@`` or ``~`` (``name@deployment`` or a hub agent
+    id) lives on another deployment and goes through ``clawmeets hub send``.
     """
+    # Lazy: cli_hub imports this module.
+    from clawmeets.cli_hub import in_agent_runtime, is_hub_ref, run_send
+    if is_hub_ref(agent_name):
+        if in_agent_runtime():
+            # The agent's own identity; cli_hub refuses --token here.
+            run_send(agent_name, message, server=server, token=token, data_dir=data_dir)
+        else:
+            server_url, token = _resolve_dm_session(data_dir, username, password, token, server)
+            run_send(agent_name, message, server=server_url, token=token, data_dir=data_dir)
+        return
     server_url, token = _resolve_dm_session(data_dir, username, password, token, server)
     as_agent_id = os.environ.get("CLAWMEETS_AGENT_ID")
     with _http(server_url) as client:
@@ -3751,6 +3994,34 @@ def mcp_status(
         )
         raise typer.Exit(2)
     typer.echo(f"{mcp_name}: ready (token at {manager.token_path(mcp_name)})")
+
+
+@mcp_app.command("scoped-turns")
+def mcp_scoped_turns(
+    mcp_name: str = typer.Argument(..., help="Installed MCP server name"),
+    state: str = typer.Argument(..., help="on | off"),
+    agent: str = typer.Option(..., "--agent", "-a", help="Agent name"),
+    data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir"),
+):
+    """Let an MCP server start in scoped turns (conversations for someone other
+    than the owner). Off by default: scoped turns run with no MCP server."""
+    if state not in ("on", "off"):
+        typer.echo("Error: state must be 'on' or 'off'", err=True)
+        raise typer.Exit(2)
+    agent_dir = _resolve_agent_dir(data_dir, agent)
+    manager = McpManager(agent_dir)
+    if state == "on" and mcp_name not in manager.installed_mcps():
+        typer.echo(f"Error: {mcp_name!r} is not installed for {agent_dir.name}", err=True)
+        raise typer.Exit(1)
+    manager.set_scoped_turns(mcp_name, state == "on")
+    if state == "on":
+        typer.echo(
+            f"{mcp_name}: ON in scoped turns for {agent_dir.name}. Warning: its "
+            f"credentials and data become readable by turns that serve people "
+            f"other than you."
+        )
+    else:
+        typer.echo(f"{mcp_name}: off in scoped turns for {agent_dir.name}.")
 
 
 @mcp_app.command("install")
@@ -4255,6 +4526,39 @@ def _archive_stale_agent_dirs(agents_dir: Path, registered_name: str, keep: Path
             typer.echo(f"  Warning: could not archive {sibling.name}: {e}", err=True)
 
 
+def _sync_llm_settings(client: httpx.Client, token: str, agent_id: str, settings: dict) -> None:
+    """PATCH an agent's llm_* settings on the server, which makes them a named
+    model config and the default. Warns, never fails, like the other
+    post-register syncs."""
+    resp = client.patch(
+        f"/agents/{agent_id}/local-settings",
+        json={"local_settings": settings},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    if resp.status_code >= 400:
+        typer.echo(f"  Warning: failed to save the model settings: {resp.text}", err=True)
+
+
+# The local_settings keys a model config mirrors (``model_config.apply_mirror``)
+# plus the smart-routing knobs. ``llm_api_key`` is never in a server read.
+_MODEL_SETTING_KEYS = (
+    "llm_provider", "llm_model", "llm_base_url", "smart_routes",
+    "smart_max_attempts", "smart_cooldown_seconds",
+)
+
+
+def _server_model_settings(client: httpx.Client, token: str, agent_id: str) -> dict:
+    """The model settings the server gave a just-registered agent (its copy of
+    the owner's default model config), or {} when it has none."""
+    resp = client.get(f"/agents/{agent_id}", headers={"Authorization": f"Bearer {token}"})
+    if resp.status_code >= 400:
+        return {}
+    settings = (resp.json() or {}).get("local_settings") or {}
+    if not settings.get("llm_provider"):
+        return {}
+    return {k: settings[k] for k in _MODEL_SETTING_KEYS if settings.get(k) is not None}
+
+
 def _detect_llm_provider() -> dict:
     """``{"llm_provider": ...}`` for the first model CLI signed in on this
     machine (``doctor.pick_provider``), or ``{}`` when none is.
@@ -4296,6 +4600,8 @@ def _register_one_assistant(
         "description": description,
         "capabilities": ["coordination", "planning", "delegation", "user communication"],
         "discoverable_through_registry": False,
+        # --llm-provider wins over a copy of the owner's default model config.
+        "seed_model_default": not local_settings.get("llm_provider"),
     }
     resp = client.post(
         "/agents/register",
@@ -4488,7 +4794,16 @@ def assistant_register(
         existing_card = FileUtil.read(assistant_dir / "card.json", "json") or {}
         local_settings = {**(existing_card.get("local_settings") or {}), **local_settings}
         if not local_settings.get("llm_provider"):
-            local_settings.update(_detect_llm_provider())
+            # A new assistant got a copy of the owner's default model config on
+            # the server; write it into card.json so the first start (and
+            # doctor's assistant check) sees it. No default: pick the first
+            # signed-in CLI here, as before.
+            seeded = _server_model_settings(client, token, agent_id)
+            if seeded:
+                typer.echo(f"  Model: your default model config ({seeded['llm_provider']}).")
+                local_settings.update(seeded)
+            else:
+                local_settings.update(_detect_llm_provider())
 
         # local_settings is set via a follow-up PUT because /agents/register
         # doesn't accept it. Skip when no settings to send.
@@ -4531,6 +4846,7 @@ def assistant_register(
             status=result.get("status", "offline"),
             registered_at=str(result.get("registered_at") or datetime.now(UTC).isoformat()),
             discoverable=False,
+            registered_by=result.get("registered_by"),
             local_settings=local_settings,
         )
         typer.echo(f"  Card: {card_path}")
@@ -4590,6 +4906,10 @@ def _register_one_worker(
     }
     if agent_user_teams:
         register_payload["user_teams"] = agent_user_teams
+    # A template / model agent that names its provider is that model, not a
+    # copy of the owner's default model config.
+    if llm_provider_override or agent.get("llm_provider"):
+        register_payload["seed_model_default"] = False
 
     resp = client.post(
         "/agents/register",
@@ -4673,6 +4993,7 @@ def _register_one_worker(
         status=result.get("status", "offline"),
         registered_at=str(result.get("registered_at") or datetime.now(UTC).isoformat()),
         discoverable=result.get("discoverable_through_registry", discoverable),
+        registered_by=result.get("registered_by"),
         user_teams=final_teams or None,
         local_settings=local_settings or None,
     )

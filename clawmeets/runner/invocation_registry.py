@@ -121,6 +121,7 @@ async def invoke_with_registry(
     role: "str | None" = None,
     correction: "str | None" = None,
     override_cli: "LLMProvider | None" = None,
+    turn: "object | None" = None,
 ) -> "tuple[ActionBlock, LLMUsage]":
     """Run cli.invoke and register the task so it can be cancelled.
 
@@ -139,11 +140,28 @@ async def invoke_with_registry(
     ``override_cli`` is a one-turn provider built from a per-request
     ``model_config_name`` override (spec #3). When ``None`` (the common case)
     the invocation uses the agent's default ``model_ctx.cli``; the override
-    never mutates ``model_ctx.cli``, so it applies to this turn only.
+    never mutates ``model_ctx.cli``, so it applies to this turn only. A scoped
+    turn ignores it: the turn home, token and canaries were set up for
+    ``model_ctx.cli``'s provider, and the override name comes from the
+    (untrusted) requester.
+
+    ``turn`` is the scoped turn (``runner/turn_session.TurnSession``) or
+    ``None`` for a full turn. It is passed to the provider only when set, so a
+    full turn's call is byte-for-byte what it was; a provider that does not
+    support scoped turns refuses one (fail closed).
     """
     if correction is not None:
         prompt = f"{prompt}\n\n{correction}"
-    cli = override_cli or model_ctx.cli
+    cli = model_ctx.cli if turn is not None else (override_cli or model_ctx.cli)
+    kwargs: dict = {}
+    if turn is not None:
+        if not getattr(cli, "supports_scoped_turns", False):
+            from ..llm.base import SandboxUnavailable
+
+            raise SandboxUnavailable(
+                f"provider {type(cli).__name__} cannot run an isolated turn; refusing"
+            )
+        kwargs["turn"] = turn
     coro = cli.invoke(
         prompt,
         working_dir=working_dir,
@@ -154,7 +172,8 @@ async def invoke_with_registry(
         trigger_version=trigger_version,
         mcp_config_dir=model_ctx.mcp_dist_dir,
         skill_source_dirs=model_ctx.skill_source_dirs(role=role),
-        memory_dir=model_ctx.memory_dir,
+        memory_dir=model_ctx.memory_dir if turn is None else None,
+        **kwargs,
     )
     registry = model_ctx.invocation_registry
     if registry is None:

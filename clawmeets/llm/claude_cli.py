@@ -25,7 +25,9 @@ from .base import (
     SubprocessLLMProvider,
     link_mcp_config_into,
     materialize_skill_tree,
+    scratch_dir,
 )
+from ..utils import nofollow_fs
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +45,11 @@ class ClaudeCLI(SubprocessLLMProvider):
 
     _provider_name = "Claude Code"
     _log_tag = "claude-invoke"
+    # Model auth for generate_text's scrubbed environment (Anthropic API,
+    # Bedrock, Vertex).
+    _text_env_prefixes = ("ANTHROPIC_", "CLAUDE_", "AWS_", "CLOUD_ML_", "GOOGLE_")
     _install_hint = "Install Claude Code: https://docs.anthropic.com/claude-code"
+    _turn_provider = "claude"
 
     def __init__(
         self,
@@ -140,6 +146,26 @@ class ClaudeCLI(SubprocessLLMProvider):
             env["ANTHROPIC_API_KEY"] = token
         return env
 
+    # --- scoped turns (plan 4.3) --------------------------------------------
+
+    def _scoped_env_extra(self, turn) -> dict[str, str]:
+        # Instruction files load only from the knowledge dir: the sandbox denies
+        # every other CLAUDE.md the CLI could reach (ancestors, other roots).
+        return {"CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD": "1"}
+
+    def _scoped_cmd(self, cmd: list[str], turn) -> list[str]:
+        # MCP off except opted-in servers: ignore every discovered .mcp.json and
+        # load only the turn's own render.
+        return [
+            cmd[0],
+            "--strict-mcp-config",
+            "--mcp-config", str(turn.mcp_dir / ".mcp.json"),
+            *cmd[1:],
+        ]
+
+    def _scoped_read_roots(self) -> list[Path]:
+        return [d.expanduser().resolve() for d in self._claude_plugin_dirs]
+
     def _prepare_invocation(
         self,
         prompt: str,
@@ -156,24 +182,16 @@ class ClaudeCLI(SubprocessLLMProvider):
         # agent's pre-rendered dist (refreshed on MCP_SYNC) so the spawned
         # subprocess picks up installed MCP servers.
         if mcp_config_dir is not None:
-            link_mcp_config_into(
-                mcp_config_dir / ".mcp.json",
-                working_dir / ".mcp.json",
-            )
+            link_mcp_config_into(mcp_config_dir / ".mcp.json", working_dir, ".mcp.json")
 
         # Claude Code auto-discovers `.claude/skills/<name>/SKILL.md` from
         # cwd. Materialize a flat tree of symlinks to the agent's installed
         # + personal skills so the CLI's native skill-loader picks them up.
         if skill_source_dirs is not None:
-            materialize_skill_tree(
-                working_dir / ".claude" / "skills",
-                skill_source_dirs,
-            )
+            materialize_skill_tree(working_dir, ".claude/skills", skill_source_dirs)
 
         # Write prompt to a temp file for debugging
-        prompt_file = working_dir / ".agent-prompt.txt"
-        prompt_file.write_text(prompt, encoding="utf-8")
-        prompt_file_abs = str(prompt_file.resolve())
+        prompt_file_abs = str(nofollow_fs.write_text(scratch_dir(working_dir), ".agent-prompt.txt", prompt))
         claude_cwd = str(working_dir)
 
         cmd = [
@@ -223,12 +241,18 @@ class ClaudeCLI(SubprocessLLMProvider):
         to stdout in its default text format), no MCP/skills/add-dir, no session
         persistence — the cheapest way to turn a one-line titling prompt into a
         title. Reads the prompt from stdin like the main invoke path.
+
+        It runs outside the turn sandbox on text that may not be the owner's,
+        so it gets no tools at all (``--tools ""``), no MCP servers, and no
+        permission bypass.
         """
         working_dir.mkdir(parents=True, exist_ok=True)
         cmd = [
             self._bin,
             "--print",
-            "--permission-mode", "bypassPermissions",
+            "--tools", "",
+            "--strict-mcp-config",
+            "--permission-mode", "dontAsk",
             "--no-session-persistence",
         ]
         if self._model:

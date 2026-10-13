@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .base import (
+    current_turn,
     LLMInvocationError,
     LLMNotFoundError,
     LLMRateLimitError,
@@ -29,7 +30,9 @@ from .base import (
     SubprocessLLMProvider,
     link_mcp_config_into,
     materialize_skill_tree,
+    scratch_dir,
 )
+from ..utils import nofollow_fs
 from .pricing import price_usd
 
 logger = logging.getLogger(__name__)
@@ -128,7 +131,10 @@ class CodexCLI(SubprocessLLMProvider):
 
     _provider_name = "Codex"
     _log_tag = "codex-invoke"
+    # Model auth for generate_text's scrubbed environment.
+    _text_env_prefixes = ("OPENAI_", "CODEX_", "AZURE_OPENAI_")
     _install_hint = "Install Codex: https://github.com/openai/codex"
+    _turn_provider = "codex"
 
     def __init__(
         self,
@@ -136,7 +142,7 @@ class CodexCLI(SubprocessLLMProvider):
         agent_env: dict[str, str],
         codex_bin: str = "codex",
         model: Optional[str] = None,
-        sandbox_mode: str = "workspace-write",
+        sandbox_mode: str = "danger-full-access",
     ) -> None:
         """Initialize CodexCLI.
 
@@ -147,10 +153,10 @@ class CodexCLI(SubprocessLLMProvider):
                 for rationale. Required — pass ``{}`` explicitly to opt out.
             codex_bin: Path to codex CLI binary
             model: Optional model override (e.g. "o3"); None uses Codex default.
-            sandbox_mode: Codex sandbox policy. Default "workspace-write" lets
-                the agent modify its own sandbox (clawmeets already isolates
-                sandboxes per agent). Other options: "read-only",
-                "danger-full-access".
+            sandbox_mode: Codex sandbox policy. Default "danger-full-access"
+                lets full agent turns write bound local Git repositories,
+                including their protected ``.git`` object stores. Explicit
+                callers may still select "workspace-write" or "read-only".
 
         The JSON action schema is selected per invocation and passed to
         ``invoke(action_schema=...)``.
@@ -189,6 +195,15 @@ class CodexCLI(SubprocessLLMProvider):
         except subprocess.TimeoutExpired:
             raise LLMTimeoutError(timeout_seconds=10, provider="Codex")
 
+    def _scoped_cmd(self, cmd: list[str], turn) -> list[str]:
+        # The turn already runs inside the runner's OS sandbox, and macOS
+        # refuses a nested sandbox_apply, so codex's own seatbelt is turned off
+        # here; the outer sandbox is the boundary.
+        out = list(cmd)
+        if "--sandbox" in out:
+            out[out.index("--sandbox") + 1] = "danger-full-access"
+        return out
+
     def _prepare_invocation(
         self,
         prompt: str,
@@ -207,35 +222,27 @@ class CodexCLI(SubprocessLLMProvider):
         # then idempotently auto-trust the sandbox path so the prompt is
         # elided for fresh sandboxes.
         if mcp_config_dir is not None:
-            link_mcp_config_into(
-                mcp_config_dir / ".codex" / "config.toml",
-                working_dir / ".codex" / "config.toml",
-            )
-            _ensure_codex_project_trust(working_dir)
+            link_mcp_config_into(mcp_config_dir / ".codex" / "config.toml", working_dir, ".codex/config.toml")
+            # A scoped turn never touches the user's ~/.codex: its opted-in
+            # servers live in the throwaway CODEX_HOME instead.
+            if current_turn() is None:
+                _ensure_codex_project_trust(working_dir)
 
         # Codex auto-discovers `.agents/skills/<name>/SKILL.md` from cwd
         # (Agent Skills open-standard path). Materialize the flat tree so
         # codex's native skill-loader picks up installed + personal skills.
         if skill_source_dirs is not None:
-            materialize_skill_tree(
-                working_dir / ".agents" / "skills",
-                skill_source_dirs,
-            )
+            materialize_skill_tree(working_dir, ".agents/skills", skill_source_dirs)
 
-        prompt_file = working_dir / ".agent-prompt.txt"
-        prompt_file.write_text(prompt, encoding="utf-8")
-        prompt_file_abs = str(prompt_file.resolve())
+        scratch = scratch_dir(working_dir)
+        prompt_file_abs = str(nofollow_fs.write_text(scratch, ".agent-prompt.txt", prompt))
 
-        schema_file = working_dir / ".agent-schema.json"
         adapted_schema = _adapt_schema_for_codex(action_schema)
-        schema_file.write_text(json.dumps(adapted_schema), encoding="utf-8")
-        schema_file_abs = str(schema_file.resolve())
+        schema_file_abs = str(nofollow_fs.write_text(scratch, ".agent-schema.json", json.dumps(adapted_schema)))
 
-        last_message_file = working_dir / ".agent-last-message.json"
         # Remove any stale file from a prior invocation so we never read a previous run's output.
-        if last_message_file.exists():
-            last_message_file.unlink()
-        last_message_abs = str(last_message_file.resolve())
+        nofollow_fs.remove(scratch, ".agent-last-message.json")
+        last_message_abs = str(scratch / ".agent-last-message.json")
 
         codex_cwd = str(working_dir)
 
@@ -249,6 +256,12 @@ class CodexCLI(SubprocessLLMProvider):
             "-o", last_message_abs,
             "-C", codex_cwd,
         ]
+
+        # workspace-write blocks command networking by default; skills and MCP
+        # tools need outbound access. Enable it for this child process only so
+        # the user's ~/.codex/config.toml keeps its own default.
+        if self._sandbox_mode == "workspace-write":
+            cmd.extend(["-c", "sandbox_workspace_write.network_access=true"])
 
         if self._model:
             cmd.extend(["-m", self._model])
@@ -449,9 +462,10 @@ class CodexCLI(SubprocessLLMProvider):
         # Read the schema-conformant final message from Codex's -o file.
         final_message: Optional[dict] = None
         last_message_path = Path(prepared.extras["last_message_abs"])
-        if last_message_path.exists():
+        raw = nofollow_fs.read_text(last_message_path.parent, last_message_path.name)
+        if raw is not None:
             try:
-                content = last_message_path.read_text(encoding="utf-8").strip()
+                content = raw.strip()
                 if content:
                     final_message = json.loads(content)
             except json.JSONDecodeError as e:

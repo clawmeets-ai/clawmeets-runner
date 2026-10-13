@@ -33,6 +33,7 @@ from typing import Optional
 # binary; the ``-api`` suffix selects the in-process BYO-key provider. Kept
 # here (Layer 1, pure) and re-exported by cli_runner as ``_VALID_LLM_PROVIDERS``.
 VALID_CONFIG_PROVIDERS: tuple[str, ...] = (
+    "smart",
     "claude", "openai", "gemini", "opencode", "antigravity",
     "claude-api", "openai-api", "gemini-api", "openrouter-api",
     # In-process, BYO-key, native OpenRouter tool-loop (no Pydantic-AI). Coexists
@@ -47,6 +48,11 @@ VALID_CONFIG_PROVIDERS: tuple[str, ...] = (
 KEYED_PROVIDERS: tuple[str, ...] = (
     "claude-api", "openai-api", "gemini-api", "openrouter-api", "openrouter-native",
 )
+
+# Meta-providers select another configured provider instead of speaking to a
+# model backend themselves.  Keeping this explicit prevents callers from
+# incorrectly treating every keyless provider as a subprocess CLI.
+ROUTER_PROVIDERS: tuple[str, ...] = ("smart",)
 
 # Config name: 1–64 chars, alphanumerics + space / underscore / hyphen.
 NAME_RE = re.compile(r"^[A-Za-z0-9 _-]{1,64}$")
@@ -331,9 +337,88 @@ def set_default(card: dict, name: str) -> None:
     card["default_model_config_name"] = match["name"]
 
 
+
+def reorder_configs(card: dict, names: list[str]) -> None:
+    """Reorder configs to match ``names`` (case-insensitive).
+
+    List order IS the smart-routing priority (``effective_local_settings``
+    emits routes in stored order), so this is how a user ranks routes.
+    ``names`` must name every stored config exactly once — a partial or stale
+    list is refused rather than guessed at. Raises ValueError otherwise.
+    """
+    configs = _get_list(card)
+    if not isinstance(names, list) or len(names) != len(configs):
+        raise ValueError("order must list every model config exactly once")
+    ordered: list[dict] = []
+    for name in names:
+        match = next(
+            (c for c in configs if _name_eq(c.get("name"), name) and c not in ordered),
+            None,
+        )
+        if match is None:
+            raise ValueError(f"order names an unknown or repeated config {name!r}")
+        ordered.append(match)
+    card["model_configs"] = ordered
+
+
+# Smart-routing behaviour knobs. They live in ``local_settings`` because the
+# runner's ``cli_factory`` reads them there (``smart_max_attempts`` /
+# ``smart_cooldown_seconds``) and the AGENT_SETTINGS_CHANGE hot-swap already
+# rebuilds on either key; this module only owns their defaults and bounds.
+SMART_DEFAULT_MAX_ATTEMPTS = 3
+SMART_DEFAULT_COOLDOWN_SECONDS = 300
+SMART_MAX_ATTEMPTS_RANGE = (1, 10)
+SMART_COOLDOWN_RANGE = (0, 86400)
+
+
+def routing_settings(card: dict) -> dict:
+    """Return ``{max_attempts, cooldown_seconds}`` with defaults filled in."""
+    ls = card.get("local_settings") or {}
+    attempts = ls.get("smart_max_attempts")
+    cooldown = ls.get("smart_cooldown_seconds")
+    return {
+        "max_attempts": int(attempts) if attempts else SMART_DEFAULT_MAX_ATTEMPTS,
+        "cooldown_seconds": (
+            int(cooldown) if cooldown is not None else SMART_DEFAULT_COOLDOWN_SECONDS
+        ),
+    }
+
+
+def set_routing_settings(
+    card: dict,
+    *,
+    max_attempts: Optional[int] = None,
+    cooldown_seconds: Optional[int] = None,
+) -> dict:
+    """Validate and store the smart-routing knobs; ``None`` leaves one as-is."""
+    ls = dict(card.get("local_settings") or {})
+    if max_attempts is not None:
+        lo, hi = SMART_MAX_ATTEMPTS_RANGE
+        if not lo <= int(max_attempts) <= hi:
+            raise ValueError(f"max_attempts must be between {lo} and {hi}")
+        ls["smart_max_attempts"] = int(max_attempts)
+    if cooldown_seconds is not None:
+        lo, hi = SMART_COOLDOWN_RANGE
+        if not lo <= int(cooldown_seconds) <= hi:
+            raise ValueError(f"cooldown_seconds must be between {lo} and {hi}")
+        ls["smart_cooldown_seconds"] = int(cooldown_seconds)
+    card["local_settings"] = ls
+    return routing_settings(card)
+
 # ---------------------------------------------------------------------------
 # Runner-path mirror (spec #7)
 # ---------------------------------------------------------------------------
+
+def smart_routes(card: dict) -> list[dict]:
+    """The RAW non-smart configs in stored order — the smart-routing priority.
+
+    Runner-facing only (keys intact). Excluding smart prevents recursive loops.
+    """
+    return [
+        dict(route) for route in _get_list(card)
+        if route.get("provider") not in ROUTER_PROVIDERS
+    ]
+
 
 def effective_local_settings(card: dict) -> dict:
     """Derive the singular ``llm_*`` fields the runner reads from the default.
@@ -359,13 +444,22 @@ def effective_local_settings(card: dict) -> dict:
             "llm_model": None,
             "llm_base_url": None,
             "llm_api_key": None,
+            "smart_routes": None,
         }
-    return {
+    settings = {
         "llm_provider": cfg.get("provider"),
         "llm_model": cfg.get("model"),
         "llm_base_url": cfg.get("base_url"),
         "llm_api_key": cfg.get("api_key"),
     }
+    if cfg.get("provider") == "smart":
+        # The list order is the routing priority.  Keep raw per-route keys only
+        # in runner-facing local settings; client reads continue through
+        # redact_model_configs().  Excluding smart prevents recursive loops.
+        settings["smart_routes"] = smart_routes(card)
+    else:
+        settings["smart_routes"] = None
+    return settings
 
 
 def apply_mirror(card: dict) -> dict:

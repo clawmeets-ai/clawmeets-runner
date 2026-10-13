@@ -232,6 +232,9 @@ def resolve_agent(agents: list[dict], ref: str) -> dict:
         if len(found) > 1:
             names = ", ".join(sorted(str(a.get("name")) for a in found))
             _fail("ambiguous_agent", f"{ref!r} matches several of your agents: {names}")
+    if "~" in ref or "@" in ref.lstrip("@"):
+        _fail("remote_agent", f"{ref!r} looks like an agent on another deployment; "
+                              "home folders of remote agents cannot be browsed")
     _fail("agent_not_found", f"none of your agents is named {ref!r}")
 
 

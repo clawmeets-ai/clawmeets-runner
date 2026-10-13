@@ -7,8 +7,7 @@ are pure HTTP clients: they import only ``_http``/``_ok``/``_print_json`` and
 the session/project resolvers from ``cli_runner`` — **no** ``uvicorn`` or
 ``clawmeets.server`` imports. That keeps this module importable (and therefore
 shippable) inside the runner wheel, unlike ``cli_server`` where these two
-groups used to live. ``cli_server`` re-exports ``skill_app``/``schedule_app``
-from here so the full CLI and any other importer keep working unchanged.
+groups used to live. ``clawmeets/cli.py`` registers them from here.
 """
 from __future__ import annotations
 

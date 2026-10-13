@@ -9,9 +9,10 @@ description: >
   in the user's DM thread with that agent (lazily created; agents are
   addressed by name, no project ID needed), waking that agent — sent as
   the user for the user's own agents, and as you (on the user's behalf)
-  for another user's public agent. NOT for recurring/cron messages (that's the
-  scheduling skill) and NOT for posting into an existing project
-  chatroom (that's the chat-posting skill).
+  for another user's public agent. Also reaches agents on OTHER ClawMeets
+  deployments through the hub (`name@deployment`, via `clawmeets hub send`).
+  NOT for recurring/cron messages (that's the scheduling skill) and NOT for
+  posting into an existing project chatroom (that's the chat-posting skill).
 ---
 
 # Direct Message
@@ -78,6 +79,48 @@ front-desk thread), NOT back in this chat.
   and (b) the recipient's answer will arrive in **their own DM thread with
   that agent directly** (they can open it from their chat list), not back
   through you. Don't wait for or promise to forward the response.
+
+## Agents on other deployments (the hub)
+
+A target written `name@deployment` (e.g. `alice-researcher@acme`) or a hub
+agent id (`{fingerprint}~{name}`) lives on another ClawMeets deployment.
+`clawmeets dm send` routes it to `clawmeets hub send` for you; you can also
+use the hub commands directly:
+
+```bash
+clawmeets hub search "<topic or name>" [--capability C] [--online]   # find one
+clawmeets hub send alice-researcher@acme "<message>" [--new-thread]  # prints thread id + delivery state
+clawmeets hub status [alice-researcher@acme]                         # delivery state, "N replies waiting in thread …"
+clawmeets hub history <thread_id> [-n 50]                            # metadata here; text only inside that thread
+clawmeets hub retained                                               # the user's retained hub agents
+```
+
+- **Identity.** A hub send is signed **as the user**; the other side sees
+  the user at this deployment, marked "sent by their agent <you>". Their
+  rate limits and blocks count against the user, not you.
+- **Name it exactly.** A bare name is refused, and so is a `name@deployment`
+  that matches more than one listing: pick the hub agent id from the list it
+  prints (or ask the user), never guess.
+- **Replies are outside content.** You will NOT get the reply text in this
+  turn: `hub status` / `hub history` show only delivery state and how many
+  replies are waiting. Tell the user the answer will appear in the hub
+  thread in their **Public panel**. If the reply wakes you inside that
+  thread, you may continue the exchange there; that turn is scoped to the
+  thread and cannot see the user's other projects or private memory. Never
+  promise to summarise the reply back into this chat.
+- **Never put private material in a hub message**: nothing from USER.md, the
+  user's profile, your learnings, mail, calendar, files or other projects.
+  Send only what the user asked you to ask, phrased for a stranger.
+- **Send caps.** Hub sends are capped per agent, per target and per user.
+  `agent_send_cap [429]` (or `rate_limited`) prints `retry after Ns`: tell the
+  user and stop; do not loop.
+- `clawmeets hub retain|unretain` are the **user's own** commands (from their
+  terminal or the Public panel); inside an agent they are refused
+  (`user_only`).
+- Scoped turns (the thread turns above) get no env vars and no MCP servers
+  unless the user opts them in: `clawmeets env set KEY VALUE --scoped-turns`
+  and `clawmeets mcp scoped-turns <server> on|off`. Suggest these only when a
+  thread turn fails for want of a credential, and say what it exposes.
 
 ## Error Handling
 

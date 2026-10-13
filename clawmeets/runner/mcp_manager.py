@@ -239,6 +239,64 @@ class McpManager:
         codex_target.write_text(_emit_codex_toml(servers))
 
 
+    # ---------- Scoped turns (plan 4.3: MCP off unless opted in) ----------
+
+    @property
+    def scoped_turns_path(self) -> Path:
+        """``mcp-hub/scoped-turns.json``: servers the owner opted into scoped
+        turns. Under ``mcp-hub/``, which every scoped turn is denied."""
+        return self.mcp_hub_dir / "scoped-turns.json"
+
+    def scoped_turn_servers(self) -> list[str]:
+        """Installed servers opted into scoped turns. Unreadable => none."""
+        try:
+            data = json.loads(self.scoped_turns_path.read_text())
+        except (OSError, ValueError):
+            return []
+        if not isinstance(data, list):
+            return []
+        installed = set(self.installed_mcps())
+        return sorted({str(n) for n in data if str(n) in installed})
+
+    def set_scoped_turns(self, mcp_name: str, enabled: bool) -> list[str]:
+        """Opt ``mcp_name`` in or out of scoped turns; returns the new list."""
+        try:
+            data = json.loads(self.scoped_turns_path.read_text())
+        except (OSError, ValueError):
+            data = []
+        names = {str(n) for n in data} if isinstance(data, list) else set()
+        if enabled:
+            names.add(mcp_name)
+        else:
+            names.discard(mcp_name)
+        self.mcp_hub_dir.mkdir(parents=True, exist_ok=True)
+        self.scoped_turns_path.write_text(json.dumps(sorted(names), indent=2))
+        return sorted(names)
+
+    def render_scoped(self, dest_dir: Path, servers: "set[str] | frozenset[str]") -> dict[str, dict]:
+        """Render only ``servers`` into ``dest_dir`` for one scoped turn.
+
+        Always writes ``.mcp.json`` (Claude's ``--mcp-config`` needs a file,
+        possibly ``{"mcpServers": {}}``); writes the Gemini and Codex files only
+        when at least one server is opted in. Returns the rendered map.
+        """
+        chosen = {n: s for n, s in self._resolved_servers().items() if n in servers}
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps({"mcpServers": chosen}, indent=2)
+        (dest_dir / ".mcp.json").write_text(payload)
+        if chosen:
+            (dest_dir / ".gemini").mkdir(exist_ok=True)
+            (dest_dir / ".gemini" / "settings.json").write_text(payload)
+            (dest_dir / ".codex").mkdir(exist_ok=True)
+            (dest_dir / ".codex" / "config.toml").write_text(_emit_codex_toml(chosen))
+        return chosen
+
+
+def emit_codex_toml(servers: dict[str, dict]) -> str:
+    """Public alias used by the scoped-turn renderer."""
+    return _emit_codex_toml(servers)
+
+
 def _emit_codex_toml(servers: dict[str, dict]) -> str:
     """Emit `[mcp_servers.<name>] command/args/env` TOML blocks for codex.
 

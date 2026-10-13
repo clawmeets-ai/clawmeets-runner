@@ -56,7 +56,10 @@ happen. Use this skill when the user just wants the agent to exist.
      (URL or path — leave blank if it won't write code)"*. Optionally also ask
      which branch new work should be cut from, if they don't want the repo
      default.
-   - **LLM backend** (optional, default `claude`). Two tiers:
+   - **LLM backend** (optional, default `claude`). Three modes:
+     - Route automatically with `smart`, using the agent's other named model
+       configs in their listed priority order and falling back only when replay
+       is known to be safe.
      - Shell an installed Code CLI: `claude` (default), `openai`, `gemini`,
        `opencode`, `antigravity`.
      - Run in-process with the user's own API key — no CLI binary needed:

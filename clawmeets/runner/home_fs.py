@@ -29,7 +29,8 @@ are ``_PosixOps`` here and ``home_fs_win.WindowsOps``):
   operation relative to the last descriptor (``dir_fd=``). A component
   swapped for a symlink mid-operation fails the open instead of being
   followed. Symlinks are listed (never their target) and can only be
-  deleted. On Windows every open is ``NtCreateFile`` relative to the
+  deleted. The one exception is the ``shared_storage`` link at the home
+  root (see "Shared storage" below). On Windows every open is ``NtCreateFile`` relative to the
   parent's handle with ``FILE_OPEN_REPARSE_POINT``; junctions and every
   other reparse point are treated exactly like symlinks, and an open whose
   real name differs from the requested one (an 8.3 short name) is refused.
@@ -55,6 +56,18 @@ are ``_PosixOps`` here and ``home_fs_win.WindowsOps``):
   the passes can leave a partial delete but can never escape the home
   folder or remove a protected file.
 
+Shared storage: ``{home}/shared_storage`` is a link the runner makes to the
+computer-wide shared folder (``utils/agent_storage``). Because that folder
+holds what agents hand to each other and to the user, the browser opens it
+like a folder. The link itself is still never followed: when a path starts
+with ``shared_storage`` and that home entry is a link, the walk instead opens
+the folder the RUNNER's settings name (``shared_storage`` callable, never the
+link's target and never a value from a request), final component without
+following, and continues inside it under every rule above — its own device,
+the home folder's protected identities, ``O_NOFOLLOW`` per component. A
+shared folder that contains the home folder is refused, and the link cannot
+be deleted from here (the runner recreates it on start anyway).
+
 All public methods on ``HomeFs`` are blocking; ``HomeFs.run`` executes one
 in a worker thread so the runner's event loop (heartbeats, changelog
 pushes) never stalls on a large read or recursive delete.
@@ -71,6 +84,7 @@ import unicodedata
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+from typing import Callable, Optional
 from urllib.parse import unquote
 
 
@@ -134,6 +148,10 @@ _SYSTEM_ROOT_DIRS = frozenset({
     "mcp-hub", "skill-hub", "knowledge_packs",
 })
 _PERSONAL_SKILLS_DIR = "personal-skill-hub"
+# The home-root link to the computer-wide shared folder; opened as a folder
+# (see "Shared storage" in the module docstring). Mirrors
+# ``utils.agent_storage.SHARED_STORAGE_DIRNAME``.
+_SHARED_STORAGE_LINK = "shared_storage"
 
 # Path / list / size caps. The server applies its own (smaller) wire caps;
 # these are the runner's last line of defence.
@@ -457,8 +475,12 @@ class HomeFs:
         max_entries: int = DEFAULT_MAX_ENTRIES,
         max_read_bytes: int = DEFAULT_MAX_READ_BYTES,
         max_write_bytes: int = DEFAULT_MAX_WRITE_BYTES,
+        shared_storage: Optional[Callable[[], Optional[Path]]] = None,
     ) -> None:
         self.home = Path(home)
+        # Returns the runner's CURRENT shared-storage folder (settings can
+        # change it while the runner is up); None leaves the link unopenable.
+        self._shared_storage = shared_storage
         self.max_entries = max_entries
         self.max_read_bytes = max_read_bytes
         self.max_write_bytes = max_write_bytes
@@ -664,6 +686,8 @@ class HomeFs:
             st = self._lstat(pfd, name)
             if st.reparse:
                 raise _unsupported_entry()
+            if self._is_shared_link(walk.key, name, st):
+                raise HomeFsError("read_only", "the shared storage link is managed by the runner and cannot be deleted")
             key = walk.key + (_fold(name),)
             if st.kind != "symlink":
                 self._same_device(walk, st)
@@ -747,6 +771,9 @@ class HomeFs:
                 raise HomeFsError("home_moved", "the agent home folder was moved or replaced")
             walk.dev = rst.dev
             walk.identities = self._protected_identities(root)
+            if parts and self._is_shared_link((), parts[0], self._lstat(root, parts[0], missing_ok=True)):
+                self._enter_shared(walk)
+                parts = parts[1:]
             for part in parts:
                 cur = walk.fds[-1]
                 try:
@@ -771,6 +798,52 @@ class HomeFs:
             walk.close()
             raise
 
+    def _is_shared_link(self, parent_key: tuple[str, ...], name: str, st: _Stat | None) -> bool:
+        """True for the home-root ``shared_storage`` link this runner manages."""
+        return (
+            self._shared_storage is not None and not parent_key
+            and _fold(name) == _SHARED_STORAGE_LINK
+            and st is not None and st.kind == "symlink"
+        )
+
+    def _enter_shared(self, walk: _Walk) -> None:
+        """Re-root ``walk`` at the runner's shared-storage folder, as if it
+        were the home-root folder ``shared_storage``. The folder comes from
+        the runner's settings, never from the link or the request."""
+        shared = self._shared_storage() if self._shared_storage else None
+        if shared is None or not shared.name:
+            raise HomeFsError("symlink", "symlinks are never followed")
+        shared = Path(os.path.abspath(shared))
+        try:
+            if Path(os.path.realpath(self.home)).is_relative_to(os.path.realpath(shared)):
+                raise HomeFsError("forbidden", "shared storage contains the agent home folder, so it is not browsable")
+        except OSError as exc:
+            raise self._os_error(exc) from exc
+        ops = self._ops
+        try:
+            parent = ops.open_root(shared.parent)
+        except OSError as exc:
+            raise self._os_error(exc) from exc
+        try:
+            fd = ops.open_dir(parent, shared.name)  # final component: not followed
+        except OSError as exc:
+            st = self._lstat(parent, shared.name, missing_ok=True)
+            if st is not None and st.kind == "symlink":
+                raise HomeFsError("symlink", "symlinks are never followed") from exc
+            raise self._os_error(exc) from exc
+        finally:
+            ops.close_dir(parent)
+        walk.fds.append(fd)
+        st = ops.stat_dir(fd)
+        if st.kind != "dir":
+            raise HomeFsError("symlink", "symlinks are never followed")
+        if st.id == self._home_id:
+            raise HomeFsError("forbidden", "shared storage is the agent home folder, so it is not browsable")
+        # The shared folder is its own tree: its device is the boundary, and
+        # the home's protected identities still apply inside it.
+        walk.dev = st.dev
+        walk.key = walk.identity_key(st, (_SHARED_STORAGE_LINK,))
+
     @staticmethod
     def _same_device(walk: _Walk, st: _Stat) -> None:
         if st.dev != walk.dev:
@@ -794,6 +867,11 @@ class HomeFs:
         if kind in ("dir", "file"):
             key = walk.identity_key(st, key)
         tier = classify(key)
+        if self._is_shared_link(parent_key, name, st):
+            # Listed as the folder it opens as, writable like any open folder
+            # (``delete`` still refuses the link itself — it is the runner's).
+            return FsEntry(name=name, type="dir", size=0, mtime=st.mtime,
+                           tier=tier, writable=True, readable=True)
         if kind == "symlink":
             readable = False
         elif kind == "file":

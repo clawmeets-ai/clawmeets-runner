@@ -18,7 +18,7 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional, Sequence
 
 from .changelog import (
     ChangelogEntry,
@@ -53,6 +53,16 @@ class BatchEntrySpec:
     source_version: int | None = None
     link_to_index: int | None = None
     mirrored_from: MirroredFromRef | None = None
+
+
+#: A check the SERVER installs on its runloops (``ChangelogRunloopManager``'s
+#: ``append_guard``), run on every server-side append before anything is
+#: stored: ``(project_id, [(entry_type, payload), ...], ingress_ticket)``. It
+#: raises to refuse the append. The runner installs none. Kept as an opaque
+#: callable so this module (shipped in the runner wheel) never imports server
+#: code: the server's guard refuses an outside-authored MESSAGE or FILE that
+#: carries no matching ingress ticket (``server/inspection.py``).
+AppendGuard = Callable[[str, Sequence[tuple[ChangelogEntryType, ChangelogPayload]], Any], None]
 
 
 class ChangelogRunloop:
@@ -94,6 +104,7 @@ class ChangelogRunloop:
         project_id: str,
         project_name: str,
         changelog_dir: Path,
+        append_guard: Optional[AppendGuard] = None,
     ) -> None:
         """Initialize the runloop.
 
@@ -101,7 +112,10 @@ class ChangelogRunloop:
             project_id: The project ID this runloop handles
             project_name: The project name (for path resolution)
             changelog_dir: Directory for changelog persistence
+            append_guard: Server-side check run before every ``append`` /
+                ``append_batch`` stores anything (see ``AppendGuard``).
         """
+        self._append_guard = append_guard
         self._project_id = project_id
         self._project_name = project_name
         self._changelog_dir = changelog_dir
@@ -264,6 +278,8 @@ class ChangelogRunloop:
         payload: ChangelogPayload,
         source_version: int | None = None,
         mirrored_from: MirroredFromRef | None = None,
+        *,
+        ingress_ticket: Any = None,
     ) -> ChangelogEntry:
         """Append entry with version assignment (server-side).
 
@@ -277,10 +293,16 @@ class ChangelogRunloop:
             mirrored_from: Set by TunnelSubscriber when this entry is a
                 cross-project mirror of another entry. Subscribers use this
                 as a loop guard.
+            ingress_ticket: The admission (or admissions) of an outside
+                message, handed to the installed append guard. An
+                outside-authored MESSAGE or FILE without a matching one is
+                refused on the server.
 
         Returns:
             The created ChangelogEntry with assigned version
         """
+        if self._append_guard is not None:
+            self._append_guard(self._project_id, [(entry_type, payload)], ingress_ticket)
         async with self._lock:
             # Get current version from file
             current_version = self.get_current_version()
@@ -306,6 +328,8 @@ class ChangelogRunloop:
     async def append_batch(
         self,
         specs: list["BatchEntrySpec"],
+        *,
+        ingress_ticket: Any = None,
     ) -> list[ChangelogEntry]:
         """Append several entries atomically under a single lock hold.
 
@@ -325,6 +349,12 @@ class ChangelogRunloop:
         """
         if not specs:
             return []
+        if self._append_guard is not None:
+            self._append_guard(
+                self._project_id,
+                [(spec.entry_type, spec.payload) for spec in specs],
+                ingress_ticket,
+            )
 
         async with self._lock:
             base_version = self.get_current_version()

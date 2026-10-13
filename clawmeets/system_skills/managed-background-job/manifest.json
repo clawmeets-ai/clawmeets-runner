@@ -1,0 +1,6 @@
+{
+  "audiences": ["worker", "coordinator", "assistant"],
+  "surfaces": ["agent_runtime"],
+  "version": "1.0.0",
+  "description": "Register long-running work as a durable managed job with bounded deadlines, leases, checkpoints, and truthful completion."
+}

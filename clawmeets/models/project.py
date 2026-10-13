@@ -207,6 +207,24 @@ class Project(BaseModel):
     surface: ProjectSurface = "regular"  # Explicit project shape; "regular" | "dm"
     display_name: Optional[str] = None    # Model-set human label (regular projects AND dm threads).
                                           # None only on legacy/pre-migration rows -> callers render `name` (the slug).
+    # Who a host-side conversation serves, when it serves someone other than
+    # the owner: "hub:{root_fp}/{user_id}" | "account:{user_id}" |
+    # "channel:{conn}/{user_key}" | "project:{id}". Set at creation, never
+    # changed. A project with one is isolated (``is_isolated``): its turns are
+    # requester-scoped and the server hands it only to a sandbox-capable runner.
+    requester_key: Optional[str] = None
+    # Kept out of every durable input (recent activity, reflection, briefings,
+    # search). Never cleared once set.
+    memory_excluded: bool = False
+    # Holds outside content as a whole (hub DM threads; projects created from a
+    # restricted turn). Never cleared once set. Read from old data only: it no
+    # longer isolates (plan-owner-isolation section 3).
+    remote_content: bool = False
+    # The outside party of a requester end: a hub stand-in, or another
+    # account's agent on a same-server Front Desk requester thread. The owning
+    # user coordinates such a project (the own-coordinator rule).
+    counterpart_id: Optional[str] = None
+    counterpart_name: Optional[str] = None
     last_request_ts: Optional[datetime] = None   # ts of the most recent non-ack USER message across the project.
     last_response_ts: Optional[datetime] = None  # ts of the most recent non-ack AGENT/ASSISTANT message.
     # ISO timestamp of the project's published completion report (mirrors
@@ -468,8 +486,8 @@ class Project(BaseModel):
         terminal: cross-account delegation must not bleed a tunnel out of them).
         """
         from .agent import Agent
-        if not self.created_by:
-            return False
+        if not self.created_by or self.counterpart_id:
+            return False                      # a requester end: the outside party is the counterpart
         coordinator = Agent.get(self.coordinator_id, ctx)
         if coordinator is None:
             return False
@@ -684,7 +702,11 @@ class Project(BaseModel):
         # could resolve to a different {name}-{id} dir across processes if a stale
         # duplicate ever exists — yielding a different project.name and thus a
         # different sandbox_dir between the writer and the action executor.
-        matches = sorted(ctx.metadata_dir.glob(f"*-{project_id}"))
+        # The id comes straight from URLs, so it is matched literally: an id
+        # like "*" must not resolve to some other project.
+        if not FileUtil.is_safe_id(project_id):
+            raise ValueError(f"Project {project_id} not found")
+        matches = FileUtil.id_suffix_dirs(ctx.metadata_dir, project_id, "meta.json")
         if not matches:
             # Callers may pass the bare id or the full "{name}-{id}" slug (what
             # an agent sees as its synced project dir). The glob above only
@@ -908,6 +930,63 @@ class Project(BaseModel):
 # =============================================================================
 
 
+#: The separator in a hub stand-in's id, ``{genesis fp16}~{agent_name}``. Local
+#: participant ids are UUIDs and agent names never contain it.
+STAND_IN_SEPARATOR = "~"
+
+
+def scope_key(project: "Project") -> Optional[str]:
+    """The requester key a turn in this project is scoped by: its own, or, for
+    a project a scoped turn created (``remote_content``, not a hub thread) that
+    ``migrate_scoped_turn_projects`` has not keyed yet, the key that migration
+    gives it, ``project:{id}``. So a start-up pass that failed partway leaves
+    the rest scoped, never at full power. Pure: no I/O."""
+    key = getattr(project, "requester_key", None)
+    if key:
+        return key
+    if getattr(project, "remote_content", False) and not is_untrusted_source(project):
+        return f"project:{project.id}"
+    return None
+
+
+def is_isolated(project: "Project") -> bool:
+    """True when the project's turns must run scoped: it serves a requester
+    other than the owner (``scope_key``). The server's isolation gate refuses
+    to hand such a project to an agent whose runner can neither sandbox the
+    turn nor run it owner-isolated. Hub threads' ``remote_content`` does not
+    isolate (plan-owner-isolation section 3). Pure: no I/O."""
+    return scope_key(project) is not None
+
+
+def turn_kind(project: "Project") -> str:
+    """How a turn in this project runs: "requester" (it serves someone other
+    than the owner) or "full". The runner's TurnScope classifies the same way
+    (runner/turn_scope.py)."""
+    return "requester" if scope_key(project) else "full"
+
+
+def counterpart_of(project: "Project") -> Optional[str]:
+    """The outside party of a requester end: ``counterpart_id``, or, on a hub
+    thread the own-coordinator migration has not reached yet, the stand-in
+    coordinator. None on every other project. Pure."""
+    if project.counterpart_id:
+        return project.counterpart_id
+    if STAND_IN_SEPARATOR in (project.coordinator_id or ""):
+        return project.coordinator_id
+    return None
+
+
+def is_untrusted_source(project: "Project") -> bool:
+    """True for a hub requester thread: a Front Desk project whose outside
+    party (``counterpart_id``; the coordinator before the own-coordinator
+    migration) is the stand-in for an agent on another deployment. Its
+    messages are written by a stranger's agent, so no agent-context assembly
+    (reflection transcripts, recent activity, summaries, memory inputs) may
+    read them; the owner still sees the thread in the browser. Pure: no I/O,
+    no hub import."""
+    return getattr(project, "surface", None) == "frontdesk" and STAND_IN_SEPARATOR in (counterpart_of(project) or "")
+
+
 class ProjectState:
     """Mutable state model for project write operations.
 
@@ -947,6 +1026,11 @@ class ProjectState:
         agent_names: list[str] | None = None,
         surface: ProjectSurface = "regular",
         display_name: Optional[str] = None,
+        requester_key: Optional[str] = None,
+        memory_excluded: bool = False,
+        remote_content: bool = False,
+        counterpart_id: Optional[str] = None,
+        counterpart_name: Optional[str] = None,
     ) -> Project:
         """Create a new project with directories and meta.json.
 
@@ -997,6 +1081,17 @@ class ProjectState:
             "surface": surface,
             "display_name": display_name,
         }
+        # Written only when set, so every meta.json of an ordinary project
+        # stays byte-identical to what it was.
+        if requester_key is not None:
+            project_data["requester_key"] = requester_key
+        if memory_excluded:
+            project_data["memory_excluded"] = True
+        if remote_content:
+            project_data["remote_content"] = True
+        if counterpart_id is not None:
+            project_data["counterpart_id"] = counterpart_id
+            project_data["counterpart_name"] = counterpart_name
         FileUtil.write(meta_dir / "meta.json", project_data, "json", atomic=True)
 
         # Return the created project
@@ -1126,6 +1221,46 @@ class ProjectState:
         project_dict["report_published_at"] = ts
         FileUtil.write(meta_path, project_dict, "json", atomic=True)
         return True
+
+    def set_isolation_flags(
+        self,
+        *,
+        requester_key: Optional[str] = None,
+        memory_excluded: bool = False,
+        remote_content: bool = False,
+    ) -> bool:
+        """Set isolation flags in meta.json (PROJECT_FLAGS_CHANGED). Only ever
+        sets: ``requester_key`` is written only when the project has none, and
+        a flag already true stays true. Returns True when meta.json changed."""
+        meta_path = self._project.meta_path
+        project_dict = FileUtil.read(meta_path, "json") or {}
+        changed = False
+        if requester_key and not project_dict.get("requester_key"):
+            project_dict["requester_key"] = requester_key
+            changed = True
+        if memory_excluded and not project_dict.get("memory_excluded"):
+            project_dict["memory_excluded"] = True
+            changed = True
+        if remote_content and not project_dict.get("remote_content"):
+            project_dict["remote_content"] = True
+            changed = True
+        if changed:
+            FileUtil.write(meta_path, project_dict, "json", atomic=True)
+        return changed
+
+    def reassign_coordinator(self, *, coordinator_id: str, coordinator_name: str,
+                             counterpart_id: str, counterpart_name: str) -> None:
+        """PROJECT_COORDINATOR_REASSIGNED: the owning user coordinates, the
+        old outside coordinator becomes the counterpart (meta.json)."""
+        meta_path = self._project.meta_path
+        project_dict = FileUtil.read(meta_path, "json") or {}
+        project_dict.update(coordinator_id=coordinator_id, coordinator_name=coordinator_name,
+                            counterpart_id=counterpart_id, counterpart_name=counterpart_name)
+        agents = list(project_dict.get("participating_agents") or [])
+        if coordinator_id not in agents:
+            agents.append(coordinator_id)
+        project_dict["participating_agents"] = agents
+        FileUtil.write(meta_path, project_dict, "json", atomic=True)
 
     def set_plan_state(
         self,

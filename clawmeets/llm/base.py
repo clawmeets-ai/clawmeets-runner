@@ -10,19 +10,20 @@ the generic LLM* exceptions defined here.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import os
-import shutil
+import signal
 import tempfile
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Protocol
 
 from ..api.actions import ActionBlock
-from ..utils import env_store
+from ..utils import env_store, nofollow_fs
 from ..utils.notification_center import LLM_COMPLETE, LLM_ERROR, NotificationCenter
 
 logger = logging.getLogger(__name__)
@@ -75,6 +76,46 @@ class LLMInvocationError(Exception):
         self.working_dir = working_dir
         self.status_code = status_code
         super().__init__(message)
+
+
+class SandboxUnavailable(LLMInvocationError):
+    """A scoped turn cannot run: no working sandbox, or a provider without
+    isolated-turn support. Scoped turns fail closed; they never fall back."""
+
+
+class ScopedTurn(Protocol):
+    """What a provider needs from a scoped turn (``runner/turn_session.py``).
+
+    Kept as a protocol so this layer-0 module never imports the runner.
+    """
+
+    mcp_dir: Path
+    # Runner scratch files (prompt, schema, last message) live here, in the
+    # turn home, not in the turn-writable sandbox.
+    scratch_dir: Path
+    write_roots: tuple[Path, ...]
+    read_roots: tuple[Path, ...]
+
+    def additional_dirs(self, cwd: Path) -> list[Path]: ...
+
+    def environment(self, extra: Optional[dict[str, str]] = None) -> dict[str, str]: ...
+
+    def wrap(self, cmd: list[str], *, cwd: Path, extra_read: list[Path] = ...) -> list[str]: ...
+
+    def is_readable(self, path: Path) -> bool: ...
+
+
+# The scoped turn whose invocation is being prepared, for the few
+# ``_prepare_invocation`` steps that must differ (e.g. never touching the user's
+# own ~/.codex). Task-local: concurrent turns never see each other's value.
+_CURRENT_TURN: "contextvars.ContextVar[Optional[ScopedTurn]]" = contextvars.ContextVar(
+    "clawmeets_current_turn", default=None
+)
+
+
+def current_turn() -> Optional[ScopedTurn]:
+    """The scoped turn being prepared, or ``None`` for a full turn."""
+    return _CURRENT_TURN.get()
 
 
 class LLMTimeoutError(LLMInvocationError):
@@ -197,8 +238,8 @@ class LLMUsage:
 # ---------------------------------------------------------------------------
 
 
-def link_mcp_config_into(source: Path, target: Path) -> bool:
-    """Idempotently symlink ``source`` → ``target``.
+def link_mcp_config_into(source: Path, cwd: Path, rel: str) -> bool:
+    """Idempotently symlink ``cwd/rel`` → ``source``.
 
     Returns ``True`` if a link now points at the source, ``False`` if the
     source doesn't exist (in which case any stale target is removed so a
@@ -208,41 +249,35 @@ def link_mcp_config_into(source: Path, target: Path) -> bool:
     per-provider file from the agent's ``mcp-hub/dist/`` into the
     per-invocation working dir. Replaces any existing target — symlinks,
     plain files, or broken links — so callers can re-run safely after
-    ``McpManager.render_dist`` rewrites the source.
+    ``McpManager.render_dist`` rewrites the source. A scoped turn can write
+    ``cwd``, so nothing under it is followed (``utils.nofollow_fs``).
     """
-    target.parent.mkdir(parents=True, exist_ok=True)
-    if target.is_symlink() or target.exists():
-        target.unlink()
     if not source.exists():
+        nofollow_fs.remove(cwd, rel)
         return False
-    target.symlink_to(source)
+    nofollow_fs.symlink(cwd, rel, source)
     return True
 
 
-def materialize_skill_tree(target_dir: Path, source_dirs: list[Path]) -> None:
-    """Recreate ``target_dir`` as a flat tree of ``<name> → source/<name>``
+def materialize_skill_tree(cwd: Path, rel: str, source_dirs: list[Path]) -> None:
+    """Recreate ``cwd/rel`` as a flat tree of ``<name> → source/<name>``
     symlinks.
 
     Walks each source dir in order. Any subdir containing ``SKILL.md`` is
-    surfaced as ``target_dir/<name>`` symlinked at the source. Later
+    surfaced as ``cwd/rel/<name>`` symlinked at the source. Later
     sources win on name collisions, so callers should order
     ``source_dirs`` as ``[platform-curated, personal]`` — the agent's
     own learned version overrides the curated default.
 
-    Idempotent: wipes ``target_dir`` and recreates from scratch on each
+    Idempotent: wipes ``cwd/rel`` and recreates from scratch on each
     call. Used at invoke time by each LLM provider's
     ``_prepare_invocation`` so the CLI's native skill auto-discovery
     (Claude scans ``.claude/skills/``; Codex + Gemini scan
     ``.agents/skills/``) sees the agent's installed + personal skills as
-    a single flat list at the cwd-relative path it already expects.
+    a single flat list at the cwd-relative path it already expects. A
+    symlinked ``.claude`` / ``.agents`` left in ``cwd`` is unlinked, never
+    followed.
     """
-    if target_dir.is_symlink() or target_dir.exists():
-        if target_dir.is_dir() and not target_dir.is_symlink():
-            shutil.rmtree(target_dir)
-        else:
-            target_dir.unlink()
-    target_dir.mkdir(parents=True, exist_ok=True)
-
     chosen: dict[str, Path] = {}
     for src in source_dirs:
         if not src.is_dir():
@@ -252,9 +287,16 @@ def materialize_skill_tree(target_dir: Path, source_dirs: list[Path]) -> None:
                 continue
             if not (entry / "SKILL.md").exists():
                 continue
-            chosen[entry.name] = entry  # later wins
-    for name, src in chosen.items():
-        (target_dir / name).symlink_to(src.resolve())
+            chosen[entry.name] = entry.resolve()  # later wins
+    nofollow_fs.link_dir(cwd, rel, chosen)
+
+
+def scratch_dir(working_dir: Path) -> Path:
+    """Where ``_prepare_invocation`` writes the runner's own scratch files
+    (prompt, schema, last message): the scoped turn's private turn home, or
+    ``working_dir`` for a full turn."""
+    turn = current_turn()
+    return turn.scratch_dir if turn is not None else working_dir
 
 
 @dataclass
@@ -288,6 +330,37 @@ class ParsedResult:
     raw_text: str
 
 
+def kill_turn_process_group(proc, turn: Optional["ScopedTurn"] = None) -> None:
+    """Kill everything a scoped turn's process started.
+
+    A scoped turn's subprocess is spawned in its own session
+    (``start_new_session=True``), so its process group holds whatever it left
+    running in the background. Killed when the subprocess returns, so nothing
+    the turn started outlives it (e.g. to race the runner's post-turn upload
+    or push). With ``turn``, also whatever left the group (``setsid()``):
+    :func:`kill_turn_leftovers`. Idempotent; a group that is already gone is
+    fine.
+    """
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    if turn is not None:
+        kill_turn_leftovers(turn)
+
+
+def kill_turn_leftovers(turn: "ScopedTurn") -> None:
+    """Kill every process still running in ``turn``'s sandbox, wherever its
+    session (``runner.turn_session.TurnSession.kill_leftovers``)."""
+    kill = getattr(turn, "kill_leftovers", None)
+    if kill is None:
+        return
+    try:
+        kill()
+    except Exception:  # noqa: BLE001 - never fail the turn on cleanup
+        logger.warning("turn: could not kill leftover processes", exc_info=True)
+
+
 # ---------------------------------------------------------------------------
 # LLMProvider — Template Method base
 # ---------------------------------------------------------------------------
@@ -295,6 +368,10 @@ class ParsedResult:
 
 class LLMProvider(ABC):
     """Abstract base for any LLM backend — execution-model agnostic.
+
+    ``supports_scoped_turns`` is False unless a backend implements the
+    ``turn=`` keyword of ``invoke`` (plan 4.3); the runner refuses a scoped
+    turn on any other backend.
 
     Defines only the public contract every backend must honor:
 
@@ -344,6 +421,8 @@ class LLMProvider(ABC):
             LLMInvocationError: If a preflight probe returns an error.
         """
         ...
+
+    supports_scoped_turns: bool = False
 
     @abstractmethod
     async def invoke(
@@ -434,6 +513,29 @@ class SubprocessLLMProvider(LLMProvider):
 
     _bin: str
     _agent_env: dict[str, str]
+
+    # Key into the turn-home / model-auth tables ("claude", "codex", "gemini",
+    # "opencode"). ``None`` = this provider cannot run a scoped turn; such a
+    # turn is refused (fail closed).
+    _turn_provider: Optional[str] = None
+
+    @property
+    def supports_scoped_turns(self) -> bool:
+        return self._turn_provider is not None
+
+    # --- scoped-turn hooks (plan 4.3); full turns never call these ----------
+
+    def _scoped_env_extra(self, turn: ScopedTurn) -> dict[str, str]:
+        """Provider flags added to a scoped turn's allowlisted environment."""
+        return {}
+
+    def _scoped_cmd(self, cmd: list[str], turn: ScopedTurn) -> list[str]:
+        """Provider-specific argv changes for a scoped turn (e.g. MCP off)."""
+        return cmd
+
+    def _scoped_read_roots(self) -> list[Path]:
+        """Extra read-only paths the provider itself needs (e.g. plugin dirs)."""
+        return []
 
     # --- abstract hooks -----------------------------------------------------
 
@@ -538,6 +640,44 @@ class SubprocessLLMProvider(LLMProvider):
         """
         return None
 
+    def _prepare_scoped(
+        self,
+        turn: ScopedTurn,
+        prompt: str,
+        working_dir: Path,
+        action_schema: dict,
+        skill_source_dirs: Optional[list[Path]],
+    ) -> tuple["PreparedInvocation", dict[str, str]]:
+        """The scoped branch of ``invoke``: the turn's roots instead of the
+        caller's ``additional_dirs``, the turn's opted-in MCP render instead of
+        the agent's dist, an environment built from ``{}`` (never
+        ``os.environ``) and the command wrapped in the OS sandbox.
+
+        Raises :class:`SandboxUnavailable` for a provider that cannot run a
+        scoped turn, or when the sandbox cannot be built.
+        """
+        if not self.supports_scoped_turns:
+            raise SandboxUnavailable(
+                f"{self._provider_name} cannot run an isolated turn; refusing"
+            )
+        token = _CURRENT_TURN.set(turn)
+        try:
+            prepared = self._prepare_invocation(
+                prompt, working_dir, turn.additional_dirs(working_dir), action_schema,
+                mcp_config_dir=turn.mcp_dir,
+                skill_source_dirs=skill_source_dirs,
+            )
+        finally:
+            _CURRENT_TURN.reset(token)
+        env = turn.environment(self._scoped_env_extra(turn))
+        cmd = turn.wrap(
+            self._scoped_cmd(list(prepared.cmd), turn),
+            cwd=Path(prepared.cwd),
+            extra_read=self._scoped_read_roots(),
+        )
+        prepared.cmd = cmd
+        return prepared, env
+
     def _build_env(self) -> dict[str, str]:
         """Build the environment passed to the subprocess.
 
@@ -589,6 +729,31 @@ class SubprocessLLMProvider(LLMProvider):
         """
         return None
 
+    # The one-shot text call runs outside any turn sandbox, on text that may
+    # come from someone other than the owner. Its environment is an allowlist:
+    # what a CLI needs to start, plus the provider's own model-auth variables
+    # (``_text_env_prefixes``). The agent token, the env store's other secrets
+    # and every other CLAWMEETS_* variable stay out.
+    _TEXT_ENV_NAMES: frozenset[str] = frozenset({
+        "PATH", "HOME", "USER", "LOGNAME", "SHELL", "TMPDIR", "TMP", "TEMP",
+        "LANG", "TERM", "TZ", "SSL_CERT_FILE", "SSL_CERT_DIR",
+        "REQUESTS_CA_BUNDLE", "NODE_EXTRA_CA_CERTS",
+        "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
+        "http_proxy", "https_proxy", "no_proxy", "all_proxy",
+        "SYSTEMROOT", "APPDATA", "LOCALAPPDATA", "USERPROFILE",
+    })
+    _TEXT_ENV_BASE_PREFIXES: tuple[str, ...] = ("LC_", "XDG_")
+    _text_env_prefixes: tuple[str, ...] = ()
+
+    def _text_env(self) -> dict[str, str]:
+        """The scrubbed environment for ``generate_text``'s subprocess."""
+        prefixes = self._TEXT_ENV_BASE_PREFIXES + self._text_env_prefixes
+        return {
+            k: v for k, v in self._build_env().items()
+            if not k.startswith("CLAWMEETS_")
+            and (k in self._TEXT_ENV_NAMES or k.startswith(prefixes))
+        }
+
     def _parse_text_result(self, prepared: PreparedInvocation, stdout: str) -> str:
         """Extract the completion text from a one-shot text invocation.
 
@@ -636,7 +801,7 @@ class SubprocessLLMProvider(LLMProvider):
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
                         cwd=prepared.cwd,
-                        env=self._build_env(),
+                        env=self._text_env(),
                     )
                 except FileNotFoundError:
                     logger.warning(
@@ -695,6 +860,7 @@ class SubprocessLLMProvider(LLMProvider):
         mcp_config_dir: Optional[Path] = None,
         skill_source_dirs: Optional[list[Path]] = None,
         memory_dir: Optional[Path] = None,
+        turn: Optional[ScopedTurn] = None,
     ) -> tuple[ActionBlock, LLMUsage]:
         """Run the CLI subprocess and translate its output into an ActionBlock.
 
@@ -734,12 +900,17 @@ class SubprocessLLMProvider(LLMProvider):
             Tuple of (action_block, usage_stats). action_block.actions may be
             empty if the model returned no structured output.
         """
-        prepared = self._prepare_invocation(
-            prompt, working_dir, additional_dirs, action_schema,
-            mcp_config_dir=mcp_config_dir,
-            skill_source_dirs=skill_source_dirs,
-        )
-        env = self._build_env()
+        if turn is None:
+            prepared = self._prepare_invocation(
+                prompt, working_dir, additional_dirs, action_schema,
+                mcp_config_dir=mcp_config_dir,
+                skill_source_dirs=skill_source_dirs,
+            )
+            env = self._build_env()
+        else:
+            prepared, env = self._prepare_scoped(
+                turn, prompt, working_dir, action_schema, skill_source_dirs
+            )
 
         start_time = time.time()
         proc: Optional[asyncio.subprocess.Process] = None
@@ -756,6 +927,7 @@ class SubprocessLLMProvider(LLMProvider):
                     stderr=asyncio.subprocess.PIPE,
                     cwd=prepared.cwd,
                     env=env,
+                    start_new_session=turn is not None,
                 )
             except FileNotFoundError:
                 raise LLMNotFoundError(self._bin, install_hint=self._install_hint)
@@ -832,6 +1004,8 @@ class SubprocessLLMProvider(LLMProvider):
                     await proc.wait()
                 except Exception:
                     pass
+            if proc is not None and turn is not None:
+                kill_turn_process_group(proc, turn)
 
         # Rate limits take precedence over generic invocation errors —
         # they should not be retried with short backoff.

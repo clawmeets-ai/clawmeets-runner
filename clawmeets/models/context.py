@@ -30,9 +30,10 @@ Optional runtime fields for agent execution:
 from __future__ import annotations
 
 import logging
-import shutil
+import os
 from pathlib import Path
 from typing import Optional
+from urllib.parse import unquote, urlparse
 
 from clawmeets.sync.changelog import (
     BatchTimeoutPayload,
@@ -44,15 +45,19 @@ from clawmeets.sync.changelog import (
     ProjectAllowlistUpdatedPayload,
     ProjectPlanStatePayload,
     ProjectCreatedPayload,
+    ProjectCoordinatorReassignedPayload,
+    ProjectFlagsChangedPayload,
+    ChatroomFlowChangedPayload,
     MessagePayload,
     FilePayload,
     RoomCreatedPayload,
     RoomDeletedPayload,
     ParticipantAddedPayload,
+    ParticipantUpdatedPayload,
     is_contact_id,
 )
 from clawmeets.sync.subscriber import ChangelogSubscriber
-from clawmeets.utils import extra_dirs as extra_dirs_lib
+from clawmeets.utils import extra_dirs as extra_dirs_lib, nofollow_fs
 from clawmeets.utils.file_io import FileUtil
 from .file_cache import ParsedFileCache
 from .project import Project, ProjectState
@@ -215,6 +220,31 @@ class ModelContext:
     def update_git_url(self, git_url: Optional[str]) -> None:
         """Replace the bound git_url. Takes effect on the next LLM invocation."""
         self._git_url = git_url or None
+
+    @property
+    def local_git_repo_dir(self) -> Optional[Path]:
+        """The bound repo's folder when ``git_url`` points at this computer
+        (``file:///abs/path`` or a bare absolute path), else None.
+
+        A push to a local repo is not a network call: git writes objects
+        straight into that folder (and, with ``updateInstead``, its working
+        tree). Providers running with a filesystem sandbox refuse that unless
+        the folder is an allowed dir, so ``Agent._extra_dirs`` adds it. A
+        folder that does not exist is ignored.
+        """
+        url = self._git_url
+        if not url:
+            return None
+        if url.startswith("file://"):
+            parsed = urlparse(url)
+            if parsed.netloc not in ("", "localhost"):
+                return None
+            path = Path(unquote(parsed.path))
+        elif url.startswith("/"):
+            path = Path(url)
+        else:
+            return None
+        return path if path.is_dir() else None
 
     @property
     def storage(self) -> Optional["AgentStorage"]:
@@ -639,6 +669,19 @@ class ModelContextChangelogSubscriber(ChangelogSubscriber):
                 # and the gate is inert. §7.4.
                 await self._handle_project_plan_state(entry)
 
+            case ChangelogEntryType.PROJECT_COORDINATOR_REASSIGNED:
+                await self._handle_project_coordinator_reassigned(entry)
+            case ChangelogEntryType.PROJECT_FLAGS_CHANGED:
+                # Load-bearing on the runner too: it classifies every turn
+                # (full / project / requester) from these flags.
+                await self._handle_project_flags_changed(entry)
+
+            case ChangelogEntryType.CHATROOM_FLOW_CHANGED:
+                await self._handle_chatroom_flow_changed(entry)
+
+            case ChangelogEntryType.PARTICIPANT_UPDATED:
+                await self._handle_participant_updated(entry)
+
             case ChangelogEntryType.BATCH_COMPLETE:
                 pass  # Existing reply-window logic in the chip already covers it
 
@@ -681,6 +724,58 @@ class ModelContextChangelogSubscriber(ChangelogSubscriber):
             agent_names=getattr(payload, "agent_names", []) or [],
             surface=getattr(payload, "surface", "regular"),
             display_name=getattr(payload, "display_name", None),
+            requester_key=getattr(payload, "requester_key", None),
+            memory_excluded=getattr(payload, "memory_excluded", False),
+            remote_content=getattr(payload, "remote_content", False),
+            counterpart_id=getattr(payload, "counterpart_id", None),
+            counterpart_name=getattr(payload, "counterpart_name", None),
+        )
+
+    async def _handle_project_coordinator_reassigned(self, entry: ChangelogEntry) -> None:
+        """The own-coordinator migration (plan-owner-isolation section 4)."""
+        payload: ProjectCoordinatorReassignedPayload = entry.payload  # type: ignore[assignment]
+        try:
+            project = Project.get(self._project_id, self._model_ctx)
+        except ValueError:
+            logger.warning(f"PROJECT_COORDINATOR_REASSIGNED: project {self._project_id[:8]} not found; skipping")
+            return
+        project.state().reassign_coordinator(
+            coordinator_id=payload.coordinator_id, coordinator_name=payload.coordinator_name,
+            counterpart_id=payload.counterpart_id, counterpart_name=payload.counterpart_name,
+        )
+
+    async def _handle_project_flags_changed(self, entry: ChangelogEntry) -> None:
+        """Apply isolation flags to an existing project's meta.json. Only
+        ever sets: see ``ProjectState.set_isolation_flags``."""
+        payload: ProjectFlagsChangedPayload = entry.payload  # type: ignore[assignment]
+        try:
+            project = Project.get(self._project_id, self._model_ctx)
+        except ValueError:
+            logger.warning(
+                f"PROJECT_FLAGS_CHANGED: project {self._project_id[:8]} not found; skipping"
+            )
+            return
+        project.state().set_isolation_flags(
+            requester_key=payload.requester_key,
+            memory_excluded=bool(payload.memory_excluded),
+            remote_content=bool(payload.remote_content),
+        )
+
+    async def _handle_chatroom_flow_changed(self, entry: ChangelogEntry) -> None:
+        """Record a room's inbound flow (stopped / reopened) on its meta.json."""
+        payload: ChatroomFlowChangedPayload = entry.payload  # type: ignore[assignment]
+        room = Chatroom.get(self._project_id, payload.chatroom_name, self._model_ctx)
+        if room is None:
+            logger.warning(
+                f"CHATROOM_FLOW_CHANGED: room {payload.chatroom_name!r} not found in "
+                f"project {self._project_id[:8]}; skipping"
+            )
+            return
+        room.state().set_flow(
+            payload.inbound_flow,
+            stopped_by=payload.stopped_by,
+            reason=payload.reason,
+            at=entry.timestamp,
         )
 
     async def _handle_room_created(self, entry: ChangelogEntry) -> None:
@@ -694,7 +789,9 @@ class ModelContextChangelogSubscriber(ChangelogSubscriber):
 
         # Convert RoomCreatedParticipant list to dict format for ChatroomState.create()
         participants_data = [
-            {"id": p.id, "name": p.name, "external": p.external}
+            {"id": p.id, "name": p.name, "external": p.external,
+             "kind": p.kind, "bridge_state": p.bridge_state,
+             "inactive_reason": p.inactive_reason, "hub": p.hub}
             for p in payload.participants
         ]
 
@@ -736,10 +833,17 @@ class ModelContextChangelogSubscriber(ChangelogSubscriber):
         project_dir = self._model_ctx.project_dir(self._project_id, self._project_name)
         sandbox_dir = self._model_ctx.sandbox_dir(self._project_id, self._project_name)
         meta_dir = self._model_ctx.changelog_dir(self._project_id, self._project_name)
+        # A scoped turn can write the sandbox (``chatrooms -> <agent_dir>``):
+        # nothing is followed, so only the link itself is ever removed.
+        rel = Path("chatrooms") / chatroom_name
         for parent in (project_dir, sandbox_dir, meta_dir):
-            target = parent / "chatrooms" / chatroom_name
-            if target.exists():
-                shutil.rmtree(target)
+            target = parent / rel
+            if os.path.lexists(target):
+                try:
+                    nofollow_fs.remove(parent, rel)
+                except ValueError:  # `..` or an empty part: not a room dir
+                    logger.warning(f"ROOM_DELETED: refusing to remove {target}")
+                    return
                 logger.info(f"ROOM_DELETED: removed {target}")
 
     async def _handle_participant_added(self, entry: ChangelogEntry) -> None:
@@ -764,9 +868,22 @@ class ModelContextChangelogSubscriber(ChangelogSubscriber):
                 payload.participant_name,
                 entry.timestamp,
                 external=getattr(payload, "external", False),
+                stand_in={"kind": payload.kind, "bridge_state": payload.bridge_state,
+                          "inactive_reason": payload.inactive_reason, "hub": payload.hub},
             )
         project = Project.get(self._project_id, self._model_ctx)
         project.state().add_participant(payload.participant_id)
+
+    async def _handle_participant_updated(self, entry: ChangelogEntry) -> None:
+        """Rewrite a stand-in member's bridge state on its PARTICIPANTS row."""
+        payload: ParticipantUpdatedPayload = entry.payload  # type: ignore[assignment]
+        chatroom = Chatroom.get(self._project_id, payload.chatroom_name, self._model_ctx)
+        if chatroom is None:
+            return
+        chatroom.state().update_participant(
+            payload.participant_id, bridge_state=payload.bridge_state,
+            inactive_reason=payload.inactive_reason,
+        )
 
     async def _handle_message(self, entry: ChangelogEntry) -> None:
         """Append message to CHATS.ndjson.
@@ -864,6 +981,7 @@ class ModelContextChangelogSubscriber(ChangelogSubscriber):
             filename=payload.filename,
             version=entry.version,
             source_version=entry.source_version,
+            outside_isolated=payload.outside_isolated,
         )
         chatroom.state().append_file_event(file_event)
 
@@ -889,6 +1007,7 @@ class ModelContextChangelogSubscriber(ChangelogSubscriber):
             responded_participants=list(payload.responded_participants),
             timed_out_participants=list(payload.timed_out_participants),
             offline_participants=list(payload.offline_participants),
+            reason=payload.reason,
             version=entry.version,
             source_version=entry.source_version,
         )
@@ -1033,4 +1152,3 @@ class ModelContextChangelogSubscriber(ChangelogSubscriber):
             cleared_at=payload.cleared_at,
             cleared_through_version=payload.cleared_through_version,
         )
-

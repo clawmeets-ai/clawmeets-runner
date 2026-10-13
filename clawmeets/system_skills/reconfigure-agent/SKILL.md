@@ -5,8 +5,10 @@ description: >
   LLM provider/model, knowledge directory, storage folders, or extra
   directories. Use when the user says things like "point backend-x at
   <repo>", "change your repo to <url>", "use o3 for the analyst", "set your
-  model to ...", "switch your knowledge dir to ...", "let om_assets work in
-  ~/OpenMontage", "give yourself access to <folder>". You perform the change yourself by shelling the
+  model to ...", "turn on smart routing", "try codex first, then claude",
+  "set all my agents to my default model", "switch your knowledge dir to
+  ...", "let om_assets work in ~/OpenMontage", "give yourself access to
+  <folder>". You perform the change yourself by shelling the
   clawmeets CLI and confirm the result. Two modes: reconfigure one of the
   user's OTHER agents (assistant), or reconfigure YOURSELF on the owner's
   request.
@@ -34,7 +36,7 @@ Settings you can change (pass any subset; an empty string clears a key):
 | `--shared-storage-dir` | the shared storage folder (`$AGENT_SHARED_STORAGE_DIR`; default `~/.clawmeets/shared_storage`) |
 | `--add-extra-dir` / `--remove-extra-dir` | add or drop one existing folder the agent also works in, e.g. a tool checkout like `~/OpenMontage`, keeping the rest. Repeatable. Prefer these. |
 | `--extra-dir` | **replace** the whole extra-directory list (repeat for several); `--extra-dir ""` clears it |
-| `--llm-provider` | LLM backend (claude / openai / gemini / opencode / `antigravity` / *-api) |
+| `--llm-provider` | LLM backend (claude / openai / gemini / opencode / `antigravity` / *-api) — see **Models** below; prefer `clawmeets model-config` |
 | `--llm-model` | provider-specific model |
 | `--llm-api-key` | BYO key for a `-api` provider |
 | `--llm-base-url` | local-model endpoint — for `openai-api` an OpenAI-compatible URL (ollama `http://localhost:11434/v1`, vLLM, LM Studio); for the `claude` CLI a local Anthropic Messages-API URL (ollama `http://localhost:11434` — no `/v1`, or a gateway) |
@@ -42,6 +44,47 @@ Settings you can change (pass any subset; an empty string clears a key):
 
 Changes take effect on the target's **next** turn (existing in-flight work is
 unaffected).
+
+## Models: named configs and smart routing
+
+An agent's model is a list of **named model configs**. One of them answers:
+either a single model, or **smart routing**, which tries the configs in list
+order and moves on when one fails. Read before you change:
+```bash
+clawmeets model-config list <agent|self>
+```
+
+| Ask | Command |
+|---|---|
+| "use o3 for the analyst" | `clawmeets model-config add analyst o3 --provider openai --model o3 --default` (or `default analyst <existing name>`) |
+| "turn on / off smart routing" | `clawmeets model-config smart <agent> on` / `off` |
+| "try codex first, then claude" | `clawmeets model-config order <agent> openai claude` (names first; the rest keep their order) |
+| change one route's model | `clawmeets model-config edit <agent> <name> --model <m>` |
+| drop a route | `clawmeets model-config remove <agent> <name>` |
+| "try at most 2", "rest a failed model 15 min" | `clawmeets model-config routing <agent> --max-attempts 2 --cooldown 900` |
+| "put the analyst back on my default" (assistant only) | `clawmeets model-config reset <agent>` |
+
+`--llm-provider` / `--llm-model` on `agent reconfigure` still work and edit
+these same configs (they print the `model-config` command they ran). Under
+smart routing `--llm-model` alone is refused — name the route with
+`model-config edit`. `--llm-provider` on a smart agent turns smart routing
+off; say so when you confirm.
+
+**The owner's default model** (assistant only — an agent's own token cannot
+reach it). New agents start with a copy of it; changing it does not change
+existing agents until you apply it:
+```bash
+clawmeets model-default show
+clawmeets model-default set claude openai gemini     # smart routing in this order
+clawmeets model-default set gemini --single          # one model
+clawmeets model-default apply --dry-run              # who would change
+clawmeets model-default apply                        # copy it onto the user's agents
+```
+`apply` skips the "Model agents" team (each exists to be one model; add
+`--include-model-agents` only if the user asks), keeps any config holding an
+API key after the default's, and lists every agent it changed. Run
+`--dry-run` first and tell the user which agents will change before applying.
+The default stores no API keys: a `-api` provider is added per agent.
 
 **Extra directories:** the agent keeps its own per-project sandbox as its
 working directory; each extra directory is added on top, the same way for every
@@ -102,9 +145,11 @@ own config — don't let them.
 
 When the guard passes:
 ```bash
-clawmeets agent reconfigure self --llm-model gemini-2.5-pro
+clawmeets model-config list self
+clawmeets model-config add self gemini-pro --provider gemini --model gemini-2.5-pro --default
 ```
-Then confirm: "Done — I'll use `gemini-2.5-pro` from my next turn."
+Then confirm: "Done — I'll use `gemini-2.5-pro` from my next turn." You can
+change only your own model configs, never your owner's default.
 
 ## API keys
 

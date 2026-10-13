@@ -13,7 +13,7 @@ import logging
 from pathlib import Path
 from typing import Callable
 
-from .runloop import ChangelogRunloop
+from .runloop import AppendGuard, ChangelogRunloop
 from .subscriber import ChangelogSubscriber
 
 logger = logging.getLogger(__name__)
@@ -60,6 +60,8 @@ class ChangelogRunloopManager:
                 Returns (changelog_dir, subscribers) for the new runloop.
         """
         self._runloop_factory = runloop_factory
+        # Server only (see ``set_append_guard``); the runner never sets one.
+        self._append_guard: AppendGuard | None = None
         self._runloops: dict[str, ChangelogRunloop] = {}
         # Guards ONLY the _runloops/_create_locks dicts. Never held across an
         # awaited runloop operation (load_state/save_state/processing) — doing
@@ -70,6 +72,14 @@ class ChangelogRunloopManager:
         # SAME project without serializing different projects (and without
         # holding the global lock across load_state()).
         self._create_locks: dict[str, asyncio.Lock] = {}
+
+    def set_append_guard(self, guard: AppendGuard | None) -> None:
+        """Install the check every append of every runloop runs first (the
+        server's ingress guard, ``server/inspection.py``). Applies to runloops
+        already created and to every one created after."""
+        self._append_guard = guard
+        for runloop in self._runloops.values():
+            runloop._append_guard = guard
 
     async def get_or_create(
         self,
@@ -118,6 +128,7 @@ class ChangelogRunloopManager:
                 project_id=project_id,
                 project_name=project_name,
                 changelog_dir=changelog_dir,
+                append_guard=self._append_guard,
             )
 
             for subscriber in subscribers:

@@ -35,6 +35,16 @@ class PendingWork(BaseModel):
     responded_participants: list[str] = Field(default_factory=list)  # Participant IDs who have responded
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     timeout_seconds: int = 1800        # Default 30 minutes
+    #: The timer waits: the message has not reached its target yet (it is
+    #: queued for delivery somewhere the server cannot see). Until
+    #: ``start_timer``, no timeout runs; a ceiling counted from
+    #: ``awaiting_since`` still applies (the checker's policy).
+    awaiting_delivery: bool = False
+    awaiting_since: Optional[datetime] = None
+    #: When the timer started, if later than ``created_at`` (``start_timer``).
+    timer_started_at: Optional[datetime] = None
+    managed_job_id: str | None = None
+    managed_job_lease_expires_at: datetime | None = None
 
     @property
     def is_complete(self) -> bool:
@@ -86,6 +96,7 @@ class WorkTracker:
         coordinator_id: str,
         expected_participants: list[str],
         timeout_seconds: int = 1800,
+        awaiting_delivery: bool = False,
     ) -> PendingWork:
         key = (project_id, chatroom_name)
         async with self._lock:
@@ -93,6 +104,7 @@ class WorkTracker:
                 raise ValueError(
                     f"Pending work already exists for ({project_id!r}, {chatroom_name!r})"
                 )
+            now = datetime.now(UTC)
             work = PendingWork(
                 message_id=message_id,
                 message_version=message_version,
@@ -101,12 +113,30 @@ class WorkTracker:
                 chatroom_name=chatroom_name,
                 coordinator_id=coordinator_id,
                 expected_participants=expected_participants,
+                created_at=now,
                 timeout_seconds=timeout_seconds,
+                awaiting_delivery=awaiting_delivery,
+                awaiting_since=now if awaiting_delivery else None,
             )
             self._pending[key] = work
         await self._emit_change(
             project_id, chatroom_name, list(work.expected_participants)
         )
+        return work
+
+    async def start_timer(self, project_id: str, chatroom_name: str) -> Optional[PendingWork]:
+        """The message reached its target: the paused batch's timer starts now
+        (its elapsed time counts from here, not from ``created_at``). None
+        when no batch is open; a batch that was not paused is left as is."""
+        key = (project_id, chatroom_name)
+        async with self._lock:
+            work = self._pending.get(key)
+            if work is None or not work.awaiting_delivery:
+                return work
+            work = work.model_copy(update={
+                "awaiting_delivery": False, "timer_started_at": datetime.now(UTC),
+            })
+            self._pending[key] = work
         return work
 
     async def get_pending_work(
@@ -286,6 +316,50 @@ class WorkTracker:
         )
         return work
 
+    async def restore_awaiting_delivery(
+        self,
+        *,
+        message_id: str,
+        message_version: int,
+        project_id: str,
+        project_name: str,
+        chatroom_name: str,
+        coordinator_id: str,
+        expected_participants: list[str],
+        awaiting_since: datetime,
+        timeout_seconds: int = 1800,
+        timer_started_at: Optional[datetime] = None,
+    ) -> PendingWork:
+        """Reopen a batch paused on a delivery after a server restart (the
+        tracker is in memory). ``awaiting_since`` is when it first began
+        waiting, so a restart never resets the ceiling counted from it.
+        ``timer_started_at``: the message had already reached its target then,
+        so the batch is not paused and its timer runs from that time (a
+        restart does not restart it). Idempotent: an open batch for the room
+        is returned as it is."""
+        key = (project_id, chatroom_name)
+        async with self._lock:
+            work = self._pending.get(key)
+            if work is not None:
+                return work
+            work = PendingWork(
+                message_id=message_id,
+                message_version=message_version,
+                project_id=project_id,
+                project_name=project_name,
+                chatroom_name=chatroom_name,
+                coordinator_id=coordinator_id,
+                expected_participants=expected_participants,
+                created_at=awaiting_since,
+                timeout_seconds=timeout_seconds,
+                awaiting_delivery=timer_started_at is None,
+                awaiting_since=awaiting_since,
+                timer_started_at=timer_started_at,
+            )
+            self._pending[key] = work
+        await self._emit_change(project_id, chatroom_name, list(work.expected_participants))
+        return work
+
     async def remap_expected(
         self, project_id: str, chatroom_name: str, mapping: dict[str, str]
     ) -> None:
@@ -324,6 +398,46 @@ class WorkTracker:
             existed = self._pending.pop((project_id, chatroom_name), None) is not None
         if existed:
             await self._emit_change(project_id, chatroom_name, [])
+
+    async def attach_managed_job(
+        self,
+        project_id: str,
+        chatroom_name: str,
+        *,
+        message_id: str,
+        job_id: str,
+        lease_expires_at: datetime,
+    ) -> PendingWork:
+        """Attach a server-authenticated job lease to the matching open batch."""
+        async with self._lock:
+            key = (project_id, chatroom_name)
+            work = self._pending.get(key)
+            if work is None or work.message_id != message_id:
+                raise ValueError("matching pending work is no longer open")
+            if work.managed_job_id and work.managed_job_id != job_id:
+                raise ValueError("pending work already has a managed job")
+            work = work.model_copy(update={
+                "managed_job_id": job_id,
+                "managed_job_lease_expires_at": lease_expires_at,
+            })
+            self._pending[key] = work
+            return work
+
+    async def renew_from_managed_job(
+        self,
+        project_id: str,
+        chatroom_name: str,
+        job_id: str,
+        lease_expires_at: datetime,
+    ) -> PendingWork | None:
+        async with self._lock:
+            key = (project_id, chatroom_name)
+            work = self._pending.get(key)
+            if work is None or work.managed_job_id != job_id:
+                return None
+            work = work.model_copy(update={"managed_job_lease_expires_at": lease_expires_at})
+            self._pending[key] = work
+            return work
 
     async def clear_project(self, project_id: str) -> None:
         """Remove all pending work for a project."""

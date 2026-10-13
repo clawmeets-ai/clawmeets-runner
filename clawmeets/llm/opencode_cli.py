@@ -52,7 +52,9 @@ from .base import (
     PreparedInvocation,
     SubprocessLLMProvider,
     materialize_skill_tree,
+    scratch_dir,
 )
+from ..utils import nofollow_fs
 from .pricing import price_usd
 from ..utils.file_io import FileUtil
 
@@ -115,10 +117,9 @@ def _write_opencode_mcp_config(mcp_config_dir: Optional[Path], working_dir: Path
     translated = _translate_mcp_to_opencode(servers) if servers else {}
     if not translated:
         return
-    FileUtil.write(
-        working_dir / "opencode.json",
-        {"$schema": "https://opencode.ai/config.json", "mcp": translated},
-        "json",
+    nofollow_fs.write_text(
+        working_dir, "opencode.json",
+        json.dumps({"$schema": "https://opencode.ai/config.json", "mcp": translated}, indent=2),
     )
 
 
@@ -131,6 +132,7 @@ class OpenCodeCLI(SubprocessLLMProvider):
     _provider_name = "OpenCode"
     _log_tag = "opencode-invoke"
     _install_hint = _INSTALL_HINT
+    _turn_provider = "opencode"
 
     def __init__(
         self,
@@ -217,10 +219,7 @@ class OpenCodeCLI(SubprocessLLMProvider):
         # personal skills are present; the prompt also carries absolute paths
         # opencode can read directly.
         if skill_source_dirs is not None:
-            materialize_skill_tree(
-                working_dir / ".agents" / "skills",
-                skill_source_dirs,
-            )
+            materialize_skill_tree(working_dir, ".agents/skills", skill_source_dirs)
 
         # Translate installed MCP servers (rendered Claude `.mcp.json`) into
         # opencode's own `opencode.json` project config, which it reads from the
@@ -229,9 +228,7 @@ class OpenCodeCLI(SubprocessLLMProvider):
 
         full_prompt = prompt + _JSON_ONLY_SUFFIX
 
-        prompt_file = working_dir / ".agent-prompt.txt"
-        prompt_file.write_text(full_prompt, encoding="utf-8")
-        prompt_file_abs = str(prompt_file.resolve())
+        prompt_file_abs = str(nofollow_fs.write_text(scratch_dir(working_dir), ".agent-prompt.txt", full_prompt))
         cwd = str(working_dir)
 
         # Prompt rides as a positional arg (no stdin); --format json streams

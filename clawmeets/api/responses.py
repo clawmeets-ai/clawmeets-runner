@@ -19,7 +19,7 @@ from pydantic import BaseModel, ConfigDict, Field
 # (not imported) because api/ is Layer 0 and must not depend on models/. Used
 # as a Literal so a bad ``provider`` yields a Pydantic list-shape 422.
 _CONFIG_PROVIDER = Literal[
-    "claude", "openai", "gemini", "opencode", "antigravity",
+    "smart", "claude", "openai", "gemini", "opencode", "antigravity",
     "claude-api", "openai-api", "gemini-api", "openrouter-api", "openrouter-native",
 ]
 _CONFIG_NAME_PATTERN = r"^[A-Za-z0-9 _-]+$"
@@ -80,6 +80,15 @@ class AgentResponse(BaseModel):
     model_configs: list[dict] = Field(default_factory=list)
     default_model_config_name: Optional[str] = None
     last_reflected_at: Optional[datetime] = None  # Last successful reflection cycle
+    # True when the VIEWING user owns this agent, so the home-folder navigator
+    # (/agents/{id}/fs/*) can be offered. Viewer-relative, set by the
+    # GET /agents routes; never stored on a card. Hub stand-ins are not in
+    # this roster (RetainedAgent carries its own, always false).
+    home_folder_browsable: bool = False
+    # plan-owner-isolation: the owner's stored "runs in its own environment"
+    # choice, and the owner-isolated agent whose exposed host refused this one.
+    owner_isolated: bool = False
+    blocked_by_exposed_host: Optional[str] = None
 
 
 class ModelConfig(BaseModel):
@@ -140,10 +149,30 @@ class ModelConfigPatch(BaseModel):
     api_key: Optional[str] = None
 
 
+class SmartRoutingSettings(BaseModel):
+    """Smart-routing behaviour knobs (stored in ``local_settings.smart_*``)."""
+    max_attempts: int = 3
+    cooldown_seconds: int = 300
+
+
 class ModelConfigList(BaseModel):
-    """GET / set-default response — the configs plus the default name."""
+    """GET / set-default / reorder / routing response — the configs (in
+    routing-priority order), the default name, and the smart-routing knobs."""
     configs: list[ModelConfig] = Field(default_factory=list)
     default: Optional[str] = None
+    routing: SmartRoutingSettings = Field(default_factory=SmartRoutingSettings)
+
+
+class ModelConfigOrderBody(BaseModel):
+    """PUT .../model-configs/order body — every config name, highest priority first."""
+    names: list[str]
+
+
+class SmartRoutingPatch(BaseModel):
+    """PUT .../model-configs/routing body — omitted fields stay unchanged.
+    Bounds are enforced in ``model_config.set_routing_settings`` (422)."""
+    max_attempts: Optional[int] = None
+    cooldown_seconds: Optional[int] = None
 
 
 class SetDefaultBody(BaseModel):
@@ -171,6 +200,9 @@ class AgentRegistrationResponse(BaseModel):
     """
     agent_id: str
     agent_name: str
+    # The registering user. Written onto the runner's own card, so the agent
+    # reads its own owner without waiting for a settings sync.
+    registered_by: Optional[str] = None
     token: Optional[str] = None
     description: str
     status: AgentStatus = AgentStatus.OFFLINE
@@ -289,6 +321,11 @@ class ParticipantProjectResponse(BaseModel):
     status: str
     current_version: int
     coordinator_id: str
+    #: The outside party of a requester end (hub stand-in or another account's
+    #: agent); the owning user is its coordinator (plan-owner-isolation). The
+    #: browser classifies requester threads by ``counterpart_id ?? coordinator_id``.
+    counterpart_id: Optional[str] = None
+    counterpart_name: Optional[str] = None
     is_viewer: bool = False
     created_by: str
     surface: Optional[str] = None  # "regular" | "dm"
@@ -297,3 +334,6 @@ class ParticipantProjectResponse(BaseModel):
     report_published_at: Optional[datetime] = None  # Same meaning as Project.report_published_at: ISO ts string | null, non-null EXACTLY when the project has a real completion report. Present on every row of the desk's list (GET /participants/{id}/projects).
     plan_updated_at: Optional[datetime] = None  # Same meaning as Project.plan_updated_at: when PLAN.md or its sidecar last moved. From meta.json — no extra read.
     plan: Optional[PlanSummary] = None  # D23, §6.2. ABSENT means: this project has no plan at all (a DM, or a pre-feature project with no PLAN.md).
+    #: A hub requester thread's target (the server's hub browser contract,
+    #: ``HubTarget``); None on every other project.
+    hub_target: Optional[dict] = None
