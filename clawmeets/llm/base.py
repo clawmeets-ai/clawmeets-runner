@@ -409,6 +409,16 @@ class LLMProvider(ABC):
     _log_tag: str = ""
     _install_hint: str = ""
 
+    # True when the backend itself loads ``CLAUDE.md`` from the knowledge dir
+    # as project instructions, so the prompt need not point at that file.
+    auto_loads_claude_md: bool = False
+
+    def disable_web(self) -> bool:
+        """Turn off web search and fetch for later invocations (evals compare
+        agents with web off). Returns False when this backend cannot, so the
+        caller must check each run's tool telemetry instead."""
+        return False
+
     @classmethod
     @abstractmethod
     def verify_cli(cls) -> None:

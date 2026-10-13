@@ -185,6 +185,11 @@ class ModelContext:
         self._cli = cli
 
     @property
+    def cli_auto_loads_claude_md(self) -> bool:
+        """The current provider loads the knowledge dir's ``CLAUDE.md`` itself."""
+        return bool(getattr(self._cli, "auto_loads_claude_md", False))
+
+    @property
     def file_cache(self) -> ParsedFileCache:
         """Stat-validated cache of parsed ``meta.json`` / ``card.json`` dicts,
         shared by every scan through this context (see ``models/file_cache``)."""

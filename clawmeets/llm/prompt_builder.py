@@ -203,6 +203,7 @@ def _build_runtime_context(
     roster_path: Optional[Path] = None,
     storage: Optional[AgentStorage] = None,
     extra_dirs: list[Path] | None = None,
+    role_autoloaded: bool = False,
     turn_kind: str = "full",
 ) -> str:
     """Compact `== FILES & STATE ==` block listing all the paths the agent
@@ -262,9 +263,30 @@ def _build_runtime_context(
         lines.append(
             f"- User-curated reference material (read-only): {kd}"
         )
+        for d in knowledge_dirs:
+            line = _role_file_line(d, role_autoloaded)
+            if line:
+                lines.append(line)
     for d in extra_dirs or []:
         lines.append(_extra_dir_line(d))
     return "\n".join(lines)
+
+
+def _role_file_line(knowledge_dir: Path, role_autoloaded: bool) -> Optional[str]:
+    """A FILES & STATE line pointing at the knowledge dir's ``CLAUDE.md`` (an
+    installed pool agent's role lives at ``knowledge/CLAUDE.md``). Only the
+    Claude CLI auto-loads it from there, and the reference index skips it by
+    name, so without this line every other provider never sees the role.
+    Only ``CLAUDE.md`` is named: an AGENTS.md or GEMINI.md beside it stays an
+    ordinary reference file and must not be promoted to standing instructions.
+    Omitted when the file is missing or the backend already loaded it."""
+    role = knowledge_dir / "CLAUDE.md"
+    if role_autoloaded or not role.is_file():
+        return None
+    return (
+        f"- Your role and standing instructions: {role}  (read it before your first "
+        "action; where it conflicts with your output contract here, this prompt wins)"
+    )
 
 
 def _extra_dir_line(extra_dir: Path) -> str:
@@ -852,6 +874,7 @@ class PromptBuilder:
     _git_url: Optional[str] = None
     _storage: Optional[AgentStorage] = None
     _extra_dirs: "list[Path] | tuple[()]" = ()
+    _role_autoloaded: bool = False
 
     #: "full" | "project" | "requester". Set by ``create_prompt_builder``.
     turn_kind: str = "full"
@@ -923,6 +946,7 @@ class PromptBuilder:
             storage=self._storage,
             extra_dirs=self._extra_dirs if self.turn_kind == "full" else None,
             turn_kind=self.turn_kind,
+            role_autoloaded=self._role_autoloaded,
             # Only coordinators that actually delegate need the roster path. The
             # roster is the GLOBAL agent registry at the agent root — NOT inside
             # the synced project files (a frequent prompt-vs-reality mismatch that
@@ -988,12 +1012,14 @@ class WorkerPromptBuilder(PromptBuilder):
         git_url: Optional[str] = None,
         storage: Optional[AgentStorage] = None,
         extra_dirs: Optional[list[Path]] = None,
+        role_autoloaded: bool = False,
     ) -> None:
         self._coordinator_name = coordinator_name
         self._capabilities = capabilities or []
         self._git_url = git_url
         self._storage = storage
         self._extra_dirs = list(extra_dirs or [])
+        self._role_autoloaded = role_autoloaded
         self._is_dm = False
         # set per-build; None on a DM and on any project with no seeded plan.
         self._plan: Optional[PlanPromptState] = None
@@ -1191,10 +1217,12 @@ class CoordinatorPromptBuilder(PromptBuilder):
         git_url: Optional[str] = None,
         storage: Optional[AgentStorage] = None,
         extra_dirs: Optional[list[Path]] = None,
+        role_autoloaded: bool = False,
     ) -> None:
         self._git_url = git_url
         self._storage = storage
         self._extra_dirs = list(extra_dirs or [])
+        self._role_autoloaded = role_autoloaded
         self._is_dm = False
         # True when the DM-shaped project is the user's own assistant DM
         # (project.created_by == coordinator.registered_by). False for an
@@ -2377,6 +2405,7 @@ def create_prompt_builder(
     git_url: Optional[str] = None,
     storage: Optional[AgentStorage] = None,
     extra_dirs: Optional[list[Path]] = None,
+    role_autoloaded: bool = False,
     turn_kind: str = "full",
 ) -> PromptBuilder:
     """Create a prompt builder based on operational mode.
@@ -2391,6 +2420,8 @@ def create_prompt_builder(
             FILES & STATE. None off the runner.
         extra_dirs: Existing folders the agent works in alongside its
             sandbox, each listed in FILES & STATE with its instruction file.
+        role_autoloaded: The provider already loads the knowledge dir's
+            ``CLAUDE.md`` itself, so FILES & STATE does not point at it.
         turn_kind: "full" | "project" | "requester" (models/project.turn_kind).
             A scoped turn's prompt omits what its sandbox denies: private
             memory and the memory-write triggers (``_assemble``).
@@ -2401,6 +2432,7 @@ def create_prompt_builder(
     if mode == OperationalMode.COORDINATOR:
         builder: PromptBuilder = CoordinatorPromptBuilder(
             git_url=git_url, storage=storage, extra_dirs=extra_dirs,
+            role_autoloaded=role_autoloaded,
         )
         builder.turn_kind = turn_kind
         return builder
@@ -2412,6 +2444,7 @@ def create_prompt_builder(
         git_url=git_url,
         storage=storage,
         extra_dirs=extra_dirs,
+        role_autoloaded=role_autoloaded,
     )
     builder.turn_kind = turn_kind
     return builder

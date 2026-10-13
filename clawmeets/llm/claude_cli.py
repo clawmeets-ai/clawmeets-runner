@@ -49,6 +49,7 @@ class ClaudeCLI(SubprocessLLMProvider):
     # Bedrock, Vertex).
     _text_env_prefixes = ("ANTHROPIC_", "CLAUDE_", "AWS_", "CLOUD_ML_", "GOOGLE_")
     _install_hint = "Install Claude Code: https://docs.anthropic.com/claude-code"
+    auto_loads_claude_md = True
     _turn_provider = "claude"
 
     def __init__(
@@ -99,6 +100,7 @@ class ClaudeCLI(SubprocessLLMProvider):
         self._claude_plugin_dirs = claude_plugin_dirs or []
         self._agent_env = dict(agent_env)
         self._model = model
+        self._disallowed_tools: list[str] = []
         self._base_url = base_url or None
         self._api_key = api_key or None
 
@@ -207,6 +209,9 @@ class ClaudeCLI(SubprocessLLMProvider):
         if self._model:
             cmd.extend(["--model", self._model])
 
+        if self._disallowed_tools:
+            cmd.extend(["--disallowedTools", ",".join(self._disallowed_tools)])
+
         for d in additional_dirs:
             cmd.extend(["--add-dir", str(d.expanduser().resolve())])
 
@@ -231,6 +236,16 @@ class ClaudeCLI(SubprocessLLMProvider):
             prompt_file_abs=prompt_file_abs,
             stdin_bytes=prompt.encode("utf-8"),
         )
+
+    # Deny rules for the common network clients a Bash call could reach for
+    # once the web tools are gone. Prefix rules (``Bash(cmd:*)``) only; the
+    # eval harness still screens every shell command, since a deny list
+    # cannot catch ``python -c 'import urllib...'`` and the like.
+    _NETWORK_BASH_DENY = ("Bash(curl:*)", "Bash(wget:*)", "Bash(nc:*)", "Bash(ncat:*)")
+
+    def disable_web(self) -> bool:
+        self._disallowed_tools = ["WebSearch", "WebFetch", *self._NETWORK_BASH_DENY]
+        return True
 
     def _prepare_text_invocation(
         self, prompt: str, working_dir: Path, max_tokens: int

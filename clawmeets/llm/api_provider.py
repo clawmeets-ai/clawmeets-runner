@@ -857,6 +857,10 @@ class ApiLLMProvider(LLMProvider):
             return min(self._web_fetch_max_uses, self._coordinator_web_max_uses)
         return self._web_fetch_max_uses
 
+    def disable_web(self) -> bool:
+        self._enable_web = False
+        return True
+
     def _web_capabilities(self, is_coordinator: bool) -> list:
         """Provider-aware web search/fetch capabilities for one invocation.
 

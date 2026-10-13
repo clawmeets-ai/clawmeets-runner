@@ -1620,6 +1620,7 @@ class Agent(PersistableParticipant):
             git_url=self._model_ctx.git_url,
             storage=self._model_ctx.storage,
             extra_dirs=self._model_ctx.extra_dirs,
+            role_autoloaded=self._model_ctx.cli_auto_loads_claude_md,
             turn_kind=turn_kind(project),
         )
 
@@ -2462,6 +2463,7 @@ class Agent(PersistableParticipant):
             git_url=self._model_ctx.git_url,
             storage=self._model_ctx.storage,
             extra_dirs=self._model_ctx.extra_dirs,
+            role_autoloaded=self._model_ctx.cli_auto_loads_claude_md,
             turn_kind=turn_kind(project),
         )
         assert isinstance(coordinator_builder, CoordinatorPromptBuilder)
@@ -2559,6 +2561,7 @@ class Agent(PersistableParticipant):
             git_url=self._model_ctx.git_url,
             storage=self._model_ctx.storage,
             extra_dirs=self._model_ctx.extra_dirs,
+            role_autoloaded=self._model_ctx.cli_auto_loads_claude_md,
             turn_kind=turn_kind(project),
         )
         assert isinstance(coordinator_builder, CoordinatorPromptBuilder)
@@ -2708,6 +2711,7 @@ class Agent(PersistableParticipant):
             git_url=self._model_ctx.git_url,
             storage=self._model_ctx.storage,
             extra_dirs=self._model_ctx.extra_dirs,
+            role_autoloaded=self._model_ctx.cli_auto_loads_claude_md,
             turn_kind=turn_kind(project),
         )
         assert isinstance(prompt_builder, CoordinatorPromptBuilder)

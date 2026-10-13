@@ -89,6 +89,7 @@ from clawmeets.llm.antigravity_cli import AntigravityCLI
 from clawmeets.models.context import ModelContext
 from clawmeets.models.model_config import VALID_CONFIG_PROVIDERS, routing_settings
 from clawmeets.models import provider_agents
+from clawmeets.models import agent_bundle
 from clawmeets.models.provider_agents import ProviderAgent
 from clawmeets.models.agent import Agent
 from clawmeets.models.user import User, NotificationConfig
@@ -4461,8 +4462,12 @@ def _write_agent_card(
     registered_by: Optional[str] = None,
     user_teams: Optional[list[str]] = None,
     local_settings: Optional[dict] = None,
+    pool: Optional[str] = None,
 ) -> Path:
-    """Write a card.json for an agent. Returns the path written."""
+    """Write a card.json for an agent. Returns the path written.
+
+    ``pool`` marks an agent installed from a specialist pool (the setup.json
+    entry's ``pool``); a re-install only takes over agents carrying it."""
     card: dict = {
         "id": agent_id,
         "name": agent_name,
@@ -4478,6 +4483,8 @@ def _write_agent_card(
         card["user_teams"] = list(user_teams)
     if local_settings:
         card["local_settings"] = dict(local_settings)
+    if pool:
+        card["pool"] = pool
     card_path = agent_dir / "card.json"
     card_path.write_text(json.dumps(card, indent=2, default=str))
     _provision_agent_home(agent_dir, local_settings)
@@ -4996,6 +5003,7 @@ def _register_one_worker(
         registered_by=result.get("registered_by"),
         user_teams=final_teams or None,
         local_settings=local_settings or None,
+        pool=agent.get("pool"),
     )
 
     # MCPs + skills declared in setup.json: same HTTP path the web UI uses.
@@ -5241,6 +5249,81 @@ def agent_provider_list(
         typer.echo(f"  {agent.name:12s} {agent.label:16s} {status}")
 
 
+def _check_pool_entries(
+    client: httpx.Client, token: str, entries: list[dict], agents_dir: Path,
+) -> list[str]:
+    """Names of bundle-carrying entries that must not be registered: a bundle
+    with no ``pool``, one whose ``knowledge_dir`` is not ``./knowledge`` (the
+    role would land outside it), or a name the user already gave an agent they made themselves.
+
+    Runs before any ``POST /agents/register``, because the server's re-register
+    is an upsert: registering first would already have taken the agent over.
+    An agent counts as installed from this pool when its card's ``pool`` or
+    its install record's ``pool`` equals the entry's, so a retry after a
+    failed install is allowed and another pool's agent is not.
+    """
+    refused: list[str] = []
+    pool_entries = [e for e in entries if e.get("bundle")]
+    for entry in pool_entries:
+        problem = None
+        if not isinstance(entry.get("pool"), str) or not entry["pool"]:
+            problem = "a bundle needs a non-empty \"pool\""
+        elif entry.get("knowledge_dir") != "./knowledge":
+            problem = (
+                f"a bundle needs knowledge_dir \"./knowledge\" (got {entry.get('knowledge_dir')!r})"
+            )
+        else:
+            try:
+                agent_bundle.check_bundle(entry["bundle"])
+            except agent_bundle.BundleError as e:
+                problem = str(e)
+        if problem:
+            typer.echo(f"  Refused '{entry['name']}': {problem}.", err=True)
+            refused.append(entry["name"])
+    if len(refused) == len(pool_entries):
+        return refused
+    owned, username = _owned_agents_by_name(client, token)
+    for entry in pool_entries:
+        if entry["name"] in refused:
+            continue
+        existing = owned.get(f"{username}-{entry['name']}")
+        if existing is None:
+            continue
+        home = agents_dir / f"{existing['name']}-{existing['id']}"
+        card = FileUtil.read(home / "card.json", format="json", default={}) or {}
+        if entry.get("pool") and entry["pool"] in (card.get("pool"), agent_bundle.installed_pool(home)):
+            continue
+        typer.echo(
+            f"  Refused '{entry['name']}': you already have an agent named "
+            f"'{existing['name']}', and no record on this computer shows it was "
+            "installed from this pool (it may be your own agent, from another pool, "
+            "or installed on another computer). Rename or delete it to install this one.",
+            err=True,
+        )
+        refused.append(entry["name"])
+    return refused
+
+
+def _install_agent_bundle(
+    entry: dict, agent_home: Path, template_base: str, *, overwrite_local: bool,
+) -> bool:
+    """Fetch and place a pool entry's bundle into its agent home. A failure is
+    a warning: the registered agent stays, and a re-run retries the install.
+    Fetched with a plain client: the server client's default headers carry
+    the agent identity, which must not go to a third-party host."""
+    try:
+        with httpx.Client() as http:
+            files = agent_bundle.fetch_bundle(entry["bundle"], template_base, http=http)
+        report = agent_bundle.install_bundle(
+            files, agent_home, pool=entry["pool"], overwrite_local=overwrite_local,
+        )
+    except agent_bundle.BundleError as e:
+        typer.echo(f"    Warning: bundle for '{entry['name']}' not installed: {e}", err=True)
+        return False
+    typer.echo(f"    Bundle: {report.summary()}")
+    return True
+
+
 @agent_team_app.command("register")
 def agent_team_register(
     url: str = typer.Argument(..., help="URL or path to setup.json template"),
@@ -5291,8 +5374,18 @@ def agent_team_register(
         help="Fan out personalize-trigger DMs to each worker after "
              "registering so they self-personalize. Off by default.",
     ),
+    overwrite_local: bool = typer.Option(
+        False, "--overwrite-local",
+        help="Overwrite bundle files changed locally since install (default: keep them). "
+             "A bundle file you deleted is reinstalled either way.",
+    ),
 ):
     """Bulk-register a team of worker agents from a setup.json template.
+
+    Entries carrying a ``bundle`` (the specialist agent pool) also get their
+    role, field knowledge, reference material and private skills copied into
+    the agent's home. Re-running keeps bundle files changed locally since the
+    last install unless --overwrite-local, and never deletes anything.
 
     Personalize-trigger DMs are posted into each registered worker's per-agent
     DM project (`user-communication`) only when `--auto-personalize` is passed,
@@ -5358,15 +5451,29 @@ def agent_team_register(
     agents_dir = Path(data_dir).expanduser() / "agents"
 
     registered_names: list[str] = []
+    failed: list[str] = []
+    template_base = agent_bundle.template_base_of(url)
     with _http(server) as client:
+        refused = set(_check_pool_entries(client, token, agents_list, agents_dir))
+        failed.extend(sorted(refused))
         for entry in agents_list:
+            if entry["name"] in refused:
+                continue
             result = _register_one_worker(
                 client, token, entry, agents_dir,
                 llm_provider_override=llm_provider,
                 llm_base_url_override=llm_base_url,
             )
-            if result is not None:
-                registered_names.append(result.get("agent_name") or entry["name"])
+            if result is None:
+                failed.append(entry["name"])
+                continue
+            registered_name = result.get("agent_name") or entry["name"]
+            registered_names.append(registered_name)
+            if entry.get("bundle") and not _install_agent_bundle(
+                entry, agents_dir / f"{registered_name}-{result['agent_id']}", template_base,
+                overwrite_local=overwrite_local,
+            ):
+                failed.append(entry["name"])
 
         if auto_personalize and registered_names:
             typer.echo("\n  Posting personalize-trigger DMs...")
@@ -5376,4 +5483,7 @@ def agent_team_register(
                 ):
                     typer.echo(f"    -> {worker_name}")
 
+    if failed:
+        typer.echo(f"\nNot fully installed: {', '.join(failed)}. Fix the above and re-run.", err=True)
+        raise typer.Exit(1)
     typer.echo("\nDone. Run `clawmeets start` to bring your agents online.")
