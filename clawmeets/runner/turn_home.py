@@ -15,6 +15,13 @@ the whole tree.
 ``environment`` builds the turn's environment from ``{}``. It never copies the
 runner's ``os.environ``; it only reads the few allowlisted variable NAMES out of
 it (PATH, LANG, LC_*, TERM, TZ). Everything else is set explicitly.
+
+On macOS the home also carries ``shims/``: stand-ins for system tools the
+sandbox refuses to exec, placed first on ``PATH``. Claude Code shells
+``security`` at start to read its login from the keychain; with the real tool
+denied, the refused spawn crashes it, while "item not found" makes it fall back
+to the placeholder key the model-auth proxy gives the turn. The sandbox profile
+lets the turn exec these files and never write to them.
 """
 from __future__ import annotations
 
@@ -23,6 +30,7 @@ import os
 import secrets
 import shutil
 import stat
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Mapping, Optional
@@ -54,6 +62,15 @@ _SEED: Mapping[str, tuple[str, str]] = {
 }
 
 _DIR_MODE = stat.S_IRWXU  # 0700
+
+# name -> script. Each answers like the real tool does when it finds nothing.
+MACOS_SHIMS: Mapping[str, str] = {
+    "security": (
+        "#!/bin/sh\n"
+        "echo 'security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain.' >&2\n"
+        "exit 44\n"
+    ),
+}
 
 
 def turns_root(agent_dir: Path) -> Path:
@@ -91,6 +108,17 @@ class TurnHome:
         return self.root / "mcp"
 
     @property
+    def shim_dir(self) -> Path:
+        """Stand-ins for denied system tools (macOS only; see the module docstring)."""
+        return self.root / "shims"
+
+    def shim_paths(self) -> list[Path]:
+        """The shim files this home carries; empty when it has none."""
+        if not self.shim_dir.is_dir():
+            return []
+        return sorted(p for p in self.shim_dir.iterdir() if p.name in MACOS_SHIMS)
+
+    @property
     def config_dir(self) -> Optional[Path]:
         spec = PROVIDER_CONFIG.get(self.provider)
         return (self.home / spec[0][1]).resolve() if spec else None
@@ -117,6 +145,12 @@ class TurnHome:
             path.parent.mkdir(parents=True, exist_ok=True, mode=_DIR_MODE)
             path.write_text(seed[1], encoding="utf-8")
             os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)
+        if sys.platform == "darwin":
+            th.shim_dir.mkdir(mode=_DIR_MODE)
+            for name, script in MACOS_SHIMS.items():
+                shim = th.shim_dir / name
+                shim.write_text(script, encoding="utf-8")
+                os.chmod(shim, stat.S_IRUSR | stat.S_IXUSR)
         return th
 
     def environment(
@@ -148,6 +182,8 @@ class TurnHome:
             if name.startswith(PASSTHROUGH_PREFIXES):
                 env[name] = value
         env.setdefault("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        if self.shim_paths():
+            env["PATH"] = f"{self.shim_dir}{os.pathsep}{env['PATH']}"
         env["HOME"] = str(self.home)
         env["TMPDIR"] = str(self.tmp)
         env["CLAWMEETS_AGENT_ID"] = agent_id

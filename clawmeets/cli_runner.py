@@ -57,7 +57,9 @@ from clawmeets.api.responses import AgentRegistrationResponse
 from clawmeets.api.control import RESYNC_CAPABILITY, ControlEnvelope, ControlMessageType
 from clawmeets.api.fs_protocol import FS_CAPABILITY, FS_WS_MAX_SIZE
 from clawmeets.runner.model_auth_proxy import DefaultCredentials, ModelAuthProxy
-from clawmeets.runner.turn_capability import CanaryReport, IsolatedTurnsCapability, run_canaries_for
+from clawmeets.runner.turn_capability import (
+    ISOLATION_CHECK_FILE, CanaryReport, IsolatedTurnsCapability, run_canaries_for,
+)
 from clawmeets.runner.turn_session import get_egress_proxy, open_turn
 from clawmeets.api.client import ClawMeetsClient
 from clawmeets.api.retry_transport import RetryingTransport, SyncRetryingTransport
@@ -2985,7 +2987,7 @@ async def _runner_loop(
     # configured provider; withdrawn on a provider/model/login change until
     # they pass again (plan 4.3 item 9). One real scoped run of the provider
     # CLI is part of the canaries.
-    isolation = IsolatedTurnsCapability()
+    isolation = IsolatedTurnsCapability(agent_dir / ISOLATION_CHECK_FILE)
     # The runner's own client says it runs isolated turns; see stamp_request.
     http_client.event_hooks = {
         **http_client.event_hooks,

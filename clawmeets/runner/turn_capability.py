@@ -34,6 +34,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
@@ -43,6 +44,7 @@ from ..api.turn_protocol import (
     ISOLATION_HEADER,
     ISOLATION_HEADER_VALUE,
 )
+from ..utils.file_io import FileUtil
 from .egress_proxy import EgressProxy
 from .model_auth_proxy import ModelAuthProxy, capable
 from .turn_home import TurnHome, turns_root
@@ -53,6 +55,9 @@ from .turn_session import TurnSession
 logger = logging.getLogger(__name__)
 
 INSTRUCTION_CANARY_PREFIX = "CLAWMEETS-INSTRUCTION-CANARY-"
+# The latest canary result, in the agent's home: `clawmeets doctor` reads it
+# (doctor.ISOLATION_CHECK_FILE is the stdlib copy of this name).
+ISOLATION_CHECK_FILE = "isolation-check.json"
 
 # Runs INSIDE the sandbox with the runner's interpreter (``python -c``). Stdlib
 # only; takes one JSON argument; prints one JSON object of check -> bool, where
@@ -168,6 +173,16 @@ def _canary_world(provider: str):
     return base, agent_dir, sandbox, user_home, scope, marker
 
 
+def _excerpt(text: str, keep: int = 2000) -> str:
+    """Start and end of a failed run's output. The cause is usually at the top
+    (the error line) and the bottom only shows the stack, so never keep just the
+    tail."""
+    text = text.strip()
+    if len(text) <= 2 * keep:
+        return text
+    return f"{text[:keep]}\n... [{len(text) - 2 * keep} chars cut] ...\n{text[-keep:]}"
+
+
 def run_canaries_for(
     provider: str,
     *,
@@ -235,14 +250,14 @@ def run_canaries_for(
         try:
             rep.checks = json.loads(r.stdout.strip().splitlines()[-1])
         except (ValueError, IndexError):
-            rep.failures.append(f"probe did not report (rc={r.returncode}): {r.stderr[-300:]}")
+            rep.failures.append(f"probe did not report (rc={r.returncode}): {_excerpt(r.stderr)}")
             return rep
         rep.failures.extend(k for k, ok in rep.checks.items() if not ok)
 
         # The instruction canary: one scoped run of the provider's own CLI.
         prepared, penv = cli._prepare_scoped(
             session, "Reply with the single word OK.", sandbox,
-            {"type": "object", "properties": {}}, None,
+            {"type": "object", "properties": {}, "additionalProperties": False}, None,
         )
         r = subprocess.run(prepared.cmd, cwd=prepared.cwd, env=penv,
                            input=prepared.stdin_bytes, capture_output=True, timeout=timeout)
@@ -252,7 +267,7 @@ def run_canaries_for(
         if marker in out:
             rep.failures.append("instruction_canary")
         if r.returncode != 0:
-            rep.failures.append(f"provider_turn_ran (rc={r.returncode}): {out[-300:]}")
+            rep.failures.append(f"provider_turn_ran (rc={r.returncode}): {_excerpt(out)}")
         rep.passed = not rep.failures
         return rep
     except Exception as e:  # noqa: BLE001 - any error is a failed canary
@@ -293,7 +308,8 @@ class IsolatedTurnsCapability:
     passing canary run).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, result_path: Optional[Path] = None) -> None:
+        self._result_path = result_path
         self._ok = False
         self._listeners: list[Callable[[bool], None]] = []
         self._lock = threading.Lock()
@@ -353,4 +369,18 @@ class IsolatedTurnsCapability:
             self._set(True)
         elif not rep.passed:
             logger.warning(f"isolated turns not advertised: {rep.provider}: {rep.failures}")
+        if current:
+            self._save(rep)
         return current and rep.passed
+
+    def _save(self, rep: CanaryReport) -> None:
+        """Leave the result where `clawmeets doctor` looks for it."""
+        if self._result_path is None:
+            return
+        try:
+            FileUtil.write(self._result_path, {
+                "provider": rep.provider, "passed": rep.passed,
+                "failures": rep.failures, "checked_at": time.time(),
+            }, "json")
+        except OSError:
+            logger.warning("could not save the isolation check result", exc_info=True)

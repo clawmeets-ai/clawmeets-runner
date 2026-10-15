@@ -955,6 +955,12 @@ PROVIDER_KEY_ENV = (
 )
 
 
+ISOLATED_TURNS_TITLE = "Isolated conversations: your computer can safely serve people other than you"
+# Each agent's last start-up check result, written by the runner
+# (runner/turn_capability.ISOLATION_CHECK_FILE; a test keeps the two equal).
+ISOLATION_CHECK_FILE = "isolation-check.json"
+
+
 def _sandbox_works(argv: list[str]) -> bool:
     try:
         r = subprocess.run(argv, capture_output=True, timeout=PROBE_TIMEOUT_SECONDS)
@@ -963,14 +969,9 @@ def _sandbox_works(argv: list[str]) -> bool:
     return r.returncode == 0
 
 
-def check_isolated_turns() -> Check:
-    """Can this computer run a conversation for someone other than the owner?
-
-    Those conversations run inside an OS sandbox (sandbox-exec on macOS,
-    bubblewrap on Linux) and are refused, never run unprotected, without one.
-    Non-blocking: the owner's own work does not need it.
-    """
-    title = "Your computer can safely serve people other than you"
+def _check_os_sandbox() -> Check:
+    """Is there a working OS sandbox (sandbox-exec on macOS, bubblewrap on Linux)?"""
+    title = ISOLATED_TURNS_TITLE
     if sys.platform == "darwin":
         path = "/usr/bin/sandbox-exec"
         if os.path.exists(path) and _sandbox_works(
@@ -1004,6 +1005,61 @@ def check_isolated_turns() -> Check:
         id="isolated_turns", title=title, ok=False, blocking=False,
         detail=f"no supported sandbox on {sys.platform}",
         fix_note="Conversations for other people are held until a macOS or Linux computer with a sandbox connects.",
+    )
+
+
+def _agent_isolation_results(username: str) -> list[tuple[str, dict]]:
+    """``(agent short name, saved canary result)`` for this account's agents."""
+    agents = _data_dir() / "agents"
+    prefix = f"{username}-"
+    out = []
+    for d in sorted(agents.iterdir() if agents.is_dir() and username else []):
+        if not d.is_dir() or not d.name.startswith(prefix):
+            continue
+        result = _read_json(d / ISOLATION_CHECK_FILE)
+        if result is not None:
+            # agents/<user>-<short>-<id>: the id is the last hyphen part.
+            short = d.name[len(prefix):].rsplit("-", 1)[0]
+            out.append((short, result))
+    return out
+
+
+def _first_line(failures: list) -> str:
+    for f in failures:
+        for line in str(f).splitlines():
+            if line.strip():
+                return line.strip()[:200]
+    return "failed"
+
+
+def check_isolated_turns(username: str = "") -> Check:
+    """Can this computer run a conversation for someone other than the owner?
+
+    Those conversations run inside an OS sandbox and are refused, never run
+    unprotected, without one. A working sandbox is not enough: each agent runs
+    one real sandboxed model turn when it starts (its start-up check) and takes
+    such conversations only if that passes, so this reads each agent's last
+    result too. Non-blocking: the owner's own work does not need it.
+    """
+    sandbox = _check_os_sandbox()
+    if not sandbox.ok:
+        return sandbox
+    results = _agent_isolation_results(username or current_username())
+    failed = [(name, r) for name, r in results if not r.get("passed")]
+    if not failed:
+        detail = sandbox.detail + (f"; start-up check passed for {len(results)} agent(s)" if results else "")
+        return Check(id="isolated_turns", title=ISOLATED_TURNS_TITLE, ok=True, detail=detail, blocking=False)
+    detail = "; ".join(
+        f"{name} ({r.get('provider') or '?'}): {_first_line(r.get('failures') or [])}" for name, r in failed
+    )
+    return Check(
+        id="isolated_turns", title=ISOLATED_TURNS_TITLE, ok=False, blocking=False,
+        detail=f"the start-up check failed for {detail}",
+        fix_note=(
+            "Update ClawMeets, then restart your agents (`clawmeets stop`, then `clawmeets start`); "
+            "the check runs again at start. The full error is in "
+            f"{ISOLATION_CHECK_FILE} in that agent's folder under {_data_dir() / 'agents'}."
+        ),
     )
 
 
@@ -1058,7 +1114,7 @@ def run_checks(
         *([assistant_model] if assistant_model else []),
         check_computer(username),
     ]
-    checks.append(check_isolated_turns())
+    checks.append(check_isolated_turns(username))
     checks.append(check_provider_keys_in_env())
     if include_autostart:
         checks.append(check_autostart(username))

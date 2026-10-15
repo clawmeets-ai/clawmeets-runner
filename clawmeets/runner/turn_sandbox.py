@@ -395,6 +395,12 @@ def build_macos_profile(
         ) + ")")
     # The turn home lives under the denied turns root; re-allow this one only.
     L.append(f"(allow file-read* file-write* (subpath {_q(turn_root)}))")
+    # The home's stand-ins for denied tools (turn_home.MACOS_SHIMS): exec only
+    # these files, and the turn may not rewrite them into something else.
+    shims = home.shim_paths()
+    if shims:
+        L.append("(allow process-exec " + " ".join(f"(literal {_q(_real(p))})" for p in shims) + ")")
+        L.append(f"(deny file-write* (subpath {_q(_real(home.shim_dir))}))")
     # A subpath allow covers the root itself, so the turn could rmdir its
     # sandbox and put a symlink there that the runner, unsandboxed, would
     # follow. Everything below a write root stays writable; the root does not.
