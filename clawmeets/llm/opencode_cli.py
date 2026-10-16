@@ -392,6 +392,10 @@ class OpenCodeCLI(SubprocessLLMProvider):
             return error_text[:1000] or "(no error detail)"
         return None
 
+    def _turn_produced_result(self, prepared: PreparedInvocation, stdout: str) -> bool:
+        """At least one parsed JSONL event: a banner or bare text is not a run."""
+        return next(self._iter_events(stdout), None) is not None
+
     def _has_error_event(self, stdout: str) -> bool:
         return any(
             ev.get("type") == "error" or ev.get("error")

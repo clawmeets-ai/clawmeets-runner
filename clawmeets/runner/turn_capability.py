@@ -261,13 +261,29 @@ def run_canaries_for(
         )
         r = subprocess.run(prepared.cmd, cwd=prepared.cwd, env=penv,
                            input=prepared.stdin_bytes, capture_output=True, timeout=timeout)
-        out = (r.stdout + r.stderr).decode("utf-8", "replace")
+        stdout = r.stdout.decode("utf-8", "replace")
+        stderr = r.stderr.decode("utf-8", "replace")
+        out = stdout + stderr
         rep.checks["instruction_canary"] = marker not in out
-        rep.checks["provider_turn_ran"] = r.returncode == 0
         if marker in out:
             rep.failures.append("instruction_canary")
+        # Exit 0 is not proof of a turn: a CLI that quietly exits 0 with no
+        # output (seen in the wild) would advertise a capability whose every
+        # turn produces nothing. Demand output the provider does not itself
+        # read as an error and that carries a result in its own shape.
         if r.returncode != 0:
-            rep.failures.append(f"provider_turn_ran (rc={r.returncode}): {_excerpt(out)}")
+            problem = f"rc={r.returncode}"
+        elif not stdout.strip():
+            problem = "exit 0 with no result"
+        elif detail := cli._build_error_detail(prepared, stdout, stderr, r.returncode):
+            problem = f"provider error: {detail[:200]}"
+        elif not cli._turn_produced_result(prepared, stdout):
+            problem = "exit 0 with no result"
+        else:
+            problem = None
+        rep.checks["provider_turn_ran"] = problem is None
+        if problem:
+            rep.failures.append(f"provider_turn_ran ({problem}): {_excerpt(out)}")
         rep.passed = not rep.failures
         return rep
     except Exception as e:  # noqa: BLE001 - any error is a failed canary

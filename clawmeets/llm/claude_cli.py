@@ -153,7 +153,11 @@ class ClaudeCLI(SubprocessLLMProvider):
     def _scoped_env_extra(self, turn) -> dict[str, str]:
         # Instruction files load only from the knowledge dir: the sandbox denies
         # every other CLAUDE.md the CLI could reach (ancestors, other roots).
-        return {"CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD": "1"}
+        # The CLI's per-uid temp dir defaults to /tmp/claude-<uid>, which the
+        # sandbox cannot read, so start-up fails with EEXIST; keep it in the
+        # turn's own scratch dir.
+        return {"CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD": "1",
+                "CLAUDE_CODE_TMPDIR": str(turn.scratch_dir)}
 
     def _scoped_cmd(self, cmd: list[str], turn) -> list[str]:
         # MCP off except opted-in servers: ignore every discovered .mcp.json and
@@ -380,6 +384,12 @@ class ClaudeCLI(SubprocessLLMProvider):
         if stderr:
             parts.append(stderr)
         return " ".join(parts) if parts else "(no stderr)"
+
+    def _turn_produced_result(self, prepared: PreparedInvocation, stdout: str) -> bool:
+        """A `result` item exists and is not an error (`is_error` is the
+        honest discriminator; `subtype` stays "success" on API errors)."""
+        item = self._result_item(stdout)
+        return item is not None and item.get("is_error") is not True
 
     def _error_status_code(
         self,

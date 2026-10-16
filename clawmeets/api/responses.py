@@ -221,6 +221,9 @@ class UserResponse(BaseModel):
     user_id: str
     username: str
     user_created_at: datetime
+    # True when the account starts verified (a domain the operator trusts), so
+    # the caller can sign in at once instead of waiting for an email.
+    email_verified: bool = False
 
 
 class ChangelogBatch(BaseModel):

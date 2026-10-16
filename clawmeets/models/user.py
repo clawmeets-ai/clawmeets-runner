@@ -19,7 +19,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Awaitable, Callable, Optional
 
 import bcrypt
 
@@ -60,15 +60,31 @@ _passwd_lock = asyncio.Lock()
 _DUMMY_PASSWORD_HASH = "$2b$12$6.CEUQyzFfVgJcsot6UBY.Wk7ooPUDXlU98jkK.B3BlBcsMNb1TB2"
 
 
-class OAuthProvisionError(Exception):
-    """Raised by ``User.oauth_authenticate_or_provision`` when provisioning a new
-    OAuth account is refused.
+# How an account's email address was proven (passwd field ``email_proven_by``).
+# A row with ``email_verified: true`` and no field predates it and counts as
+# EMAIL_PROOF_LINK. Only EMAIL_PROOF_TRUSTED_DOMAIN is not proof of mailbox
+# control: anyone may password-register any address in a trusted domain.
+EMAIL_PROOF_LINK = "link"                      # clicked the verification link
+EMAIL_PROOF_OAUTH = "oauth"                    # provisioned from a provider-verified email
+EMAIL_PROOF_TRUSTED_DOMAIN = "trusted_domain"  # CLAWMEETS_SIGNUP_TRUSTED_DOMAINS, no mail sent
+EMAIL_PROOF_OPERATOR = "operator"              # `clawmeets server admin` vouched for it
+EMAIL_PROOFS = (EMAIL_PROOF_LINK, EMAIL_PROOF_OAUTH, EMAIL_PROOF_TRUSTED_DOMAIN, EMAIL_PROOF_OPERATOR)
 
-    Carries a stable invite error ``code`` (one of ``INVITE_REQUIRED`` /
+# OAuth sign-in refused: its email matches an account whose own address was
+# never proven, so linking would hand that account to whoever registered it.
+EMAIL_UNPROVEN = "EMAIL_UNPROVEN"
+
+
+class OAuthProvisionError(Exception):
+    """Raised by ``User.oauth_authenticate_or_provision`` when an OAuth sign-in
+    is refused.
+
+    Carries a stable error ``code``: an invite code (``INVITE_REQUIRED`` /
     ``INVITE_MALFORMED`` / ``INVITE_NOT_FOUND`` / ``INVITE_ALREADY_REDEEMED`` /
-    ``INVITE_EXPIRED`` / ``INVITE_REVOKED``). The OAuth-login router maps this to
-    the ported error envelope — the model stays free of any server-layer import
-    (Layer 1 models must not depend on Layer 2 server code).
+    ``INVITE_EXPIRED`` / ``INVITE_REVOKED``), ``SIGNUP_CLOSED``, or
+    ``EMAIL_UNPROVEN``. The OAuth-login router maps this to the ported error
+    envelope — the model stays free of any server-layer import (Layer 1 models
+    must not depend on Layer 2 server code).
     """
 
     def __init__(self, code: str) -> None:
@@ -403,6 +419,8 @@ class User(Participant):
             for user_id, user_data in users.items():
                 if user_data.get("verification_token") == token:
                     user_data["email_verified"] = True
+                    # Upgrades a trusted_domain account: the holder proved it now.
+                    user_data["email_proven_by"] = EMAIL_PROOF_LINK
                     user_data["verification_token"] = None
                     data["users"] = users
                     FileUtil.write(passwd_path, data, "json", atomic=True)
@@ -418,6 +436,7 @@ class User(Participant):
         ctx: "ModelContext",
         email: Optional[str] = None,
         email_verified: bool = False,
+        email_proven_by: Optional[str] = None,
     ) -> "User":
         """Create a new user.
 
@@ -427,6 +446,10 @@ class User(Participant):
             ctx: ModelContext for filesystem operations
             email: Email address (required for self-registration)
             email_verified: Whether email is pre-verified (True for operator-created users)
+            email_proven_by: How a pre-verified email was proven, one of
+                ``EMAIL_PROOFS``. Every production caller passes it; left unset
+                the row reads like a legacy verified account (proven). Ignored
+                when ``email_verified`` is False.
 
         Returns:
             New User instance
@@ -435,6 +458,8 @@ class User(Participant):
             ValueError: If username is invalid or already exists, or email already registered
         """
         username = cls._validate_username(username)
+        if email_proven_by is not None and email_proven_by not in EMAIL_PROOFS:
+            raise ValueError(f"email_proven_by must be one of {EMAIL_PROOFS}")
 
         async with _passwd_lock:
             passwd_path = cls._passwd_path(ctx)
@@ -470,7 +495,13 @@ class User(Participant):
                 "created_at": _now().isoformat(),
                 "email": email,
                 "email_verified": email_verified,
-                "verification_token": None if email_verified else secrets.token_urlsafe(32),
+                "email_proven_by": email_proven_by if email_verified else None,
+                # A trusted-domain account keeps a token: clicking its link is
+                # how the holder later proves the address (see verify_email).
+                "verification_token": (
+                    None if email_verified and email_proven_by != EMAIL_PROOF_TRUSTED_DOMAIN
+                    else secrets.token_urlsafe(32)
+                ),
             }
             users[user_id] = entry
             data["users"] = users
@@ -684,6 +715,15 @@ class User(Participant):
                         return normalized
         return cls._unique_oauth_username(users, email, ctx)
 
+    @staticmethod
+    def _email_proven(rec: dict) -> bool:
+        """True when a passwd row's email was proven by the address's holder:
+        verified, by anything but a trusted-domain pre-verification. A verified
+        row with no ``email_proven_by`` predates the field and counts as a link."""
+        if not rec.get("email_verified"):
+            return False
+        return (rec.get("email_proven_by") or EMAIL_PROOF_LINK) != EMAIL_PROOF_TRUSTED_DOMAIN
+
     @classmethod
     async def oauth_authenticate_or_provision(
         cls,
@@ -696,18 +736,28 @@ class User(Participant):
         invite_code: Optional[str],
         ctx: "ModelContext",
         desired_username: Optional[str] = None,
+        admit: Optional[Callable[[Optional[str], str], Awaitable[None]]] = None,
     ) -> tuple["User", str]:
         """THE account decision for an OAuth callback, under ``_passwd_lock``.
 
         Order (returns ``(user, outcome)`` where outcome in login/linked/created):
           1) (provider, subject) already linked          -> ("login")   invite untouched
-          2) else verified email matches an account       -> link identity, ("linked")  invite untouched
-          3) else NEW account -> invite REQUIRED:
-               code missing/empty                          -> OAuthProvisionError("INVITE_REQUIRED")
-               classify(code) not None                     -> OAuthProvisionError(that code)
-               validate_and_consume(code, ...)  (multi-use, UNCHANGED)
-                 False (lost race)                         -> OAuthProvisionError("INVITE_ALREADY_REDEEMED")
-                 True  -> provision record (password_hash=OAUTH_PASSWORD_SENTINEL,
+          2) else verified email matches an account:
+               that account's email is proven             -> link identity, ("linked")  invite untouched
+               otherwise                                  -> OAuthProvisionError(EMAIL_UNPROVEN)
+             Proven = ``email_verified`` AND ``email_proven_by`` is not
+             ``trusted_domain`` (a verified row without the field is legacy and
+             counts as a link click). An unverified or trusted-domain row says
+             nothing about who holds the mailbox — an insider can
+             password-register ``victim@corp.com`` — so linking would sign the
+             real owner in to the registrant's account. Never falls through to
+             3): that would create a second account with the same email.
+          3) else NEW account -> ``admit(invite_code, username)``, which raises
+             OAuthProvisionError to refuse. The route injects the server's sign-up
+             policy (server/signup_policy.py); without one, an invite is REQUIRED:
+               invitation_code.redeem(code, ...) not None  -> OAuthProvisionError(that code)
+                 (INVITE_REQUIRED / a classify() code / INVITE_ALREADY_REDEEMED)
+               admitted -> provision record (password_hash=OAUTH_PASSWORD_SENTINEL,
                           email_verified=True, oauth_identities=[identity]) -> ("created")
                           The provisioned username is ``desired_username`` when valid
                           + free, else an email-derived fallback (never fails here).
@@ -717,7 +767,13 @@ class User(Participant):
         identical to today's password register. Only VERIFIED provider emails
         reach here, so provisioned accounts are pre-verified.
         """
-        from .invitation_code import classify, validate_and_consume
+        from .invitation_code import redeem
+
+        if admit is None:
+            async def admit(code: Optional[str], username: str) -> None:
+                err = await redeem(code, ctx.participants_dir, username)
+                if err is not None:
+                    raise OAuthProvisionError(err)
 
         email = (verified_email or "").strip().lower()
         async with _passwd_lock:
@@ -734,9 +790,12 @@ class User(Participant):
                             and ident.get("provider_subject") == provider_subject):
                         return cls(user_id, ctx), "login"
 
-            # 2) verified email matches an existing account -> link (invite untouched)
+            # 2) verified email matches an existing account -> link (invite
+            #    untouched), only when that account proved the address itself.
             for user_id, rec in users.items():
                 if (rec.get("email") or "").strip().lower() == email:
+                    if not cls._email_proven(rec):
+                        raise OAuthProvisionError(EMAIL_UNPROVEN)
                     idents = rec.setdefault("oauth_identities", [])
                     idents.append({
                         "provider": provider,
@@ -752,22 +811,14 @@ class User(Participant):
                     FileUtil.write(passwd_path, data, "json", atomic=True)
                     return cls(user_id, ctx), "linked"
 
-            # 3) NEW account -> invite REQUIRED
-            if not invite_code or not str(invite_code).strip():
-                raise OAuthProvisionError("INVITE_REQUIRED")
-            code_err = await classify(invite_code, ctx.participants_dir)
-            if code_err is not None:
-                raise OAuthProvisionError(code_err)
-
+            # 3) NEW account -> the sign-up gate decides
             # Honor the slug the user picked in the sign-up flow when it's valid
             # and free; otherwise fall back to an email-derived unique name so a
             # taken/invalid/omitted username never fails the OAuth callback.
             username = cls._resolve_oauth_username(users, email, desired_username, ctx)
-            # Consume a use (multi-use semantics preserved). Re-checks redeemability
-            # under invitation_code's own lock — the single-use fence for a race.
-            consumed = await validate_and_consume(invite_code, ctx.participants_dir, username)
-            if not consumed:
-                raise OAuthProvisionError("INVITE_ALREADY_REDEEMED")
+            # In invite mode this consumes a use (multi-use semantics preserved),
+            # re-checking redeemability under invitation_code's own lock.
+            await admit(invite_code, username)
 
             user_id = str(uuid.uuid4())
             users[user_id] = {
@@ -778,6 +829,7 @@ class User(Participant):
                 "created_at": _now().isoformat(),
                 "email": email,
                 "email_verified": True,          # only verified provider emails reach here
+                "email_proven_by": EMAIL_PROOF_OAUTH,
                 "verification_token": None,
                 "display_name": display_name,
                 "avatar_url": avatar_url,
@@ -861,6 +913,12 @@ class User(Participant):
         return self._load_passwd_entry().get("email_verified", False)
 
     @property
+    def email_proven(self) -> bool:
+        """Verified by the address's own holder (see ``_email_proven``). False
+        for a trusted-domain pre-verified account until its link is clicked."""
+        return self._email_proven(self._load_passwd_entry())
+
+    @property
     def verification_token(self) -> Optional[str]:
         """Get verification token (None if already verified)."""
         return self._load_passwd_entry().get("verification_token")
@@ -932,18 +990,27 @@ class User(Participant):
             data["users"] = users
             self._save_passwd(data)
 
-    async def set_email_verified(self, verified: bool) -> None:
+    async def set_email_verified(self, verified: bool, *, proven_by: Optional[str] = None) -> None:
         """Set email verification status.
 
         Args:
             verified: Whether email is verified
+            proven_by: How it was proven, one of ``EMAIL_PROOFS``. Left unset,
+                a recorded proof is kept as is (so this never silently upgrades
+                a ``trusted_domain`` account). Clearing verification clears it.
         """
+        if proven_by is not None and proven_by not in EMAIL_PROOFS:
+            raise ValueError(f"proven_by must be one of {EMAIL_PROOFS}")
         async with _passwd_lock:
             data = self._load_passwd()
             users = data.get("users", {})
             if self._id not in users:
                 raise KeyError(f"User {self._id!r} not found")
             users[self._id]["email_verified"] = verified
+            if not verified:
+                users[self._id]["email_proven_by"] = None
+            elif proven_by is not None:
+                users[self._id]["email_proven_by"] = proven_by
             if verified:
                 users[self._id]["verification_token"] = None
             data["users"] = users

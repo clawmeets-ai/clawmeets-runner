@@ -142,3 +142,21 @@ async def validate_and_consume(code: str, data_dir: Path, username: str) -> bool
                     _save(data, data_dir)
                     return True
         return False
+
+
+async def redeem(code: str | None, data_dir: Path, username: str) -> str | None:
+    """Redeem one use of ``code`` for a new account named ``username``.
+
+    The invite half of every sign-up path. Returns ``None`` when a use was
+    consumed, else the stable error code: ``INVITE_REQUIRED`` (no code),
+    whatever :func:`classify` reports, or ``INVITE_ALREADY_REDEEMED`` when the
+    last use went to a concurrent sign-up between the check and the consume.
+    """
+    if not code or not str(code).strip():
+        return "INVITE_REQUIRED"
+    code_err = await classify(code, data_dir)
+    if code_err is not None:
+        return code_err
+    if not await validate_and_consume(code, data_dir, username):
+        return "INVITE_ALREADY_REDEEMED"
+    return None

@@ -97,6 +97,25 @@ _STRIP_HEADERS = {
     "trailer", "upgrade", "proxy-connection", "accept-encoding",
 }
 _STRIP_QUERY = {"key", "api_key", "access_token"}
+
+
+# Comma-list headers the credential ADDS to rather than replaces: the OAuth
+# login's ``anthropic-beta`` flag must not drop the betas the client asked for
+# (Claude Code sends context management there; without it the API answers 400).
+_MERGED_HEADERS = {"anthropic-beta"}
+
+
+def _add_credential_headers(headers: dict[str, str], cred: Mapping[str, str]) -> None:
+    for name, value in cred.items():
+        key = next((k for k in headers if k.lower() == name.lower()), None)
+        if key is not None and name.lower() in _MERGED_HEADERS:
+            have = [v.strip() for v in headers.pop(key).split(",") if v.strip()]
+            add = [v.strip() for v in value.split(",") if v.strip() and v.strip() not in have]
+            headers[name] = ",".join([*have, *add])
+        else:
+            if key is not None:
+                headers.pop(key)
+            headers[name] = value
 _HOP = {"connection", "keep-alive", "transfer-encoding", "te", "trailer", "upgrade",
         "proxy-authenticate", "content-length"}
 
@@ -315,7 +334,7 @@ class ModelAuthProxy:
             logger.info(f"model-auth: refused {req.command} {path} for {turn.provider}/{turn.credential.login}")
             return _reply(req, 403, "not an inference route")
         headers = {k: v for k, v in req.headers.items() if k.lower() not in _STRIP_HEADERS}
-        headers.update(turn.credential.headers)
+        _add_credential_headers(headers, turn.credential.headers)
         headers["Host"] = host
         headers["Content-Length"] = str(len(body))
         q = [(k, v) for k, v in parse_qsl(query, keep_blank_values=True) if k.lower() not in _STRIP_QUERY]

@@ -632,6 +632,17 @@ class SubprocessLLMProvider(LLMProvider):
         """
         ...
 
+    @abstractmethod
+    def _turn_produced_result(self, prepared: PreparedInvocation, stdout: str) -> bool:
+        """Whether a clean exit actually carried a turn result in this
+        provider's own output shape (not just any stdout).
+
+        Used by the start canary, where exit 0 alone is not proof of a turn:
+        a CLI that exits 0 with a banner, an error item or nothing at all
+        would otherwise advertise a capability whose every turn is empty.
+        """
+        ...
+
     # --- shared helpers (overridable) ---------------------------------------
 
     def _error_status_code(

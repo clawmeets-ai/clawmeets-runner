@@ -451,6 +451,19 @@ class CodexCLI(SubprocessLLMProvider):
             parts.append(stderr[:500])
         return "\n".join(parts) or "(no error detail)"
 
+    def _turn_produced_result(self, prepared: PreparedInvocation, stdout: str) -> bool:
+        """The `-o` last-message file exists and parses as JSON (`{}` is a
+        valid empty turn). Codex writes it only when a turn completed."""
+        path = Path(prepared.extras["last_message_abs"])
+        raw = nofollow_fs.read_text(path.parent, path.name)
+        if raw is None or not raw.strip():
+            return False
+        try:
+            json.loads(raw)
+        except json.JSONDecodeError:
+            return False
+        return True
+
     def _parse_result(
         self,
         prepared: PreparedInvocation,

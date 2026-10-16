@@ -411,6 +411,10 @@ class GeminiCLI(SubprocessLLMProvider):
             parts.append(stderr[:500])
         return "\n".join(parts) or "(no error detail)"
 
+    def _turn_produced_result(self, prepared: PreparedInvocation, stdout: str) -> bool:
+        """The JSON envelope parsed (its error text is `_build_error_detail`'s)."""
+        return self._parse_envelope(stdout) is not None
+
     def _parse_result(
         self,
         prepared: PreparedInvocation,

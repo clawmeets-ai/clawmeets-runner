@@ -132,6 +132,8 @@ MACOS_SYSTEM_EXEC: tuple[str, ...] = (
 # Tools whose only purpose in a turn would be to drive the GUI session, the
 # clipboard or the keychain. Exec denied outright (``osascript -e 'return 1'``
 # needs no Apple Event, so denying appleevent-send alone does not stop it).
+# Claude Code's own ``security`` call is answered by the turn home's shim
+# (turn_home: shims/security, first on PATH), never by the real tool.
 MACOS_DENIED_EXEC: tuple[str, ...] = (
     "/usr/bin/osascript",
     "/usr/bin/open",
@@ -587,6 +589,12 @@ def wrap_command(
     reads = [*reads, *(_real(p) for p in extra_read)]
     if kind == "sandbox-exec":
         profile = build_macos_profile(scope, home, cwd=cwd, exec_paths=execs, extra_read=reads)
+        # Exec the resolved binary itself. sandbox-exec's PATH search would
+        # try the symlink (``~/.local/bin/claude``), which the profile does
+        # not allow, and silently fall through to a later, other install.
+        found = shutil.which(cmd[0], path=env_path) if cmd and os.sep not in cmd[0] else None
+        if found:
+            cmd[0] = str(_real(found))
         return [SANDBOX_EXEC, "-p", profile, *cmd]
     if kind == "bwrap":
         argv = build_bwrap_args(scope, home, cwd=cwd, extra_read=reads, bwrap=shutil.which("bwrap") or "bwrap")

@@ -439,6 +439,11 @@ class AntigravityCLI(SubprocessLLMProvider):
             return error_text[:1000] or "(no error detail)"
         return None
 
+    def _turn_produced_result(self, prepared: PreparedInvocation, stdout: str) -> bool:
+        """The envelope parsed and reports SUCCESS."""
+        envelope = self._envelope(stdout)
+        return envelope is not None and envelope.get("status") == "SUCCESS"
+
     def _parse_result(
         self,
         prepared: PreparedInvocation,
