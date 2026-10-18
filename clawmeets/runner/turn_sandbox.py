@@ -296,6 +296,11 @@ def command_roots(cmd: Sequence[str], env_path: Optional[str] = None) -> tuple[l
         if len(rp.parts) >= 4:
             reads.append(rp)
     execs.append(_real(sys.executable))
+    # A python.org framework build's bin/python3.x is a launcher that
+    # posix_spawns the real interpreter inside Python.app; allow that too.
+    app = Path(sys.base_prefix) / "Resources" / "Python.app" / "Contents" / "MacOS" / "Python"
+    if app.is_file():
+        execs.append(_real(app))
     return execs, reads
 
 
