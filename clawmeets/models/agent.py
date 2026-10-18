@@ -1243,7 +1243,39 @@ class Agent(PersistableParticipant):
                 names.append(other.name.split("-", 1)[1])
             else:
                 names.append(cls.short_name(other.name, None))
+        names.extend(cls.invitable_hub_handles(project, model_ctx))
         return names
+
+    @classmethod
+    def invitable_hub_handles(
+        cls, project: "Project", model_ctx: "ModelContext",
+    ) -> list[str]:
+        """The owner's retained hub agents ``project`` admits, as ``name@deployment``.
+
+        Read from the runner's retained cache (the same file the AGENTS.md
+        "Retained hub agents" section renders from), so the coordinator's
+        invitable list and the action validator accept the handle the server's
+        room bridge accepts. Without this a hub agent named in the project's
+        allowlist was refused by the runner before the invite ever reached the
+        server. Empty where no cache exists (the server's own context).
+        """
+        retained = FileUtil.read(model_ctx.participants_dir / cls.RETAINED_FILE, "json")
+        if not isinstance(retained, list):
+            return []
+        handles: list[str] = []
+        for row in retained:
+            if not isinstance(row, dict) or row.get("state", "active") != "active":
+                continue
+            name = str(row.get("name") or "").lower()
+            deployment = str(row.get("deployment_name") or "").lower()
+            if not name or not deployment:
+                continue
+            handle = f"{name}@{deployment}"
+            if handle not in handles and project.admits_hub_agent(
+                str(row.get("hub_agent_id") or ""), handle,
+            ):
+                handles.append(handle)
+        return handles
 
     @property
     def linked_user_id(self) -> Optional[str]:

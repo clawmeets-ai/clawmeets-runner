@@ -559,6 +559,22 @@ class Project(BaseModel):
             return True
         return False
 
+    def admits_hub_agent(self, hub_agent_id: str, handle: str) -> bool:
+        """Does a retained hub agent pass this project's invitable allowlist?
+
+        The rule for hub agents, owned here so the server's room bridge and the
+        runner's invite check cannot drift: an empty allowlist admits,
+        ``agent_pool="self"`` admits none, an ``agent_names`` entry matches the
+        ``name@deployment`` handle or the hub agent id (case-insensitive), and
+        teams never match (a hub agent carries none of this owner's labels).
+        """
+        if self.agent_pool == "self":
+            return False
+        if not self.agent_names and not self.agent_teams:
+            return True
+        refs = {hub_agent_id.lower(), handle.lower()}
+        return any(str(n).lower() in refs for n in self.agent_names)
+
     def resolve_invitable_agents(
         self,
         candidates: "Iterable[Agent]",
