@@ -32,6 +32,19 @@ TURN_GRANT_HEADER = "X-Clawmeets-Turn-Grant"
 TURN_SCOPES = ("project", "requester")
 ISOLATION_HEADER = "X-Clawmeets-Isolation"
 ISOLATION_HEADER_VALUE = "v1"
+#: A runner that re-runs its start canaries on ``ISOLATION_RECHECK_REQUEST``
+#: (``clawmeets agent isolation-check``) and reports every check's result.
+ISOLATION_RECHECK_CAPABILITY = "isolation_recheck.v1"
+#: How a check ended (``runner/turn_capability.classify``): ``temporary`` is
+#: worth re-running as is, ``needs_action`` needs a fix first, ``unsupported``
+#: will fail every time for this provider, ``crashed`` is the check itself.
+CHECK_KINDS = ("passed", "temporary", "needs_action", "unsupported", "crashed")
+#: A runner whose latest current isolation check FAILED. Advertised like
+#: :data:`ISOLATED_TURNS_CAPABILITY`, per socket, so the server can tell
+#: "still checking" (neither) from "failed" (this one): only a failure is
+#: announced to the owner and the requester (``server/isolation_notice.py``).
+#: Cleared while a provider / model / login change is re-checked.
+ISOLATION_CHECK_FAILED_CAPABILITY = "isolation_check_failed.v1"
 
 # ── Owner isolation (plan-owner-isolation section 5a) ──────────────────────
 

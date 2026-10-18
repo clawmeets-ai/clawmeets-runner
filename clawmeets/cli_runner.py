@@ -22,6 +22,7 @@ import functools
 import base64
 import json
 import logging
+import time
 import os
 import platform
 import random
@@ -102,7 +103,7 @@ from clawmeets.runner.knowledge_dir_migration import migrate_legacy_knowledge_di
 from clawmeets.runner.knowledge_pack_manager import KnowledgePackManager
 from clawmeets.runner.home_fs_handler import FsJob, HomeFsRequestHandler, is_fs_frame
 from clawmeets.runner.agent_dir_readmes import write_agent_dir_readmes
-from clawmeets.api.turn_protocol import OWNER_ISOLATED_TURNS_CAPABILITY
+from clawmeets.api.turn_protocol import ISOLATION_RECHECK_CAPABILITY, OWNER_ISOLATED_TURNS_CAPABILITY
 from clawmeets.runner.host_report import collect_host_report
 from clawmeets.runner.references_index import build_references_index
 from clawmeets.runner.resync import ResyncScheduler
@@ -1743,6 +1744,104 @@ def agent_invoke_timeout(
         )
 
 
+#: The next step for each way a check can end (turn_protocol.CHECK_KINDS).
+_ISOLATION_NEXT_STEP = {
+    "temporary": "A temporary problem (the provider or network). Run this again in a few minutes.",
+    "needs_action": "Fix what the check reports (for a login error, sign the model CLI in again on "
+                    "the agent's computer), then run this again.",
+    "unsupported": "This model provider can't run isolated conversations yet; re-running will not "
+                   "change that. Switch the agent to a model CLI to serve conversations from other people.",
+    "crashed": "The check itself crashed; the traceback is in the agent's stderr.log. Run this again "
+               "after fixing it.",
+}
+
+
+def _print_isolation_status(agent_name: str, status: dict) -> None:
+    state = status.get("state")
+    serving = "yes" if status.get("isolated_turns") else "no"
+    held = status.get("held_conversations") or 0
+    if state == "passed":
+        typer.echo(f"{agent_name}: isolation check passed ({status.get('provider') or '?'}).")
+    elif state == "failed":
+        kind = status.get("kind") or "needs_action"
+        typer.echo(f"{agent_name}: isolation check failed ({status.get('provider') or '?'}, {kind}).")
+        for line in (status.get("failures") or [])[:3]:
+            typer.echo(f"  - {line.splitlines()[0][:300] if line else line}")
+        typer.echo(_ISOLATION_NEXT_STEP.get(kind, ""))
+    elif state == "running":
+        typer.echo(f"{agent_name}: isolation check still running.")
+    else:
+        typer.echo(f"{agent_name}: no isolation check reported since the server started.")
+    typer.echo(f"Accepting conversations from other people: {serving}. Waiting conversations: {held}.")
+
+
+@agent_app.command("isolation-check")
+def agent_isolation_check(
+    agent: str = typer.Argument(
+        ..., help="Agent name or id, or 'self' (an agent checks itself via its runner-injected env)",
+    ),
+    wait: bool = typer.Option(True, "--wait/--no-wait", help="Wait for the result (default) or return at once."),
+    timeout: int = typer.Option(900, "--timeout", help="Seconds to wait for the result."),
+    status_only: bool = typer.Option(False, "--status", help="Show the last result; start nothing."),
+    token: Optional[str] = typer.Option(None, "--token", "-t"),
+    server: Optional[str] = typer.Option(None, "--server", "-s"),
+    data_dir: Path = typer.Option(DEFAULT_DATA_DIR, "--data-dir"),
+):
+    """Re-run an agent's isolation check inside its running process.
+
+    The check decides whether the agent may take conversations from other
+    people (hub, Front Desk, channels): each runs in a sandbox, and the
+    runner proves at start that the sandbox holds. Run this after signing
+    the model CLI in again, after a temporary failure, or when an email
+    says conversations are waiting. The agent keeps serving while it runs;
+    only a failure stops it. When it passes, waiting conversations are
+    delivered.
+
+    Exit codes: 0 passed, 1 failed, 3 still running at --timeout,
+    4 agent not running or its runner too old.
+
+    Examples::
+
+        clawmeets agent isolation-check self
+        clawmeets agent isolation-check nyc_dining --no-wait
+        clawmeets agent isolation-check nyc_dining --status
+    """
+    server_url, token, agent_id, agent_name = _resolve_session_for_config(
+        data_dir, token, server, agent,
+    )
+    headers = {"Authorization": f"Bearer {token}"}
+    with _http(server_url) as client:
+        if status_only:
+            _print_isolation_status(agent_name, _ok(client.get(f"/agents/{agent_id}/isolation-check",
+                                                               headers=headers)))
+            return
+        resp = client.post(f"/agents/{agent_id}/isolation-check", headers=headers)
+        if resp.status_code == 409:
+            detail = (resp.json() or {}).get("detail") or {}
+            typer.echo(f"{agent_name}: {detail.get('message') or resp.text}", err=True)
+            raise typer.Exit(4)
+        started = _ok(resp)
+        if started.get("already_running"):
+            typer.echo(f"{agent_name}: a check is already running; waiting for it.")
+        else:
+            typer.echo(f"{agent_name}: isolation check started (it can take a few minutes).")
+        if not wait:
+            return
+        deadline = time.monotonic() + max(1, timeout)
+        status: dict = {}
+        while time.monotonic() < deadline:
+            time.sleep(5)
+            status = _ok(client.get(f"/agents/{agent_id}/isolation-check", headers=headers))
+            if status.get("state") != "running":       # any report ends the request
+                break
+        else:
+            typer.echo(f"{agent_name}: still running after {timeout}s; check later with --status.")
+            raise typer.Exit(3)
+    _print_isolation_status(agent_name, status)
+    if status.get("state") != "passed":
+        raise typer.Exit(1)
+
+
 # ---------------------------------------------------------------------------
 # agent list
 # ---------------------------------------------------------------------------
@@ -3003,15 +3102,51 @@ async def _runner_loop(
                                 ["provider cannot run isolated turns"])
         return run_canaries_for(key, model_auth=model_auth, egress=egress_proxy, cli=cli_now)
 
-    def _recheck_isolation(settings: dict):
-        return isolation.recheck(lambda: _run_isolation_canaries(settings))
+    # The settings the last check ran with: a requested re-check (no new
+    # settings) runs against them.
+    isolation_settings = {"current": dict(local_settings or {})}
+
+    async def _recheck_isolation(
+        settings: Optional[dict] = None, *, keep_while_running: bool = False,
+        recheck_id: Optional[str] = None,
+    ) -> bool:
+        if settings is not None:
+            isolation_settings["current"] = dict(settings)
+        current = isolation_settings["current"]
+
+        async def _report(rep) -> None:
+            # Every current result goes to the server, so `clawmeets agent
+            # isolation-check` and the owner's notice can name it. A result a
+            # newer check superseded is never reported (recheck skips it).
+            try:
+                await client.post_isolation_check_result(
+                    agent_id, recheck_id=recheck_id, provider=rep.provider, passed=rep.passed,
+                    kind=rep.kind, failures=rep.failures,
+                )
+            except Exception as exc:  # noqa: BLE001 — the local result file is saved either way
+                logging.getLogger("clawmeets").info(f"isolation check result not reported: {exc}")
+
+        return await isolation.recheck(
+            lambda: _run_isolation_canaries(current), keep_while_running=keep_while_running,
+            provider=str(current.get("llm_provider") or "claude"), on_result=_report,
+        )
 
     loop_obj.attach_isolation_capability(isolation, _recheck_isolation)
+
+    def _isolation_start_done(task: "asyncio.Task") -> None:
+        # Never discard what the start-up check raised: recheck already turns a
+        # crashed canary run into a saved result, so anything here is a bug.
+        if not task.cancelled() and task.exception() is not None:
+            logging.getLogger("clawmeets").error(
+                "isolation start-up check failed", exc_info=task.exception(),
+            )
 
     # Start the loop
     await loop_obj.start()
     isolation_start = asyncio.create_task(_recheck_isolation(dict(local_settings or {})))
-    isolation_start.add_done_callback(lambda t: t.cancelled() or t.exception())
+    isolation_start.add_done_callback(_isolation_start_done)
+    # A re-check requested while this one runs is answered by its result.
+    loop_obj.track_isolation_check(isolation_start)
 
     # Convert http:// → ws://
     ws_url = server_http.replace("https://", "wss://").replace("http://", "ws://")
@@ -3122,7 +3257,7 @@ async def _runner_loop(
                     "token": token,
                     "clawmeets_version": runner_version,  # str | None
                     "capabilities": [FS_CAPABILITY, RESYNC_CAPABILITY, OWNER_ISOLATED_TURNS_CAPABILITY,
-                                     *isolation.capabilities()],
+                                     ISOLATION_RECHECK_CAPABILITY, *isolation.capabilities()],
                     "in_flight_turns": [t.to_wire() for t in in_flight],
                 }
                 try:

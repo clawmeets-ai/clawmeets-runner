@@ -1,0 +1,6 @@
+{
+  "audiences": ["worker", "coordinator", "assistant"],
+  "surfaces": ["agent_runtime"],
+  "version": "1.0.0",
+  "description": "Re-run an agent's isolation check inside its running process (clawmeets agent isolation-check <agent|self>), so it can take conversations from other people again. Run it when the owner asks, after the model CLI was signed in again, or when an isolated turn failed or an email says conversations are waiting."
+}

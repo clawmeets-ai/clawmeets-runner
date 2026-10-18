@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 import httpx
 
-from clawmeets.api.control import AgentEnvRequestPayload, AgentRegistryChangePayload, AgentSettingsChangePayload, AgentStatusChangePayload, CancelLLMPayload, ChangelogUpdatePayload, ControlMessageType, KnowledgePackSyncPayload, McpAuthCodePayload, McpSyncPayload, ProjectDeletedPayload, SkillAuthCodePayload, SkillSyncPayload
+from clawmeets.api.control import AgentEnvRequestPayload, AgentRegistryChangePayload, AgentSettingsChangePayload, AgentStatusChangePayload, CancelLLMPayload, ChangelogUpdatePayload, ControlMessageType, IsolationRecheckRequestPayload, KnowledgePackSyncPayload, McpAuthCodePayload, McpSyncPayload, ProjectDeletedPayload, SkillAuthCodePayload, SkillSyncPayload
 from clawmeets.models.agent import Agent
 from clawmeets.models.context import ModelContext
 from clawmeets.runner.agent_dir_readmes import write_agent_dir_readmes
@@ -420,6 +420,16 @@ class ReactiveControlLoop:
                     )
                 else:
                     await self._answer_env_request(payload)
+
+            case ControlMessageType.ISOLATION_RECHECK_REQUEST:
+                payload: IsolationRecheckRequestPayload = envelope.payload
+                if payload.agent_id != self._participant.id:
+                    logger.warning(
+                        f"ISOLATION_RECHECK_REQUEST routed to wrong participant: "
+                        f"target={payload.agent_id[:8]} self={self._participant.id[:8]} — ignoring"
+                    )
+                else:
+                    self._on_isolation_recheck_request(payload)
 
             case ControlMessageType.AGENT_REGISTRY_CHANGE:
                 # A peer agent (owned by this runner's owner) was registered,
@@ -1071,6 +1081,11 @@ class ReactiveControlLoop:
         self._capability = capability
         self._capability_recheck = recheck
 
+    def track_isolation_check(self, task: "asyncio.Task") -> None:
+        """The check running now (the start-up one): a re-check requested
+        while it runs waits for its result instead of starting a second."""
+        self._capability_task = task
+
     def _on_isolation_settings(self, new: dict, prior: dict) -> None:
         """Withdraw ``isolated_turns.v1`` NOW on a provider / model / login
         change and re-run the canaries in the background; the capability comes
@@ -1083,6 +1098,41 @@ class ReactiveControlLoop:
             return
         capability.withdraw()
         self._capability_task = asyncio.create_task(recheck(dict(new)))
+
+    def _on_isolation_recheck_request(self, payload: "IsolationRecheckRequestPayload") -> None:
+        """Re-run the isolation check on request (``clawmeets agent
+        isolation-check``), without withdrawing the capability first: an
+        agent that is serving keeps serving until a failure says otherwise.
+        One check at a time; a request while one runs is answered by that
+        check's result."""
+        capability = getattr(self, "_capability", None)
+        recheck = getattr(self, "_capability_recheck", None)
+        if capability is None or recheck is None:
+            # Answer anyway, or the requester waits out its whole timeout.
+            logger.warning("isolation re-check requested, but this runner has no isolation check")
+            if self._client is None:
+                return
+            task = asyncio.create_task(self._client.post_isolation_check_result(
+                self._participant.id, recheck_id=payload.recheck_id, provider="unknown",
+                passed=False, kind="unsupported", failures=["provider cannot run isolated turns: "
+                                                            "this runner has no isolation check"],
+            ))
+            task.add_done_callback(lambda t: t.cancelled() or t.exception())
+            return
+        running = getattr(self, "_capability_task", None)
+        if running is not None and not running.done():
+            logger.info("isolation re-check requested while one runs; its result answers")
+            return
+
+        def _done(task: asyncio.Task) -> None:
+            if not task.cancelled() and task.exception() is not None:
+                logger.error("isolation re-check failed", exc_info=task.exception())
+
+        logger.info(f"isolation re-check requested ({payload.recheck_id[:8]})")
+        self._capability_task = asyncio.create_task(
+            recheck(None, keep_while_running=True, recheck_id=payload.recheck_id)
+        )
+        self._capability_task.add_done_callback(_done)
 
     async def _apply_local_settings(
         self,

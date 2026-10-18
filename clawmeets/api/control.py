@@ -27,7 +27,7 @@ class ControlMessageType(str, Enum):
         - To runners (agents) only:
             SKILL_SYNC, MCP_SYNC, AGENT_SETTINGS_CHANGE, CANCEL_LLM,
             MCP_AUTH_CODE, KNOWLEDGE_PACK_SYNC, AGENT_REGISTRY_CHANGE,
-            AGENT_ENV_REQUEST
+            AGENT_ENV_REQUEST, ISOLATION_RECHECK_REQUEST
         - To user UIs (web frontend) only:
             AGENT_STATUS_CHANGE, MCP_AUTH_URL_FOR_USER, AGENT_CARD_UPDATE,
             RUNNER_VERSIONS, HOST_SYNC, INSTALL_SYNC
@@ -105,6 +105,14 @@ class ControlMessageType(str, Enum):
     # An ``env_set`` carries the value — a secret — so this envelope must never
     # reach a browser or another participant.
     AGENT_ENV_REQUEST = "agent_env_request"
+
+    # Server -> the ONE agent whose isolation check its owner (or the agent
+    # itself) asked to re-run (``POST /agents/{id}/isolation-check``). Sent
+    # only to a socket that advertised ``ISOLATION_RECHECK_CAPABILITY``. The
+    # runner re-runs its start canaries without first withdrawing
+    # ``isolated_turns.v1`` and reports the outcome over HTTP
+    # (``POST /agents/{id}/isolation-check/result``).
+    ISOLATION_RECHECK_REQUEST = "isolation_recheck_request"
 
     # Server -> every runner, browser and CLI listener that advertised
     # RESYNC_CAPABILITY: "catch up as if you had just reconnected". With the
@@ -655,6 +663,17 @@ class AgentEnvRequestPayload(BaseModel):
     value: str | None = None
 
 
+class IsolationRecheckRequestPayload(BaseModel):
+    """Payload for ISOLATION_RECHECK_REQUEST — see the enum member.
+
+    ``recheck_id`` pairs the runner's result with the request; it is also the
+    required field no other payload has, which keeps this member
+    distinguishable in ``ControlEnvelope.payload``'s non-discriminated Union.
+    """
+    agent_id: str
+    recheck_id: str
+
+
 # Advertised in a socket's auth frame (``capabilities``) by clients that act on
 # RESYNC. A client without it is closed with 1012 instead, and reconnects.
 RESYNC_CAPABILITY = "resync"
@@ -695,7 +714,7 @@ class ControlEnvelope(BaseModel):
     would need a real discriminator first.
     """
     type: ControlMessageType
-    payload: Union[ChangelogUpdatePayload, AgentStatusChangePayload, ProjectDeletedPayload, SkillSyncPayload, McpSyncPayload, AgentSettingsChangePayload, CancelLLMPayload, ActiveWorkChangePayload, McpAuthUrlForUserPayload, McpAuthCodePayload, SkillAuthUrlForUserPayload, SkillAuthCodePayload, KnowledgePackSyncPayload, AgentRegistryChangePayload, AgentCardUpdatePayload, BriefTabSyncPayload, ProjectReportSyncPayload, ProjectPlanSyncPayload, DeskTodoSyncPayload, DeskReadStateSyncPayload, DeskSopSyncPayload, DeskLabelSyncPayload, RunnerVersionsPayload, HostSyncPayload, InstallSyncPayload, AgentEnvRequestPayload, ResyncPayload, dict] = Field(default_factory=dict)
+    payload: Union[ChangelogUpdatePayload, AgentStatusChangePayload, ProjectDeletedPayload, SkillSyncPayload, McpSyncPayload, AgentSettingsChangePayload, CancelLLMPayload, ActiveWorkChangePayload, McpAuthUrlForUserPayload, McpAuthCodePayload, SkillAuthUrlForUserPayload, SkillAuthCodePayload, KnowledgePackSyncPayload, AgentRegistryChangePayload, AgentCardUpdatePayload, BriefTabSyncPayload, ProjectReportSyncPayload, ProjectPlanSyncPayload, DeskTodoSyncPayload, DeskReadStateSyncPayload, DeskSopSyncPayload, DeskLabelSyncPayload, RunnerVersionsPayload, HostSyncPayload, InstallSyncPayload, AgentEnvRequestPayload, IsolationRecheckRequestPayload, ResyncPayload, dict] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_required_fields_for_type(self) -> "ControlEnvelope":
@@ -778,6 +797,9 @@ class ControlEnvelope(BaseModel):
         elif self.type == ControlMessageType.AGENT_ENV_REQUEST:
             if not isinstance(self.payload, AgentEnvRequestPayload):
                 raise ValueError(f"control message type {self.type} requires AgentEnvRequestPayload")
+        elif self.type == ControlMessageType.ISOLATION_RECHECK_REQUEST:
+            if not isinstance(self.payload, IsolationRecheckRequestPayload):
+                raise ValueError(f"control message type {self.type} requires IsolationRecheckRequestPayload")
         elif self.type == ControlMessageType.RESYNC:
             if not isinstance(self.payload, ResyncPayload):
                 raise ValueError(f"control message type {self.type} requires ResyncPayload")

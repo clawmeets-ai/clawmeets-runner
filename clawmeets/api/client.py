@@ -442,6 +442,26 @@ class ClawMeetsClient:
         )
         resp.raise_for_status()
 
+    async def post_isolation_check_result(
+        self,
+        agent_id: str,
+        *,
+        recheck_id: str | None,
+        provider: str,
+        passed: bool,
+        kind: str | None,
+        failures: list[str],
+    ) -> None:
+        """Report one isolation check's outcome (start-up, settings change or
+        a requested re-check) so ``clawmeets agent isolation-check`` and the
+        owner notice can say what happened and what to do next."""
+        url = f"{self._base_url}/agents/{agent_id}/isolation-check/result"
+        resp = await self._http.post(url, json={
+            "recheck_id": recheck_id, "provider": provider, "passed": passed,
+            "kind": kind, "failures": failures[:20],
+        })
+        resp.raise_for_status()
+
     async def put_in_flight_turns(
         self,
         agent_id: str,

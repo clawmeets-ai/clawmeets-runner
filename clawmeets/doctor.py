@@ -1052,8 +1052,11 @@ def check_isolated_turns(username: str = "") -> Check:
     detail = "; ".join(
         f"{name} ({r.get('provider') or '?'}): {_first_line(r.get('failures') or [])}" for name, r in failed
     )
-    restart = "restart your agents (`clawmeets stop`, then `clawmeets start`); the check runs again at start."
-    if any(_is_login_failure(r) for _, r in failed):
+    commands = " ".join(f"`clawmeets agent isolation-check {name}`" for name, _ in failed)
+    restart = (f"re-run the check with {commands} (or restart the agent: it runs again at start).")
+    if all(r.get("kind") == "unsupported" for _, r in failed):
+        remedy = "This model provider can't run isolated conversations yet; re-running will not change that."
+    elif any(_is_login_failure(r) for _, r in failed):
         remedy = f"Sign the model CLI in again on this computer ({_relogin_hint(failed)}), then {restart}"
     else:
         remedy = restart[0].upper() + restart[1:]

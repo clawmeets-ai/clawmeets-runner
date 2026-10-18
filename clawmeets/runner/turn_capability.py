@@ -37,10 +37,11 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Awaitable, Callable, Iterable, Optional
 
 from ..api.turn_protocol import (
     ISOLATED_TURNS_CAPABILITY,
+    ISOLATION_CHECK_FAILED_CAPABILITY,
     ISOLATION_HEADER,
     ISOLATION_HEADER_VALUE,
 )
@@ -133,6 +134,56 @@ class CanaryReport:
     passed: bool
     failures: list[str] = field(default_factory=list)
     checks: dict[str, bool] = field(default_factory=dict)
+    #: ``turn_protocol.CHECK_KINDS``; None until ``classify`` ran.
+    kind: Optional[str] = None
+
+
+# Failure text that is the provider or the network having a bad minute, not
+# something the owner has to fix: re-running the check as is can pass.
+_TEMPORARY_MARKERS = (
+    "rate limit", "rate_limit", "429", "overloaded", "529", "500", "502", "503", "504",
+    "timed out", "timeout", "temporarily", "connection reset", "connection refused",
+)
+# Failures that will repeat for this provider whatever the owner does.
+_UNSUPPORTED_PREFIXES = (
+    "provider cannot run isolated turns", "no inference routes for",
+    "no provider CLI to run the instruction canary",
+)
+
+
+def classify(report: CanaryReport) -> str:
+    """How a check ended, for the next step the owner is told: ``passed``,
+    ``temporary`` (5xx, rate limit, timeout: just re-run), ``needs_action``
+    (not signed in, no sandbox, a probe that leaked: fix first),
+    ``unsupported`` (``-api`` and smart-routing providers, a login with no
+    inference routes) or ``crashed`` (the check itself raised)."""
+    if report.kind == "crashed":
+        return "crashed"
+    if report.passed:
+        return "passed"
+    if any(f.startswith(_UNSUPPORTED_PREFIXES) for f in report.failures):
+        return "unsupported"
+    text = " ".join(report.failures).lower()
+    auth = ("401", "403", "not logged in", "login", "oauth", "unauthorized", "expired", "api key")
+    if any(m in text for m in auth):
+        return "needs_action"
+    if all(f.startswith(("provider_turn_ran", "canary error")) for f in report.failures) and any(
+        m in text for m in _TEMPORARY_MARKERS
+    ):
+        return "temporary"
+    return "needs_action"
+
+
+def next_step(kind: Optional[str], agent: str = "self") -> str:
+    """One line telling whoever reads the log what to do about a check."""
+    command = f"clawmeets agent isolation-check {agent}"
+    return {
+        "passed": "",
+        "temporary": f"a temporary problem: run `{command}` again in a few minutes",
+        "needs_action": f"fix the problem above (for a login error, sign the model CLI in again), then run `{command}`",
+        "unsupported": "this provider can't run isolated conversations yet; re-running will not change that",
+        "crashed": f"the check itself crashed (traceback in this log); run `{command}` after fixing it",
+    }.get(kind or "", f"run `{command}`")
 
 
 def _real(p: Path) -> Path:
@@ -320,17 +371,21 @@ def run_start_canaries(providers: Iterable[str], **kw) -> frozenset[str]:
 
 
 class IsolatedTurnsCapability:
-    """Whether this runner may advertise ``isolated_turns.v1`` right now.
+    """Whether this runner may advertise ``isolated_turns.v1`` right now,
+    and whether its latest current check failed (``isolation_check_failed.v1``).
 
     ``capabilities()`` is read when the websocket auth frame is built. Any
     change calls the listeners (the websocket loop reconnects, so the server
     sees the new set: withdrawal is immediate, re-advertisement follows a
-    passing canary run).
+    passing canary run, and a failure is advertised as one). While a check is
+    running after a withdrawal neither is advertised: the server reads that as
+    "still checking" and announces nothing.
     """
 
     def __init__(self, result_path: Optional[Path] = None) -> None:
         self._result_path = result_path
         self._ok = False
+        self._failed = False
         self._listeners: list[Callable[[bool], None]] = []
         self._lock = threading.Lock()
         self._generation = 0
@@ -341,7 +396,9 @@ class IsolatedTurnsCapability:
         return self._ok
 
     def capabilities(self) -> list[str]:
-        return [ISOLATED_TURNS_CAPABILITY] if self._ok else []
+        if self._ok:
+            return [ISOLATED_TURNS_CAPABILITY]
+        return [ISOLATION_CHECK_FAILED_CAPABILITY] if self._failed else []
 
     async def stamp_request(self, request: Any) -> None:
         """httpx request hook for the runner's OWN client: send
@@ -355,10 +412,10 @@ class IsolatedTurnsCapability:
     def on_change(self, fn: Callable[[bool], None]) -> None:
         self._listeners.append(fn)
 
-    def _set(self, ok: bool) -> None:
+    def _set(self, ok: bool, *, failed: bool = False) -> None:
         with self._lock:
-            changed = ok != self._ok
-            self._ok = ok
+            changed = (ok, failed) != (self._ok, self._failed)
+            self._ok, self._failed = ok, failed
         if changed:
             for fn in list(self._listeners):
                 try:
@@ -374,23 +431,52 @@ class IsolatedTurnsCapability:
         self._set(False)
         return gen
 
-    async def recheck(self, run: Callable[[], CanaryReport]) -> bool:
-        """Withdraw, run the canaries off the event loop, advertise on a pass.
+    async def recheck(
+        self,
+        run: Callable[[], CanaryReport],
+        *,
+        keep_while_running: bool = False,
+        provider: str = "unknown",
+        on_result: Optional[Callable[[CanaryReport], Awaitable[None]]] = None,
+    ) -> bool:
+        """Run the canaries off the event loop, advertise on a pass.
 
-        A newer recheck (another settings change) supersedes an older one: the
-        older result is discarded rather than re-advertising stale state.
+        By default (a provider / model / login change) the capability is
+        withdrawn first: the old canaries no longer prove anything. With
+        ``keep_while_running`` (a manual re-check, ``clawmeets agent
+        isolation-check``) nothing changes until the result is in, so a
+        healthy agent keeps serving and only a failure withdraws.
+
+        A newer recheck supersedes an older one: the older result is
+        discarded rather than re-advertising stale state. A ``run`` that
+        raises is a ``crashed`` report, logged with its traceback and saved
+        like any other result, so a check never leaves nothing behind.
+        ``on_result`` (the report to the server) runs only for a current one.
         """
-        gen = self.withdraw()
-        rep = await asyncio.to_thread(run)
-        self.last_report = rep
+        if keep_while_running:
+            with self._lock:
+                self._generation += 1
+                gen = self._generation
+        else:
+            gen = self.withdraw()
+        try:
+            rep = await asyncio.to_thread(run)
+        except Exception as exc:  # noqa: BLE001 — a crashed check is a failed one
+            logger.error("isolation check crashed", exc_info=True)
+            rep = CanaryReport(provider, False, [f"check crashed: {type(exc).__name__}: {exc}"], kind="crashed")
+        rep.kind = classify(rep)
         with self._lock:
             current = gen == self._generation
-        if current and rep.passed:
-            self._set(True)
-        elif not rep.passed:
-            logger.warning(f"isolated turns not advertised: {rep.provider}: {rep.failures}")
+        if current:
+            self.last_report = rep
+            self._set(rep.passed, failed=not rep.passed)
+        if not rep.passed:
+            logger.warning(f"isolated turns not advertised: {rep.provider}: {rep.failures}"
+                           f" ({rep.kind}: {next_step(rep.kind)})")
         if current:
             self._save(rep)
+            if on_result is not None:
+                await on_result(rep)
         return current and rep.passed
 
     def _save(self, rep: CanaryReport) -> None:
@@ -399,7 +485,7 @@ class IsolatedTurnsCapability:
             return
         try:
             FileUtil.write(self._result_path, {
-                "provider": rep.provider, "passed": rep.passed,
+                "provider": rep.provider, "passed": rep.passed, "kind": rep.kind,
                 "failures": rep.failures, "checked_at": time.time(),
             }, "json")
         except OSError:
