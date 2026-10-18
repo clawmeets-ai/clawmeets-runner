@@ -885,24 +885,47 @@ class Agent(PersistableParticipant):
     #: The owner's retained hub agents as last read from the server (the
     #: AGENTS.md "Retained hub agents" section is rendered from it).
     RETAINED_FILE = "retained_hub_agents.json"
+    #: The ids of the agents of OTHER accounts on this server the owner
+    #: retained. Present only when the server retains its own agents: then
+    #: AGENTS.md lists another account's agent only if it is here. Absent (an
+    #: older server), every public agent is listed as before.
+    LOCAL_RETAINED_FILE = "retained_local_agents.json"
 
     @classmethod
     async def _sync_retained(cls, ctx: "ModelContext") -> bool:
-        """Read GET /api/hub/retained into the local cache. True when it changed."""
-        lister = getattr(ctx.client, "list_retained", None)
-        if lister is None:
+        """Read GET /api/hub/retained into the local caches. True when either changed."""
+        lister = getattr(ctx.client, "list_retained_page", None)
+        plain = getattr(ctx.client, "list_retained", None)
+        if lister is None and plain is None:
             return False
         try:
-            retained = await lister()
+            if lister is not None:
+                page = await lister()
+            else:
+                rows = await plain()
+                page = {"agents": rows, "local_retains": False} if isinstance(rows, list) else None
         except Exception:  # noqa: BLE001 — keep what we had
             return False
-        if not isinstance(retained, list):
+        if not isinstance(page, dict) or not isinstance(page.get("agents"), list):
             return False
+        rows = page["agents"]
+        hub_rows = [r for r in rows if not r.get("is_local")]
+        changed = False
         path = ctx.participants_dir / cls.RETAINED_FILE
-        if FileUtil.read(path, "json") == retained:
-            return False
-        FileUtil.write(path, retained, "json")
-        return True
+        if FileUtil.read(path, "json") != hub_rows:
+            FileUtil.write(path, hub_rows, "json")
+            changed = True
+        local_path = ctx.participants_dir / cls.LOCAL_RETAINED_FILE
+        if page.get("local_retains"):
+            local_ids = sorted(str(r["agent_id"]) for r in rows
+                               if r.get("is_local") and r.get("agent_id") and r.get("state", "active") == "active")
+            if FileUtil.read(local_path, "json") != local_ids:
+                FileUtil.write(local_path, local_ids, "json")
+                changed = True
+        elif local_path.exists():
+            local_path.unlink()
+            changed = True
+        return changed
 
     @classmethod
     def regenerate_agents_md(
@@ -943,12 +966,14 @@ class Agent(PersistableParticipant):
             ctx, discoverable_only=True, viewer_user_id=owner_user_id
         )
         retained = FileUtil.read(ctx.participants_dir / cls.RETAINED_FILE, "json")
+        local_retained = FileUtil.read(ctx.participants_dir / cls.LOCAL_RETAINED_FILE, "json")
         cls._generate_agents_md(
             all_agents,
             ctx.participants_dir / "AGENTS.md",
             owner_username=owner_username,
             owner_user_id=owner_user_id,
             retained=retained if isinstance(retained, list) else None,
+            local_retained=set(local_retained) if isinstance(local_retained, list) else None,
         )
 
     @classmethod
@@ -1002,6 +1027,7 @@ class Agent(PersistableParticipant):
         owner_username: Optional[str] = None,
         owner_user_id: Optional[str] = None,
         retained: Optional[list[dict]] = None,
+        local_retained: Optional[set[str]] = None,
     ) -> None:
         """Generate AGENTS.md file listing all available agents.
 
@@ -1018,6 +1044,10 @@ class Agent(PersistableParticipant):
             output_path: Path to write AGENTS.md
             owner_username: Runner owner's username (used to strip prefixes)
             owner_user_id: Runner owner's user id (used to match registered_by)
+            retained: The owner's retained hub agents (other servers)
+            local_retained: Ids of the other accounts' agents the owner
+                retained; when given, "Other accounts" lists only those (the
+                user's own Cmd-K shows the same set). None: every public one.
         """
         header = "| Agent | Role | Status | Notes |\n|-------|------|--------|-------|"
 
@@ -1039,13 +1069,20 @@ class Agent(PersistableParticipant):
         # know the owner; otherwise fall back to a single flat table.
         if owner_user_id:
             owned = [a for a in agents if a.registered_by == owner_user_id]
-            external = [a for a in agents if a.registered_by != owner_user_id]
+            external = [a for a in agents if a.registered_by != owner_user_id
+                        and (local_retained is None or a.id in local_retained)]
+            other_head = (
+                "## Other accounts (public — reach via cross-account delegation)\n"
+                "Public agents owned by **other users**, NOT part of your roster. "
+                if local_retained is None else
+                "## Other accounts (retained — reach via cross-account delegation)\n"
+                "Public agents of **other users** on this server that your user retained, NOT part of your roster. "
+            )
             sections = (
                 f"## Your agents\n"
                 f"Your own crew — delegate to these directly.\n\n"
                 f"{header}\n{_table(owned)}\n\n"
-                f"## Other accounts (public — reach via cross-account delegation)\n"
-                f"Public agents owned by **other users**, NOT part of your roster. "
+                f"{other_head}"
                 f"They appear here only so you can delegate across accounts when the "
                 f"user explicitly asks; never present them as the user's own agents.\n\n"
                 f"{header}\n{_table(external)}"
@@ -1264,7 +1301,7 @@ class Agent(PersistableParticipant):
             return []
         handles: list[str] = []
         for row in retained:
-            if not isinstance(row, dict) or row.get("state", "active") != "active":
+            if not isinstance(row, dict) or row.get("state", "active") != "active" or row.get("is_local"):
                 continue
             name = str(row.get("name") or "").lower()
             deployment = str(row.get("deployment_name") or "").lower()

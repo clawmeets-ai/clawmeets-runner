@@ -345,18 +345,29 @@ class ClawMeetsClient:
         return agents, resp.headers.get("ETag")
 
     async def list_retained(self) -> Optional[list[dict]]:
-        """``GET /api/hub/retained``: the owner's retained hub agents (plain
+        """``GET /api/hub/retained``: the owner's retained agents (plain
         dicts, read by the AGENTS.md roster). None when the server has no
         such route or refuses (an older server, the hub off): the caller
         keeps what it had."""
+        page = await self.list_retained_page()
+        return page["agents"] if page is not None else None
+
+    async def list_retained_page(self) -> Optional[dict]:
+        """``GET /api/hub/retained`` whole: ``{"agents": [dict], "local_retains": bool}``.
+        ``local_retains`` is true when the server also retains agents of its
+        own (an older server's answer lacks it). None as for ``list_retained``."""
         try:
             resp = await self._http.get(f"{self._base_url}/api/hub/retained")
         except Exception:  # noqa: BLE001 — the roster never fails on this
             return None
         if resp.status_code != 200:
             return None
-        agents = (resp.json() or {}).get("agents")
-        return [a for a in agents if isinstance(a, dict)] if isinstance(agents, list) else None
+        body = resp.json() or {}
+        agents = body.get("agents")
+        if not isinstance(agents, list):
+            return None
+        return {"agents": [a for a in agents if isinstance(a, dict)],
+                "local_retains": body.get("local_retains") is True}
 
     async def list_projects(self, participant_id: str) -> list[ParticipantProjectResponse]:
         """
