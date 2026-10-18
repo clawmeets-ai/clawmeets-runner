@@ -7,7 +7,7 @@ description: >
   before wrapping up EVERY regular project — a completion report is
   required, not optional. The report renders inside the project's own UI
   ("Report" tab) — not in chat, not on /today. Two exceptions only: for
-  git-shaped projects (FILES & STATE block shows a `Git repo` line) use
+  git-shaped projects (FILES & STATE block shows a "Bound git repo" line) use
   `coding-project-completion-report` instead (it pairs the summary with
   an annotated diff review); and DM-shaped projects (a one-to-one direct
   message, no PLAN.md / milestones) don't get a report — a chat reply is
@@ -32,7 +32,7 @@ publish one.
 
 Only two cases are exempt:
 
-- **git-shaped projects** (FILES & STATE block shows a `Git repo` line) —
+- **git-shaped projects** (FILES & STATE block shows a "Bound git repo" line) —
   use `coding-project-completion-report` instead; its diff-aware review
   is what users want for code changes. (You still publish a report — just
   the coding variant.)

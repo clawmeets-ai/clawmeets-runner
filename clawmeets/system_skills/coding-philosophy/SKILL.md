@@ -2,7 +2,7 @@
 name: coding-philosophy
 description: >
   The stance to hold whenever you write, restructure, or review code in a
-  git-tracked project (FILES & STATE block shows a `Git repo` line) — pairs with
+  git-tracked project (FILES & STATE block shows a "Bound git repo" line) — pairs with
   `coding-plan`. Optimize for comprehensibility above all else; the biggest
   question for any change is finding the right semantic home for each piece of
   logic, and when no home fits, extending the system rather than hacking. Read

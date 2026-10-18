@@ -1,0 +1,6 @@
+{
+  "audiences": ["worker", "coordinator", "assistant"],
+  "surfaces": ["agent_runtime"],
+  "version": "1.0.0",
+  "description": "Turn a hard answer into one shared HTML page alongside a self-contained Markdown reply."
+}

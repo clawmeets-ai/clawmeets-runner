@@ -2,7 +2,7 @@
 name: coding-project-completion-report
 description: >
   Publish a final interactive report for a git-shaped project (FILES &
-  STATE block shows a `Git repo` line). The report is the summary of the
+  STATE block shows a "Bound git repo" line). The report is the summary of the
   change PLUS the coordinator's overall review of the change PLUS an
   annotated diff review — what was done, why, the holistic verdict, key
   files, risk areas, and the diff with inline reviewer comments. Invoke
@@ -29,7 +29,7 @@ self-serve protocol as `/today` tabs: a `data` JSON + a small
 Author this for **every git-shaped project** — a report is required
 before `project_completed`, not optional. Use it when:
 
-- The project's FILES & STATE block shows a `Git repo` line (it's
+- The project's FILES & STATE block shows a "Bound git repo" line (it's
   git-tracked), AND
 - Acceptance criteria have passed.
 
