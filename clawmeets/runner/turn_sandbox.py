@@ -538,10 +538,13 @@ def build_bwrap_args(
             a += ["--tmpfs", p]
         elif os.path.exists(p):
             a += ["--ro-bind", "/dev/null", p]
+    binds: list[Path] = []
     for p in (*(_real(x) for x in extra_read), *scope.read_roots):
         a += ["--ro-bind-try", str(p), str(p)]
+        binds.append(p)
     for p in (*scope.write_roots, _real(home.root)):
         a += ["--bind", str(p), str(p)]
+        binds.append(p)
     # Denied paths inside a bound root are masked (dirs by tmpfs, files by /dev/null).
     bound = [*scope.read_roots, *scope.write_roots, *(_real(x) for x in extra_read)]
     for d in (*scope.deny_roots, *instruction_denies(cwd, scope.read_roots, scope.instruction_roots)):
@@ -553,8 +556,33 @@ def build_bwrap_args(
             a += ["--ro-bind", "/dev/null", str(d)]
     a += ["--dir", os.path.dirname(SANDBOX_SOCKET_PATH)]
     a += ["--bind", str(home.egress_socket), SANDBOX_SOCKET_PATH]
+    a += _seal_bwrap_skeleton([*binds, *(Path(p) for p in LINUX_SYSTEM_RO)])
     a += ["--chdir", str(_real(cwd))]
     return a
+
+
+def _seal_bwrap_skeleton(mounts: Sequence[Path]) -> list[str]:
+    """Close the directories bwrap creates on its empty root to hold mounts.
+
+    Binding ``/home/u/.clawmeets/agents/a/projects/p1`` makes bwrap create
+    ``/home``, ``/home/u``, ... ``projects`` as empty dirs on the root tmpfs.
+    Left alone, a turn can list them (seeing the mount names) and create files
+    in them. Each becomes traverse-only (0111), then the root is remounted
+    read-only so the turn cannot chmod them back. ``/tmp`` and ``/run`` are
+    their own tmpfs mounts and stay writable.
+    """
+    mounted = [_real(m) for m in mounts if os.path.exists(m)]
+    keep = {Path("/"), Path("/tmp"), Path("/run"), Path("/proc"), Path("/dev")}
+    skeleton: set[Path] = set()
+    for m in mounted:
+        for d in m.parents:
+            if d in keep or any(d == x or x in d.parents for x in mounted):
+                continue
+            skeleton.add(d)
+    a: list[str] = []
+    for d in sorted(skeleton):
+        a += ["--chmod", "0111", str(d)]
+    return [*a, "--remount-ro", "/"]
 
 
 # ---------------------------------------------------------------------------
@@ -602,14 +630,16 @@ def wrap_command(
             cmd[0] = str(_real(found))
         return [SANDBOX_EXEC, "-p", profile, *cmd]
     if kind == "bwrap":
-        argv = build_bwrap_args(scope, home, cwd=cwd, extra_read=reads, bwrap=shutil.which("bwrap") or "bwrap")
+        # The shim is found through the runner's own source / site-packages root.
+        src_root = Path(__file__).resolve().parents[2]
+        argv = build_bwrap_args(
+            scope, home, cwd=cwd, extra_read=[*reads, src_root], bwrap=shutil.which("bwrap") or "bwrap",
+        )
         shim = [
             str(_real(sys.executable)), "-m", "clawmeets.runner.netshim",
             "--listen", f"{NETSHIM_LISTEN[0]}:{NETSHIM_LISTEN[1]}",
             "--upstream", SANDBOX_SOCKET_PATH, "--",
         ]
-        # The shim is found through the runner's own source / site-packages root.
-        src_root = Path(__file__).resolve().parents[2]
-        argv += ["--ro-bind-try", str(src_root), str(src_root), "--setenv", "PYTHONPATH", str(src_root)]
+        argv += ["--setenv", "PYTHONPATH", str(src_root)]
         return [*argv, *shim, *cmd]
     raise SandboxUnavailable(f"unknown sandbox kind {kind!r}")
