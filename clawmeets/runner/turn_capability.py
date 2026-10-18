@@ -272,7 +272,11 @@ def run_canaries_for(
         # turn produces nothing. Demand output the provider does not itself
         # read as an error and that carries a result in its own shape.
         if r.returncode != 0:
-            problem = f"rc={r.returncode}"
+            # The provider's own reason ("401 OAuth access token has expired"),
+            # not just the code: the raw output after it starts with the CLI's
+            # init line, so the doctor's one-line summary would never reach it.
+            detail = cli._build_error_detail(prepared, stdout, stderr, r.returncode)
+            problem = f"rc={r.returncode}, provider error: {detail[:200]}" if detail else f"rc={r.returncode}"
         elif not stdout.strip():
             problem = "exit 0 with no result"
         elif detail := cli._build_error_detail(prepared, stdout, stderr, r.returncode):

@@ -1052,15 +1052,45 @@ def check_isolated_turns(username: str = "") -> Check:
     detail = "; ".join(
         f"{name} ({r.get('provider') or '?'}): {_first_line(r.get('failures') or [])}" for name, r in failed
     )
+    restart = "restart your agents (`clawmeets stop`, then `clawmeets start`); the check runs again at start."
+    if any(_is_login_failure(r) for _, r in failed):
+        remedy = f"Sign the model CLI in again on this computer ({_relogin_hint(failed)}), then {restart}"
+    else:
+        remedy = restart[0].upper() + restart[1:]
     return Check(
         id="isolated_turns", title=ISOLATED_TURNS_TITLE, ok=False, blocking=False,
         detail=f"the start-up check failed for {detail}",
         fix_note=(
-            "Update ClawMeets, then restart your agents (`clawmeets stop`, then `clawmeets start`); "
-            "the check runs again at start. The full error is in "
+            f"{remedy} The full error is in "
             f"{ISOLATION_CHECK_FILE} in that agent's folder under {_data_dir() / 'agents'}."
         ),
     )
+
+
+# What a provider prints when the login it was handed is refused (expired or
+# revoked OAuth token, bad API key). Matched on the saved failure text.
+_LOGIN_FAILURE_MARKERS = ("(HTTP 401)", "Failed to authenticate", "access token has expired", "Invalid API key")
+
+
+def _is_login_failure(result: dict) -> bool:
+    text = " ".join(str(f) for f in result.get("failures") or [])
+    return any(m in text for m in _LOGIN_FAILURE_MARKERS)
+
+
+def _relogin_hint(failed: list[tuple[str, dict]]) -> str:
+    providers = sorted({r.get("provider") or "" for _, r in failed if _is_login_failure(r)})
+    # A canary's provider is the CLI's id (``codex``, not ``openai``).
+    by_id = {m.id: m for m in MODEL_CLIS}
+    cmds = []
+    for p in providers:
+        m = by_id.get(p)
+        if m and m.login_fix:
+            cmds.append(f"`{m.login_fix}`")
+        elif m and m.login_note:
+            cmds.append(m.login_note[0].lower() + m.login_note[1:])
+        elif p:
+            cmds.append(f"sign {p} in")
+    return " / ".join(cmds) or "sign it in"
 
 
 def check_provider_keys_in_env() -> Check:
