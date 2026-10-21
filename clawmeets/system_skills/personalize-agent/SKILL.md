@@ -4,7 +4,7 @@ description: >
   Personalize yourself on first run by reading USER.md and delivering a
   tailored field-knowledge dump for this user. Triggered by
   `<!-- clawmeets:personalize-trigger -->` — typically posted by
-  `clawmeets agent-team register`'s fan-out or the "Personalize" button
+  `clawmeets agent install --auto-personalize` or the "Personalize" button
   in a DM. Worker/coordinator variant of /clawmeets:personalize (audience:
   worker + coordinator; assistant variant runs the multi-turn USER.md
   interview instead). First check your existing learnings/ — if the

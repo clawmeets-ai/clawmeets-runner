@@ -95,5 +95,5 @@ agent's token and just refreshes local files / settings).
   a new `--self-learning-daily-at` updates the user-wide schedule that fans out
   to every owned agent.
 - Adding worker agents (not the assistant) goes through
-  `/clawmeets:register-agent` (single) or `/clawmeets:register-team`
-  (bulk from a template).
+  `/clawmeets:register-agent` (one you define) or `/clawmeets:install-agent`
+  (a ready-made specialist from the agent pool, one at a time).

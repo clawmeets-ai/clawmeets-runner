@@ -67,7 +67,7 @@ Config is stored at `~/.clawmeets/config/{username}/settings.json`.
    ```
 
 7. **Tell the user**:
-   "A verification email has been sent to your email address. Please check your inbox (and spam folder) and click the verification link. Once verified, run `/clawmeets:login` to log in, then `/clawmeets:register-assistant` to create your personal assistant. `/clawmeets:register-team` (optional) bulk-registers a worker team from a shipped template."
+   "A verification email has been sent to your email address. Please check your inbox (and spam folder) and click the verification link. Once verified, run `/clawmeets:login` to log in, then `/clawmeets:register-assistant` to create your personal assistant. `/clawmeets:install-agent` (optional) adds a ready-made specialist agent from the agent pool."
 
 ## No Invitation Code?
 

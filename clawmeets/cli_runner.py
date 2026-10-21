@@ -142,10 +142,6 @@ assistant_app = typer.Typer(
     help="Create and manage your personal assistant agent ({username}-assistant).",
     no_args_is_help=True,
 )
-agent_team_app = typer.Typer(
-    help="Bulk-register a team of worker agents from a setup.json template.",
-    no_args_is_help=True,
-)
 provider_app = typer.Typer(
     help="Model provider agents: one per model CLI or API key on this computer.",
     no_args_is_help=True,
@@ -4565,7 +4561,7 @@ def bootstrap_browser(
 
 
 # ---------------------------------------------------------------------------
-# assistant register / agent-team register
+# assistant register / agent install
 # ---------------------------------------------------------------------------
 
 _PERSONALIZE_TRIGGER_MARKER = "<!-- clawmeets:personalize-trigger -->"
@@ -5461,115 +5457,26 @@ def _install_agent_bundle(
     return True
 
 
-@agent_team_app.command("register")
-def agent_team_register(
-    url: str = typer.Argument(..., help="URL or path to setup.json template"),
-    username: Optional[str] = typer.Option(
-        None, "--username", "-u",
-        help="Your ClawMeets username (defaults to current_user from a saved session).",
-    ),
-    password: Optional[str] = typer.Option(
-        None, "--password", "-p",
-        help="Your ClawMeets password (only needed when no saved session exists).",
-    ),
-    server: Optional[str] = typer.Option(
-        None, "--server", "-s",
-        help="Server URL (defaults to the server your saved session was made on).",
-    ),
-    data_dir: Path = typer.Option(
-        DEFAULT_DATA_DIR, "--data-dir",
-        help="Root data directory (agents saved to {data_dir}/agents/)",
-    ),
-    agent: List[str] = typer.Option(
-        None, "--agent",
-        help=(
-            "Register only these agents from the template (repeatable; matches "
-            "setup.json agent `name`). Default: register every agent in the template."
-        ),
-    ),
-    llm_provider: Optional[str] = typer.Option(
-        None, "--llm-provider",
-        help=(
-            "Override LLM provider for every worker registered in this run. "
-            "One of: claude, openai, gemini, opencode, antigravity (CLI) or claude-api, "
-            "openai-api, gemini-api, openrouter-api (in-process BYO-key). "
-            "Wins over per-agent llm_provider in setup.json."
-        ),
-    ),
-    llm_base_url: Optional[str] = typer.Option(
-        None, "--llm-base-url",
-        help=(
-            "Override the local-model endpoint for every worker in this run: "
-            "OpenAI-compatible for 'openai-api' (ollama 'http://localhost:11434/v1'), "
-            "or a local Anthropic Messages-API URL for the 'claude' CLI (ollama "
-            "'http://localhost:11434' — no '/v1'). Wins over per-agent llm_base_url "
-            "in setup.json."
-        ),
-    ),
-    auto_personalize: bool = typer.Option(
-        False, "--auto-personalize",
-        help="Fan out personalize-trigger DMs to each worker after "
-             "registering so they self-personalize. Off by default.",
-    ),
-    overwrite_local: bool = typer.Option(
-        False, "--overwrite-local",
-        help="Overwrite bundle files changed locally since install (default: keep them). "
-             "A bundle file you deleted is reinstalled either way.",
-    ),
-):
-    """Bulk-register a team of worker agents from a setup.json template.
-
-    Entries carrying a ``bundle`` (the specialist agent pool) also get their
-    role, field knowledge, reference material and private skills copied into
-    the agent's home. Re-running keeps bundle files changed locally since the
-    last install unless --overwrite-local, and never deletes anything.
-
-    Personalize-trigger DMs are posted into each registered worker's per-agent
-    DM project (`user-communication`) only when `--auto-personalize` is passed,
-    so the workers self-personalize on their own runners. Off by default —
-    otherwise wake each worker on demand via its DM's **Personalize** button.
-
-    Example:
-        clawmeets agent-team register https://example.com/team.json
-        clawmeets agent-team register ./team.json -u alice -p secret --auto-personalize
+def _register_entries(
+    agents_list: list[dict],
+    source: str,
+    *,
+    username: Optional[str],
+    password: Optional[str],
+    server: Optional[str],
+    data_dir: Path,
+    llm_provider: Optional[str],
+    llm_base_url: Optional[str],
+    auto_personalize: bool,
+    overwrite_local: bool,
+) -> list[str]:
+    """Register setup.json ``agents[]`` entries as the signed-in user and
+    install each entry's pool bundle (role, knowledge, learnings, private
+    skills; every file checked against its sha256). ``source`` is the
+    setup.json's URL or path, which a bundle's relative files resolve against.
+    Exits 1 after the loop when any entry was refused or not fully installed;
+    returns the registered names otherwise.
     """
-    if llm_provider is not None and llm_provider.lower() not in _VALID_LLM_PROVIDERS:
-        typer.echo(
-            f"Error: --llm-provider must be one of {_VALID_LLM_PROVIDERS} (got {llm_provider!r}).",
-            err=True,
-        )
-        raise typer.Exit(1)
-
-    template = _fetch_setup_template(url)
-    agents_list = template.get("agents") or []
-    if not agents_list:
-        typer.echo("Error: Template contains no agent definitions.", err=True)
-        raise typer.Exit(1)
-
-    if agent:
-        requested = list(dict.fromkeys(agent))
-        available = {a["name"] for a in agents_list}
-        unknown = [n for n in requested if n not in available]
-        if unknown:
-            typer.echo(
-                f"Error: --agent name(s) not in template: {', '.join(unknown)}. "
-                f"Available: {', '.join(sorted(available))}.",
-                err=True,
-            )
-            raise typer.Exit(1)
-        keep = set(requested)
-        total = len(agents_list)
-        agents_list = [a for a in agents_list if a["name"] in keep]
-        typer.echo(
-            f"  --agent filter: registering {len(agents_list)} of {total} "
-            f"({', '.join(a['name'] for a in agents_list)})"
-        )
-    else:
-        typer.echo(
-            f"  Registering {len(agents_list)} agent(s): "
-            f"{', '.join(a['name'] for a in agents_list)}"
-        )
-
     if username and password:
         server = _server_url(server or DEFAULT_SERVER)
         token = _login_for_jwt(server, username, password)
@@ -5589,7 +5496,7 @@ def agent_team_register(
 
     registered_names: list[str] = []
     failed: list[str] = []
-    template_base = agent_bundle.template_base_of(url)
+    template_base = agent_bundle.template_base_of(source)
     with _http(server) as client:
         refused = set(_check_pool_entries(client, token, agents_list, agents_dir))
         failed.extend(sorted(refused))
@@ -5623,4 +5530,149 @@ def agent_team_register(
     if failed:
         typer.echo(f"\nNot fully installed: {', '.join(failed)}. Fix the above and re-run.", err=True)
         raise typer.Exit(1)
-    typer.echo("\nDone. Run `clawmeets start` to bring your agents online.")
+    return registered_names
+
+
+def _agent_pool_source(from_: Optional[str]) -> str:
+    """Where `agent install` reads the pool's setup.json: --from, else
+    $CLAWMEETS_AGENT_POOL_URL, else the pinned public pool."""
+    return from_ or os.environ.get("CLAWMEETS_AGENT_POOL_URL") or agent_bundle.DEFAULT_AGENT_POOL_URL
+
+
+def _pool_listing(pool: dict) -> list[dict]:
+    """One row per pool agent: what `agent install --list` shows."""
+    rows = []
+    for a in pool.get("agents") or []:
+        if not isinstance(a, dict) or not a.get("name"):
+            continue
+        samples = [s for s in (a.get("sample_requests") or []) if isinstance(s, dict)]
+        rows.append({
+            "name": a["name"],
+            "blurb": a.get("blurb") or "",
+            "description": a.get("description") or "",
+            "sample_requests": samples,
+        })
+    return rows
+
+
+@agent_app.command("install")
+def agent_install(
+    name: Optional[str] = typer.Argument(
+        None, help="The pool agent to install (see `clawmeets agent install --list`).",
+    ),
+    list_: bool = typer.Option(False, "--list", help="List the agents in the pool instead of installing."),
+    json_out: bool = typer.Option(False, "--json", help="With --list: print JSON (for skills and scripts)."),
+    from_: Optional[str] = typer.Option(
+        None, "--from",
+        help="Pool setup.json URL or path (default: $CLAWMEETS_AGENT_POOL_URL, else the "
+             "pinned public clawmeets-agents release).",
+    ),
+    team: List[str] = typer.Option(
+        None, "--team", help="Also label the agent with this team (repeatable; added to the pool's labels).",
+    ),
+    username: Optional[str] = typer.Option(
+        None, "--username", "-u", help="Your ClawMeets username (defaults to the saved session).",
+    ),
+    password: Optional[str] = typer.Option(
+        None, "--password", "-p", help="Your ClawMeets password (only needed when no saved session exists).",
+    ),
+    server: Optional[str] = typer.Option(
+        None, "--server", "-s", help="Server URL (defaults to the server your saved session was made on).",
+    ),
+    data_dir: Path = typer.Option(
+        DEFAULT_DATA_DIR, "--data-dir", help="Root data directory (agents saved to {data_dir}/agents/)",
+    ),
+    llm_provider: Optional[str] = typer.Option(
+        None, "--llm-provider",
+        help="LLM provider for this agent (default: a copy of your default model). One of: claude, "
+             "openai, gemini, opencode, antigravity (CLI) or claude-api, openai-api, gemini-api, "
+             "openrouter-api (in-process BYO-key).",
+    ),
+    llm_base_url: Optional[str] = typer.Option(
+        None, "--llm-base-url", help="Local-model endpoint (see `clawmeets agent register --help`).",
+    ),
+    auto_personalize: bool = typer.Option(
+        False, "--auto-personalize", help="Post a personalize-trigger DM so the agent tailors itself to you.",
+    ),
+    overwrite_local: bool = typer.Option(
+        False, "--overwrite-local",
+        help="Overwrite bundle files changed locally since the last install (default: keep them).",
+    ),
+):
+    """Install ONE specialist agent from the agent pool.
+
+    Registers the agent under your account and installs its files into its
+    home on this computer: its role, field knowledge, reference material and
+    private skills, each checked against the sha256 the pool lists.
+    Re-running it updates the agent: files you or the agent changed since the
+    last install are kept (and reported) unless --overwrite-local, and nothing
+    is ever deleted.
+
+    Examples:
+        clawmeets agent install --list
+        clawmeets agent install contract_reviewer
+        clawmeets agent install my_agent --from ./my-pool/setup.json
+    """
+    if llm_provider is not None and llm_provider.lower() not in _VALID_LLM_PROVIDERS:
+        typer.echo(
+            f"Error: --llm-provider must be one of {_VALID_LLM_PROVIDERS} (got {llm_provider!r}).",
+            err=True,
+        )
+        raise typer.Exit(1)
+    source = _agent_pool_source(from_)
+    try:
+        pool = _fetch_setup_template(source)
+    except typer.Exit:
+        if source == agent_bundle.DEFAULT_AGENT_POOL_URL:
+            # Running from main before the pinned pool tag is published.
+            typer.echo(
+                f"The pinned agent pool ({agent_bundle.AGENT_POOL_REPO} at tag "
+                f"{agent_bundle.AGENT_POOL_REF}) could not be read. From a clawmeets "
+                "checkout, pass --from agents/setup.json.",
+                err=True,
+            )
+        raise
+    rows = _pool_listing(pool)
+
+    if list_:
+        if json_out:
+            typer.echo(json.dumps({"source": source, "agents": rows}, indent=2))
+            return
+        if not rows:
+            typer.echo(f"The pool at {source} lists no agents.")
+            return
+        typer.echo(f"Agents in {source}:\n")
+        for row in rows:
+            typer.echo(f"  {row['name']}")
+            if row["blurb"]:
+                typer.echo(f"      {row['blurb']}")
+            if row["sample_requests"]:
+                typer.echo(f"      e.g. \"{row['sample_requests'][0].get('title', '')}\"")
+        typer.echo("\nInstall one with: clawmeets agent install <name>")
+        return
+
+    if not name:
+        typer.echo("Error: name the agent to install, or pass --list to see the pool.", err=True)
+        raise typer.Exit(2)
+    entry = next((a for a in pool.get("agents") or [] if isinstance(a, dict) and a.get("name") == name), None)
+    if entry is None:
+        names = [r["name"] for r in rows]
+        key = name.lower().replace("-", "_")
+        close = [n for n in names if key[:4] in n or n.startswith(key.split("_")[0])][:3]
+        hint = f" Did you mean: {', '.join(close)}?" if close else ""
+        typer.echo(f"Error: no agent named {name!r} in {source}.{hint} See `clawmeets agent install --list`.", err=True)
+        raise typer.Exit(2)
+    if team:
+        entry = {**entry, "user_teams": _normalize_user_teams_from_setup(
+            _normalize_user_teams_from_setup(entry.get("user_teams")) + list(team)
+        )}
+
+    registered = _register_entries(
+        [entry], source,
+        username=username, password=password, server=server, data_dir=data_dir,
+        llm_provider=llm_provider, llm_base_url=llm_base_url,
+        auto_personalize=auto_personalize, overwrite_local=overwrite_local,
+    )
+    shown = registered[0] if registered else name
+    typer.echo(f"\nInstalled {shown}. Run `clawmeets start --agent {name}` to bring it online.")
+

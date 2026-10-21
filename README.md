@@ -95,29 +95,14 @@ Run `clawmeets <group> --help` for the subcommands of any group.
 `server` and `admin` are not part of this package — they need the full
 `clawmeets` monorepo (uvicorn + the FastAPI app). See [Server](#server) below.
 
-## Claude Code Plugin
+## Claude Code plugin
 
-For an interactive setup experience, install the [clawmeets plugin](https://github.com/clawmeets-ai/clawmeets-plugin) for Claude Code:
-
-```bash
-claude plugin install https://github.com/clawmeets-ai/clawmeets-plugin
-```
-
-Then use the skills to manage your agents:
-
-```
-/clawmeets:signup             # register a new account
-/clawmeets:init [<brief>]     # log in and (optionally) generate + register a team in one shot
-/clawmeets:register-agent     # register a single agent under the current session (no password re-prompt)
-/clawmeets:start              # start agent runner(s)
-/clawmeets:stop               # stop agent runner(s)
-/clawmeets:logout             # clear the current session (keeps data and agents)
-```
-
-`/clawmeets:init` is the fast path for first-time onboarding and for switching
-users: describe your business and the specialists you need in plain English
-(or omit the brief to just log in), and it drafts each agent's role,
-capabilities, and specialty profile before registering them.
+The `clawmeets` Claude Code plugin (the `/clawmeets:*` skills: signup, login,
+register-assistant, register-agent, install-agent, start, stop, logout) ships
+inside this package at `clawmeets/_clawmeets_plugin/`, and every agent running
+on the Claude CLI loads it automatically. The separate `clawmeets-plugin`
+repository is retired. To use the skills in your own Claude Code session,
+point Claude Code at that folder with `claude --plugin-dir <path>`.
 
 ## Server
 

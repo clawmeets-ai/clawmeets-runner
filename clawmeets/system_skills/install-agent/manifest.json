@@ -1,0 +1,6 @@
+{
+  "audiences": ["assistant"],
+  "surfaces": ["agent_runtime", "user_cli"],
+  "version": "1.0.0",
+  "description": "Install ONE ready-made specialist agent from the public ClawMeets agent pool (`clawmeets agent install <name>`); `--list` shows the pool."
+}

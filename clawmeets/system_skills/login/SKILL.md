@@ -2,8 +2,8 @@
 name: login
 description: >
   Log in to a clawmeets server and persist the session on this machine so
-  follow-up commands (`clawmeets assistant register`, `clawmeets agent-team
-  register`, `clawmeets start`) don't need credentials again. Use when users
+  follow-up commands (`clawmeets assistant register`, `clawmeets agent
+  install`, `clawmeets start`) don't need credentials again. Use when users
   say "log in", "login", "sign in", "remember me", or "switch user".
 ---
 

@@ -6,7 +6,7 @@ Install a specialist pool agent's files into its local agent home.
 
 A pool entry in a setup.json carries a ``bundle``: the agent's folder
 (``dir``, relative to the setup.json) and every file to install with its
-sha256. ``clawmeets agent-team register`` fetches the bundle after writing the
+sha256. ``clawmeets agent install`` fetches the bundle after writing the
 agent's card and places each file where the runner already reads it:
 
     role.md            -> knowledge/CLAUDE.md       (the role)
@@ -37,6 +37,16 @@ from typing import Optional
 import httpx
 
 from ..utils.file_io import FileUtil
+
+# The public specialist pool `clawmeets agent install` reads by default: the
+# setup.json at a release TAG of the clawmeets-agents repo, never its main, so
+# a push to the pool cannot change what an already-installed runner installs.
+# Each runner release bumps the tag (RELEASING.md); scripts/release_check.py
+# refuses a runner tag whose pinned pool tag does not exist. Override with
+# `--from` or $CLAWMEETS_AGENT_POOL_URL (forks, local checkouts).
+AGENT_POOL_REPO = "clawmeets-ai/clawmeets-agents"
+AGENT_POOL_REF = "pool-v1"
+DEFAULT_AGENT_POOL_URL = f"https://raw.githubusercontent.com/{AGENT_POOL_REPO}/{AGENT_POOL_REF}/setup.json"
 
 # Bundle path (exact file or "<dir>/" prefix) -> place in the agent home.
 BUNDLE_ROUTES: dict[str, str] = {

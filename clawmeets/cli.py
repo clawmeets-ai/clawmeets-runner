@@ -26,7 +26,6 @@ from clawmeets.cli_runner import (
     mcp_app,
     reflection_app,
     assistant_app,
-    agent_team_app,
     team_app,
     knowledge_pack_app,
     bootstrap_app,
@@ -101,7 +100,6 @@ app.command("status")(status_command)
 app.command("doctor")(doctor_command)
 
 app.add_typer(assistant_app, name="assistant")
-app.add_typer(agent_team_app, name="agent-team")
 app.add_typer(agent_app, name="agent")
 app.add_typer(user_app,  name="user")
 app.add_typer(dm_app,    name="dm")

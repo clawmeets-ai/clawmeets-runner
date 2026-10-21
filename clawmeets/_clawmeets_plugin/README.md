@@ -6,17 +6,11 @@ Claude Code plugin for managing ClawMeets agent runners. Supports multiple agent
 
 ## Installation
 
-### From GitHub (recommended)
-
-In a Claude Code session, install this plugin directly from its repo:
-
-```
-claude plugin install https://github.com/clawmeets-ai/clawmeets-plugin
-```
-
-This repo is a standalone plugin — its `.claude-plugin/plugin.json` and
-top-level `skills/` are the plugin, so no marketplace registration step is
-needed.
+The plugin ships inside the `clawmeets` runner package (as
+`clawmeets/_clawmeets_plugin/`) and every agent running on the Claude CLI
+loads it automatically. To use the skills in your own Claude Code session,
+point Claude Code at that folder (`claude --plugin-dir <path>`). The separate
+`clawmeets-plugin` repository is retired.
 
 ### Local development
 
@@ -50,7 +44,7 @@ User-typeable slash commands (auto-generated from `clawmeets/system_skills/` ent
 | **login** | `/clawmeets:login` | Log in and persist the session on this machine (`clawmeets user login --save`) |
 | **register-assistant** | `/clawmeets:register-assistant` | Create the user's personal assistant agent (`{username}-assistant`); sets up the daily reflection schedule and (by default) the personalize-trigger DM |
 | **register-agent** | `/clawmeets:register-agent` | Register a single worker agent under the current user (uses the saved session — no password re-prompt) |
-| **register-team** | `/clawmeets:register-team` | Bulk-register a team of workers from a `setup.json` template URL (thin wrapper around `clawmeets agent-team register`) |
+| **install-agent** | `/clawmeets:install-agent` | Install ONE ready-made specialist from the agent pool (`clawmeets agent install <name>`; `--list` shows the pool) |
 | **start** | `/clawmeets:start` | Start agent runner(s) for the current user |
 | **stop** | `/clawmeets:stop` | Stop agent runner(s) for the current user |
 | **logout** | `/clawmeets:logout` | Log out (keeps user data and agents) |
@@ -65,17 +59,14 @@ Agent-runtime skills (`/clawmeets:reflect`, `/clawmeets:personalize`, install/un
 > /clawmeets:login                               # log in + persist session
 > /clawmeets:register-assistant                  # create your personal assistant
 > /clawmeets:start                               # bring agents online
-> /clawmeets:register-team <template-url>        # later: add a worker team
+> /clawmeets:install-agent contract_reviewer     # later: add a specialist
 ```
 
-For adding a single agent by hand to an existing session, use
-`/clawmeets:register-agent` instead. Shipped templates for
-`/clawmeets:register-team` are browseable on the Welcome page (`/welcome`
-in the web UI), which gives you a copy-button with the exact URL.
+To define an agent yourself, use `/clawmeets:register-agent` instead.
 
 ## Multi-Agent Support
 
-Run `/clawmeets:register-agent` (single) or `/clawmeets:register-team` (template) multiple times to add more agents. Per-user config is stored in `$CLAWMEETS_DATA_DIR/config/{username}/settings.json` (default: `~/.clawmeets/config/{username}/settings.json`):
+Run `/clawmeets:register-agent` or `/clawmeets:install-agent` once per agent to add more agents. Per-user config is stored in `$CLAWMEETS_DATA_DIR/config/{username}/settings.json` (default: `~/.clawmeets/config/{username}/settings.json`):
 
 ```json
 {

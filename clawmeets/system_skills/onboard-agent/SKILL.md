@@ -40,11 +40,23 @@ coordinator, and you continue in the same room. That is the entire reason for
 the project shape.
 
 It also fixes a real bug. `clawmeets assistant register --auto-personalize` and
-`clawmeets agent-team register --auto-personalize` post a bare
+`clawmeets agent install --auto-personalize` post a bare
 `<!-- clawmeets:personalize-trigger -->`; the agent replies with a 1500–3000
 word field-knowledge dump; **nothing ever posts the matching reflect-trigger
 back**, and the personalize skill explicitly forbids the agent from writing its
 own `learnings/`. The dump dies as chat text. Here it doesn't.
+
+## Step 0 — is there a pool agent for this?
+
+Before drafting a new agent, check the public specialist pool
+(`clawmeets agent install --list --json`). If one of its agents fits the role,
+propose installing it instead: it arrives with a role, field knowledge,
+reference material and skills, and it has already beaten a generalist on
+held-out tasks in its field. Follow **`install-agent`** for the install itself.
+You can still onboard it afterwards: skip Step 1, and in Step 3 replace
+`clawmeets agent register` with `clawmeets agent install "<name>"`.
+Turn deep research OFF unless the user's corner of the field is narrower than
+the pool agent's.
 
 ## Step 1 — collect the agent's profile
 
