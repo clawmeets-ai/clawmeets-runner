@@ -50,7 +50,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
 
-from clawmeets.models.desk_sop import CONVENE_PROCEDURE
+from clawmeets.models.desk_sop import CONVENE_PROCEDURE, SCHEDULED_DEAL_SOP_TITLE
 from clawmeets.models.onboarding_plan import (
     ONBOARDING_PLAN_TEMPLATE,
     PLAN_TEMPLATE_END,
@@ -148,6 +148,7 @@ SEED_TIMESTAMP = "1970-01-01T00:00:00+00:00"
 ONBOARDING_SEED_ID = "t-seed-onboarding-know-me"
 THINKING_PARTNER_SEED_ID = "t-seed-thinking-partner"
 CONVENE_SEED_ID = "t-seed-convene-models"
+SCHEDULED_DEAL_SEED_ID = "t-seed-scheduled-deal-monitor"
 
 # The second starter row's prompt. Same shape as onboarding's: the assistant
 # fills the one ``<…>`` line of a ready-made plan
@@ -306,6 +307,22 @@ SEED: tuple[dict[str, object], ...] = (
         "text": "Get the best answer from all my models combined",
         "drafted": True,
         "draft_prompt": CONVENE_PROMPT,
+    },
+    {
+        # Last: a standalone everyday job that needs nothing onboarding writes.
+        # Unlike the rows above it POINTS at an SOP rather than carrying the
+        # procedure inline, so the owner edits the tracking steps in one place;
+        # if they delete or rename that SOP, the assistant says it cannot find
+        # it. Not in ``BACKFILL_SEED_IDS``: new accounts only.
+        "id": SCHEDULED_DEAL_SEED_ID,
+        "text": "Scheduled Deal Monitor",
+        "drafted": True,
+        "draft_prompt": (
+            f"Please invoke the SOP \"{SCHEDULED_DEAL_SOP_TITLE}\". Ask me "
+            "what product to track and how often to check it (for example "
+            "\"every day at 9am\" or \"every Monday\"). If any other parameter "
+            "is missing or you are not sure about one, ask me before you start."
+        ),
     },
 )
 

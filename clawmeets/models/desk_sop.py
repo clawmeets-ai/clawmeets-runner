@@ -101,6 +101,11 @@ MAX_BODY_CHARS = 16_384
 # would bake one user's assistant name into a constant.
 SEED_TIMESTAMP = "1970-01-01T00:00:00+00:00"
 
+# Named by title, not id, in the "Scheduled Deal Monitor" starter to-do
+# (``models/desk_todo.py``): the assistant resolves an SOP the owner names the
+# same way the owner would, through ``clawmeets sop list``.
+SCHEDULED_DEAL_SOP_TITLE = "SHOPPING:Scheduled Deal Tracking"
+
 # The moderation steps of the convene panel: the blind round, the claim ledger,
 # the reconciliation loop and the report. Shared with the convene starter to-do
 # in ``models/desk_todo.py``, which carries it inline (the owner may delete this
@@ -674,6 +679,86 @@ SEED: tuple[dict[str, str], ...] = (
             "the render report honestly lists any defects, the cost log shows "
             "the total, and the publish pack is waiting for my yes. Finish with "
             "a short summary listing the file paths."
+        ),
+    },
+    {
+        # The SHOPPING section's one row, and the SOP the "Scheduled Deal Monitor"
+        # starter to-do in ``models/desk_todo.py`` names by title. Product and
+        # schedule are required; criteria and sources default to "none", which
+        # the body reads as "no filter" and "suggest some for me". The
+        # schedule is the owner's words, turned into a desk-sop schedule.
+        "id": "sop-seed-shopping-scheduled-deal-tracking",
+        "title": SCHEDULED_DEAL_SOP_TITLE,
+        "body": (
+            "Track deals on a product for me: check them once now, then keep "
+            "checking on my schedule.\n"
+            "\n"
+            "  Product:      {{Product|text:a 65-inch OLED TV}}\n"
+            "  Schedule:     {{Schedule|text:every day at 9am}}\n"
+            "  Criteria:     {{Criteria (optional)|text:none}}\n"
+            "  Deal sources: {{Deal sources (optional)|text:none}}\n"
+            "\n"
+            "Product is required: if it is blank or vague (no brand, model, "
+            "size or variant where one matters), ask me before searching. "
+            "Schedule is how often to check, in my words (\"every day at 9am\", "
+            "\"weekdays at 8am and 6pm\", \"every Monday\", \"every 4 hours\"); "
+            "\"once\" means just this check. If it is blank, has no time where "
+            "one matters, or you cannot read it as a cadence, ask me. "
+            "Criteria is anything a deal must meet, such as a maximum price, "
+            "quantity, condition (new, open-box, refurbished), seller, "
+            "shipping or pickup; \"none\" means no filter beyond the product "
+            "itself. Deal sources are the websites I want checked; \"none\" "
+            "means I have no favourites.\n"
+            "\n"
+            "1. Browser. If you do not have the playwright-browser skill yet, "
+            "install it on yourself with your install-skill skill (`clawmeets "
+            "skill install self playwright-browser`) and run `clawmeets "
+            "bootstrap browser` once if the skill says this computer needs it. "
+            "Use plain web fetches for static pages and the browser only for "
+            "pages that need JavaScript, a login or a click-through. If a "
+            "site asks me to sign in, tell me which one and skip it; never "
+            "ask me for a password in chat.\n"
+            "\n"
+            "2. Sources. If I named deal sources, use those. If not, suggest "
+            "4 to 6 that fit this product, one line each on why: the major "
+            "retailers that sell it, the maker's own store, a price tracker "
+            "(CamelCamelCamel or Keepa for Amazon), a deal community "
+            "(Slickdeals) and, where it fits, a used or refurbished market. "
+            "Ask me to confirm or edit the list and stop until I answer. Once "
+            "I confirm, write the list into this SOP's Deal sources so the "
+            "next run does not ask again.\n"
+            "\n"
+            "3. Check. On each source, find current listings of the product "
+            "and record the seller, price including shipping and tax where "
+            "shown, any coupon or promo code, stock, condition, and the "
+            "deal's end date if it has one. Drop anything that fails my "
+            "criteria, and anything that is not the same product (a different "
+            "model year, size or bundle), unless it is clearly a better deal, "
+            "in which case flag it as an alternative.\n"
+            "\n"
+            "4. Remember. Keep a price history for this product in your local "
+            "storage ($AGENT_LOCAL_STORAGE_DIR/deal-tracking/), one file per "
+            "product, with each run's best price per source, so later runs "
+            "can tell a real drop from the usual price.\n"
+            "\n"
+            "5. Report. Lead with one line: the best deal right now (price, "
+            "seller, link), or \"nothing matches your criteria today\". "
+            "Then a short table of the rest, best first, and whether each "
+            "price is new, lower or higher than last run. Say which sources "
+            "you could not check and why. Never buy, add to a cart, sign up "
+            "or subscribe to anything on my behalf.\n"
+            "\n"
+            "6. Schedule. After the first check, unless my schedule is "
+            "\"once\", schedule this SOP on that cadence with your desk-sop "
+            "skill, carrying the values settled here (including any sources "
+            "I confirmed). Read my times as my local time. Repeat the schedule "
+            "back to me in plain words with the next run time, and tell me how "
+            "to change or stop it. If this product already has a schedule, "
+            "replace it rather than adding a second. On a scheduled run, "
+            "never ask me anything; report only "
+            "when something changed (a new low, a new deal that matches, or a "
+            "deal about to end); otherwise post one line saying nothing "
+            "changed."
         ),
     },
 )
