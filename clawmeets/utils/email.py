@@ -2,7 +2,7 @@
 """
 clawmeets/utils/email.py
 Generic email infrastructure: value object (``EmailMessage``), pluggable
-``Mailer`` transports (SendGrid + console), and reusable text/HTML
+``Mailer`` transports (SendGrid, Mailgun + console), and reusable text/HTML
 rendering primitives. ClawMeets-specific templates live in
 ``clawmeets/server/email.py``.
 """
@@ -18,6 +18,7 @@ import re
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Optional
 
+import httpx
 import sendgrid
 from markdown_it import MarkdownIt
 from pydantic import BaseModel, Field
@@ -50,6 +51,19 @@ SENDGRID_FROM_NAME = os.environ.get("SENDGRID_FROM_NAME", "ClawMeets AI")
 SENDGRID_TIMEOUT_SECONDS = float(
     os.environ.get("CLAWMEETS_SENDGRID_TIMEOUT_SECONDS", "15")
 )
+
+# Mailgun (``CLAWMEETS_EMAIL_PROVIDER=mailgun``): the messages API with a
+# sending key for ``MAILGUN_DOMAIN``. ``MAILGUN_API_BASE`` is the region
+# (``https://api.eu.mailgun.net`` for EU domains).
+EMAIL_PROVIDER = os.environ.get("CLAWMEETS_EMAIL_PROVIDER", "").strip().lower() or "sendgrid"
+MAILGUN_API_KEY = os.environ.get("MAILGUN_API_KEY")
+MAILGUN_DOMAIN = os.environ.get("MAILGUN_DOMAIN", "")
+MAILGUN_FROM_EMAIL = os.environ.get("MAILGUN_FROM_EMAIL") or (
+    f"noreply@{MAILGUN_DOMAIN}" if MAILGUN_DOMAIN else ""
+)
+MAILGUN_FROM_NAME = os.environ.get("MAILGUN_FROM_NAME", SENDGRID_FROM_NAME)
+MAILGUN_API_BASE = os.environ.get("MAILGUN_API_BASE", "https://api.mailgun.net").rstrip("/")
+MAILGUN_TIMEOUT_SECONDS = float(os.environ.get("CLAWMEETS_MAILGUN_TIMEOUT_SECONDS", "15"))
 
 # Attachment caps — keep a message under SendGrid's ~30 MB hard limit and
 # avoid inlining an unbounded deliverable set. Any candidate that trips a cap
@@ -400,12 +414,84 @@ class SendGridMailer(Mailer):
             raise
 
 
+class MailgunMailer(Mailer):
+    """``POST {api_base}/v3/{domain}/messages`` with HTTP basic auth
+    ``api:<key>``. Async ``httpx`` with a hard timeout, so — unlike the
+    SendGrid SDK — nothing here can block the event loop or park a thread.
+    Click and open tracking are off on every message: links in a verification
+    mail are not rewritten. Any answer but 200 raises, like SendGrid's."""
+
+    def __init__(
+        self, api_key: str, domain: str, from_email: str, from_name: str, *,
+        api_base: str = "https://api.mailgun.net",
+        transport: Optional[httpx.AsyncBaseTransport] = None,
+    ) -> None:
+        self._api_key = api_key
+        self._domain = domain
+        self._from_email = from_email
+        self._from_name = from_name
+        self._api_base = api_base.rstrip("/")
+        self._transport = transport
+
+    def form(self, message: EmailMessage) -> list[tuple[str, str]]:
+        from email.utils import formataddr
+
+        fields = [
+            ("from", formataddr((self._from_name, self._from_email))),
+            ("to", message.to_email),
+            ("subject", message.subject),
+            ("text", message.body),
+        ]
+        if message.html_body:
+            fields.append(("html", message.html_body))
+        fields += [("bcc", addr) for addr in message.bcc]
+        fields += [("o:tracking", "no"), ("o:tracking-clicks", "no"), ("o:tracking-opens", "no")]
+        return fields
+
+    async def send(self, message: EmailMessage) -> None:
+        files = [
+            ("attachment", (att.filename, base64.b64decode(att.content_b64), att.mime_type))
+            for att in message.attachments
+        ]
+        try:
+            async with httpx.AsyncClient(
+                transport=self._transport, timeout=MAILGUN_TIMEOUT_SECONDS,
+            ) as client:
+                response = await client.post(
+                    f"{self._api_base}/v3/{self._domain}/messages",
+                    auth=("api", self._api_key),
+                    data=_grouped(self.form(message)),
+                    files=files or None,
+                )
+            if response.status_code != 200:
+                raise RuntimeError(f"Mailgun answered {response.status_code}")
+            logger.info(
+                f"{message.log_label} sent to {message.to_email} "
+                f"(status={response.status_code})"
+            )
+        except Exception as e:
+            # The type and status only: an httpx error can quote the request.
+            logger.error(
+                f"Failed to send {message.log_label.lower()} to {message.to_email}: "
+                f"{type(e).__name__}: {e if isinstance(e, RuntimeError) else ''}"
+            )
+            raise
+
+
+def _grouped(fields: list[tuple[str, str]]) -> dict[str, list[str]]:
+    """httpx takes repeated form fields (several ``bcc``) as a dict of lists."""
+    out: dict[str, list[str]] = {}
+    for name, value in fields:
+        out.setdefault(name, []).append(value)
+    return out
+
+
 class ConsoleMailer(Mailer):
     async def send(self, message: EmailMessage) -> None:
         logger.info(
             f"[EMAIL FALLBACK] {message.log_label} for {message.to_email}"
         )
-        print(f"\n--- {message.log_label} (SendGrid not configured) ---")
+        print(f"\n--- {message.log_label} (no email provider configured) ---")
         print(f"To: {message.to_email}")
         for bcc_addr in message.bcc:
             print(f"BCC: {bcc_addr}")
@@ -420,6 +506,15 @@ class ConsoleMailer(Mailer):
 
 
 def get_mailer() -> Mailer:
+    """The provider ``CLAWMEETS_EMAIL_PROVIDER`` names (``sendgrid`` by
+    default), or the console when it has no key."""
+    if EMAIL_PROVIDER == "mailgun":
+        if MAILGUN_API_KEY and MAILGUN_DOMAIN:
+            return MailgunMailer(
+                MAILGUN_API_KEY, MAILGUN_DOMAIN, MAILGUN_FROM_EMAIL, MAILGUN_FROM_NAME,
+                api_base=MAILGUN_API_BASE,
+            )
+        return ConsoleMailer()
     if SENDGRID_API_KEY:
         return SendGridMailer(SENDGRID_API_KEY, SENDGRID_FROM_EMAIL, SENDGRID_FROM_NAME)
     return ConsoleMailer()
